@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Query Spec v1 Accepts JSON Arrays at Every Position (#185)**:
+  - The spec consumer now accepts Python lists (the JSON array form produced by `json.loads`/`json.dumps`) and Python tuples interchangeably at every array position, so any schema-valid JSON document compiles instead of raising `TypeError: 'list' object is not an instance of 'tuple'`.
+  - Fixed list-rejected positions: `load_csv`, `unwinds` entries, `case` branches, merge `ON CREATE SET` / `ON MATCH SET` entries, `order_by` entries (root and inside `with_clauses`), `linear_clauses` entries, path steps, mutations and projections.
+  - Fixed tuple-rejected positions for uniformity: `fn` arguments, `case` branch lists, `list` literal items, and the array containers `matches`, `paths`, `unwinds`, `mutations`, `with_clauses`, `projections`, `order_by`, merge set lists and `linear_clauses`.
+  - Malformed shapes at these positions (non-sequences and too-short arrays) now raise `VoyagerError` with code `INVALID_CLAUSE` naming the field, instead of bare `TypeError`/`IndexError` from the FFI layer.
+  - `order_by` direction accepts a boolean (`true` = ascending, `false` = descending) or the uppercase strings `"ASC"`/`"DESC"`, for both the `[variable, property, direction]` and `[expression, direction]` entry variants; the schema documents both forms. Other spellings (for example `"asc"`, `"up"` or `1`) raise `INVALID_CLAUSE`, and an `['alias', expr, name]` projection now keeps its alias in the JSON list spelling, matching the tuple spelling.
+
 ## [0.4.1] - 2026-11-21
 
 ### Changed
