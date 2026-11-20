@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Query Spec v1 Node and Relationship Properties (#263)**: path steps now carry an optional properties object as the 4th node item (`["node", variable, labels, properties]`) or the 7th edge item (`["edge", direction, types, variable, min_hops, max_hops, properties]`). Property values are Expressions, so both literals and parameters work, for example `{"name": ["lit", "Alice"]}` or `{"email": ["param", "email"]}`. The properties compile in `MATCH`, `OPTIONAL MATCH`, `CREATE` and `MERGE` (and in pattern comprehensions and `exists`/`count` subqueries, which share the path reader): openCypher and Apache AGE emit inline `{k: v}` maps, ISO GQL emits its inline property map, and SQL:PGQ renders the same values as `WHERE` predicates inside the node/edge pattern (including named parameters). Omitted, `null` and `{}` properties compile identically, variable-length edge hops are preserved, and a non-object properties item, a non-null item past the new shape, or an untagged property value is rejected with `INVALID_SPEC` and its JSON path. The v1 JSON Schema gains the optional properties item plus `maxItems` on both step shapes.
+
 ### Fixed
 - **Query Spec v1 Accepts JSON Arrays at Every Position (#185)**:
   - The spec consumer now accepts Python lists (the JSON array form produced by `json.loads`/`json.dumps`) and Python tuples interchangeably at every array position, so any schema-valid JSON document compiles instead of raising `TypeError: 'list' object is not an instance of 'tuple'`.
@@ -18,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.1] - 2026-11-21
 
 ### Changed
+- **README installation guide**: added an Installation section covering PyPI and uv installs, optional extras, supported Python versions and platforms, the crates.io crates and Cargo features, the `voyager` CLI, pre-release installs, and the Rust MSRV. Added PyPI, Python, crates.io, and docs.rs badges and converted relative links to absolute GitHub URLs so the README renders correctly on PyPI.
+- **Crate README badges**: added crates.io, docs.rs, CI, license, and MSRV badges to the `voyager-ogm`, `voyager-drivers`, and `voyager-cli` READMEs, and split multi-command install snippets into one command per code block.
+- **Pre-releases publish to crates.io**: release tags with a pre-release suffix (`-alpha.N`, `-beta.N`, `-rc.N`) now publish the Rust crates to crates.io as well as the Python package to TestPyPI; PyPI still receives stable releases only.
+- **Maintenance-branch releases**: releases can now be prepared and tagged from `release/X.Y` branches (cut from the `vX.Y.0` tag) so patch fixes still ship after `main` moves to the next minor. `just release-prepare` and `just release-tag` validate the base line and version (a `release/X.Y` base accepts only `X.Y.N`), CI runs on `release/**`, and the release workflow refuses tags not reachable from `main` or the matching release branch and marks a tag **Latest** only when it is the highest `v*` version.
 
 ### Fixed
 - **PyPI package page**: `voyager-ogm` now uses a Python-focused `packages/python/README.md` as its PyPI long description instead of the repository-wide root README.
