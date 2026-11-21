@@ -325,7 +325,7 @@ def test_postgres_sync_bridge_simulation():
     bridge = PostgresBridge(mock_conn)
     session = Session(bridge=bridge, dialect="sql_pgq")
 
-    # 1. Test GRAPH_TABLE query with parameters (parameter inlining)
+    # 1. Test GRAPH_TABLE query with parameters ($p0 -> %s binding, Issue #226)
     pgq_stmt = (
         "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.city = $p0 COLUMNS (p.name))"
     )
@@ -335,8 +335,8 @@ def test_postgres_sync_bridge_simulation():
     assert len(mock_conn.cursor_inst.executed) == 1
     executed_stmt, executed_params = mock_conn.cursor_inst.executed[0]
     assert "$p0" not in executed_stmt
-    assert "'London'" in executed_stmt
-    assert executed_params == ()
+    assert "%s" in executed_stmt
+    assert executed_params == ["London"]
 
     # 2. Test standard SQL query with parameters ($p0 -> %s translation)
     sql_stmt = "SELECT * FROM person WHERE city = $p0 AND age >= $p1"
@@ -488,10 +488,11 @@ def test_bridge_parameter_formatting_prefix_collision_safety():
     assert "p.age > 30" in formatted_duck
     assert "'Alice'0" not in formatted_duck
 
-    formatted_pg, _ = pg_bridge._format_pgq_statement(stmt, params)
-    assert "p.name = 'Alice'" in formatted_pg
-    assert "p.age > 30" in formatted_pg
-    assert "'Alice'0" not in formatted_pg
+    formatted_pg, ordered_pg = pg_bridge._format_pgq_statement(stmt, params)
+    assert formatted_pg == (
+        "SELECT * FROM GRAPH_TABLE(g MATCH (p) WHERE p.name = %s AND p.age > %s COLUMNS (p.id))"
+    )
+    assert ordered_pg == ["Alice", 30]
 
 
 def test_postgres_bridge_multiple_occurrences_parameter_count():

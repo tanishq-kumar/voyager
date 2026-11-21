@@ -11,10 +11,12 @@ import asyncio
 import datetime
 import inspect
 import json
+import math
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Literal, Protocol, overload, runtime_checkable
 
 import polars as pl
@@ -1261,6 +1263,54 @@ class AsyncNeo4jBoltTransaction:
         )
 
 
+def _encode_duckdb_literal(v: Any) -> str:
+    """Encodes a Python value as a valid SQL literal for DuckDB / DuckPGQ.
+
+    Handles str with proper quoting, int, float (including nan/inf), bool, None,
+    date/datetime/time, list/tuple, and dict/map. Raises TypeError for unsupported types.
+    """
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if math.isnan(v):
+            return "'nan'::DOUBLE"
+        if math.isinf(v):
+            return "'inf'::DOUBLE" if v > 0 else "'-inf'::DOUBLE"
+        return repr(v)
+    if isinstance(v, Decimal):
+        if v.is_nan():
+            return "'nan'::DOUBLE"
+        if v.is_infinite():
+            return "'inf'::DOUBLE" if v > 0 else "'-inf'::DOUBLE"
+        return str(v)
+    if isinstance(v, str):
+        escaped = v.replace("'", "''")
+        return f"'{escaped}'"
+    if isinstance(v, datetime.datetime):
+        if v.tzinfo is not None:
+            return f"TIMESTAMPTZ '{v.isoformat(sep=' ')}'"
+        return f"TIMESTAMP '{v.isoformat(sep=' ')}'"
+    if isinstance(v, datetime.date):
+        return f"DATE '{v.isoformat()}'"
+    if isinstance(v, datetime.time):
+        return f"TIME '{v.isoformat()}'"
+    if isinstance(v, (list, tuple)):
+        items = [_encode_duckdb_literal(elem) for elem in v]
+        return f"[{', '.join(items)}]"
+    if isinstance(v, (dict, Mapping)):
+        items = [
+            f"{_encode_duckdb_literal(k)}: {_encode_duckdb_literal(val)}" for k, val in v.items()
+        ]
+        return f"MAP {{{', '.join(items)}}}"
+    raise TypeError(
+        f"Unsupported parameter type {type(v).__name__} for SQL literal encoding: {v!r}"
+    )
+
+
 class DuckDbBridge:
     """Synchronous DuckDB driver bridge with zero-copy Polars / Arrow output."""
 
@@ -1277,25 +1327,15 @@ class DuckDbBridge:
     ) -> tuple[str, dict[str, Any]]:
         """Interpolates parameters for DuckPGQ GRAPH_TABLE queries where native parameter binding is unsupported."""
         if "GRAPH_TABLE" in statement and parameters:
-            import re
+            regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
 
-            def _make_repl(r: str) -> Callable[[re.Match[str]], str]:
-                return lambda _m: r
+            def repl(m: re.Match[str]) -> str:
+                key = m.group(1)
+                if key in parameters:
+                    return _encode_duckdb_literal(parameters[key])
+                return m.group(0)
 
-            stmt = statement
-            for k in sorted(parameters.keys(), key=len, reverse=True):
-                v = parameters[k]
-                if isinstance(v, str):
-                    escaped = v.replace("'", "''")
-                    replacement = f"'{escaped}'"
-                elif v is None:
-                    replacement = "NULL"
-                elif isinstance(v, bool):
-                    replacement = "TRUE" if v else "FALSE"
-                else:
-                    replacement = str(v)
-                pattern = r"\$" + re.escape(k) + r"\b"
-                stmt = re.sub(pattern, _make_repl(replacement), stmt)
+            stmt = regex.sub(repl, statement)
             return stmt, {}
         return statement, parameters
 
@@ -1813,11 +1853,6 @@ class PostgresBridge:
         if not parameters:
             return statement, ()
 
-        import re
-
-        def _make_repl(r: str) -> Callable[[re.Match[str]], str]:
-            return lambda _m: r
-
         if "cypher(" in statement:
             if not getattr(self.conn, "_voyager_age_initialized", False):
                 setup_postgres_age(self.conn, force=True)
@@ -1825,36 +1860,18 @@ class PostgresBridge:
 
             return statement, (json.dumps(parameters),)
 
-        if "GRAPH_TABLE" in statement:
-            # PG19 GRAPH_TABLE does not support prepared parameters inside table function AST
-            stmt = statement
-            for k in sorted(parameters.keys(), key=len, reverse=True):
-                v = parameters[k]
-                if isinstance(v, str):
-                    escaped = v.replace("'", "''")
-                    replacement = f"'{escaped}'"
-                elif v is None:
-                    replacement = "NULL"
-                elif isinstance(v, bool):
-                    replacement = "TRUE" if v else "FALSE"
-                else:
-                    replacement = str(v)
-                pattern = r"\$" + re.escape(k) + r"\b"
-                stmt = re.sub(pattern, _make_repl(replacement), stmt)
-            return stmt, ()
-        else:
-            ordered_params: list[Any] = []
-            regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
+        ordered_params: list[Any] = []
+        regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
 
-            def repl(m: re.Match[str]) -> str:
-                key = m.group(1)
-                if key in parameters:
-                    ordered_params.append(parameters[key])
-                    return "%s"
-                return m.group(0)
+        def repl(m: re.Match[str]) -> str:
+            key = m.group(1)
+            if key in parameters:
+                ordered_params.append(parameters[key])
+                return "%s"
+            return m.group(0)
 
-            stmt = regex.sub(repl, statement)
-            return stmt, ordered_params
+        stmt = regex.sub(repl, statement)
+        return stmt, ordered_params
 
     def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
