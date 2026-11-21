@@ -273,10 +273,55 @@ fn value_to_text(value: &Value) -> Option<Vec<u8>> {
             b"false".to_vec()
         }),
         Value::Number(n) => Some(n.to_string().into_bytes()),
-        // Nested maps and lists are sent as JSON text. With an unspecified
-        // parameter OID the server infers (and parses) the target type.
-        other => serde_json::to_vec(other).ok(),
+        Value::Array(items) => {
+            let mut out = String::new();
+            encode_pg_array(items, &mut out);
+            Some(out.into_bytes())
+        }
+        // Top-level maps are sent as JSON text.
+        Value::Object(_) => serde_json::to_vec(value).ok(),
     }
+}
+
+/// Encodes a JSON array as PostgreSQL array literal text (`{elem1,elem2}`).
+fn encode_pg_array(items: &[Value], out: &mut String) {
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        encode_pg_array_element(item, out);
+    }
+    out.push('}');
+}
+
+/// Encodes an element inside a PostgreSQL array literal.
+fn encode_pg_array_element(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("NULL"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => escape_and_quote_element(s, out),
+        Value::Array(nested) => encode_pg_array(nested, out),
+        Value::Object(_) => {
+            if let Ok(json_str) = serde_json::to_string(value) {
+                escape_and_quote_element(&json_str, out);
+            }
+        }
+    }
+}
+
+/// Double-quotes an array element, escaping `\` as `\\` and `"` as `\"`.
+fn escape_and_quote_element(s: &str, out: &mut String) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 fn is_placeholder_name_byte(byte: u8) -> bool {
@@ -525,8 +570,58 @@ mod tests {
             vec![
                 None,
                 Some(br#"{"k":"v"}"#.to_vec()),
-                Some(b"[1,2,3]".to_vec()),
+                Some(b"{1,2,3}".to_vec()),
             ]
+        );
+    }
+
+    #[test]
+    fn pg_array_parameter_encoding_supports_all_types() {
+        let query = "SELECT $empty, $strings, $numbers, $bools, $nulls, $nested, $maps";
+        let prepared = prepare_postgres_statement(
+            query,
+            &params(&[
+                ("empty", json!([])),
+                (
+                    "strings",
+                    json!(["foo\"bar", "foo\\bar", "a,b", "{brace}", "NULL"]),
+                ),
+                ("numbers", json!([1, -42, 3.5])),
+                ("bools", json!([true, false])),
+                ("nulls", json!([null, null])),
+                ("nested", json!([[1, 2], [3, 4]])),
+                ("maps", json!([{"a": 1}])),
+            ]),
+        )
+        .expect("prepare should succeed");
+
+        assert_eq!(
+            prepared.parameter_values[0].as_deref(),
+            Some(b"{}".as_slice())
+        );
+        assert_eq!(
+            prepared.parameter_values[1].as_deref(),
+            Some(br#"{"foo\"bar","foo\\bar","a,b","{brace}","NULL"}"#.as_slice())
+        );
+        assert_eq!(
+            prepared.parameter_values[2].as_deref(),
+            Some(b"{1,-42,3.5}".as_slice())
+        );
+        assert_eq!(
+            prepared.parameter_values[3].as_deref(),
+            Some(b"{true,false}".as_slice())
+        );
+        assert_eq!(
+            prepared.parameter_values[4].as_deref(),
+            Some(b"{NULL,NULL}".as_slice())
+        );
+        assert_eq!(
+            prepared.parameter_values[5].as_deref(),
+            Some(b"{{1,2},{3,4}}".as_slice())
+        );
+        assert_eq!(
+            prepared.parameter_values[6].as_deref(),
+            Some(br#"{"{\"a\":1}"}"#.as_slice())
         );
     }
 

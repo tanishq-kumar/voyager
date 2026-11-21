@@ -492,6 +492,93 @@ class TestPostgres19PgqParameterBindingLive:
                 f"Parity mismatch in {case_name}: bridge={res_b!r} vs native={res_n!r}"
             )
 
+    def test_pg19_bridge_and_native_list_parameter_parity(self, pg19_conn):
+        """Verifies backend='bridge' and backend='native' return identical rows for list parameters (Issue #283).
+
+        Tests plain SQL `= ANY(...)` and GRAPH_TABLE queries with:
+        - strings list
+        - ints list
+        - empty list
+        """
+        pg_uri = "postgresql://postgres:voyagerpass123@127.0.0.1:5456/voyager_graph"
+        bridge = PostgresBridge(pg19_conn)
+        session_bridge = Session(bridge=bridge, dialect="sql_pgq")
+        session_native = Session(pg_uri, backend="native", dialect="sql_pgq")
+
+        test_cases: list[tuple[str, str, dict[str, Any], int]] = [
+            # Plain SQL = ANY(...)
+            (
+                "plain SQL = ANY(...) strings",
+                "SELECT id, name FROM pg19_param_person WHERE name = ANY($names) ORDER BY id",
+                {"names": ["Alice", "Bob"]},
+                2,
+            ),
+            (
+                "plain SQL = ANY(...) ints",
+                "SELECT id, name FROM pg19_param_person WHERE id = ANY($ids) ORDER BY id",
+                {"ids": [1, 3]},
+                2,
+            ),
+            (
+                "plain SQL = ANY(...) empty list",
+                "SELECT id, name FROM pg19_param_person WHERE id = ANY($ids) ORDER BY id",
+                {"ids": []},
+                0,
+            ),
+            # GRAPH_TABLE with list parameter (= ANY(...))
+            (
+                "GRAPH_TABLE = ANY(...) strings",
+                (
+                    "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+                    "MATCH (p IS Person) WHERE p.name = ANY($names) "
+                    "COLUMNS (p.id, p.name)) ORDER BY id"
+                ),
+                {"names": ["Alice", "Charlie"]},
+                2,
+            ),
+            (
+                "GRAPH_TABLE = ANY(...) ints",
+                (
+                    "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+                    "MATCH (p IS Person) WHERE p.id = ANY($ids) "
+                    "COLUMNS (p.id, p.name)) ORDER BY id"
+                ),
+                {"ids": [2, 4]},
+                2,
+            ),
+            (
+                "GRAPH_TABLE = ANY(...) empty list",
+                (
+                    "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+                    "MATCH (p IS Person) WHERE p.id = ANY($ids) "
+                    "COLUMNS (p.id, p.name)) ORDER BY id"
+                ),
+                {"ids": []},
+                0,
+            ),
+            # GRAPH_TABLE array column equality (tags = $tags)
+            (
+                "GRAPH_TABLE array column equality strings",
+                (
+                    "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+                    "MATCH (p IS Person) WHERE p.tags = $tags "
+                    "COLUMNS (p.id, p.name)) ORDER BY id"
+                ),
+                {"tags": ["admin", "staff"]},
+                1,
+            ),
+        ]
+
+        for case_name, q, p, expected_count in test_cases:
+            res_b = sorted(session_bridge.execute(q, p), key=lambda x: x["id"])
+            res_n = sorted(session_native.execute(q, p), key=lambda x: x["id"])
+            assert res_b == res_n, (
+                f"Parity mismatch in {case_name}: bridge={res_b!r} vs native={res_n!r}"
+            )
+            assert len(res_b) == expected_count, (
+                f"Unexpected row count for {case_name}: expected {expected_count}, got {len(res_b)}"
+            )
+
     @pytest.mark.asyncio
     async def test_pg19_async_bridge_bound_parameters(self, pg19_conn):
         """Verifies AsyncPostgresBridge and AsyncSession correctly bind parameters."""
