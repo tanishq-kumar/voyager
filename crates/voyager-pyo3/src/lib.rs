@@ -828,12 +828,9 @@ fn is_known_expr_tag(tag: &str) -> bool {
             | "ident"
             | "param"
             | "lit"
-            | "literal"
             | "bin"
             | "unary"
             | "fn"
-            | "func"
-            | "call"
             | "case"
             | "list_comp"
             | "pattern_comp"
@@ -900,7 +897,7 @@ fn handle_dict_expr(
     let dict_cloned = dict.clone();
     let mut subquery_err: Option<PyErr> = None;
     let sub_h = builder.subquery(|q| {
-        if let Err(e) = build_query_from_spec_internal(q, &dict_cloned, depth + 1, path) {
+        if let Err(e) = build_query_from_spec_internal(q, &dict_cloned, depth + 1, path, false) {
             subquery_err = Some(e);
         }
     });
@@ -1539,7 +1536,7 @@ fn handle_expr_sequence(
         "prop" => handle_prop_tuple(builder, &tuple, path),
         "ident" => handle_ident_tuple(builder, &tuple, path),
         "param" => handle_param_tuple(builder, &tuple, path),
-        "lit" | "literal" => handle_lit_tuple(builder, &tuple, path),
+        "lit" => handle_lit_tuple(builder, &tuple, path),
         "bin" => {
             check_spec_arity_bounded(
                 &tuple,
@@ -1578,7 +1575,7 @@ fn handle_expr_sequence(
                 py_to_node_handle_depth(builder, &tuple.get_item(2)?, depth + 1, &path.index(2))?;
             Ok(builder.unary_expr(op, operand))
         }
-        "fn" | "func" | "call" => handle_fn_tuple(builder, &tuple, depth, path),
+        "fn" => handle_fn_tuple(builder, &tuple, depth, path),
         "case" => handle_case_tuple(builder, &tuple, depth, path),
         "list_comp" => handle_list_comp_tuple(builder, &tuple, depth, path),
         "pattern_comp" => handle_pattern_comp_tuple(builder, &tuple, depth, path),
@@ -1609,7 +1606,7 @@ fn handle_expr_sequence(
 }
 
 fn parse_direction(dir_str: &str) -> PyResult<Direction> {
-    match dir_str.to_ascii_lowercase().as_str() {
+    match dir_str {
         "out" | "outgoing" | "->" => Ok(Direction::Outgoing),
         "in" | "incoming" | "<-" => Ok(Direction::Incoming),
         "undirected" | "both" | "-" | "--" => Ok(Direction::Undirected),
@@ -1906,7 +1903,7 @@ fn build_subquery_from_py(
         let dict_cloned = dict.clone();
         let mut err: Option<PyErr> = None;
         let sub_h = builder.subquery(|q| {
-            if let Err(e) = build_query_from_spec_internal(q, &dict_cloned, depth, path) {
+            if let Err(e) = build_query_from_spec_internal(q, &dict_cloned, depth, path, false) {
                 err = Some(e);
             }
         });
@@ -2003,6 +2000,11 @@ fn reject_unknown_keys(
 }
 
 /// Parses a non-negative `skip` / `offset` / `limit` value.
+///
+/// The schema types these positions as `integer`, which also accepts a JSON
+/// number with a zero fractional part such as `0.0` or `3.0`. Integral floats
+/// are therefore accepted; a non-integral number is rejected at the element's
+/// path.
 fn parse_non_negative(val: &Bound<'_, PyAny>, path: &SpecPath, field: &str) -> PyResult<u64> {
     if val.is_instance_of::<PyBool>() {
         return Err(make_spec_err(
@@ -2013,7 +2015,28 @@ fn parse_non_negative(val: &Bound<'_, PyAny>, path: &SpecPath, field: &str) -> P
             ),
         ));
     }
-    let value: i64 = extract_required(val, path, "a non-negative integer")?;
+    let value: i64 = if val.is_instance_of::<PyFloat>() {
+        let number: f64 = extract_required(val, path, "a non-negative integer")?;
+        if !number.is_finite() || number.fract() != 0.0 {
+            let rendered =
+                render_json_scalar(val).unwrap_or_else(|| json_type_name(val).to_string());
+            return Err(make_spec_err(
+                path,
+                format!(
+                    "Invalid '{field}': expected a non-negative integer, got {rendered} (not an integral number)."
+                ),
+            ));
+        }
+        if number < 0.0 || number > i64::MAX as f64 {
+            return Err(make_spec_err(
+                path,
+                format!("Invalid '{field}': expected a non-negative integer, got {number}."),
+            ));
+        }
+        number as i64
+    } else {
+        extract_required(val, path, "a non-negative integer")?
+    };
     if value < 0 {
         return Err(make_spec_err(
             path,
@@ -2080,7 +2103,7 @@ fn build_projection_item(
                 &path.index(4),
                 "a string or null alias",
             )?;
-            let agg = match func_str.to_lowercase().as_str() {
+            let agg = match func_str.as_str() {
                 "count" => AggregationFunc::Count,
                 "count_distinct" => AggregationFunc::CountDistinct,
                 "sum" => AggregationFunc::Sum,
@@ -2142,6 +2165,7 @@ fn build_query_from_spec_internal(
     spec: &Bound<'_, PyDict>,
     depth: usize,
     path: &SpecPath,
+    require_version: bool,
 ) -> PyResult<()> {
     // Everything below this point is Query Spec v1 parsing, even when a dict
     // expression reached here through the fluent API.
@@ -2163,10 +2187,12 @@ fn build_query_from_spec_internal(
             }
         }
         None => {
-            return Err(make_spec_err(
-                &version_path,
-                "Missing required 'spec_version' in query spec dictionary. Expected 'spec_version': 1.",
-            ));
+            if require_version {
+                return Err(make_spec_err(
+                    &version_path,
+                    "Missing required 'spec_version' in query spec dictionary. Expected 'spec_version': 1.",
+                ));
+            }
         }
     }
 
@@ -2289,7 +2315,7 @@ fn build_query_from_spec_internal(
                     let mode_path = m_path.key("path_mode");
                     let m_str: String =
                         extract_required(&mode_item, &mode_path, "a string path mode")?;
-                    let m = match m_str.to_ascii_lowercase().as_str() {
+                    let m = match m_str.as_str() {
                         "trail" => voyager_ogm::ast::PathMode::Trail,
                         "simple" => voyager_ogm::ast::PathMode::Simple,
                         "acyclic" => voyager_ogm::ast::PathMode::Acyclic,
@@ -2723,6 +2749,32 @@ fn build_query_from_spec_internal(
         }
     }
 
+    // `skip` and `offset` are aliases of the same pagination position. Accepting
+    // both used to let the later one win silently, so a document that sets both
+    // is rejected at the second key in document order.
+    if let (Some(skip_item), Some(offset_item)) = (spec.get_item("skip")?, spec.get_item("offset")?)
+        && !skip_item.is_none()
+        && !offset_item.is_none()
+    {
+        let mut seen = 0usize;
+        let mut second_key: Option<String> = None;
+        for key in spec.keys() {
+            if let Ok(name) = key.extract::<String>()
+                && (name == "skip" || name == "offset")
+            {
+                seen += 1;
+                if seen == 2 {
+                    second_key = Some(name);
+                }
+            }
+        }
+        let second_key = second_key.unwrap_or_else(|| "offset".to_string());
+        return Err(make_spec_err(
+            &path.key(&second_key),
+            "conflicting pagination keys: 'skip' and 'offset' are aliases; provide only one of them.",
+        ));
+    }
+
     if let Some(skip_item) = spec.get_item("skip")? {
         if !skip_item.is_none() {
             let skip = parse_non_negative(&skip_item, &path.key("skip"), "skip")?;
@@ -2812,7 +2864,7 @@ fn build_query_from_spec_internal(
             let mode_path = path.key("execution_mode");
             let mode_str: String =
                 extract_required(&mode_item, &mode_path, "a string execution mode")?;
-            match mode_str.to_ascii_lowercase().as_str() {
+            match mode_str.as_str() {
                 "normal" => {}
                 "explain" => {
                     builder.explain();
@@ -4002,7 +4054,7 @@ fn compile_query_from_spec<'py>(
     }
 
     let mut builder = QueryBuilder::new();
-    build_query_from_spec_internal(&mut builder, spec, 0, &SpecPath::spec_root())?;
+    build_query_from_spec_internal(&mut builder, spec, 0, &SpecPath::spec_root(), true)?;
     check_warn_cypher_path_mode(py, dialect, builder.get_path_mode().as_deref())?;
     let (mut arena, root) = builder.try_build().map_err(map_compile_error)?;
 

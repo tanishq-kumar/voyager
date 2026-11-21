@@ -1,0 +1,53 @@
+{
+  "description": "Integral JSON numbers such as 0.0 and 3.0 are accepted for skip and limit.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ],
+    "skip": 0.0,
+    "limit": 3.0
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN p.name SKIP 0 LIMIT 3",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name SKIP 0 LIMIT 3 $$) AS (name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN p.name OFFSET 0 LIMIT 3",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) LIMIT 3 OFFSET 0",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) LIMIT 3 OFFSET 0",
+      "parameters": {}
+    }
+  }
+}

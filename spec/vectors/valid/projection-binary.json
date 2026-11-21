@@ -1,0 +1,107 @@
+{
+  "description": "A nested binary expression with arithmetic and comparison operators.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "bin",
+          "and",
+          [
+            "bin",
+            "gt",
+            [
+              "bin",
+              "add",
+              [
+                "prop",
+                "p",
+                "age"
+              ],
+              [
+                "lit",
+                1
+              ]
+            ],
+            [
+              "lit",
+              18
+            ]
+          ],
+          [
+            "bin",
+            "eq",
+            [
+              "prop",
+              "p",
+              "name"
+            ],
+            [
+              "lit",
+              "Alice"
+            ]
+          ]
+        ],
+        "flag"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN ((p.age + $p0) > $p1) AND (p.name = $p2) AS flag",
+      "parameters": {
+        "p2": "Alice",
+        "p1": 18,
+        "p0": 1
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN ((p.age + $p0) > $p1) AND (p.name = $p2) AS flag $$, %s) AS (flag agtype)",
+      "parameters": {
+        "p1": 18,
+        "p0": 1,
+        "p2": "Alice"
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN ((p.age + $p0) > $p1) AND (p.name = $p2) AS flag",
+      "parameters": {
+        "p2": "Alice",
+        "p0": 1,
+        "p1": 18
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (((p.age + $p0) > $p1) AND (p.name = $p2) AS flag))",
+      "parameters": {
+        "p0": 1,
+        "p1": 18,
+        "p2": "Alice"
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (((p.age + $p0) > $p1) AND (p.name = $p2) AS flag))",
+      "parameters": {
+        "p0": 1,
+        "p2": "Alice",
+        "p1": 18
+      }
+    }
+  }
+}

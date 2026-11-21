@@ -1,0 +1,65 @@
+{
+  "description": "Pattern comprehension over a path with a null where filter.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "pattern_comp",
+          [
+            [
+              "node",
+              "f",
+              [
+                "Person"
+              ]
+            ]
+          ],
+          null,
+          [
+            "prop",
+            "f",
+            "name"
+          ]
+        ],
+        "names"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN [(f:Person) | f.name] AS names",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN [(f:Person) | f.name] AS names $$) AS (names agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN [(f:Person) | f.name] AS names",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

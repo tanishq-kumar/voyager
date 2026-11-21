@@ -1,0 +1,73 @@
+{
+  "description": "Two comma-separated paths in one match clause.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ],
+            [
+              "node",
+              "f",
+              [
+                "Person"
+              ]
+            ]
+          ],
+          [
+            [
+              "node",
+              "m",
+              [
+                "Movie"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ],
+      [
+        "field",
+        "m",
+        "title",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) MATCH (f:Person), (m:Movie) RETURN p.name, m.title",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) MATCH (f:Person), (m:Movie) RETURN p.name, m.title $$) AS (name agtype, title agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) MATCH (f:Person), (m:Movie) RETURN p.name, m.title",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person), (f IS Person), (m IS Movie) COLUMNS (p.name, m.title))",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person), (f IS Person), (m IS Movie) COLUMNS (p.name, m.title))",
+      "parameters": {}
+    }
+  }
+}

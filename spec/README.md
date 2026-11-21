@@ -15,20 +15,26 @@ This formal ABI contract guarantees cross-language stability and deterministic t
 
 ## 1. Specification Versioning (`spec_version: 1`)
 
-Every query spec dictionary **must** carry a top-level integer attribute:
+Every query spec document **must** carry a top-level integer attribute:
 ```json
 {
   "spec_version": 1
 }
 ```
 
+`spec_version` is required only at the document root. Nested specs — each
+`matches[i]` and `with_clauses[i]` object, a nested spec passed to `exists` or
+`count`, and an object-wrapped expression — may omit it. If a nested object does
+declare it, it must be `1`; any other value is rejected at that nested
+`spec_version` key.
+
 ### Compatibility Rules
 1. **Major Version Invariance**: The native Rust compiler (`compile_query_from_spec`) and internal builders strictly reject unknown major versions:
-   - Any payload missing `"spec_version"` is rejected immediately with:
+   - Any payload missing a root `"spec_version"` is rejected immediately with:
      `Missing required 'spec_version' in query spec dictionary. Expected 'spec_version': 1.`
    - Any payload with an unsupported version (`spec_version: 2`) is rejected with:
      `Unsupported query spec_version: 2. Supported major versions: 1.`
-2. **Clause Versioning**: Individual clause dictionaries (`matches[i]`, `with_clauses[i]`) may optionally declare `"spec_version": 1`. If present, unknown values are rejected.
+2. **Clause Versioning**: A nested clause or expression object (`matches[i]`, `with_clauses[i]`, an `exists`/`count` subquery spec and an object-wrapped expression) may optionally declare `"spec_version": 1`. If present, unknown values are rejected at that nested key.
 
 ---
 
@@ -65,6 +71,18 @@ Examples:
 | `{"spec_version": 1, "matches": [{"paths": [[["node","n",["N"]],["edge","out",["E"],null,null,null,{},1]]]}]}` (8th edge item) | `/matches/0/paths/0/1/7` |
 | `{"spec_version": 1, "skip": -1, ...}` | `/skip` |
 
+### `null` means omitted
+
+At every optional key and optional array position, JSON `null` means the same as
+omitting the key. This covers root `load_csv`, `projections`, `distinct`,
+`order_by`, `skip`, `offset`, `limit` and `execution_mode`; match `optional`,
+`path_mode`, `path_variable` and `where`; with-clause `distinct`, `where`,
+`order_by`, `skip` and `limit`; the optional node and edge path-step items; and
+the nullable expression positions (`case` operand and else branch, `list_comp`
+where and map expressions, and `pattern_comp` where). Required keys do not accept
+`null`: root `spec_version`, `matches[i].paths`, `with_clauses[i].projections`,
+and the `expr` key of an object-wrapped expression.
+
 The following are rejected:
 
 - Unknown object keys at the root, in a match clause, in a with clause, and in
@@ -72,9 +90,24 @@ The following are rejected:
 - Wrong container types for `load_csv`, `unwinds`, `matches`, `paths`,
   `mutations`, `with_clauses`, `projections`, `order_by`, `linear_clauses`, and
   merge set lists.
-- Unknown enum values: `path_mode`, `execution_mode`, `linear_clauses` tags,
-  mutation tags, path step tags, projection tags, and aggregation functions.
-- Negative or boolean `skip` / `offset` / `limit` values.
+- Unknown or wrongly spelled enum values. `path_mode` (`trail`, `simple`,
+  `acyclic`, `walk`, `none`), `execution_mode` (`normal`, `explain`, `profile`,
+  `explain_and_profile`), edge `direction` (`outgoing`/`out`/`->`,
+  `incoming`/`in`/`<-`, `undirected`/`both`/`-`/`--`) and aggregation function
+  names (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `collect`) are
+  exact and case-sensitive. So are the mutation, path-step, projection and
+  `linear_clauses` tags.
+- The undocumented tag aliases `literal` (for `lit`) and `func` / `call` (for
+  `fn`). They are rejected as unknown expression tags; write the canonical `lit`
+  and `fn` tags.
+- Boolean, negative or non-integral `skip` / `offset` / `limit` values. An
+  integral JSON number such as `0.0` or `3.0` is accepted (the schema's
+  `integer` type accepts it). `skip` and `offset` are aliases of the same
+  position, so providing both is rejected at the second key in document order.
+- Negative `min_hops` / `max_hops` values. `min_hops` and `max_hops` both have
+  minimum 0; when `max_hops` is `null`, the traversal is exactly `min_hops`
+  hops. When `min_hops` is omitted or `null` and `max_hops` is set, the minimum
+  is 1.
 - A bare or untagged array in an expression position: an empty array, a non-string
   first element (for example `[1, 2, 3]`) or an unknown first string (for
   example `["propp", ...]` or `["red", "green"]`). Every expression array must
@@ -114,8 +147,8 @@ The following are rejected:
   `["ident", ""]` or `["param", ""]`.
 - A JSON object in an expression position that has no `expr` key. Only the
   `exists`, `count` and `pattern_comp` payloads accept a nested query spec or
-  path spec; every other object must be written as
-  `{"spec_version": 1, "expr": ...}`.
+  path spec; every other object must be written as `{"expr": ...}` (the nested
+  `spec_version` key is optional).
 - A compile-time build or emission failure. These raise `VoyagerError` too:
   `INVALID_SPEC` at the document root (`path == ""`) when the AST cannot be
   built or emitted, or `UNSUPPORTED_FEATURE` / `UNSUPPORTED_DIALECT` when the
@@ -126,9 +159,11 @@ Parameter names may be written with or without one leading `$`: `["param",
 "$name"]` and `["param", "name"]` both bind `$name`, and an `unwinds` entry
 `["$batch", "row"]` compiles to `UNWIND $batch AS row`, matching the Python
 SDK's `param()`. Exactly one `$` is stripped. An `["alias", expression, name]`
-name only takes effect where a projection carries an alias (the `expr`
-projection item); elsewhere the alias is validated and the inner expression is
-used.
+expression is only meaningful in a projection: an `expr` projection uses the
+name when its own alias is `null`, and the `alias` expression inside a
+projection item is the same as carrying that name. In every other expression
+position (`where`, `set`, function arguments, and so on) the name is validated
+as a string and the inner expression is used; no alias is emitted there.
 
 `INVALID_CLAUSE` remains the code for non-spec callers, such as the fluent
 Python/Rust builder API.
@@ -218,7 +253,7 @@ Paths within `matches[i].paths` or `create`/`merge` mutations are sequences of s
 | Step Type | Shape | Description |
 | :--- | :--- | :--- |
 | **Node** | `["node", variable, labels, properties]` | Node pattern, e.g. `["node", "u", ["User", "Admin"]]`. `variable` can be `null` for anonymous nodes. `properties` is optional: an object mapping property names to [expressions](#4-expression-ast-descriptors), for example `{"name": ["lit", "Alice"]}`. Omitted, `null`, and `{}` all mean no properties; any other non-object is rejected. |
-| **Edge** | `["edge", dir, types, variable, min_hops, max_hops, properties]` | Directed or undirected relationship traversal. `dir` accepts `"outgoing"` (`"out"`, `"->"`), `"incoming"` (`"in"`, `"<-"`), and `"undirected"` (`"both"`, `"-"`, `"--"`), case-insensitively. `min_hops` and `max_hops` specify variable-length paths (`null` for 1 hop). `variable`, `min_hops`, `max_hops` and `properties` may be omitted (`["edge", dir, types]`) and default to `null`. `properties` follows the same rules as the node step. A non-null item after `properties` is rejected. |
+| **Edge** | `["edge", dir, types, variable, min_hops, max_hops, properties]` | Directed or undirected relationship traversal. `dir` accepts exactly `"outgoing"` (`"out"`, `"->"`), `"incoming"` (`"in"`, `"<-"`), and `"undirected"` (`"both"`, `"-"`, `"--"`); the spelling is case-sensitive. `min_hops` and `max_hops` specify variable-length paths and both have minimum 0. `max_hops: null` means exactly `min_hops` hops; when `min_hops` is omitted or `null` and `max_hops` is set, the minimum is 1. `variable`, `min_hops`, `max_hops` and `properties` may be omitted (`["edge", dir, types]`) and default to `null`. `properties` follows the same rules as the node step. A non-null item after `properties` is rejected. |
 
 Property values follow the same strict rule as every other expression
 position: each value must be a tagged expression such as `["lit", "Alice"]` or
@@ -240,15 +275,30 @@ Expression trees used in `where`, `set`, and projections support fine-grained op
 | **Property Access** | `["prop", var, property]` | Access entity property: `u.age` |
 | **Identifier** | `["ident", name]` | Variable or alias identifier: `friend_count` |
 | **Parameter** | `["param", name]` | Query parameter reference: `$param` |
-| **Literal** | `["lit", value]` | Scalar literal (`42`, `"Alice"`, `true`, `null`) |
-| **Binary Op** | `["bin", op, left, right]` | Binary operators: `eq` (`=`), `neq` (`!=`, `ne`, `<>`), `gt` (`>`), `gte` (`>=`, `ge`), `lt` (`<`), `lte` (`<=`, `le`), `and` (`&`), `or` (`\|`), `xor` (`^`), `add` (`+`), `sub` (`-`), `mul` (`*`), `div` (`/`), `mod` (`%`), `concat` (`\|\|`), `contains`, `starts_with` (`startswith`), `ends_with` (`endswith`), `regex` (`=~`), `in`, `not_in` (`not in`) |
-| **Unary Op** | `["unary", op, operand]` | `not` (`~`), `neg` (`-`), `is_null` (`is null`), `is_not_null` (`is not null`) |
+| **Literal** | `["lit", value]` | Any JSON value: a scalar (`42`, `"Alice"`, `true`, `null`), a list or an object |
+| **Binary Op** | `["bin", op, left, right]` | Binary operators (canonical lowercase spellings; the consumer also accepts the uppercase word spellings): `eq` (`=`), `neq` (`!=`, `ne`, `<>`), `gt` (`>`), `gte` (`>=`, `ge`), `lt` (`<`), `lte` (`<=`, `le`), `and` (`&`), `or` (`\|`), `xor` (`^`), `add` (`+`), `sub` (`-`), `mul` (`*`), `div` (`/`), `mod` (`%`), `concat` (`\|\|`), `contains`, `starts_with` (`startswith`), `ends_with` (`endswith`), `regex` (`=~`), `in`, `not_in` (`not in`). Any other operator is `INVALID_SPEC` at the operator element. |
+| **Unary Op** | `["unary", op, operand]` | `not` (`~`), unary minus as `["unary", "-", operand]` (the operator `neg` is an alias for `-`), `is_null` (`is null`), `is_not_null` (`is not null`). Negation has no top-level `neg` or `negate` tag. |
 | **Function** | `["fn", name, [args...]]` | Function call: `["fn", "toUpper", [["prop", "u", "name"]]]` |
 | **CASE WHEN** | `["case", operand, [[when, then]...], else]` | Conditional branching |
 | **List Literal** | `["list", [items...]]` | Literal list of expressions |
 | **Subquery Exists**| `["exists", subquery_spec]` | Existential graph subquery |
 | **Subquery Count** | `["count", subquery_spec]` | Scalar subquery count |
-| **Alias** | `["alias", inner, alias_name]` | Projection aliasing |
+| **Alias** | `["alias", inner, alias_name]` | Projection aliasing (only meaningful in projections) |
+
+The recursive payload positions are fully typed:
+
+- A `case` branch is exactly `[when, then]`; the `case` operand and else branch
+  are an expression or `null`.
+- `list_comp` is `["list_comp", variable, list_expr, where | null, map | null]`.
+- `pattern_comp` is `["pattern_comp", path, where | null, projection]`, where
+  `path` is a path-step list (the same shape as a `matches[i].paths` entry).
+- An `exists` or `count` payload is either a nested query spec object (the same
+  shape as the root document, with `spec_version` optional) or a path-step list.
+- `["lit", value]` accepts any JSON value.
+- A merge `ON CREATE SET` / `ON MATCH SET` entry is exactly
+  `[variable, property, value_expression]`.
+- A `bin` operator is one of the operators in the table above; anything else is
+  rejected at the operator element.
 
 ### Expression arrays are always tagged
 

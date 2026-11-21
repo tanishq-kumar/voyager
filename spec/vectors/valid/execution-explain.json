@@ -1,0 +1,52 @@
+{
+  "description": "execution_mode explain prefixes the statement.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ],
+    "execution_mode": "explain"
+  },
+  "expected": {
+    "cypher": {
+      "statement": "EXPLAIN MATCH (p:Person) RETURN p.name",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "EXPLAIN SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name $$) AS (name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "EXPLAIN MATCH (p:Person) RETURN p.name",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "EXPLAIN SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name))",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "EXPLAIN SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name))",
+      "parameters": {}
+    }
+  }
+}

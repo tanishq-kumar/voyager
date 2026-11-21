@@ -1,0 +1,25 @@
+{
+  "description": "spec_version is required at the document root.",
+  "spec": {
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/spec_version"
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "description": "A nested object-wrapped expression may omit spec_version.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        {
+          "expr": [
+            "lit",
+            7
+          ]
+        },
+        "seven"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN $p0 AS seven",
+      "parameters": {
+        "p0": 7
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN $p0 AS seven $$, %s) AS (seven agtype)",
+      "parameters": {
+        "p0": 7
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN $p0 AS seven",
+      "parameters": {
+        "p0": 7
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS ($p0 AS seven))",
+      "parameters": {
+        "p0": 7
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS ($p0 AS seven))",
+      "parameters": {
+        "p0": 7
+      }
+    }
+  }
+}

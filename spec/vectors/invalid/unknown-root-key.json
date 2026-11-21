@@ -1,0 +1,12 @@
+{
+  "description": "Unknown root keys are rejected at their own path.",
+  "spec": {
+    "spec_version": 1,
+    "bogus": 1
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/bogus"
+  }
+}

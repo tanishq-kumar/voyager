@@ -1,0 +1,44 @@
+{
+  "description": "Binary operator names are an enum.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "bin",
+          "sideways",
+          [
+            "lit",
+            1
+          ],
+          [
+            "lit",
+            2
+          ]
+        ],
+        "x"
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/projections/0/1/1"
+  }
+}

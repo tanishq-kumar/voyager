@@ -1,0 +1,65 @@
+{
+  "description": "MERGE with distinct ON CREATE SET and ON MATCH SET assignments.",
+  "spec": {
+    "spec_version": 1,
+    "mutations": [
+      [
+        "merge",
+        [
+          [
+            "node",
+            "c",
+            [
+              "Company"
+            ]
+          ]
+        ],
+        [
+          [
+            "c",
+            "name",
+            [
+              "lit",
+              "Acme"
+            ]
+          ]
+        ],
+        [
+          [
+            "c",
+            "name",
+            [
+              "lit",
+              "AcmeCorp"
+            ]
+          ]
+        ]
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MERGE (c:Company) ON CREATE SET c.name = $p0 ON MATCH SET c.name = $p1",
+      "parameters": {
+        "p0": "Acme",
+        "p1": "AcmeCorp"
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MERGE (c:Company) ON CREATE SET c.name = $p0 ON MATCH SET c.name = $p1 $$, %s) AS (result agtype)",
+      "parameters": {
+        "p0": "Acme",
+        "p1": "AcmeCorp"
+      }
+    },
+    "iso_gql": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

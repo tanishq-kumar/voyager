@@ -1,0 +1,42 @@
+{
+  "description": "CREATE mutation with a path list.",
+  "spec": {
+    "spec_version": 1,
+    "mutations": [
+      [
+        "create",
+        [
+          [
+            [
+              "node",
+              "c",
+              [
+                "Company"
+              ]
+            ]
+          ]
+        ]
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "CREATE (c:Company)",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ CREATE (c:Company) $$) AS (result agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "INSERT (c:Company)",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

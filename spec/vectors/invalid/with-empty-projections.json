@@ -1,0 +1,16 @@
+{
+  "description": "A with clause needs at least one projection; the schema alone cannot express this.",
+  "spec": {
+    "spec_version": 1,
+    "with_clauses": [
+      {
+        "projections": []
+      }
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/with_clauses/0/projections"
+  }
+}

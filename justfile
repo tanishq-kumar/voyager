@@ -110,6 +110,10 @@ test-snapshot:
 test-python:
     uv run --no-sync pytest -m "not live"
 
+# Validate the Query Spec v1 JSON Schema and its reference vectors
+spec-check:
+    uv run --no-sync pytest packages/python/tests/test_spec_vectors.py -v
+
 # Run Relate embedded database integration tests
 test-relate:
     uv run --no-sync pytest packages/python/tests/test_relate_compatibility.py -v

@@ -1,0 +1,113 @@
+{
+  "description": "CASE with an operand, branches and an else branch.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "case",
+          [
+            "prop",
+            "p",
+            "age"
+          ],
+          [
+            [
+              [
+                "lit",
+                18
+              ],
+              [
+                "lit",
+                "adult"
+              ]
+            ],
+            [
+              [
+                "lit",
+                65
+              ],
+              [
+                "lit",
+                "senior"
+              ]
+            ]
+          ],
+          [
+            "lit",
+            "minor"
+          ]
+        ],
+        "age_group"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group",
+      "parameters": {
+        "p2": 65,
+        "p4": "minor",
+        "p1": "adult",
+        "p0": 18,
+        "p3": "senior"
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group $$, %s) AS (age_group agtype)",
+      "parameters": {
+        "p4": "minor",
+        "p0": 18,
+        "p2": 65,
+        "p3": "senior",
+        "p1": "adult"
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group",
+      "parameters": {
+        "p2": 65,
+        "p4": "minor",
+        "p0": 18,
+        "p3": "senior",
+        "p1": "adult"
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group))",
+      "parameters": {
+        "p0": 18,
+        "p4": "minor",
+        "p3": "senior",
+        "p2": 65,
+        "p1": "adult"
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group))",
+      "parameters": {
+        "p1": "adult",
+        "p0": 18,
+        "p3": "senior",
+        "p2": 65,
+        "p4": "minor"
+      }
+    }
+  }
+}

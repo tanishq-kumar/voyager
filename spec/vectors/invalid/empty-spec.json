@@ -1,0 +1,11 @@
+{
+  "description": "A spec with no clause is rejected by the consumer; the schema alone cannot express this.",
+  "spec": {
+    "spec_version": 1
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": ""
+  }
+}

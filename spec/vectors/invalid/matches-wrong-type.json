@@ -1,0 +1,12 @@
+{
+  "description": "matches must be an array.",
+  "spec": {
+    "spec_version": 1,
+    "matches": 42
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches"
+  }
+}

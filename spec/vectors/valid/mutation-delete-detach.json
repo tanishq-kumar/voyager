@@ -1,0 +1,49 @@
+{
+  "description": "DETACH DELETE renders in openCypher and Apache AGE; ISO GQL rejects it.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "mutations": [
+      [
+        "delete",
+        true,
+        [
+          "p"
+        ]
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) DETACH DELETE p",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) DETACH DELETE p $$) AS (result agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

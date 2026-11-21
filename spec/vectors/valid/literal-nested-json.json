@@ -1,0 +1,117 @@
+{
+  "description": "A lit payload may be any JSON value, including nested objects and arrays.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "lit",
+          {
+            "name": "Alice",
+            "age": 30,
+            "tags": [
+              "a",
+              "b"
+            ],
+            "ok": true,
+            "none": null
+          }
+        ],
+        "m"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN $p0 AS m",
+      "parameters": {
+        "p0": {
+          "name": "Alice",
+          "age": 30,
+          "tags": [
+            "a",
+            "b"
+          ],
+          "ok": true,
+          "none": null
+        }
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN $p0 AS m $$, %s) AS (m agtype)",
+      "parameters": {
+        "p0": {
+          "name": "Alice",
+          "age": 30,
+          "tags": [
+            "a",
+            "b"
+          ],
+          "ok": true,
+          "none": null
+        }
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN $p0 AS m",
+      "parameters": {
+        "p0": {
+          "name": "Alice",
+          "age": 30,
+          "tags": [
+            "a",
+            "b"
+          ],
+          "ok": true,
+          "none": null
+        }
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS ($p0 AS m))",
+      "parameters": {
+        "p0": {
+          "name": "Alice",
+          "age": 30,
+          "tags": [
+            "a",
+            "b"
+          ],
+          "ok": true,
+          "none": null
+        }
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS ($p0 AS m))",
+      "parameters": {
+        "p0": {
+          "name": "Alice",
+          "age": 30,
+          "tags": [
+            "a",
+            "b"
+          ],
+          "ok": true,
+          "none": null
+        }
+      }
+    }
+  }
+}
