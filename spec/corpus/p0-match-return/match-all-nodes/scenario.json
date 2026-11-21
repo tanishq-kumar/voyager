@@ -1,0 +1,28 @@
+{
+  "id": "p0-match-return/match-all-nodes",
+  "pack": "p0-match-return",
+  "description": "Match all nodes in the graph and return the node variable.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match1.feature",
+    "scenario": "[2] Matching all nodes"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

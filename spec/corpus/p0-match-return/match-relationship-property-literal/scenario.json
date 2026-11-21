@@ -1,0 +1,28 @@
+{
+  "id": "p0-match-return/match-relationship-property-literal",
+  "pack": "p0-match-return",
+  "description": "Match relationship pattern with an inline literal property map.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match2.feature",
+    "scenario": "[5] Match relationship with inline property value"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

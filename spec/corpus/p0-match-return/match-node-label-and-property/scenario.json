@@ -1,0 +1,28 @@
+{
+  "id": "p0-match-return/match-node-label-and-property",
+  "pack": "p0-match-return",
+  "description": "Match node with both a label predicate and an inline literal property map.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p0-match-return",
+    "scenario": "Node pattern combining label and inline literal property map"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

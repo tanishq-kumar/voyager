@@ -1,0 +1,48 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "node",
+            []
+          ],
+          [
+            "edge",
+            "outgoing",
+            [
+              "KNOWS"
+            ],
+            "r",
+            null,
+            null,
+            {
+              "name": [
+                "lit",
+                "monkey"
+              ]
+            }
+          ],
+          [
+            "node",
+            "a",
+            []
+          ]
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "expr",
+      [
+        "prop",
+        "a",
+        ""
+      ],
+      null
+    ]
+  ]
+}

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voyager-ogm.org/schemas/corpus-scenario/v1.json",
+  "title": "VoyagerCorpusScenarioV1",
+  "description": "Schema for Query Spec conformance corpus scenario metadata (scenario.json).",
+  "type": "object",
+  "required": [
+    "id",
+    "pack",
+    "description",
+    "source",
+    "params",
+    "fixture",
+    "rows",
+    "targets"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "description": "Unique scenario identifier matching '<pack>/<scenario>'.",
+      "type": "string",
+      "pattern": "^[a-z0-9-]+/[a-z0-9-]+$"
+    },
+    "pack": {
+      "description": "Pack folder name (e.g. 'p0-match-return').",
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "description": {
+      "description": "Short human-readable summary of the scenario.",
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "description": "Origin of the scenario (e.g. openCypher TCK feature and scenario name).",
+      "type": "object",
+      "required": ["kind", "feature", "scenario"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["opencypher-tck", "postgresql-regress", "voyager"]
+        },
+        "feature": {
+          "type": "string"
+        },
+        "scenario": {
+          "type": "string"
+        }
+      }
+    },
+    "params": {
+      "description": "Query parameters mapping name to literal value.",
+      "type": "object"
+    },
+    "fixture": {
+      "description": "Reference to an engine fixture dataset, or null if empty/none.",
+      "type": ["string", "null"]
+    },
+    "rows": {
+      "description": "Expected row ordering semantics ('ordered' or 'unordered').",
+      "type": "string",
+      "enum": ["ordered", "unordered"]
+    },
+    "targets": {
+      "description": "Compilation target dialects and their support status.",
+      "type": "object",
+      "required": ["cypher", "age", "gql", "sqlpgq"],
+      "additionalProperties": false,
+      "properties": {
+        "cypher": { "$ref": "#/$defs/Target" },
+        "age": { "$ref": "#/$defs/Target" },
+        "gql": { "$ref": "#/$defs/Target" },
+        "sqlpgq": { "$ref": "#/$defs/Target" }
+      }
+    }
+  },
+  "$defs": {
+    "Target": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["supported", "unsupported", "known-diff"]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": { "enum": ["unsupported", "known-diff"] }
+            }
+          },
+          "then": {
+            "required": ["reason"]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "p0-match-return/return-column-alias",
+  "pack": "p0-match-return",
+  "description": "Project a node entity expression with a column alias renaming it.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return4.feature",
+    "scenario": "[2] Support column renaming"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

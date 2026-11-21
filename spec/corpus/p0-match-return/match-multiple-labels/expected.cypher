@@ -1,0 +1,1 @@
+MATCH (a:A:B) RETURN a

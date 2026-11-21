@@ -1,0 +1,29 @@
+{
+  "id": "p0-match-return/match-multiple-labels",
+  "pack": "p0-match-return",
+  "description": "Match nodes matching multiple conjoined labels and return the node.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match1.feature",
+    "scenario": "[3] Matching nodes using multiple labels"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: Apache AGE does not support multiple labels per node pattern."
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ does not support multiple labels per node pattern."
+    }
+  }
+}

@@ -1,0 +1,1 @@
+MATCH (a:A)<-[:R]-(b:B) RETURN a, b

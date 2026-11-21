@@ -1,0 +1,27 @@
+{
+  "id": "p0-match-return/return-multiple-properties",
+  "pack": "p0-match-return",
+  "description": "Project multiple node property values in RETURN.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return3.feature",
+    "scenario": "[2] Returning multiple node property values"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "p0-match-return/match-relationship-property-undirected",
+  "pack": "p0-match-return",
+  "description": "Match undirected relationship with inline property map returning endpoints.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match3.feature",
+    "scenario": "[5] Return two subgraphs with bound undirected relationship"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

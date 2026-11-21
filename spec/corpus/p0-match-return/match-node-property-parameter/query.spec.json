@@ -1,0 +1,35 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "n",
+            [
+              "Person"
+            ],
+            {
+              "name": [
+                "param",
+                "name"
+              ]
+            }
+          ]
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "expr",
+      [
+        "prop",
+        "n",
+        ""
+      ],
+      null
+    ]
+  ]
+}
