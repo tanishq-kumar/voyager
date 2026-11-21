@@ -125,6 +125,49 @@ fn contains_cypher_parameter_reference(statement: &str) -> bool {
     false
 }
 
+fn resolve_age_column_base_name(arena: &QueryAstArena, handle: NodeHandle) -> Result<String> {
+    match arena.get(handle)? {
+        AstNode::PropertyAccess { target, property } => {
+            if property.is_empty() {
+                match arena.get(*target)? {
+                    AstNode::Identifier(id) => Ok(id.clone()),
+                    AstNode::NodePattern {
+                        variable: Some(var),
+                        ..
+                    } => Ok(var.clone()),
+                    AstNode::EdgePattern {
+                        variable: Some(var),
+                        ..
+                    } => Ok(var.clone()),
+                    _ => Ok("entity".to_string()),
+                }
+            } else {
+                Ok(property.clone())
+            }
+        }
+        AstNode::Identifier(id) => {
+            if let Some((_, prop)) = id.rsplit_once('.') {
+                if !prop.is_empty() {
+                    Ok(prop.to_string())
+                } else {
+                    Ok(id.clone())
+                }
+            } else {
+                Ok(id.clone())
+            }
+        }
+        AstNode::NodePattern {
+            variable: Some(var),
+            ..
+        } => Ok(var.clone()),
+        AstNode::EdgePattern {
+            variable: Some(var),
+            ..
+        } => Ok(var.clone()),
+        _ => Ok("col".to_string()),
+    }
+}
+
 impl AstVisitor for AgeEmitter {
     fn visit_query(&mut self, arena: &QueryAstArena, root: NodeHandle) -> Result<CompiledQuery> {
         if !is_valid_age_graph_name(&self.graph_name) {
@@ -133,6 +176,7 @@ impl AstVisitor for AgeEmitter {
                 self.graph_name
             )));
         }
+
         let mut cypher_emitter = CypherEmitter::new().without_execution_mode();
         let cypher_compiled = cypher_emitter.visit_query(arena, root)?;
 
@@ -149,22 +193,24 @@ impl AstVisitor for AgeEmitter {
             execution_mode = *mode;
             let ret_node = arena.get(*ret_handle)?;
             if let AstNode::ReturnClause { projections, .. } = ret_node {
+                let mut used_names = std::collections::HashSet::new();
                 for proj in projections {
-                    let col_name = if let Some(alias) = &proj.alias {
+                    let base_name = if let Some(alias) = &proj.alias {
                         alias.clone()
                     } else {
-                        match arena.get(proj.expression)? {
-                            AstNode::PropertyAccess { property, .. } => {
-                                if property.is_empty() {
-                                    "entity".to_string()
-                                } else {
-                                    property.clone()
-                                }
-                            }
-                            AstNode::Identifier(id) => id.clone(),
-                            _ => "col".to_string(),
-                        }
+                        resolve_age_column_base_name(arena, proj.expression)?
                     };
+                    let base_name = if base_name.is_empty() {
+                        "col".to_string()
+                    } else {
+                        base_name
+                    };
+                    let mut col_name = base_name.clone();
+                    let mut counter = 1usize;
+                    while !used_names.insert(col_name.clone()) {
+                        col_name = format!("{base_name}_{counter}");
+                        counter += 1;
+                    }
                     column_defs.push(format!("{col_name} agtype"));
                 }
             }
@@ -218,7 +264,9 @@ impl AstVisitor for AgeEmitter {
 
 #[cfg(test)]
 mod tests {
-    use super::contains_cypher_parameter_reference;
+    use super::*;
+    use crate::builder::QueryBuilder;
+    use crate::visitor::AstVisitor;
 
     #[test]
     fn detects_runtime_parameters() {
@@ -237,5 +285,50 @@ mod tests {
         assert!(!contains_cypher_parameter_reference("RETURN 1 // $p0"));
         assert!(!contains_cypher_parameter_reference("RETURN 1 /* $p0 */"));
         assert!(!contains_cypher_parameter_reference("RETURN 'it\\'s $p0'"));
+    }
+
+    #[test]
+    fn age_emitter_unique_column_names_for_multiple_entities() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("b"), vec!["Person"])
+            .r#return()
+            .field("a", "", None::<String>)
+            .field("r", "", None::<String>)
+            .field("b", "", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b $$) AS (a agtype, r agtype, b agtype)"
+        );
+    }
+
+    #[test]
+    fn age_emitter_resolves_name_clashes_deterministically() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .r#return()
+            .field("a", "", None::<String>)
+            .field("a", "name", None::<String>)
+            .field("a", "", None::<String>)
+            .field("a", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person) RETURN a, a.name, a, a.name $$) AS (a agtype, name agtype, a_1 agtype, name_1 agtype)"
+        );
     }
 }

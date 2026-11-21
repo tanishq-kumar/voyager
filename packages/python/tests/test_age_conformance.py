@@ -179,7 +179,7 @@ def test_age_undirected_and_incoming_traversals():
     q_inc = Query.match(c).from_(WorksAt, "r").node(a).return_(c.name, a.name)
     c_inc = q_inc.compile("apache_age", graph_name="age_graph")
     assert "MATCH (c:Company)<-[r:WORKS_AT]-(a:Person) RETURN c.name, a.name" in c_inc.statement
-    assert "AS (name agtype, name agtype)" in c_inc.statement
+    assert "AS (name agtype, name_1 agtype)" in c_inc.statement
 
 
 # ---------------------------------------------------------------------------
