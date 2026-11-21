@@ -29,6 +29,8 @@ pub mod emitters;
 pub mod error;
 pub mod optimizer;
 pub mod schema;
+#[cfg(feature = "serde")]
+pub mod spec_export;
 pub mod topology;
 pub mod transaction;
 pub mod visitor;

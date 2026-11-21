@@ -232,6 +232,7 @@ use voyager_ogm::schema::{
     canonical_vector_index_name as core_canonical_vector_index_name, global_schema_registry,
     resolve_fulltext_search as core_resolve_fulltext_search,
 };
+use voyager_ogm::spec_export::{SpecExportError, SpecValue, spec_from_ast};
 use voyager_ogm::topology::GraphTopology;
 use voyager_ogm::visitor::{AstVisitor, CompiledQuery};
 
@@ -1512,6 +1513,12 @@ fn expression_tag(tuple: &Bound<'_, PyTuple>, path: &SpecPath) -> PyResult<Strin
             ));
         }
     };
+    if tag == "agg" {
+        return Err(path_error(
+            path,
+            "Invalid expression 'agg': aggregations are only valid as projection items in 'projections' or 'with_clauses[i].projections', not in where, order_by, set, function arguments or other expression positions. Write the aggregate as [\"agg\", variable, property, func, alias] in a projection list instead.",
+        ));
+    }
     if !is_known_expr_tag(&tag) {
         return Err(path_error(
             path,
@@ -2923,6 +2930,47 @@ fn literal_to_py<'py>(lit: &LiteralValue, py: Python<'py>) -> PyResult<Bound<'py
     }
 }
 
+/// Converts a Query Spec value into its Python representation.
+///
+/// Objects are inserted in order so a pattern property map keeps the order the
+/// emitters use when they assign parameter names.
+fn spec_value_to_py<'py>(py: Python<'py>, value: &SpecValue) -> PyResult<Bound<'py, PyAny>> {
+    match value {
+        SpecValue::Null => Ok(py.None().into_bound(py)),
+        SpecValue::Bool(value) => Ok(value.into_pyobject(py)?.to_owned().into_any()),
+        SpecValue::Int(value) => Ok(value.into_pyobject(py)?.to_owned().into_any()),
+        SpecValue::Float(value) => Ok(value.into_pyobject(py)?.to_owned().into_any()),
+        SpecValue::String(value) => Ok(value.into_pyobject(py)?.to_owned().into_any()),
+        SpecValue::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(spec_value_to_py(py, item)?)?;
+            }
+            Ok(list.into_any())
+        }
+        SpecValue::Object(members) => {
+            let dict = PyDict::new(py);
+            for (key, value) in members {
+                dict.set_item(key, spec_value_to_py(py, value)?)?;
+            }
+            Ok(dict.into_any())
+        }
+    }
+}
+
+/// Maps a Query Spec serialisation failure onto a `VoyagerError`.
+fn map_spec_export_error(error: SpecExportError) -> PyErr {
+    match error {
+        SpecExportError::Unsupported { construct } => make_voyager_err(
+            voyager_ogm::ErrorCode::UnsupportedFeature,
+            format!("Query Spec v1 cannot represent {construct} without changing the query"),
+        ),
+        SpecExportError::Invalid(message) => {
+            make_voyager_err(voyager_ogm::ErrorCode::InvalidClause, message)
+        }
+    }
+}
+
 fn check_warn_cypher_path_mode(
     py: Python<'_>,
     dialect: &str,
@@ -3690,6 +3738,19 @@ impl PyQueryBuilder {
             Some(yield_score),
         );
         Ok(())
+    }
+
+    /// Serialises this builder into a Query Spec v1 dictionary.
+    ///
+    /// Equivalent constructs compile from the returned document exactly like the
+    /// fluent query. A construct Query Spec cannot express raises `VoyagerError`
+    /// with code `UNSUPPORTED_FEATURE` naming it.
+    fn to_spec_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (arena, root) = self.inner.clone().try_build().map_err(|error| {
+            make_voyager_err(voyager_ogm::ErrorCode::InvalidClause, error.to_string())
+        })?;
+        let spec = spec_from_ast(&arena, root).map_err(map_spec_export_error)?;
+        spec_value_to_py(py, &spec)
     }
 
     #[pyo3(signature = (dialect="cypher", graph_name=None, optimize=false, optimization_level="standard"))]

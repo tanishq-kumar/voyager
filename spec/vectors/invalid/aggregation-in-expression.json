@@ -1,0 +1,49 @@
+{
+  "description": "An aggregation is a projection item, not an expression; the error names the aggregate misuse instead of suggesting a literal spelling.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "gt",
+          [
+            "agg",
+            "p",
+            "id",
+            "count",
+            null
+          ],
+          [
+            "lit",
+            2
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/where/2"
+  }
+}

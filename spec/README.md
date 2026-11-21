@@ -112,6 +112,10 @@ The following are rejected:
   first element (for example `[1, 2, 3]`) or an unknown first string (for
   example `["propp", ...]` or `["red", "green"]`). Every expression array must
   be tagged (see [Expression arrays are always tagged](#expression-arrays-are-always-tagged)).
+- An `agg` array in an expression position. `agg` is a projection item only;
+  the error at the array's path says aggregations are only valid as projection
+  items instead of suggesting a literal spelling (see
+  [Aggregations are projection items only](#aggregations-are-projection-items-only)).
 - A path step `properties` item that is neither an object nor `null`, a
   non-null item past a step's documented shape (5th node item, 8th edge item),
   or a property value that is not a tagged expression.
@@ -365,6 +369,24 @@ An `["alias", expression, name]` name takes effect in an `expr` projection (or
 as the projection's explicit alias); in any other expression position the name
 is validated and the inner expression is used. Every shape above is exact: an
 item past the documented length is `INVALID_SPEC` at the extra item's path.
+
+### Aggregations are projection items only
+
+`agg` is not an expression tag. It is accepted only as a projection item in
+root `projections` and `with_clauses[i].projections`. An `agg` array anywhere
+in an expression position (inside `where`, `order_by`, a `set` value, a
+function argument, a binary or unary expression, or a path property map) is
+rejected with `INVALID_SPEC` at the array's own path. The message names the
+misuse directly: aggregations are only valid as projection items, so move the
+aggregate into a projection list or a `WITH` clause. It is not the generic
+unknown-tag hint about `["lit", [...]]`.
+
+The Python fluent API raises the same rule at construction or at the call that
+uses the aggregation. `p.id.count() > 2`, `~p.id.count()`, `fn.size(p.id.count())`,
+`q.where(p.id.count())`, `q.order_by(p.id.count())` and `q.set(x=p.id.count())`
+raise `VoyagerError` with code `INVALID_CLAUSE` and the message
+"aggregations are only valid in WITH/RETURN projections".
+`q.return_(count=p.id.count())` and `q.with_(count=p.id.count())` remain valid.
 
 ### Linear clauses
 

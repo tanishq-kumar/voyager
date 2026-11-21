@@ -393,7 +393,7 @@
       "items": false
     },
     "Expression": {
-      "description": "AST expression node descriptor recognized by the native FFI engine. An arbitrary JSON array is never an expression: every array must start with a known tag.",
+      "description": "AST expression node descriptor recognized by the native FFI engine. An arbitrary JSON array is never an expression: every array must start with a known tag. An 'agg' item is not an expression; aggregations are only accepted as projection items in root projections and with_clauses projections.",
       "oneOf": [
         {
           "description": "Property access: ['prop', variable, property]",
