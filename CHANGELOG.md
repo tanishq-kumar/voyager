@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **SQL/PGQ parameter binding in Python bridges (#226)**: `PostgresBridge._format_pgq_statement` now binds `GRAPH_TABLE` parameters positionally as `%s` placeholders like standard SQL instead of interpolating parameter values directly into the SQL statement, supporting prepared statements, duplicate parameter names, and preventing injection from hostile values. `DuckDbBridge` safely encodes values for `GRAPH_TABLE` queries as typed SQL literals (strings with quote-doubling, ints, floats including `'nan'::DOUBLE` / `'inf'::DOUBLE`, booleans, `NULL`, dates, datetimes, times, lists, and maps) and raises `TypeError` for unsupported parameter types, working around DuckPGQ's lack of prepared parameter support inside table function ASTs.
+
 ## [0.4.1] - 2026-11-21
 
 ### Changed
