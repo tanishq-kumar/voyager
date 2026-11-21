@@ -1,0 +1,54 @@
+{
+  "description": "A list comprehension's iteration variable is local and cannot be used after the comprehension.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "list_comp",
+          "x",
+          [
+            "ident",
+            "p"
+          ],
+          null,
+          [
+            "ident",
+            "x"
+          ]
+        ],
+        "items"
+      ]
+    ],
+    "order_by": [
+      [
+        [
+          "ident",
+          "x"
+        ],
+        true
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/order_by/0/0/1"
+  }
+}

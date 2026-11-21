@@ -1,0 +1,48 @@
+{
+  "description": "A WITH projection that is not a bare variable needs an alias.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "projections": [
+          [
+            "field",
+            "p",
+            "name",
+            null
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "ident",
+          "p"
+        ],
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/with_clauses/0/projections/0"
+  }
+}

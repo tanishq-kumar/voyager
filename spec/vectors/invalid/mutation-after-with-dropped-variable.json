@@ -1,0 +1,68 @@
+{
+  "description": "A mutation after WITH cannot use a match variable the WITH does not project.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ],
+          [
+            [
+              "node",
+              "q",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "projections": [
+          [
+            "field",
+            "p",
+            "name",
+            "n"
+          ]
+        ]
+      }
+    ],
+    "mutations": [
+      [
+        "set",
+        "q",
+        "age",
+        [
+          "lit",
+          30
+        ]
+      ]
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "ident",
+          "n"
+        ],
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/mutations/0/1"
+  }
+}

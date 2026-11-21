@@ -9,6 +9,7 @@ from voyager_ogm import (
     Path,
     Query,
     Relationship,
+    col,
     node,
     relationship,
     reset_alias_counters,
@@ -109,23 +110,23 @@ def test_query_with_clause_and_intermediate_pipeline():
     query = (
         Query.match(p)
         .where(p.age > 21)
-        .with_(p.name, p.age)
-        .where(p.age < 50)
-        .return_(p.name)
+        .with_(name=p.name, age=p.age)
+        .where(col("age") < 50)
+        .return_(col("name"))
         .limit(10)
     )
 
     compiled = query.compile("cypher")
     assert (
         compiled.statement
-        == "MATCH (p:Person) WHERE p.age > $p0 WITH p.name, p.age WHERE p.age < $p1 RETURN p.name LIMIT 10"
+        == "MATCH (p:Person) WHERE p.age > $p0 WITH p.name AS name, p.age AS age WHERE age < $p1 RETURN name LIMIT 10"
     )
     assert compiled.parameters == {"p0": 21, "p1": 50}
 
     # Distinct WITH with aliased projection
-    q2 = Query.match(p).with_(p.name, distinct=True, user_age=p.age).return_("user_age")
+    q2 = Query.match(p).with_(name=p.name, distinct=True, user_age=p.age).return_("user_age")
     c2 = q2.compile("cypher")
-    assert "WITH DISTINCT p.name, p.age AS user_age" in c2.statement
+    assert "WITH DISTINCT p.name AS name, p.age AS user_age" in c2.statement
 
 
 def test_query_hybrid_method_chaining():
@@ -238,23 +239,23 @@ def test_query_subquery_with_and_projections_roundtrip():
 
     sub = (
         Query.match(c)
-        .with_(c.name)
-        .where(c.name == "Acme")
-        .return_(c.name)
-        .order_by(c.name)
+        .with_(company_name=c.name)
+        .where(col("company_name") == "Acme")
+        .return_(col("company_name"))
+        .order_by(col("company_name"))
         .limit(1)
     )
     compiled_sub = sub.compile("cypher")
-    assert "WITH c.name WHERE c.name = $p0" in compiled_sub.statement
-    assert "RETURN c.name" in compiled_sub.statement
+    assert "WITH c.name AS company_name WHERE company_name = $p0" in compiled_sub.statement
+    assert "RETURN company_name" in compiled_sub.statement
     assert "LIMIT 1" in compiled_sub.statement
 
     query = Query.match(p).where(Query.exists(sub)).return_(p.name)
     compiled = query.compile("cypher")
     assert "EXISTS {" in compiled.statement
     assert "WITH c.name" in compiled.statement
-    assert "WHERE c.name = $p0" in compiled.statement
-    assert "RETURN c.name" in compiled.statement
+    assert "WHERE company_name = $p0" in compiled.statement
+    assert "RETURN company_name" in compiled.statement
     assert "LIMIT 1" in compiled.statement
 
 
@@ -302,15 +303,15 @@ def test_query_with_where_before_order_by():
     p = Person("p")
     query = (
         Query.match(p)
-        .with_(p.name, p.age)
-        .where(p.age > 21)
-        .order_by(p.age)
+        .with_(name=p.name, age=p.age)
+        .where(col("age") > 21)
+        .order_by(col("age"))
         .limit(5)
-        .return_(p.name)
+        .return_(col("name"))
     )
     compiled = query.compile("cypher")
     assert (
-        "WITH p.name, p.age WHERE p.age > $p0 ORDER BY p.age ASC LIMIT 5 RETURN p.name"
+        "WITH p.name AS name, p.age AS age WHERE age > $p0 ORDER BY age ASC LIMIT 5 RETURN name"
         in compiled.statement
     )
 

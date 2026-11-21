@@ -926,13 +926,13 @@
     "cypher": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "MATCH (p:Person) WITH DISTINCT p.city RETURN p.city",
+      "statement": "MATCH (p:Person) WITH DISTINCT p.city AS city RETURN city",
       "status": "ok"
     },
     "iso_gql": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "MATCH (p:Person) WITH DISTINCT p.city RETURN p.city",
+      "statement": "MATCH (p:Person) WITH DISTINCT p.city AS city RETURN city",
       "status": "ok"
     },
     "sql_pgq": {
@@ -948,7 +948,7 @@
         "p0": 21,
         "p1": 50
       },
-      "statement": "MATCH (p:Person) WHERE p.age > $p0 WITH p.name, p.age WHERE p.age < $p1 RETURN p.name LIMIT 10",
+      "statement": "MATCH (p:Person) WHERE p.age > $p0 WITH p.name AS name, p.age AS age WHERE age < $p1 RETURN name LIMIT 10",
       "status": "ok"
     },
     "iso_gql": {
@@ -957,7 +957,7 @@
         "p0": 21,
         "p1": 50
       },
-      "statement": "MATCH (p:Person) WHERE p.age > $p0 WITH p.name, p.age WHERE p.age < $p1 RETURN p.name LIMIT 10",
+      "statement": "MATCH (p:Person) WHERE p.age > $p0 WITH p.name AS name, p.age AS age WHERE age < $p1 RETURN name LIMIT 10",
       "status": "ok"
     },
     "sql_pgq": {

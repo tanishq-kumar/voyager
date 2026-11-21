@@ -187,13 +187,18 @@ fn test_cypher_emitter_with_clause() {
     builder
         .r#match()
         .node(Some("p"), vec!["Person"])
-        .where_gt("p", "age", 21)
+        .where_gt("p", "age", 21);
+    let age_ident = builder.ident("age");
+    let threshold = builder.literal(50);
+    let age_filter = builder.binary_expr(age_ident, BinaryOp::Lt, threshold);
+    let actor = builder.ident("actor");
+    builder
         .r#with()
         .field("p", "name", Some("actor"))
-        .field("p", "age", None::<&str>)
-        .where_lt("p", "age", 50)
+        .field("p", "age", Some("age"))
+        .where_expr(age_filter)
         .r#return()
-        .field("p", "name", Some("actor"))
+        .select_expr(actor, None::<&str>)
         .limit(10);
 
     let (arena, root) = builder.build();
@@ -204,7 +209,7 @@ fn test_cypher_emitter_with_clause() {
 
     assert_eq!(
         compiled.statement,
-        "MATCH (p:Person) WHERE p.age > $p0 WITH p.name AS actor, p.age WHERE p.age < $p1 RETURN p.name AS actor LIMIT 10"
+        "MATCH (p:Person) WHERE p.age > $p0 WITH p.name AS actor, p.age AS age WHERE age < $p1 RETURN actor LIMIT 10"
     );
     assert_eq!(
         compiled.parameters.get("p0"),
@@ -217,15 +222,45 @@ fn test_cypher_emitter_with_clause() {
 }
 
 #[test]
+fn test_with_projection_needs_alias_unless_bare_variable() {
+    let mut builder = QueryBuilder::new();
+    builder
+        .r#match()
+        .node(Some("p"), vec!["Person"])
+        .r#with()
+        .field("p", "name", None::<&str>);
+    match builder.try_build() {
+        Err(voyager_ogm::Error::InvalidClause(message)) => {
+            assert!(
+                message.contains("WITH projection `p.name` needs an alias"),
+                "{message}"
+            );
+            assert!(
+                message.contains("only a bare variable may be projected without one"),
+                "{message}"
+            );
+        }
+        Err(other) => panic!("expected InvalidClause, got {other:?}"),
+        Ok(_) => panic!("expected InvalidClause, got a built query"),
+    }
+
+    let mut builder = QueryBuilder::new();
+    builder.r#match().node(Some("p"), vec!["Person"]);
+    let bare = builder.ident("p");
+    builder.r#with().select_expr(bare, None::<&str>);
+    assert!(builder.try_build().is_ok());
+}
+
+#[test]
 fn test_sql_pgq_emitter_rejects_with_clause() {
     let mut builder = QueryBuilder::new();
     builder
         .r#match()
         .node(Some("p"), vec!["Person"])
         .r#with()
-        .field("p", "name", None::<&str>)
+        .field("p", "name", Some("name"))
         .r#return()
-        .field("p", "name", None::<&str>);
+        .field("p", "name", Some("name"));
 
     let (arena, root) = builder.build();
     let mut emitter = SqlPgqEmitter::new("social_graph");
@@ -308,18 +343,22 @@ fn test_sql_pgq_emitter_rejects_path_variable_and_mode() {
 #[test]
 fn test_cypher_emitter_with_where_order_by_skip_limit() {
     let mut builder = QueryBuilder::new();
+    builder.r#match().node(Some("p"), vec!["Person"]);
+    let age_ident = builder.ident("age");
+    let threshold = builder.literal(18);
+    let age_filter = builder.binary_expr(age_ident, BinaryOp::Gt, threshold);
+    let order_age = builder.ident("age");
+    let return_name = builder.ident("name");
     builder
-        .r#match()
-        .node(Some("p"), vec!["Person"])
         .r#with()
-        .field("p", "name", None::<&str>)
-        .field("p", "age", None::<&str>)
-        .where_gt("p", "age", 18)
-        .order_by_asc("p", "age")
+        .field("p", "name", Some("name"))
+        .field("p", "age", Some("age"))
+        .where_expr(age_filter)
+        .order_by(order_age, true)
         .skip(2)
         .limit(10)
         .r#return()
-        .field("p", "name", None::<&str>);
+        .select_expr(return_name, None::<&str>);
 
     let (arena, root) = builder.build();
     let mut emitter = CypherEmitter::new();
@@ -329,25 +368,29 @@ fn test_cypher_emitter_with_where_order_by_skip_limit() {
 
     assert_eq!(
         compiled.statement,
-        "MATCH (p:Person) WITH p.name, p.age WHERE p.age > $p0 ORDER BY p.age ASC SKIP 2 LIMIT 10 RETURN p.name"
+        "MATCH (p:Person) WITH p.name AS name, p.age AS age WHERE age > $p0 ORDER BY age ASC SKIP 2 LIMIT 10 RETURN name"
     );
 }
 
 #[test]
 fn test_iso_gql_emitter_with_where_order_by_offset_limit() {
     let mut builder = QueryBuilder::new();
+    builder.r#match().node(Some("p"), vec!["Person"]);
+    let age_ident = builder.ident("age");
+    let threshold = builder.literal(18);
+    let age_filter = builder.binary_expr(age_ident, BinaryOp::Gt, threshold);
+    let order_age = builder.ident("age");
+    let return_name = builder.ident("name");
     builder
-        .r#match()
-        .node(Some("p"), vec!["Person"])
         .r#with()
-        .field("p", "name", None::<&str>)
-        .field("p", "age", None::<&str>)
-        .where_gt("p", "age", 18)
-        .order_by_asc("p", "age")
+        .field("p", "name", Some("name"))
+        .field("p", "age", Some("age"))
+        .where_expr(age_filter)
+        .order_by(order_age, true)
         .skip(5)
         .limit(10)
         .r#return()
-        .field("p", "name", None::<&str>);
+        .select_expr(return_name, None::<&str>);
 
     let (arena, root) = builder.build();
     let mut emitter = IsoGqlEmitter::new();
@@ -357,7 +400,7 @@ fn test_iso_gql_emitter_with_where_order_by_offset_limit() {
 
     assert_eq!(
         compiled.statement,
-        "MATCH (p:Person) WITH p.name, p.age WHERE p.age > $p0 ORDER BY p.age ASC OFFSET 5 LIMIT 10 RETURN p.name"
+        "MATCH (p:Person) WITH p.name AS name, p.age AS age WHERE age > $p0 ORDER BY age ASC OFFSET 5 LIMIT 10 RETURN name"
     );
 }
 

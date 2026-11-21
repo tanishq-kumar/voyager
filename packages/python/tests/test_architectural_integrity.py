@@ -168,7 +168,7 @@ def test_fluent_chaining_lifecycle_integrity():
     assert_architectural_integrity(q)
 
     # 10. WITH clause
-    q.with_(p.name, p2_age=p2.age)
+    q.with_(p_name=p.name, p2_age=p2.age)
     assert_architectural_integrity(q)
 
     # 11. LET linear statement

@@ -1,0 +1,54 @@
+{
+  "description": "A WITH drops an UNWIND alias unless the clause projects it.",
+  "spec": {
+    "spec_version": 1,
+    "unwinds": [
+      [
+        "$batch",
+        "row"
+      ]
+    ],
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "projections": [
+          [
+            "expr",
+            [
+              "ident",
+              "p"
+            ],
+            null
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "row",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/projections/0/1"
+  }
+}

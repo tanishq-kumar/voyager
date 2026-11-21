@@ -236,7 +236,7 @@ def test_aggregation_is_valid_in_return_and_with() -> None:
     returned = Query.match(p).return_(p.age.count().as_("total"))
     assert "COUNT(p.age) AS total" in returned.compile("cypher").statement
 
-    with_clause = Query.match(p).with_(p.age.avg().as_("avg_age")).return_(p.name)
+    with_clause = Query.match(p).with_(p.age.avg().as_("avg_age")).return_("avg_age")
     assert "AVG(p.age) AS avg_age" in with_clause.compile("cypher").statement
 
 

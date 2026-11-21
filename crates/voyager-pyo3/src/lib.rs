@@ -1,6 +1,6 @@
 //! Python PyO3 bindings and Apache Arrow bridge for Voyager OGM.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -1856,6 +1856,1335 @@ fn build_where_predicates(
     Ok(())
 }
 
+/// Variable names in scope at one point of the statement the consumer emits.
+///
+/// A `WITH` clause replaces the visible names with the ones it projects, so
+/// `names` always holds the exact set an expression at that point may resolve.
+#[derive(Clone)]
+struct SpecScope {
+    names: HashSet<String>,
+    valid_identifiers: bool,
+}
+
+impl Default for SpecScope {
+    fn default() -> Self {
+        Self {
+            names: HashSet::new(),
+            valid_identifiers: true,
+        }
+    }
+}
+
+/// Mirrors the emitter's plain-identifier rule closely enough to defer invalid
+/// names to the shared identifier validator instead of reporting them as scope
+/// errors. Identifier injection must keep its own error message.
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+impl SpecScope {
+    fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    fn bind(&mut self, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        if !is_plain_identifier(name) {
+            self.valid_identifiers = false;
+            return;
+        }
+        self.names.insert(name.to_string());
+    }
+
+    fn include(&mut self, other: &SpecScope) {
+        self.names.extend(other.names.iter().cloned());
+    }
+}
+
+/// Where a variable reference sits in the fixed emission order.
+#[derive(Clone, Copy, Debug)]
+enum ScopeClause {
+    Match,
+    LinearLet,
+    LinearFilter,
+    WithProjection { index: usize },
+    WithWhere { index: usize, only_projected: bool },
+    WithOrderBy { index: usize, only_projected: bool },
+    Mutation,
+    Return,
+    RootOrderBy { only_projected: bool },
+}
+
+/// Names defined by later clauses, used to explain a forward reference.
+#[derive(Default)]
+struct ScopeHints {
+    with_names: Vec<(usize, String)>,
+    let_names: HashSet<String>,
+}
+
+impl ScopeHints {
+    fn with_index_of(&self, name: &str) -> Option<usize> {
+        self.with_names
+            .iter()
+            .find(|(_, projected)| projected == name)
+            .map(|(index, _)| *index)
+    }
+}
+
+/// Builds the `INVALID_SPEC` error for a variable that is not in scope at the
+/// point the consumer would emit it.
+fn missing_scope_var(
+    path: &SpecPath,
+    name: &str,
+    clause: ScopeClause,
+    last_with: Option<usize>,
+    hints: &ScopeHints,
+) -> PyErr {
+    let mut message = format!("variable '{name}' is not in scope here");
+    match clause {
+        ScopeClause::LinearLet | ScopeClause::LinearFilter => {
+            if let Some(index) = hints.with_index_of(name) {
+                message.push_str(&format!(
+                    ": linear clauses are emitted before WITH clauses; move the reference into with_clauses[{index}].where or with_clauses[{index}].projections"
+                ));
+            } else if hints.let_names.contains(name) {
+                message.push_str(": a linear 'let' binds its variable only from that entry onward");
+            } else {
+                message.push_str(
+                    ": it is not bound by any preceding LOAD CSV, UNWIND, MATCH, linear let, or WITH projection",
+                );
+            }
+        }
+        ScopeClause::Match => {
+            if hints.let_names.contains(name) {
+                message.push_str(
+                    ": MATCH clauses are emitted before linear clauses; bind the variable in a preceding WITH projection instead",
+                );
+            } else {
+                message
+                    .push_str(": it is not bound by any preceding LOAD CSV, UNWIND, or MATCH path");
+            }
+        }
+        ScopeClause::WithProjection { index } => {
+            message.push_str(&format!(
+                ": with_clauses[{index}] projections can only read names bound by the preceding clauses; add it to an earlier WITH projection or a match path"
+            ));
+        }
+        ScopeClause::WithWhere {
+            index,
+            only_projected,
+        } => {
+            if only_projected {
+                message.push_str(&format!(
+                    ": a WITH with DISTINCT or an aggregation only exposes the names it projects; add '{name}' to with_clauses[{index}].projections or reference a projected alias"
+                ));
+            } else {
+                message.push_str(&format!(
+                    ": with_clauses[{index}].where sees the names that clause projects and the names in scope before it; add '{name}' to with_clauses[{index}].projections or reference a projected alias"
+                ));
+            }
+        }
+        ScopeClause::WithOrderBy {
+            index,
+            only_projected,
+        } => {
+            if only_projected {
+                message.push_str(&format!(
+                    ": a WITH with DISTINCT or an aggregation only exposes the names it projects; add '{name}' to with_clauses[{index}].projections"
+                ));
+            } else {
+                message.push_str(&format!(
+                    ": with_clauses[{index}].order_by cannot see '{name}' because the WITH neither projects it nor keeps it from before the WITH; add it to with_clauses[{index}].projections"
+                ));
+            }
+        }
+        ScopeClause::Mutation => {
+            if let Some(index) = last_with {
+                message.push_str(&format!(
+                    ": the last WITH clause (with_clauses[{index}]) does not project '{name}'; add it to that clause's projections"
+                ));
+            } else {
+                message.push_str(": it is not bound by any preceding clause");
+            }
+        }
+        ScopeClause::Return => {
+            if let Some(index) = last_with {
+                message.push_str(&format!(
+                    ": the last WITH clause (with_clauses[{index}]) does not project '{name}'; add it to that clause's projections"
+                ));
+            } else {
+                message.push_str(": it is not bound by any preceding clause");
+            }
+        }
+        ScopeClause::RootOrderBy { only_projected } => {
+            if only_projected {
+                message.push_str(
+                    ": a RETURN with DISTINCT or an aggregation only exposes the names it projects; reference a projected name",
+                );
+            } else if let Some(index) = last_with {
+                message.push_str(&format!(
+                    ": the last WITH clause (with_clauses[{index}]) does not project '{name}'; add it to that clause's projections"
+                ));
+            } else {
+                message.push_str(": it is not bound by any preceding clause");
+            }
+        }
+    }
+    make_spec_err(path, message)
+}
+
+fn seq_tag<'py>(val: &Bound<'py, PyAny>) -> Option<(Bound<'py, PyTuple>, String)> {
+    let sequence = as_spec_sequence(val)?;
+    let tag = sequence.get_item(0).ok()?.extract::<String>().ok()?;
+    Some((sequence, tag))
+}
+
+fn tuple_string(sequence: &Bound<'_, PyTuple>, index: usize) -> Option<String> {
+    sequence
+        .get_item(index)
+        .ok()
+        .and_then(|item| item.extract::<String>().ok())
+}
+
+fn tuple_optional_string(sequence: &Bound<'_, PyTuple>, index: usize) -> Option<String> {
+    sequence
+        .get_item(index)
+        .ok()
+        .and_then(|item| item.extract::<Option<String>>().ok())
+        .flatten()
+}
+
+fn dict_string(dict: &Bound<'_, PyDict>, key: &str) -> Option<String> {
+    dict.get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|item| item.extract::<String>().ok())
+}
+
+/// The names a projection introduces into the next clause.
+#[derive(Default)]
+struct ProjectionScope {
+    projected: Vec<String>,
+}
+
+/// The name a projection is addressed by after the WITH/RETURN clause.
+///
+/// An explicit alias wins. Otherwise the name follows what the emitters write:
+/// `field` and `prop` projections are named by their property, and an
+/// unaliased `ident` keeps its identifier (an outer `["alias", inner, name]`
+/// contributes `name`).
+fn expression_projection_name(expression: &Bound<'_, PyAny>) -> Option<String> {
+    let (sequence, tag) = seq_tag(expression)?;
+    match tag.as_str() {
+        "alias" => tuple_string(&sequence, 2),
+        "ident" => tuple_string(&sequence, 1),
+        "prop" => tuple_string(&sequence, 2),
+        _ => None,
+    }
+}
+
+fn projection_scope_outputs(item: &Bound<'_, PyAny>) -> ProjectionScope {
+    let mut outputs = ProjectionScope::default();
+    let Some((sequence, tag)) = seq_tag(item) else {
+        return outputs;
+    };
+    match tag.as_str() {
+        "field" => match tuple_optional_string(&sequence, 3) {
+            Some(alias) => outputs.projected.push(alias),
+            None => {
+                if let Some(prop) = tuple_string(&sequence, 2)
+                    && !prop.is_empty()
+                {
+                    outputs.projected.push(prop);
+                }
+            }
+        },
+        "agg" => {
+            if let Some(alias) = tuple_optional_string(&sequence, 4) {
+                outputs.projected.push(alias);
+            }
+        }
+        "expr" => {
+            if let Some(alias) = tuple_optional_string(&sequence, 2) {
+                outputs.projected.push(alias);
+            }
+            if let Ok(expression) = sequence.get_item(1) {
+                if outputs.projected.is_empty()
+                    && let Some(name) = expression_projection_name(&expression)
+                {
+                    outputs.projected.push(name);
+                }
+            }
+        }
+        _ => {}
+    }
+    outputs
+}
+
+/// True when a projection expression spec is exactly a bare variable.
+fn expression_spec_is_bare_identifier(expression: &Bound<'_, PyAny>) -> bool {
+    seq_tag(expression)
+        .map(|(_, tag)| tag == "ident")
+        .unwrap_or(false)
+}
+
+/// True when a projection item projects a bare variable rather than an expression.
+fn with_projection_is_bare_variable(item: &Bound<'_, PyAny>) -> bool {
+    let Some((sequence, tag)) = seq_tag(item) else {
+        return false;
+    };
+    tag == "expr"
+        && sequence
+            .get_item(1)
+            .ok()
+            .map(|expression| expression_spec_is_bare_identifier(&expression))
+            .unwrap_or(false)
+}
+
+/// True when a WITH projection carries an explicit alias or an alias wrapper.
+fn with_projection_has_alias(item: &Bound<'_, PyAny>, path: &SpecPath) -> PyResult<bool> {
+    let Some((sequence, tag)) = seq_tag(item) else {
+        return Ok(true);
+    };
+    match tag.as_str() {
+        "field" => Ok(tuple_optional_string(&sequence, 3).is_some()),
+        "agg" => Ok(tuple_optional_string(&sequence, 4).is_some()),
+        "expr" => {
+            if tuple_optional_string(&sequence, 2).is_some() {
+                return Ok(true);
+            }
+            let Ok(expression) = sequence.get_item(1) else {
+                return Ok(true);
+            };
+            Ok(extract_alias_from_expr_spec(&expression, path)?.is_some())
+        }
+        _ => Ok(true),
+    }
+}
+
+fn render_expression_spec(expression: &Bound<'_, PyAny>) -> String {
+    let Some((sequence, tag)) = seq_tag(expression) else {
+        return "expression".to_string();
+    };
+    match tag.as_str() {
+        "ident" => tuple_string(&sequence, 1).unwrap_or_else(|| "expression".to_string()),
+        "prop" => match (tuple_string(&sequence, 1), tuple_string(&sequence, 2)) {
+            (Some(variable), Some(property)) => format!("{variable}.{property}"),
+            _ => "expression".to_string(),
+        },
+        "alias" => sequence
+            .get_item(1)
+            .ok()
+            .map(|inner| render_expression_spec(&inner))
+            .unwrap_or_else(|| "expression".to_string()),
+        "fn" => match tuple_string(&sequence, 1) {
+            Some(name) => format!("{name}(...)"),
+            None => "expression".to_string(),
+        },
+        "lit" => sequence
+            .get_item(1)
+            .ok()
+            .and_then(|value| render_json_scalar(&value))
+            .unwrap_or_else(|| "expression".to_string()),
+        _ => "expression".to_string(),
+    }
+}
+
+fn render_with_projection(item: &Bound<'_, PyAny>) -> String {
+    let Some((sequence, tag)) = seq_tag(item) else {
+        return "expression".to_string();
+    };
+    match tag.as_str() {
+        "field" => match (tuple_string(&sequence, 1), tuple_string(&sequence, 2)) {
+            (Some(variable), Some(property)) => format!("{variable}.{property}"),
+            _ => "expression".to_string(),
+        },
+        "agg" => {
+            let function = tuple_string(&sequence, 3).unwrap_or_else(|| "agg".to_string());
+            let target = match (tuple_string(&sequence, 1), tuple_string(&sequence, 2)) {
+                (Some(variable), Some(property)) if !property.is_empty() && property != "*" => {
+                    format!("{variable}.{property}")
+                }
+                (Some(variable), _) => variable,
+                _ => "expression".to_string(),
+            };
+            format!("{function}({target})")
+        }
+        "expr" => sequence
+            .get_item(1)
+            .ok()
+            .map(|expression| render_expression_spec(&expression))
+            .unwrap_or_else(|| "expression".to_string()),
+        _ => "expression".to_string(),
+    }
+}
+
+/// A WITH projection that is not a bare variable must name its output column.
+fn validate_with_projection_alias(item: &Bound<'_, PyAny>, path: &SpecPath) -> PyResult<()> {
+    if with_projection_is_bare_variable(item) || with_projection_has_alias(item, path)? {
+        return Ok(());
+    }
+    let rendered = render_with_projection(item);
+    Err(make_spec_err(
+        path,
+        format!(
+            "WITH projection `{rendered}` needs an alias (for example `{rendered} AS name`); only a bare variable may be projected without one"
+        ),
+    ))
+}
+
+/// True when a spec dict's boolean flag is present and true. Invalid values are
+/// left to the builder's own validation.
+fn dict_flag_is_true(dict: &Bound<'_, PyDict>, key: &str) -> bool {
+    dict.get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|value| value.extract::<bool>().ok())
+        .unwrap_or(false)
+}
+
+/// True when a projection list contains an aggregate projection item.
+fn projections_contain_aggregation(projections: &Bound<'_, PyAny>) -> bool {
+    let Some(items) = as_spec_sequence(projections) else {
+        return false;
+    };
+    items
+        .iter()
+        .any(|item| seq_tag(&item).is_some_and(|(_, tag)| tag == "agg"))
+}
+
+fn collect_scope_hints(spec: &Bound<'_, PyDict>) -> ScopeHints {
+    let mut hints = ScopeHints::default();
+    if let Some(with_item) = spec.get_item("with_clauses").ok().flatten()
+        && let Some(with_seq) = as_spec_sequence(&with_item)
+    {
+        for (index, item) in with_seq.iter().enumerate() {
+            let Ok(with_dict) = item.cast::<PyDict>() else {
+                continue;
+            };
+            let Some(projections) = with_dict.get_item("projections").ok().flatten() else {
+                continue;
+            };
+            let Some(projection_seq) = as_spec_sequence(&projections) else {
+                continue;
+            };
+            for projection in projection_seq.iter() {
+                for name in projection_scope_outputs(&projection).projected {
+                    hints.with_names.push((index, name));
+                }
+            }
+        }
+    }
+    if let Some(linear_item) = spec.get_item("linear_clauses").ok().flatten()
+        && let Some(linear_seq) = as_spec_sequence(&linear_item)
+    {
+        for item in linear_seq.iter() {
+            let Some((sequence, tag)) = seq_tag(&item) else {
+                continue;
+            };
+            if tag == "let"
+                && let Some(name) = tuple_string(&sequence, 1)
+            {
+                hints.let_names.insert(name);
+            }
+        }
+    }
+    hints
+}
+
+fn ensure_in_scope(
+    name: &str,
+    path: &SpecPath,
+    scope: &SpecScope,
+    clause: ScopeClause,
+    last_with: Option<usize>,
+    hints: &ScopeHints,
+) -> PyResult<()> {
+    if name.is_empty()
+        || !scope.valid_identifiers
+        || !is_plain_identifier(name)
+        || scope.contains(name)
+    {
+        return Ok(());
+    }
+    Err(missing_scope_var(path, name, clause, last_with, hints))
+}
+
+fn validate_where_scope(
+    where_item: &Bound<'_, PyAny>,
+    path: &SpecPath,
+    scope: &SpecScope,
+    clause: ScopeClause,
+    last_with: Option<usize>,
+    hints: &ScopeHints,
+    depth: usize,
+) -> PyResult<()> {
+    if let Some(sequence) = as_spec_sequence(where_item) {
+        if sequence.is_empty() {
+            return Ok(());
+        }
+        let first = sequence.get_item(0)?;
+        if first.extract::<String>().is_ok() {
+            return validate_expr_scope(where_item, path, scope, clause, last_with, hints, depth);
+        }
+        if first.cast::<PyDict>().is_ok() || as_spec_sequence(&first).is_some() {
+            for (index, predicate) in sequence.iter().enumerate() {
+                validate_expr_scope(
+                    &predicate,
+                    &path.index(index),
+                    scope,
+                    clause,
+                    last_with,
+                    hints,
+                    depth,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    validate_expr_scope(where_item, path, scope, clause, last_with, hints, depth)
+}
+
+fn validate_order_by_scope(
+    entry: &Bound<'_, PyAny>,
+    path: &SpecPath,
+    scope: &SpecScope,
+    clause: ScopeClause,
+    last_with: Option<usize>,
+    hints: &ScopeHints,
+    depth: usize,
+) -> PyResult<()> {
+    let Some(sequence) = as_spec_sequence(entry) else {
+        return Ok(());
+    };
+    let Some(first) = sequence.get_item(0).ok() else {
+        return Ok(());
+    };
+    if let Ok(variable) = first.extract::<String>() {
+        return ensure_in_scope(&variable, &path.index(0), scope, clause, last_with, hints);
+    }
+    validate_expr_scope(
+        &first,
+        &path.index(0),
+        scope,
+        clause,
+        last_with,
+        hints,
+        depth,
+    )
+}
+
+/// Validates one projection item and returns the names it introduces.
+fn validate_projection_item_scope(
+    item: &Bound<'_, PyAny>,
+    path: &SpecPath,
+    scope: &SpecScope,
+    clause: ScopeClause,
+    last_with: Option<usize>,
+    hints: &ScopeHints,
+    depth: usize,
+) -> PyResult<ProjectionScope> {
+    let outputs = projection_scope_outputs(item);
+    let Some((sequence, tag)) = seq_tag(item) else {
+        return Ok(outputs);
+    };
+    match tag.as_str() {
+        "field" | "agg" => {
+            if let Some(variable) = tuple_string(&sequence, 1) {
+                ensure_in_scope(&variable, &path.index(1), scope, clause, last_with, hints)?;
+            }
+        }
+        "expr" => {
+            if let Ok(expression) = sequence.get_item(1) {
+                validate_expr_scope(
+                    &expression,
+                    &path.index(1),
+                    scope,
+                    clause,
+                    last_with,
+                    hints,
+                    depth,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(outputs)
+}
+
+/// Validates a path-step list and returns the variables it binds.
+///
+/// Property expressions are read with the path variables available, because an
+/// inline property may refer to a variable bound earlier in the same pattern.
+fn validate_path_steps_scope(
+    steps: &Bound<'_, PyTuple>,
+    path: &SpecPath,
+    scope: &SpecScope,
+    clause: ScopeClause,
+    last_with: Option<usize>,
+    hints: &ScopeHints,
+    depth: usize,
+) -> PyResult<Vec<String>> {
+    let mut bound = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let step_path = path.index(index);
+        let Some((sequence, tag)) = seq_tag(&step) else {
+            continue;
+        };
+        let variable = match tag.as_str() {
+            "node" => tuple_optional_string(&sequence, 1),
+            "edge" => tuple_optional_string(&sequence, 3),
+            _ => None,
+        };
+        if let Some(variable) = variable {
+            bound.push(variable);
+        }
+        let _ = step_path;
+    }
+
+    let mut local = scope.clone();
+    for name in &bound {
+        local.bind(name);
+    }
+
+    for (index, step) in steps.iter().enumerate() {
+        let step_path = path.index(index);
+        let Some((sequence, tag)) = seq_tag(&step) else {
+            continue;
+        };
+        let properties_index = match tag.as_str() {
+            "node" => 3,
+            "edge" => 6,
+            _ => continue,
+        };
+        let Some(properties) = sequence.get_item(properties_index).ok() else {
+            continue;
+        };
+        let Ok(properties) = properties.cast::<PyDict>() else {
+            continue;
+        };
+        let properties_path = step_path.index(properties_index);
+        for (key, value) in properties.iter() {
+            let Some(name) = key.extract::<String>().ok() else {
+                continue;
+            };
+            validate_expr_scope(
+                &value,
+                &properties_path.key(&name),
+                &local,
+                clause,
+                last_with,
+                hints,
+                depth,
+            )?;
+        }
+    }
+    Ok(bound)
+}
+
+fn validate_subquery_scope(
+    spec: &Bound<'_, PyDict>,
+    path: &SpecPath,
+    parent_scope: &SpecScope,
+    depth: usize,
+) -> PyResult<()> {
+    let mut child = parent_scope.clone();
+    validate_spec_scope_inner(spec, path, &mut child, depth + 1)
+}
+
+fn validate_expr_scope(
+    val: &Bound<'_, PyAny>,
+    path: &SpecPath,
+    scope: &SpecScope,
+    clause: ScopeClause,
+    last_with: Option<usize>,
+    hints: &ScopeHints,
+    depth: usize,
+) -> PyResult<()> {
+    if depth > MAX_AST_DEPTH || val.cast::<PyAstExpr>().is_ok() {
+        return Ok(());
+    }
+    if let Ok(dict) = val.cast::<PyDict>() {
+        if let Some(inner) = dict.get_item("expr").ok().flatten() {
+            return validate_expr_scope(
+                &inner,
+                &path.key("expr"),
+                scope,
+                clause,
+                last_with,
+                hints,
+                depth + 1,
+            );
+        }
+        // A bare object here is either a nested query spec for a dedicated
+        // payload (handled by that payload's caller) or a structural error the
+        // builder reports; there is nothing to scope-check either way.
+        return Ok(());
+    }
+    let Some((sequence, tag)) = seq_tag(val) else {
+        return Ok(());
+    };
+    match tag.as_str() {
+        "ident" | "prop" => {
+            if let Some(name) = tuple_string(&sequence, 1) {
+                ensure_in_scope(&name, &path.index(1), scope, clause, last_with, hints)?;
+            }
+        }
+        "param" | "lit" => {}
+        "bin" => {
+            for index in [2, 3] {
+                if let Ok(child) = sequence.get_item(index) {
+                    validate_expr_scope(
+                        &child,
+                        &path.index(index),
+                        scope,
+                        clause,
+                        last_with,
+                        hints,
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+        "unary" => {
+            if let Ok(operand) = sequence.get_item(2) {
+                validate_expr_scope(
+                    &operand,
+                    &path.index(2),
+                    scope,
+                    clause,
+                    last_with,
+                    hints,
+                    depth + 1,
+                )?;
+            }
+        }
+        "fn" => {
+            if let Ok(arguments) = sequence.get_item(2)
+                && let Some(arguments) = as_spec_sequence(&arguments)
+            {
+                let arguments_path = path.index(2);
+                for (index, argument) in arguments.iter().enumerate() {
+                    validate_expr_scope(
+                        &argument,
+                        &arguments_path.index(index),
+                        scope,
+                        clause,
+                        last_with,
+                        hints,
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+        "case" => {
+            for index in [1, 3] {
+                if let Ok(child) = sequence.get_item(index)
+                    && !child.is_none()
+                {
+                    validate_expr_scope(
+                        &child,
+                        &path.index(index),
+                        scope,
+                        clause,
+                        last_with,
+                        hints,
+                        depth + 1,
+                    )?;
+                }
+            }
+            if let Ok(branches) = sequence.get_item(2)
+                && let Some(branches) = as_spec_sequence(&branches)
+            {
+                let branches_path = path.index(2);
+                for (index, branch) in branches.iter().enumerate() {
+                    let branch_path = branches_path.index(index);
+                    let Some(branch) = as_spec_sequence(&branch) else {
+                        continue;
+                    };
+                    for position in [0, 1] {
+                        if let Ok(child) = branch.get_item(position) {
+                            validate_expr_scope(
+                                &child,
+                                &branch_path.index(position),
+                                scope,
+                                clause,
+                                last_with,
+                                hints,
+                                depth + 1,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        "list" => {
+            if let Ok(items) = sequence.get_item(1)
+                && let Some(items) = as_spec_sequence(&items)
+            {
+                let items_path = path.index(1);
+                for (index, item) in items.iter().enumerate() {
+                    validate_expr_scope(
+                        &item,
+                        &items_path.index(index),
+                        scope,
+                        clause,
+                        last_with,
+                        hints,
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+        "list_comp" => {
+            if let Ok(list_expression) = sequence.get_item(2) {
+                validate_expr_scope(
+                    &list_expression,
+                    &path.index(2),
+                    scope,
+                    clause,
+                    last_with,
+                    hints,
+                    depth + 1,
+                )?;
+            }
+            let mut local = scope.clone();
+            if let Some(variable) = tuple_string(&sequence, 1) {
+                local.bind(&variable);
+            }
+            for index in [3, 4] {
+                if let Ok(child) = sequence.get_item(index)
+                    && !child.is_none()
+                {
+                    validate_expr_scope(
+                        &child,
+                        &path.index(index),
+                        &local,
+                        clause,
+                        last_with,
+                        hints,
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+        "pattern_comp" => {
+            let mut local = scope.clone();
+            if let Ok(path_steps) = sequence.get_item(1)
+                && let Some(path_steps) = as_spec_sequence(&path_steps)
+            {
+                let bound = validate_path_steps_scope(
+                    &path_steps,
+                    &path.index(1),
+                    scope,
+                    clause,
+                    last_with,
+                    hints,
+                    depth + 1,
+                )?;
+                for name in bound {
+                    local.bind(&name);
+                }
+            }
+            for index in [2, 3] {
+                if let Ok(child) = sequence.get_item(index)
+                    && !child.is_none()
+                {
+                    validate_expr_scope(
+                        &child,
+                        &path.index(index),
+                        &local,
+                        clause,
+                        last_with,
+                        hints,
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+        "exists" | "count" => {
+            if let Ok(payload) = sequence.get_item(1) {
+                if let Ok(dict) = payload.cast::<PyDict>() {
+                    validate_subquery_scope(dict, &path.index(1), scope, depth)?;
+                } else if let Some(path_steps) = as_spec_sequence(&payload) {
+                    validate_path_steps_scope(
+                        &path_steps,
+                        &path.index(1),
+                        scope,
+                        clause,
+                        last_with,
+                        hints,
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+        "alias" => {
+            if let Ok(inner) = sequence.get_item(1) {
+                validate_expr_scope(
+                    &inner,
+                    &path.index(1),
+                    scope,
+                    clause,
+                    last_with,
+                    hints,
+                    depth + 1,
+                )?;
+            }
+        }
+        // `agg` in an expression position is rejected by the builder with its
+        // own message; an unknown tag is likewise reported there.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Checks that every variable reference resolves at the point the consumer
+/// emits it.
+///
+/// The consumer emits clauses in a fixed order: `load_csv`, `unwinds`,
+/// `matches`, `linear_clauses`, `with_clauses`, `mutations`, then `RETURN`
+/// (projections, then `order_by`/`skip`/`limit`). This walk follows that order
+/// rather than the order of the spec's keys, so a reference the emission order
+/// cannot honour is rejected with its own JSON Pointer.
+fn validate_spec_scope_inner(
+    spec: &Bound<'_, PyDict>,
+    path: &SpecPath,
+    scope: &mut SpecScope,
+    depth: usize,
+) -> PyResult<()> {
+    if depth > MAX_AST_DEPTH {
+        return Ok(());
+    }
+    let hints = collect_scope_hints(spec);
+    let mut last_with: Option<usize> = None;
+
+    if let Some(load_item) = spec.get_item("load_csv").ok().flatten()
+        && !load_item.is_none()
+        && let Some(sequence) = as_spec_sequence(&load_item)
+        && let Some(alias) = tuple_string(&sequence, 2)
+    {
+        scope.bind(&alias);
+    }
+
+    if let Some(unwinds_item) = spec.get_item("unwinds").ok().flatten()
+        && let Some(unwinds) = as_spec_sequence(&unwinds_item)
+    {
+        for entry in unwinds.iter() {
+            if let Some((sequence, _)) = seq_tag(&entry)
+                && let Some(alias) = tuple_string(&sequence, 1)
+            {
+                scope.bind(&alias);
+            }
+        }
+    }
+
+    if let Some(matches_item) = spec.get_item("matches").ok().flatten()
+        && let Some(matches) = as_spec_sequence(&matches_item)
+    {
+        let matches_path = path.key("matches");
+        for (index, entry) in matches.iter().enumerate() {
+            let Ok(match_dict) = entry.cast::<PyDict>() else {
+                continue;
+            };
+            let match_path = matches_path.index(index);
+            if let Some(paths_item) = match_dict.get_item("paths").ok().flatten()
+                && let Some(paths) = as_spec_sequence(&paths_item)
+            {
+                let paths_path = match_path.key("paths");
+                for (path_index, path_item) in paths.iter().enumerate() {
+                    let Some(steps) = as_spec_sequence(&path_item) else {
+                        continue;
+                    };
+                    let bound = validate_path_steps_scope(
+                        &steps,
+                        &paths_path.index(path_index),
+                        scope,
+                        ScopeClause::Match,
+                        last_with,
+                        &hints,
+                        depth,
+                    )?;
+                    for name in bound {
+                        scope.bind(&name);
+                    }
+                }
+            }
+            if let Some(path_variable) = dict_string(match_dict, "path_variable") {
+                scope.bind(&path_variable);
+            }
+            if let Some(where_item) = match_dict.get_item("where").ok().flatten()
+                && !where_item.is_none()
+            {
+                validate_where_scope(
+                    &where_item,
+                    &match_path.key("where"),
+                    scope,
+                    ScopeClause::Match,
+                    last_with,
+                    &hints,
+                    depth,
+                )?;
+            }
+        }
+    }
+
+    if let Some(linear_item) = spec.get_item("linear_clauses").ok().flatten()
+        && let Some(linear) = as_spec_sequence(&linear_item)
+    {
+        let linear_path = path.key("linear_clauses");
+        for (index, entry) in linear.iter().enumerate() {
+            let Some((sequence, tag)) = seq_tag(&entry) else {
+                continue;
+            };
+            let entry_path = linear_path.index(index);
+            match tag.as_str() {
+                "let" => {
+                    if let Ok(expression) = sequence.get_item(2) {
+                        validate_expr_scope(
+                            &expression,
+                            &entry_path.index(2),
+                            scope,
+                            ScopeClause::LinearLet,
+                            last_with,
+                            &hints,
+                            depth,
+                        )?;
+                    }
+                    if let Some(variable) = tuple_string(&sequence, 1) {
+                        scope.bind(&variable);
+                    }
+                }
+                "filter" => {
+                    if let Ok(predicate) = sequence.get_item(1) {
+                        validate_expr_scope(
+                            &predicate,
+                            &entry_path.index(1),
+                            scope,
+                            ScopeClause::LinearFilter,
+                            last_with,
+                            &hints,
+                            depth,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(with_item) = spec.get_item("with_clauses").ok().flatten()
+        && let Some(with_clauses) = as_spec_sequence(&with_item)
+    {
+        let with_path = path.key("with_clauses");
+        for (index, entry) in with_clauses.iter().enumerate() {
+            let Ok(with_dict) = entry.cast::<PyDict>() else {
+                continue;
+            };
+            let entry_path = with_path.index(index);
+            let before = scope.clone();
+            let projections_item = with_dict.get_item("projections").ok().flatten();
+            // DISTINCT and aggregation collapse the clause's own WHERE/ORDER BY
+            // scope to exactly the names it projects.
+            let only_projected = dict_flag_is_true(with_dict, "distinct")
+                || projections_item
+                    .as_ref()
+                    .is_some_and(|projections| projections_contain_aggregation(projections));
+            let mut projected = SpecScope {
+                names: HashSet::new(),
+                valid_identifiers: before.valid_identifiers,
+            };
+            if let Some(projections) = projections_item
+                && let Some(projections) = as_spec_sequence(&projections)
+            {
+                let projections_path = entry_path.key("projections");
+                for (projection_index, projection) in projections.iter().enumerate() {
+                    let projection_path = projections_path.index(projection_index);
+                    validate_with_projection_alias(&projection, &projection_path)?;
+                    let outputs = validate_projection_item_scope(
+                        &projection,
+                        &projection_path,
+                        &before,
+                        ScopeClause::WithProjection { index },
+                        last_with,
+                        &hints,
+                        depth,
+                    )?;
+                    for name in outputs.projected {
+                        projected.bind(&name);
+                    }
+                }
+            }
+            if let Some(where_item) = with_dict.get_item("where").ok().flatten()
+                && !where_item.is_none()
+            {
+                // Without DISTINCT or an aggregation, the WITH's own WHERE sees
+                // the projected names plus the names in scope before the WITH.
+                let mut where_scope = projected.clone();
+                if !only_projected {
+                    where_scope.include(&before);
+                }
+                validate_where_scope(
+                    &where_item,
+                    &entry_path.key("where"),
+                    &where_scope,
+                    ScopeClause::WithWhere {
+                        index,
+                        only_projected,
+                    },
+                    last_with,
+                    &hints,
+                    depth,
+                )?;
+            }
+            if let Some(order_item) = with_dict.get_item("order_by").ok().flatten()
+                && !order_item.is_none()
+                && let Some(order_entries) = as_spec_sequence(&order_item)
+            {
+                let order_path = entry_path.key("order_by");
+                // Without DISTINCT or an aggregation, ORDER BY may still read
+                // names that were in scope before the WITH.
+                let mut order_scope = projected.clone();
+                if !only_projected {
+                    order_scope.include(&before);
+                }
+                for (order_index, order_entry) in order_entries.iter().enumerate() {
+                    validate_order_by_scope(
+                        &order_entry,
+                        &order_path.index(order_index),
+                        &order_scope,
+                        ScopeClause::WithOrderBy {
+                            index,
+                            only_projected,
+                        },
+                        last_with,
+                        &hints,
+                        depth,
+                    )?;
+                }
+            }
+            *scope = projected;
+            last_with = Some(index);
+        }
+    }
+
+    if let Some(mutations_item) = spec.get_item("mutations").ok().flatten()
+        && let Some(mutations) = as_spec_sequence(&mutations_item)
+    {
+        let mutations_path = path.key("mutations");
+        for (index, entry) in mutations.iter().enumerate() {
+            let Some((sequence, tag)) = seq_tag(&entry) else {
+                continue;
+            };
+            let entry_path = mutations_path.index(index);
+            let clause = ScopeClause::Mutation;
+            match tag.as_str() {
+                "create" => {
+                    if let Ok(paths) = sequence.get_item(1)
+                        && let Some(paths) = as_spec_sequence(&paths)
+                    {
+                        let paths_path = entry_path.index(1);
+                        for (path_index, path_item) in paths.iter().enumerate() {
+                            let Some(steps) = as_spec_sequence(&path_item) else {
+                                continue;
+                            };
+                            let bound = validate_path_steps_scope(
+                                &steps,
+                                &paths_path.index(path_index),
+                                scope,
+                                clause,
+                                last_with,
+                                &hints,
+                                depth,
+                            )?;
+                            for name in bound {
+                                scope.bind(&name);
+                            }
+                        }
+                    }
+                }
+                "merge" => {
+                    if let Ok(path_item) = sequence.get_item(1)
+                        && let Some(steps) = as_spec_sequence(&path_item)
+                    {
+                        let bound = validate_path_steps_scope(
+                            &steps,
+                            &entry_path.index(1),
+                            scope,
+                            clause,
+                            last_with,
+                            &hints,
+                            depth,
+                        )?;
+                        for name in bound {
+                            scope.bind(&name);
+                        }
+                    }
+                    for list_index in [2, 3] {
+                        if let Ok(sets) = sequence.get_item(list_index)
+                            && let Some(sets) = as_spec_sequence(&sets)
+                        {
+                            let sets_path = entry_path.index(list_index);
+                            for (set_index, set_item) in sets.iter().enumerate() {
+                                let Some((set, _)) = seq_tag(&set_item) else {
+                                    continue;
+                                };
+                                let set_path = sets_path.index(set_index);
+                                if let Some(variable) = tuple_string(&set, 0) {
+                                    ensure_in_scope(
+                                        &variable,
+                                        &set_path.index(0),
+                                        scope,
+                                        clause,
+                                        last_with,
+                                        &hints,
+                                    )?;
+                                }
+                                if let Ok(value) = set.get_item(2) {
+                                    validate_expr_scope(
+                                        &value,
+                                        &set_path.index(2),
+                                        scope,
+                                        clause,
+                                        last_with,
+                                        &hints,
+                                        depth,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
+                "set" => {
+                    if let Some(variable) = tuple_string(&sequence, 1) {
+                        ensure_in_scope(
+                            &variable,
+                            &entry_path.index(1),
+                            scope,
+                            clause,
+                            last_with,
+                            &hints,
+                        )?;
+                    }
+                    if let Ok(value) = sequence.get_item(3) {
+                        validate_expr_scope(
+                            &value,
+                            &entry_path.index(3),
+                            scope,
+                            clause,
+                            last_with,
+                            &hints,
+                            depth,
+                        )?;
+                    }
+                }
+                "delete" => {
+                    if let Ok(targets) = sequence.get_item(2)
+                        && let Some(targets) = as_spec_sequence(&targets)
+                    {
+                        let targets_path = entry_path.index(2);
+                        for (target_index, target) in targets.iter().enumerate() {
+                            if let Ok(variable) = target.extract::<String>() {
+                                ensure_in_scope(
+                                    &variable,
+                                    &targets_path.index(target_index),
+                                    scope,
+                                    clause,
+                                    last_with,
+                                    &hints,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                "remove" => {
+                    if let Some(variable) = tuple_string(&sequence, 1) {
+                        ensure_in_scope(
+                            &variable,
+                            &entry_path.index(1),
+                            scope,
+                            clause,
+                            last_with,
+                            &hints,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut return_names = Vec::new();
+    if let Some(projections) = spec.get_item("projections").ok().flatten()
+        && let Some(projections) = as_spec_sequence(&projections)
+    {
+        let projections_path = path.key("projections");
+        for (index, projection) in projections.iter().enumerate() {
+            let outputs = validate_projection_item_scope(
+                &projection,
+                &projections_path.index(index),
+                scope,
+                ScopeClause::Return,
+                last_with,
+                &hints,
+                depth,
+            )?;
+            return_names.extend(outputs.projected);
+        }
+    }
+    if let Some(order_item) = spec.get_item("order_by").ok().flatten()
+        && !order_item.is_none()
+        && let Some(order_entries) = as_spec_sequence(&order_item)
+    {
+        let order_path = path.key("order_by");
+        // DISTINCT and aggregation collapse the RETURN's own ORDER BY scope to
+        // exactly the names it projects.
+        let only_projected = dict_flag_is_true(spec, "distinct")
+            || spec
+                .get_item("projections")
+                .ok()
+                .flatten()
+                .as_ref()
+                .is_some_and(|projections| projections_contain_aggregation(projections));
+        let mut order_scope = if only_projected {
+            SpecScope {
+                names: HashSet::new(),
+                valid_identifiers: scope.valid_identifiers,
+            }
+        } else {
+            scope.clone()
+        };
+        for name in return_names {
+            order_scope.bind(&name);
+        }
+        for (index, order_entry) in order_entries.iter().enumerate() {
+            validate_order_by_scope(
+                &order_entry,
+                &order_path.index(index),
+                &order_scope,
+                ScopeClause::RootOrderBy { only_projected },
+                last_with,
+                &hints,
+                depth,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_spec_scope(spec: &Bound<'_, PyDict>, path: &SpecPath, depth: usize) -> PyResult<()> {
+    let mut scope = SpecScope::default();
+    validate_spec_scope_inner(spec, path, &mut scope, depth)
+}
+
 fn build_path_from_py(
     builder: &mut QueryBuilder,
     spec: &Bound<'_, PyAny>,
@@ -2902,6 +4231,14 @@ fn build_query_from_spec_internal(
         ));
     }
 
+    // Scope is checked once for the document root. Nested `exists`/`count`
+    // specs are reached from the expression walker with the enclosing scope,
+    // so re-checking them from their own build entry point would lose the
+    // correlated variables they are allowed to read.
+    if depth == 0 {
+        validate_spec_scope(spec, path, depth)?;
+    }
+
     Ok(())
 }
 
@@ -3764,11 +5101,12 @@ impl PyQueryBuilder {
     ) -> PyResult<Bound<'py, PyDict>> {
         check_warn_cypher_path_mode(py, dialect, self.inner.get_path_mode().as_deref())?;
 
-        let (mut arena, root) = self
-            .inner
-            .clone()
-            .try_build()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let (mut arena, root) = self.inner.clone().try_build().map_err(|e| match e.code() {
+            voyager_ogm::ErrorCode::InvalidClause => {
+                make_voyager_err(voyager_ogm::ErrorCode::InvalidClause, e.to_string())
+            }
+            _ => PyValueError::new_err(e.to_string()),
+        })?;
 
         if optimize {
             let opt_level = OptimizationLevel::from_str_opt(optimization_level);

@@ -140,6 +140,15 @@ The following are rejected:
   `/with_clauses/i/projections`) and a `matches[i].paths: []` empty list (error
   at `/matches/i/paths`). Both would otherwise drop or misattach their
   `where`/pagination.
+- A variable reference the fixed emission order cannot honour, such as a linear
+  filter reading an alias a later `WITH` defines, or a mutation after a `WITH`
+  targeting a variable that clause dropped. The error is at the identifier's own
+  pointer and names the variable (see
+  [Clause order and scope](#5-clause-order-and-scope)).
+- A `WITH` projection that is not a bare variable and has no alias, such as
+  `["field", "p", "name", null]` or `["agg", "p", "age", "count", null]`. The
+  error is at the projection item's pointer (see
+  [Clause order and scope](#5-clause-order-and-scope)).
 - Any item past a fixed-arity shape (see the shapes below): `load_csv`,
   `unwinds` entries, every mutation tag, every projection tag, `order_by`
   entries, `linear_clauses` entries, merge `ON CREATE SET` / `ON MATCH SET`
@@ -217,7 +226,7 @@ Python/Rust builder API.
     }
   ],
   "projections": [
-    ["field", "u", "name", "user_name"],
+    ["expr", ["ident", "user_name"], null],
     ["expr", ["ident", "friend_count"], "total"]
   ],
   "distinct": false,
@@ -402,7 +411,118 @@ Neither entry accepts extra items.
 
 ---
 
-## 5. DML Mutations
+## 5. Clause order and scope
+
+The consumer emits clauses in a fixed order, whatever order the document's keys
+use. Every variable reference must resolve at the point its clause is emitted;
+a spec that depends on a different order is rejected with `INVALID_SPEC` at the
+offending identifier (or at the expression containing it) instead of being
+silently reordered.
+
+The emission order is:
+
+1. `load_csv`
+2. `unwinds` (in list order)
+3. `matches` (in list order)
+4. `linear_clauses` (`let` and `filter`, in list order)
+5. `with_clauses` (in list order)
+6. `mutations` (in list order)
+7. the final `RETURN`: `projections`, then `order_by`, then `skip`/`offset` and
+   `limit`
+
+The scope rules follow that order:
+
+- A `load_csv` or `unwinds` alias is bound from its clause onward.
+- A match path binds its node variables, edge variables and `path_variable` for
+  the rest of the query. `matches[i].where` sees the variables of its own paths
+  and everything bound before the match.
+- A linear `let` binds its variable only from that entry onward. A `filter` sees
+  the bindings of the entries before it.
+- A `WITH` clause replaces the visible names with the ones it projects. A bare
+  variable projection without an alias (`["expr", ["ident", "p"], null]`) keeps
+  that variable. Every aliased projection keeps only its alias: a bare variable
+  projected as `["expr", ["ident", "p"], "x"]` keeps `x`, and
+  `["field", "p", "name", "n"]` keeps `n` and drops `p`. `load_csv`, `unwinds`,
+  match and `let` names are dropped by a `WITH` unless the clause projects them.
+- A `WITH` projection item that is not a bare variable must have an alias. The
+  consumer rejects an unaliased `["field", "p", "name", null]`, `["agg", ...]`
+  without an alias, or a non-identifier `expr` projection without an alias, at
+  the projection item's pointer. Only a bare variable may be projected without
+  one. `RETURN` projections keep working without aliases.
+- `with_clauses[i].where` and `with_clauses[i].order_by` see the names that
+  clause projects plus the names that were in scope before the `WITH`. When the
+  `WITH` is `DISTINCT` or contains an aggregation, both see only the projected
+  names, and a reference to a pre-`WITH` name is rejected with `INVALID_SPEC`:
+  a `WITH` with `DISTINCT` or an aggregation only exposes the names it projects.
+  The clauses after the `WITH` always see only the projected names.
+- Mutations and the final `projections` see the scope after the last `WITH`
+  (plus variables the earlier mutations created). Root `order_by` may
+  additionally use the names the `RETURN` projects. When the root `RETURN` is
+  `DISTINCT` or contains an aggregation, root `order_by` sees only the names the
+  `RETURN` projects.
+- Variables bound inside an `exists`/`count` subquery or a `pattern_comp` path
+  are local to that construct, though the construct may read outer variables.
+  A `list_comp` iteration variable is visible only in that comprehension's
+  `where` and map expressions.
+- Parameters (`param`) and literals (`lit`) never need a binding.
+
+### Filter after `WITH`
+
+`linear_clauses` is emitted before `with_clauses`, so a filter cannot read an
+alias that a later `WITH` defines. This document is rejected at
+`/linear_clauses/0/1/2/1`:
+
+```text
+{"spec_version": 1,
+ "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+ "with_clauses": [{"projections": [["field", "p", "name", "n"]]}],
+ "linear_clauses": [["filter", ["bin", "gt", ["ident", "n"], ["lit", 0]]]],
+ "projections": [["expr", ["ident", "n"], null]]}
+```
+
+The error says `variable 'n' is not in scope here: linear clauses are emitted
+before WITH clauses; move the reference into with_clauses[0].where ...`. Express
+the filter in the `WITH` that defines the alias:
+
+```json
+{
+  "spec_version": 1,
+  "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+  "with_clauses": [
+    {
+      "projections": [["field", "p", "name", "n"]],
+      "where": ["bin", "gt", ["ident", "n"], ["lit", 0]]
+    }
+  ],
+  "projections": [["expr", ["ident", "n"], null]]
+}
+```
+
+That compiles to `MATCH (p:Person) WITH p.name AS n WHERE n > $p0 RETURN n`.
+
+### Mutations after `WITH`
+
+Mutations are emitted after `with_clauses`, so they see the last `WITH`'s
+projected names. A mutation that targets a match variable the last `WITH` did
+not project is rejected at the mutation's target:
+
+```text
+{"spec_version": 1,
+ "matches": [{"paths": [[["node", "p", ["Person"]]], [["node", "q", ["Person"]]]]}],
+ "with_clauses": [{"projections": [["field", "p", "name", "n"]]}],
+ "mutations": [["set", "q", "age", ["lit", 30]]],
+ "projections": [["expr", ["ident", "n"], null]]}
+```
+
+The error is at `/mutations/0/1`: `variable 'q' is not in scope here: the last
+WITH clause (with_clauses[0]) does not project 'q'; add it to that clause's
+projections`. Add the bare variable `["expr", ["ident", "q"], null]` to the
+`WITH` projections (or move the mutation before the `WITH` by removing the
+`WITH` from the pipeline) to make the target visible.
+
+---
+
+## 6. DML Mutations
 
 Mutation tuples within `mutations`:
 
@@ -414,7 +534,7 @@ Mutation tuples within `mutations`:
 
 ---
 
-## 6. Target Dialect Parity
+## 7. Target Dialect Parity
 
 Any valid `spec` compiled with `compile_query_from_spec(spec, dialect="cypher" | "iso_gql" | "sql_pgq" | "apache_age")` produces the exact same parameter-isolated SQL/Cypher statement as the fluent `Query` builder API.
 

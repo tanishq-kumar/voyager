@@ -23,13 +23,21 @@
         "p",
         "name",
         "n"
+      ],
+      [
+        "field",
+        "p",
+        "age",
+        "a"
       ]
     ],
     "distinct": true,
     "order_by": [
       [
-        "p",
-        "age",
+        [
+          "ident",
+          "a"
+        ],
         false
       ],
       [
@@ -43,23 +51,23 @@
   },
   "expected": {
     "cypher": {
-      "statement": "MATCH (p:Person) RETURN DISTINCT p.name AS n ORDER BY p.age DESC, n ASC",
+      "statement": "MATCH (p:Person) RETURN DISTINCT p.name AS n, p.age AS a ORDER BY a DESC, n ASC",
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN DISTINCT p.name AS n ORDER BY p.age DESC, n ASC $$) AS (n agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN DISTINCT p.name AS n, p.age AS a ORDER BY a DESC, n ASC $$) AS (n agtype, a agtype)",
       "parameters": {}
     },
     "iso_gql": {
-      "statement": "MATCH (p:Person) RETURN DISTINCT p.name AS n ORDER BY p.age DESC, n ASC",
+      "statement": "MATCH (p:Person) RETURN DISTINCT p.name AS n, p.age AS a ORDER BY a DESC, n ASC",
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n)) ORDER BY age DESC, n ASC",
+      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n, p.age AS a)) ORDER BY a DESC, n ASC",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n)) ORDER BY age DESC, n ASC",
+      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n, p.age AS a)) ORDER BY a DESC, n ASC",
       "parameters": {}
     }
   }

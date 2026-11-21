@@ -16,8 +16,8 @@ from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator
-from voyager_ogm import Query, compile_query_from_spec, fn, reset_config
-from voyager_ogm.expressions import case, list_comprehension
+from voyager_ogm import Query, VoyagerError, compile_query_from_spec, fn, reset_config
+from voyager_ogm.expressions import case, col, list_comprehension
 from voyager_ogm.models import Field, Node, Relationship
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -101,10 +101,10 @@ def _query_with_clause() -> Query:
     p = _person()
     return (
         Query.match(p)
-        .with_(p.name, bucket=p.age)
-        .where(p.age >= 18)
-        .return_(p.name)
-        .order_by(p.name)
+        .with_(name=p.name, bucket=p.age)
+        .where(col("bucket") >= 18)
+        .return_("name")
+        .order_by("name")
     )
 
 
@@ -112,11 +112,11 @@ def _query_with_pagination() -> Query:
     p = _person()
     return (
         Query.match(p)
-        .with_(p.name, distinct=True)
-        .order_by(p.name, ascending=False)
+        .with_(name=p.name, distinct=True)
+        .order_by("name", ascending=False)
         .skip(1)
         .limit(5)
-        .return_(p.name)
+        .return_("name")
     )
 
 
@@ -124,8 +124,8 @@ def _query_root_pagination_distinct() -> Query:
     p = _person()
     return (
         Query.match(p)
-        .return_(p.name, distinct=True)
-        .order_by(p.name, ascending=False)
+        .return_(p.name.as_("name"), distinct=True)
+        .order_by("name", ascending=False)
         .skip(2)
         .limit(10)
     )
@@ -135,14 +135,14 @@ def _query_with_aggregations() -> Query:
     p = _person()
     return (
         Query.match(p)
-        .with_(p.name, count=p.name.count(), avg_age=p.age.avg())
-        .return_(p.name, total=p.age.sum())
+        .with_(name=p.name, count=p.name.count(), avg_age=p.age.avg())
+        .return_("name", "count", "avg_age")
     )
 
 
 def _query_aliased_aggregation() -> Query:
     p = _person()
-    return Query.match(p).with_(p.age.avg().as_("avg_age")).return_(p.age.count().as_("total"))
+    return Query.match(p).with_(p.age.avg().as_("avg_age")).return_("avg_age")
 
 
 def _query_unwind() -> Query:
@@ -301,6 +301,27 @@ def test_fluent_spec_roundtrip(name: str) -> None:
         compiled_any = True
 
     assert compiled_any, f"{name}: the fluent query did not compile in any dialect"
+
+
+def test_fluent_with_projection_requires_an_alias() -> None:
+    """A non-bare WITH projection without `AS` raises INVALID_CLAUSE at compile."""
+    p = _person()
+    query = Query.match(p).with_(p.name).return_("name")
+    with pytest.raises(VoyagerError) as exc_info:
+        query.compile("cypher")
+    assert exc_info.value.code == "INVALID_CLAUSE"
+    assert "needs an alias" in str(exc_info.value)
+    assert "only a bare variable may be projected without one" in str(exc_info.value)
+
+
+def test_fluent_with_bare_variable_and_aliased_projection_compile() -> None:
+    """A bare variable and an explicitly aliased projection still compile."""
+    p = _person()
+    bare = Query.match(p).with_(p).return_(p.name)
+    assert "WITH p RETURN p.name" in bare.compile("cypher").statement
+
+    aliased = Query.match(p).with_(name=p.name).return_("name")
+    assert "WITH p.name AS name RETURN name" in aliased.compile("cypher").statement
 
 
 def test_to_json_forwards_json_kwargs() -> None:

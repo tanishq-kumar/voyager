@@ -480,7 +480,7 @@ RAW_VALUE_POSITIONS: dict[str, tuple[str, str, str]] = {
     "path_step.node[variable,labels]": (
         '{"spec_version": 1, "matches": [{"paths": '
         '[[["node", null, ["Person", "Admin"]]]]}], '
-        '"projections": [["field", "p", "name", null]]}',
+        '"projections": [["expr", ["lit", 1], "one"]]}',
         "cypher",
         "(:Person:Admin)",
     ),

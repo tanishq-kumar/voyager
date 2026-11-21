@@ -1,0 +1,56 @@
+{
+  "description": "A WITH with DISTINCT only exposes the names it projects, so its order_by cannot read a pre-WITH variable.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "distinct": true,
+        "projections": [
+          [
+            "field",
+            "p",
+            "name",
+            "name"
+          ]
+        ],
+        "order_by": [
+          [
+            "p",
+            "age",
+            true
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "ident",
+          "name"
+        ],
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/with_clauses/0/order_by/0/0"
+  }
+}
