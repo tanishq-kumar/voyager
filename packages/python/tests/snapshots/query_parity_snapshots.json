@@ -278,10 +278,9 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "execution_mode": "normal",
-      "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (n IS Person IS Developer) COLUMNS (n.name))",
-      "status": "ok"
+      "error_message": "Dialect 'sql_pgq' does not support feature: Node pattern with multiple labels - SQL:2023 PGQ GRAPH_TABLE does not support multiple labels per node pattern",
+      "error_type": "ValueError",
+      "status": "unsupported"
     }
   },
   "label_expression_disjunction": {
@@ -318,10 +317,9 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "execution_mode": "normal",
-      "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (n IS !Inactive) COLUMNS (n.name))",
-      "status": "ok"
+      "error_message": "Dialect 'sql_pgq' does not support feature: Label expression with negation/conjunction/grouping or wildcard - SQL:2023 PGQ GRAPH_TABLE does not support label expressions using negation ('!'), conjunction ('&'), grouping, or wildcard ('%')",
+      "error_type": "ValueError",
+      "status": "unsupported"
     }
   },
   "linear_let_and_linear_filter": {
@@ -609,7 +607,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -628,7 +626,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -647,7 +645,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -666,7 +664,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -685,7 +683,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -793,10 +791,9 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "execution_mode": "normal",
-      "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person IS Employee) COLUMNS (p.name))",
-      "status": "ok"
+      "error_message": "Dialect 'sql_pgq' does not support feature: Node pattern with multiple labels - SQL:2023 PGQ GRAPH_TABLE does not support multiple labels per node pattern",
+      "error_type": "ValueError",
+      "status": "unsupported"
     }
   },
   "string_concatenation_and_functions": {

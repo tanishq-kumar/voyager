@@ -645,9 +645,49 @@ fn test_label_expression_ast_dialects_emission() {
     );
 
     let mut pgq = SqlPgqEmitter::new("voyager_graph");
+    let pgq_err = pgq.visit_query(&arena, root).unwrap_err();
+    match pgq_err {
+        voyager_ogm::Error::UnsupportedFeature { dialect, feature } => {
+            assert_eq!(dialect, "sql_pgq");
+            assert!(
+                feature.contains("Label expression with negation/conjunction/grouping")
+                    || feature.contains("Whole entity column projection")
+            );
+        }
+        other => panic!("Expected UnsupportedFeature, got {other:?}"),
+    }
+
+    // When returning a property column, node label expression with negation/conjunction/grouping is rejected:
+    let mut b1_prop = QueryBuilder::new();
+    let expr1_prop = LabelExpression::parse("(Person | Company) & !Inactive").unwrap();
+    b1_prop
+        .r#match()
+        .node_expr(Some("n"), expr1_prop)
+        .r#return()
+        .field("n", "name", None::<String>);
+    let (arena1_prop, root1_prop) = b1_prop.build();
+    let pgq1_prop_err = pgq.visit_query(&arena1_prop, root1_prop).unwrap_err();
+    match pgq1_prop_err {
+        voyager_ogm::Error::UnsupportedFeature { dialect, feature } => {
+            assert_eq!(dialect, "sql_pgq");
+            assert!(feature.contains("Label expression with negation/conjunction/grouping"));
+        }
+        other => panic!("Expected UnsupportedFeature, got {other:?}"),
+    }
+
+    // Node label disjunction compiles successfully:
+    let mut b1_disj = QueryBuilder::new();
+    let expr1_disj = LabelExpression::parse("Person | Company").unwrap();
+    b1_disj
+        .r#match()
+        .node_expr(Some("n"), expr1_disj)
+        .r#return()
+        .field("n", "name", None::<String>);
+    let (arena1_disj, root1_disj) = b1_disj.build();
+    let pgq1_disj_compiled = pgq.visit_query(&arena1_disj, root1_disj).unwrap();
     assert_eq!(
-        pgq.visit_query(&arena, root).unwrap().statement,
-        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (n IS (Person | Company) & !Inactive) COLUMNS (n))"
+        pgq1_disj_compiled.statement,
+        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (n IS Person | Company) COLUMNS (n.name))"
     );
 
     // Test 2: Edge traversal with disjunction: -[r:KNOWS|FOLLOWS]->
@@ -675,10 +715,52 @@ fn test_label_expression_ast_dialects_emission() {
     );
 
     let mut pgq2 = SqlPgqEmitter::new("voyager_graph");
+    let pgq2_err = pgq2.visit_query(&arena2, root2).unwrap_err();
+    match pgq2_err {
+        voyager_ogm::Error::UnsupportedFeature { dialect, feature } => {
+            assert_eq!(dialect, "sql_pgq");
+            assert!(feature.contains("Whole entity column projection"));
+        }
+        other => panic!("Expected UnsupportedFeature, got {other:?}"),
+    }
+
+    // Test 3: Edge traversal with disjunction and valid property column:
+    let mut b3 = QueryBuilder::new();
+    b3.r#match()
+        .node(Some("a"), vec!["User"])
+        .to(vec!["KNOWS", "FOLLOWS"], Some("r"))
+        .node(Some("b"), vec!["User"])
+        .r#return()
+        .field("a", "id", None::<String>);
+
+    let (arena3, root3) = b3.build();
+    let mut pgq3 = SqlPgqEmitter::new("voyager_graph");
     assert_eq!(
-        pgq2.visit_query(&arena2, root2).unwrap().statement,
-        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (a IS User) -[r IS KNOWS | FOLLOWS]-> (b IS User) COLUMNS (a))"
+        pgq3.visit_query(&arena3, root3).unwrap().statement,
+        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (a IS User) -[r IS KNOWS | FOLLOWS]-> (b IS User) COLUMNS (a.id))"
     );
+
+    // Test 4: Edge traversal with negation rejected for SQL:PGQ:
+    let mut b4 = QueryBuilder::new();
+    let expr4 = LabelExpression::parse("!KNOWS").unwrap();
+    b4.r#match()
+        .node(Some("a"), vec!["User"])
+        .to_expr(expr4, Some("r"))
+        .node(Some("b"), vec!["User"])
+        .r#return()
+        .field("a", "id", None::<String>);
+    let (arena4, root4) = b4.build();
+    let mut pgq4 = SqlPgqEmitter::new("voyager_graph");
+    let pgq4_err = pgq4.visit_query(&arena4, root4).unwrap_err();
+    match pgq4_err {
+        voyager_ogm::Error::UnsupportedFeature { dialect, feature } => {
+            assert_eq!(dialect, "sql_pgq");
+            assert!(
+                feature.contains("Relationship type expression with negation/conjunction/grouping")
+            );
+        }
+        other => panic!("Expected UnsupportedFeature, got {other:?}"),
+    }
 }
 
 #[test]

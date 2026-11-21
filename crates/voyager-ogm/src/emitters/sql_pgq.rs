@@ -1,8 +1,8 @@
 //! SQL:2023 Property Graph Queries (PGQ) & DuckPGQ Emitter.
 
 use crate::ast::{
-    AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LiteralValue, NodeHandle,
-    ProjectionItem, QueryAstArena, UnaryOp,
+    AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LabelExpression, LiteralValue,
+    NodeHandle, ProjectionItem, QueryAstArena, UnaryOp,
 };
 use crate::error::{Error, Result};
 use crate::visitor::{AstVisitor, ColumnMeta, CompiledQuery};
@@ -80,6 +80,9 @@ impl SqlPgqEmitter {
             predicates,
         } = node
         {
+            if let Some(expr) = label_expression {
+                Self::validate_node_label_expression(expr)?;
+            }
             self.buffer.push('(');
             let mut has_prefix = false;
             if let Some(var) = variable {
@@ -127,6 +130,10 @@ impl SqlPgqEmitter {
             match direction {
                 Direction::Incoming => self.buffer.push_str(" <-["),
                 Direction::Outgoing | Direction::Undirected => self.buffer.push_str(" -["),
+            }
+
+            if let Some(expr) = label_expression {
+                Self::validate_edge_label_expression(expr)?;
             }
 
             if let Some(var) = variable {
@@ -529,6 +536,47 @@ impl SqlPgqEmitter {
         }
     }
 
+    fn is_whole_entity_expression(
+        &self,
+        arena: &QueryAstArena,
+        handle: NodeHandle,
+    ) -> Result<Option<String>> {
+        match arena.get(handle)? {
+            AstNode::NodePattern { variable, .. } => {
+                Ok(variable.clone().or_else(|| Some("entity".to_string())))
+            }
+            AstNode::EdgePattern { variable, .. } => {
+                Ok(variable.clone().or_else(|| Some("entity".to_string())))
+            }
+            AstNode::PropertyAccess { target, property } => {
+                if property.is_empty() {
+                    match arena.get(*target)? {
+                        AstNode::Identifier(id) => Ok(Some(id.clone())),
+                        AstNode::NodePattern {
+                            variable: Some(var),
+                            ..
+                        } => Ok(Some(var.clone())),
+                        AstNode::EdgePattern {
+                            variable: Some(var),
+                            ..
+                        } => Ok(Some(var.clone())),
+                        _ => Ok(Some("entity".to_string())),
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            AstNode::Identifier(id) => {
+                if !id.contains('.') {
+                    Ok(Some(id.clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn emit_matches_and_where(
         &mut self,
         arena: &QueryAstArena,
@@ -561,6 +609,122 @@ impl SqlPgqEmitter {
 
                 if let Some(wh) = where_clause {
                     self.emit_where(arena, *wh)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_node_label_expression(expr: &LabelExpression) -> Result<()> {
+        if expr.is_simple_disjunction() {
+            // Single label or plain disjunction: (A) or (A | B | C)
+            Ok(())
+        } else if let Some(labels) = expr.to_conjunction_labels() {
+            if labels.len() > 1 {
+                Err(Error::UnsupportedFeature {
+                    dialect: "sql_pgq".to_string(),
+                    feature: "Node pattern with multiple labels - SQL:2023 PGQ GRAPH_TABLE does not support multiple labels per node pattern".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(Error::UnsupportedFeature {
+                dialect: "sql_pgq".to_string(),
+                feature: "Label expression with negation/conjunction/grouping or wildcard - SQL:2023 PGQ GRAPH_TABLE does not support label expressions using negation ('!'), conjunction ('&'), grouping, or wildcard ('%')".to_string(),
+            })
+        }
+    }
+
+    fn validate_edge_label_expression(expr: &LabelExpression) -> Result<()> {
+        if expr.is_simple_disjunction() {
+            // Single type or plain disjunction: -[r IS KNOWS]-> or -[r IS KNOWS | HATES]->
+            Ok(())
+        } else {
+            Err(Error::UnsupportedFeature {
+                dialect: "sql_pgq".to_string(),
+                feature: "Relationship type expression with negation/conjunction/grouping or wildcard - SQL:2023 PGQ GRAPH_TABLE does not support relationship type expressions using negation ('!'), conjunction ('&'), grouping, or wildcard ('%')".to_string(),
+            })
+        }
+    }
+
+    fn validate_node_pattern(&self, arena: &QueryAstArena, node_handle: NodeHandle) -> Result<()> {
+        if let AstNode::NodePattern {
+            label_expression: Some(expr),
+            ..
+        } = arena.get(node_handle)?
+        {
+            Self::validate_node_label_expression(expr)?;
+        }
+        Ok(())
+    }
+
+    fn validate_edge_pattern(&self, arena: &QueryAstArena, edge_handle: NodeHandle) -> Result<()> {
+        if let AstNode::EdgePattern {
+            label_expression: Some(expr),
+            ..
+        } = arena.get(edge_handle)?
+        {
+            Self::validate_edge_label_expression(expr)?;
+        }
+        Ok(())
+    }
+
+    fn validate_matches(&self, arena: &QueryAstArena, matches: &[NodeHandle]) -> Result<()> {
+        for &match_handle in matches {
+            let match_node = arena.get(match_handle)?;
+            if let AstNode::MatchClause {
+                optional, paths, ..
+            } = match_node
+            {
+                if *optional {
+                    return Err(Error::UnsupportedFeature {
+                        dialect: "sql_pgq".to_string(),
+                        feature: "OPTIONAL MATCH clauses (optional) - SQL:2023 PGQ GRAPH_TABLE has no direct outer-join form for Cypher OPTIONAL MATCH"
+                            .to_string(),
+                    });
+                }
+                for &path_handle in paths {
+                    let path_node = arena.get(path_handle)?;
+                    match path_node {
+                        AstNode::NodePattern { .. } => {
+                            self.validate_node_pattern(arena, path_handle)?;
+                        }
+                        AstNode::PathChain {
+                            path_variable,
+                            path_mode,
+                            start_node,
+                            edges,
+                        } => {
+                            if let Some(var) = path_variable {
+                                return Err(Error::UnsupportedFeature {
+                                    dialect: "sql_pgq".to_string(),
+                                    feature: format!(
+                                        "Path variable assignment ('{var} = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables"
+                                    ),
+                                });
+                            }
+                            if *path_mode != crate::ast::PathMode::None {
+                                return Err(Error::UnsupportedFeature {
+                                    dialect: "sql_pgq".to_string(),
+                                    feature: format!(
+                                        "Path search mode '{}' - SQL:2023 PGQ GRAPH_TABLE does not support traversal search modes",
+                                        path_mode.as_str()
+                                    ),
+                                });
+                            }
+                            self.validate_node_pattern(arena, *start_node)?;
+                            for &edge_handle in edges {
+                                self.validate_edge_pattern(arena, edge_handle)?;
+                                if let AstNode::EdgePattern { target_node, .. } =
+                                    arena.get(edge_handle)?
+                                {
+                                    self.validate_node_pattern(arena, *target_node)?;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -694,6 +858,21 @@ impl AstVisitor for SqlPgqEmitter {
                 ExecutionMode::Explain => "EXPLAIN ",
                 ExecutionMode::Profile | ExecutionMode::ExplainAndProfile => "EXPLAIN ANALYZE ",
             };
+
+            self.validate_matches(arena, matches)?;
+
+            for proj in &projections_list {
+                if proj.aggregation.is_none() {
+                    if let Some(var) = self.is_whole_entity_expression(arena, proj.expression)? {
+                        return Err(Error::UnsupportedFeature {
+                            dialect: "sql_pgq".to_string(),
+                            feature: format!(
+                                "Whole entity column projection ('{var}') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables"
+                            ),
+                        });
+                    }
+                }
+            }
 
             let has_aggregates = projections_list.iter().any(|p| p.aggregation.is_some());
 
@@ -869,6 +1048,169 @@ impl AstVisitor for SqlPgqEmitter {
                 "Invalid root AST node for SQL:PGQ: {}",
                 ast_node_kind(root_node)
             )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::QueryBuilder;
+
+    #[test]
+    fn sql_pgq_rejects_multi_label_node_patterns() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("p"), vec!["Person", "Employee"])
+            .r#return()
+            .field("p", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let err = emitter.visit_query(&arena, root).unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "sql_pgq");
+                assert!(feature.contains("Node pattern with multiple labels"));
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_pgq_rejects_whole_entity_columns() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("p"), vec!["Person"])
+            .r#return()
+            .field("p", "", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let err = emitter.visit_query(&arena, root).unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "sql_pgq");
+                assert!(feature.contains("Whole entity column projection ('p')"));
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_pgq_accepts_single_label_and_property_columns() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("p"), vec!["Person"])
+            .r#return()
+            .field("p", "name", Some("actor"));
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS Person) COLUMNS (p.name AS actor))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_accepts_alternative_relationship_types() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS", "HATES"], Some("r"))
+            .node(Some("b"), vec!["Person"])
+            .r#return()
+            .field("a", "name", None::<String>)
+            .field("b", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS Person) -[r IS KNOWS | HATES]-> (b IS Person) COLUMNS (a.name, b.name))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_accepts_node_label_disjunction() {
+        let mut builder = QueryBuilder::new();
+        let expr = LabelExpression::parse("Person | Company").unwrap();
+        builder
+            .r#match()
+            .node_expr(Some("n"), expr)
+            .r#return()
+            .field("n", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (n IS Person | Company) COLUMNS (n.name))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_rejects_node_label_negation_and_complex_expressions() {
+        let mut builder = QueryBuilder::new();
+        let expr = LabelExpression::parse("!Inactive").unwrap();
+        builder
+            .r#match()
+            .node_expr(Some("n"), expr)
+            .r#return()
+            .field("n", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let err = emitter.visit_query(&arena, root).unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "sql_pgq");
+                assert!(feature.contains("Label expression with negation/conjunction/grouping"));
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_pgq_rejects_edge_label_expressions_with_negation_or_conjunction() {
+        let mut builder = QueryBuilder::new();
+        let expr = LabelExpression::parse("!KNOWS").unwrap();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to_expr(expr, Some("r"))
+            .node(Some("b"), vec!["Person"])
+            .r#return()
+            .field("a", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let err = emitter.visit_query(&arena, root).unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "sql_pgq");
+                assert!(
+                    feature.contains(
+                        "Relationship type expression with negation/conjunction/grouping"
+                    )
+                );
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
         }
     }
 }

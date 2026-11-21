@@ -153,8 +153,14 @@ fn snapshot_multi_label_conjunction() {
     assert_snapshot!("multi_label_cypher", cypher_res.statement);
 
     let mut pgq = SqlPgqEmitter::new("oss_graph");
-    let pgq_res = pgq.visit_query(&arena, root).unwrap();
-    assert_snapshot!("multi_label_sql_pgq", pgq_res.statement);
+    let pgq_err = pgq.visit_query(&arena, root).unwrap_err();
+    match pgq_err {
+        voyager_ogm::Error::UnsupportedFeature { dialect, feature } => {
+            assert_eq!(dialect, "sql_pgq");
+            assert!(feature.contains("Node pattern with multiple labels"));
+        }
+        other => panic!("Expected UnsupportedFeature, got {other:?}"),
+    }
 
     let mut gql = IsoGqlEmitter::new();
     let gql_res = gql.visit_query(&arena, root).unwrap();
