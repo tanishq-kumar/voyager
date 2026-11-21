@@ -196,6 +196,16 @@ def test_with_projection_accepts_a_bare_variable_or_an_alias() -> None:
         "MATCH (p:Person) WITH p.name AS name RETURN name"
     )
 
+    # A field with an empty property is the bare variable, so it needs no alias
+    # and keeps the variable in scope.
+    empty_property = {
+        "spec_version": 1,
+        "matches": [{"paths": PERSON_PATH}],
+        "with_clauses": [{"projections": [["field", "p", "", None]]}],
+        "projections": [["field", "p", "name", None]],
+    }
+    assert compile_cypher(empty_property)["statement"] == ("MATCH (p:Person) WITH p RETURN p.name")
+
 
 def test_with_order_by_may_still_read_a_pre_with_name() -> None:
     """WITH ORDER BY is evaluated with the projected and pre-WITH names."""

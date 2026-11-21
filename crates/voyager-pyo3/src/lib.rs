@@ -2098,13 +2098,16 @@ fn projection_scope_outputs(item: &Bound<'_, PyAny>) -> ProjectionScope {
     match tag.as_str() {
         "field" => match tuple_optional_string(&sequence, 3) {
             Some(alias) => outputs.projected.push(alias),
-            None => {
-                if let Some(prop) = tuple_string(&sequence, 2)
-                    && !prop.is_empty()
-                {
-                    outputs.projected.push(prop);
+            None => match tuple_string(&sequence, 2) {
+                Some(prop) if !prop.is_empty() => outputs.projected.push(prop),
+                // `["field", var, ""]` projects the bare variable `var`.
+                Some(_) => {
+                    if let Some(variable) = tuple_string(&sequence, 1) {
+                        outputs.projected.push(variable);
+                    }
                 }
-            }
+                None => {}
+            },
         },
         "agg" => {
             if let Some(alias) = tuple_optional_string(&sequence, 4) {
@@ -2140,12 +2143,16 @@ fn with_projection_is_bare_variable(item: &Bound<'_, PyAny>) -> bool {
     let Some((sequence, tag)) = seq_tag(item) else {
         return false;
     };
-    tag == "expr"
-        && sequence
+    match tag.as_str() {
+        "expr" => sequence
             .get_item(1)
             .ok()
             .map(|expression| expression_spec_is_bare_identifier(&expression))
-            .unwrap_or(false)
+            .unwrap_or(false),
+        // `["field", var, ""]` renders as the bare variable `var`.
+        "field" => tuple_string(&sequence, 2).is_some_and(|property| property.is_empty()),
+        _ => false,
+    }
 }
 
 /// True when a WITH projection carries an explicit alias or an alias wrapper.

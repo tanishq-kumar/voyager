@@ -2034,8 +2034,17 @@ impl QueryBuilder {
                     continue;
                 }
                 let expression = self.arena.get(projection.expression)?;
+                // `field(var, "")` builds a property access with an empty
+                // property, which the emitters render as the bare variable.
                 let bare_variable = projection.aggregation.is_none()
-                    && matches!(expression, AstNode::Identifier(_));
+                    && match expression {
+                        AstNode::Identifier(_) => true,
+                        AstNode::PropertyAccess { target, property } => {
+                            property.is_empty()
+                                && matches!(self.arena.get(*target), Ok(AstNode::Identifier(_)))
+                        }
+                        _ => false,
+                    };
                 if bare_variable {
                     continue;
                 }

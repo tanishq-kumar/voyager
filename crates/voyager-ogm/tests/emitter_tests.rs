@@ -249,6 +249,23 @@ fn test_with_projection_needs_alias_unless_bare_variable() {
     let bare = builder.ident("p");
     builder.r#with().select_expr(bare, None::<&str>);
     assert!(builder.try_build().is_ok());
+
+    // `field(var, "")` projects the bare variable and needs no alias.
+    let mut builder = QueryBuilder::new();
+    builder
+        .r#match()
+        .node(Some("p"), vec!["Person"])
+        .r#with()
+        .field("p", "", None::<&str>)
+        .r#return()
+        .field("p", "name", None::<&str>);
+    let (arena, root) = builder
+        .try_build()
+        .expect("a bare variable projected with field(var, \"\") needs no alias");
+    let compiled = CypherEmitter::new()
+        .visit_query(&arena, root)
+        .expect("Cypher emission failed");
+    assert_eq!(compiled.statement, "MATCH (p:Person) WITH p RETURN p.name");
 }
 
 #[test]
