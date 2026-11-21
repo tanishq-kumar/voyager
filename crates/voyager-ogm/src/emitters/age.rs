@@ -1,8 +1,8 @@
 //! Apache AGE (PostgreSQL Embedded Cypher) Emitter.
 
-use crate::ast::{AstNode, ExecutionMode, NodeHandle, QueryAstArena};
+use crate::ast::{AstNode, ExecutionMode, LabelExpression, NodeHandle, QueryAstArena};
 use crate::emitters::cypher::CypherEmitter;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::visitor::{AstVisitor, CompiledQuery};
 
 /// Default graph name used by Apache AGE queries when none is explicitly configured.
@@ -125,6 +125,245 @@ fn contains_cypher_parameter_reference(statement: &str) -> bool {
     false
 }
 
+fn validate_age_ast(arena: &QueryAstArena, root: NodeHandle) -> Result<()> {
+    let mut visited = std::collections::HashSet::new();
+    validate_age_node(arena, root, &mut visited)
+}
+
+fn validate_age_node(
+    arena: &QueryAstArena,
+    handle: NodeHandle,
+    visited: &mut std::collections::HashSet<NodeHandle>,
+) -> Result<()> {
+    if !visited.insert(handle) {
+        return Ok(());
+    }
+    match arena.get(handle)? {
+        AstNode::NodePattern {
+            label_expression,
+            predicates,
+            ..
+        } => {
+            if let Some(expr) = label_expression {
+                if !matches!(expr, LabelExpression::Label(_)) {
+                    return Err(Error::UnsupportedFeature {
+                        dialect: "age".to_string(),
+                        feature: "Node pattern with multiple labels - Apache AGE does not support multiple labels per node pattern".to_string(),
+                    });
+                }
+            }
+            for &p in predicates {
+                validate_age_node(arena, p, visited)?;
+            }
+        }
+        AstNode::EdgePattern {
+            label_expression,
+            predicates,
+            target_node,
+            ..
+        } => {
+            if let Some(expr) = label_expression {
+                if !matches!(expr, LabelExpression::Label(_)) {
+                    return Err(Error::UnsupportedFeature {
+                        dialect: "age".to_string(),
+                        feature: "Relationship pattern with alternative types - Apache AGE does not support relationship type alternation ('|')".to_string(),
+                    });
+                }
+            }
+            for &p in predicates {
+                validate_age_node(arena, p, visited)?;
+            }
+            validate_age_node(arena, *target_node, visited)?;
+        }
+        AstNode::PathChain {
+            start_node, edges, ..
+        } => {
+            validate_age_node(arena, *start_node, visited)?;
+            for &e in edges {
+                validate_age_node(arena, e, visited)?;
+            }
+        }
+        AstNode::MatchClause {
+            paths,
+            where_clause,
+            ..
+        } => {
+            for &p in paths {
+                validate_age_node(arena, p, visited)?;
+            }
+            if let Some(wh) = where_clause {
+                validate_age_node(arena, *wh, visited)?;
+            }
+        }
+        AstNode::WhereClause { root_predicate } => {
+            validate_age_node(arena, *root_predicate, visited)?;
+        }
+        AstNode::BinaryExpression { left, right, .. } => {
+            validate_age_node(arena, *left, visited)?;
+            validate_age_node(arena, *right, visited)?;
+        }
+        AstNode::UnaryExpression { operand, .. } => {
+            validate_age_node(arena, *operand, visited)?;
+        }
+        AstNode::FunctionCall { arguments, .. } => {
+            for &arg in arguments {
+                validate_age_node(arena, arg, visited)?;
+            }
+        }
+        AstNode::CaseExpression {
+            operand,
+            when_then_branches,
+            else_branch,
+        } => {
+            if let Some(op) = operand {
+                validate_age_node(arena, *op, visited)?;
+            }
+            for (w, t) in when_then_branches {
+                validate_age_node(arena, *w, visited)?;
+                validate_age_node(arena, *t, visited)?;
+            }
+            if let Some(el) = else_branch {
+                validate_age_node(arena, *el, visited)?;
+            }
+        }
+        AstNode::ListComprehension {
+            list_expression,
+            where_filter,
+            map_expression,
+            ..
+        } => {
+            validate_age_node(arena, *list_expression, visited)?;
+            if let Some(wh) = where_filter {
+                validate_age_node(arena, *wh, visited)?;
+            }
+            if let Some(map) = map_expression {
+                validate_age_node(arena, *map, visited)?;
+            }
+        }
+        AstNode::PatternComprehension {
+            path,
+            where_filter,
+            projection,
+        } => {
+            validate_age_node(arena, *path, visited)?;
+            if let Some(wh) = where_filter {
+                validate_age_node(arena, *wh, visited)?;
+            }
+            validate_age_node(arena, *projection, visited)?;
+        }
+        AstNode::ExistsSubquery { subquery } | AstNode::CountSubquery { subquery } => {
+            validate_age_node(arena, *subquery, visited)?;
+        }
+        AstNode::ListLiteral(items) => {
+            for &item in items {
+                validate_age_node(arena, item, visited)?;
+            }
+        }
+        AstNode::PropertyAccess { target, .. } => {
+            validate_age_node(arena, *target, visited)?;
+        }
+        AstNode::UnwindClause { expression, .. } => {
+            validate_age_node(arena, *expression, visited)?;
+        }
+        AstNode::CreateClause { paths } => {
+            for &p in paths {
+                validate_age_node(arena, p, visited)?;
+            }
+        }
+        AstNode::MergeClause {
+            path,
+            on_create_set,
+            on_match_set,
+        } => {
+            validate_age_node(arena, *path, visited)?;
+            for &h in on_create_set {
+                validate_age_node(arena, h, visited)?;
+            }
+            for &h in on_match_set {
+                validate_age_node(arena, h, visited)?;
+            }
+        }
+        AstNode::SetClause { items } => {
+            for &item in items {
+                validate_age_node(arena, item, visited)?;
+            }
+        }
+        AstNode::SetItem { target, value, .. } => {
+            validate_age_node(arena, *target, visited)?;
+            validate_age_node(arena, *value, visited)?;
+        }
+        AstNode::DeleteClause { targets, .. } => {
+            for &t in targets {
+                validate_age_node(arena, t, visited)?;
+            }
+        }
+        AstNode::RemoveClause { items } => {
+            for &item in items {
+                validate_age_node(arena, item, visited)?;
+            }
+        }
+        AstNode::ReturnClause {
+            projections,
+            order_by,
+            ..
+        } => {
+            for proj in projections {
+                validate_age_node(arena, proj.expression, visited)?;
+            }
+            for (expr, _) in order_by {
+                validate_age_node(arena, *expr, visited)?;
+            }
+        }
+        AstNode::WithClause {
+            projections,
+            where_clause,
+            order_by,
+            ..
+        } => {
+            for proj in projections {
+                validate_age_node(arena, proj.expression, visited)?;
+            }
+            if let Some(wh) = where_clause {
+                validate_age_node(arena, *wh, visited)?;
+            }
+            for (expr, _) in order_by {
+                validate_age_node(arena, *expr, visited)?;
+            }
+        }
+        AstNode::ProcedureCall { arguments, .. } => {
+            for &arg in arguments {
+                validate_age_node(arena, arg, visited)?;
+            }
+        }
+        AstNode::QueryStatement {
+            unwinds,
+            matches,
+            mutations,
+            with_clauses,
+            return_clause,
+            ..
+        } => {
+            for &u in unwinds {
+                validate_age_node(arena, u, visited)?;
+            }
+            for &m in matches {
+                validate_age_node(arena, m, visited)?;
+            }
+            for &m in mutations {
+                validate_age_node(arena, m, visited)?;
+            }
+            for &w in with_clauses {
+                validate_age_node(arena, w, visited)?;
+            }
+            if let Some(ret) = return_clause {
+                validate_age_node(arena, *ret, visited)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn resolve_age_column_base_name(arena: &QueryAstArena, handle: NodeHandle) -> Result<String> {
     match arena.get(handle)? {
         AstNode::PropertyAccess { target, property } => {
@@ -176,6 +415,7 @@ impl AstVisitor for AgeEmitter {
                 self.graph_name
             )));
         }
+        validate_age_ast(arena, root)?;
 
         let mut cypher_emitter = CypherEmitter::new().without_execution_mode();
         let cypher_compiled = cypher_emitter.visit_query(arena, root)?;
@@ -330,5 +570,51 @@ mod tests {
             compiled.statement,
             "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person) RETURN a, a.name, a, a.name $$) AS (a agtype, name agtype, a_1 agtype, name_1 agtype)"
         );
+    }
+
+    #[test]
+    fn age_emitter_rejects_multi_label_node_patterns() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("p"), vec!["Person", "Employee"])
+            .r#return()
+            .field("p", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("test_graph");
+        let err = emitter.visit_query(&arena, root).unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "age");
+                assert!(feature.contains("Node pattern with multiple labels"));
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn age_emitter_rejects_alternative_relationship_types() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS", "HATES"], Some("r"))
+            .node(Some("b"), vec!["Person"])
+            .r#return()
+            .field("r", "", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("test_graph");
+        let err = emitter.visit_query(&arena, root).unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "age");
+                assert!(feature.contains("Relationship pattern with alternative types"));
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
     }
 }

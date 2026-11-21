@@ -17,6 +17,7 @@ from voyager_ogm import (
     Node,
     Query,
     Relationship,
+    VoyagerError,
     compile_query_from_spec,
     node,
     relationship,
@@ -115,6 +116,62 @@ def test_age_spec_multiple_whole_entities_emit_unique_columns() -> None:
 # ---------------------------------------------------------------------------
 # #286: UnsupportedFeature compile-time rejection in Apache AGE
 # ---------------------------------------------------------------------------
+
+
+def test_age_rejects_multi_label_node_fluent() -> None:
+    """Verifies fluent API rejects node patterns with multiple labels for Apache AGE."""
+    query = Query.match_node("p", labels=["Person", "Employee"]).return_("p.name")
+
+    with pytest.raises(ValueError, match="multiple labels") as exc_info:
+        query.compile("apache_age", graph_name="test_graph")
+    assert "Apache AGE" in str(exc_info.value)
+
+
+def test_age_rejects_alternative_relationship_types_fluent() -> None:
+    """Verifies fluent API rejects relationship patterns with alternative types for Apache AGE."""
+    query = Query.match_node("a").to(["KNOWS", "FOLLOWS"]).node("b").return_("a.name")
+
+    with pytest.raises(ValueError, match="alternative types") as exc_info:
+        query.compile("apache_age", graph_name="test_graph")
+    assert "Apache AGE" in str(exc_info.value)
+
+
+def test_age_spec_rejects_multi_label_node() -> None:
+    """Verifies compile_query_from_spec rejects node patterns with multiple labels for Apache AGE."""
+    spec = {
+        "spec_version": 1,
+        "matches": [{"paths": [[("node", "p", ["Person", "Employee"], None)]]}],
+        "projections": [("field", "p", "name", None)],
+    }
+
+    with pytest.raises(VoyagerError, match="multiple labels") as exc_info:
+        compile_query_from_spec(spec, "apache_age", graph_name="test_graph")
+    assert exc_info.value.code == "UNSUPPORTED_FEATURE"
+    assert "Apache AGE" in str(exc_info.value)
+
+
+def test_age_spec_rejects_alternative_relationship_types() -> None:
+    """Verifies compile_query_from_spec rejects relationship patterns with alternative types for Apache AGE."""
+    spec = {
+        "spec_version": 1,
+        "matches": [
+            {
+                "paths": [
+                    [
+                        ("node", "a", ["Person"], None),
+                        ("edge", "->", ["KNOWS", "FOLLOWS"], "r", None, None, None),
+                        ("node", "b", ["Person"], None),
+                    ]
+                ]
+            }
+        ],
+        "projections": [("field", "a", "name", None)],
+    }
+
+    with pytest.raises(VoyagerError, match="alternative types") as exc_info:
+        compile_query_from_spec(spec, "apache_age", graph_name="test_graph")
+    assert exc_info.value.code == "UNSUPPORTED_FEATURE"
+    assert "Apache AGE" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------

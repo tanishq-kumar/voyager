@@ -122,11 +122,24 @@ def test_arrow_and_polars_data_integrity_and_null_checks():
     assert table.column("id").null_count == 0
 
 
+@node(label="Person")
+class SingleLabelPerson(Node):
+    name: str = Field()
+    age: int = Field()
+
+
 def test_sql_pgq_multi_hop_compilation_accuracy():
-    p = MultiLabelPerson("p")
+    # Multi-label node must be rejected under #286
+    p_multi = MultiLabelPerson("p")
     m = Movie("m")
     rel = Produced("r")
+    with pytest.raises(ValueError, match="multiple labels"):
+        Query.match(p_multi).to(rel).hops(1, 4).node(m).return_(p_multi.name).compile(
+            "sql_pgq", graph_name="hollywood"
+        )
 
+    # Single-label node compiles correctly
+    p = SingleLabelPerson("p")
     query = (
         Query.match(p)
         .to(rel)
@@ -140,7 +153,7 @@ def test_sql_pgq_multi_hop_compilation_accuracy():
 
     compiled = query.compile("sql_pgq", graph_name="hollywood")
     expected = (
-        "SELECT * FROM GRAPH_TABLE (hollywood MATCH (p IS Person IS Actor IS Producer) "
+        "SELECT * FROM GRAPH_TABLE (hollywood MATCH (p IS Person) "
         "-[r IS PRODUCED]->{1,4} (m IS Movie) "
         "WHERE (p.age > $p0) AND (m.budget >= $p1) "
         "COLUMNS (p.name, m.title, m.budget AS total_budget)) "
