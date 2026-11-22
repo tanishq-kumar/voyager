@@ -1,0 +1,50 @@
+{
+  "description": "Path search mode spelling is exact lowercase.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "path_mode": "trail"
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN p.name",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name $$) AS (name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH TRAIL (p:Person) RETURN p.name",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

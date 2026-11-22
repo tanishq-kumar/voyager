@@ -1,0 +1,83 @@
+{
+  "description": "LET and FILTER linear clauses.",
+  "spec": {
+    "spec_version": 1,
+    "linear_clauses": [
+      [
+        "let",
+        "threshold",
+        [
+          "lit",
+          30
+        ]
+      ],
+      [
+        "filter",
+        [
+          "bin",
+          "gt",
+          [
+            "ident",
+            "threshold"
+          ],
+          [
+            "lit",
+            0
+          ]
+        ]
+      ]
+    ],
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) WITH *, $p0 AS threshold WHERE threshold > $p1 RETURN p.name",
+      "parameters": {
+        "p1": 0,
+        "p0": 30
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH *, $p0 AS threshold WHERE threshold > $p1 RETURN p.name $$, %s) AS (name agtype)",
+      "parameters": {
+        "p1": 0,
+        "p0": 30
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) LET threshold = $p0 FILTER threshold > $p1 RETURN p.name",
+      "parameters": {
+        "p0": 30,
+        "p1": 0
+      }
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

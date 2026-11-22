@@ -1,0 +1,45 @@
+{
+  "description": "Each case branch is exactly [when, then].",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "case",
+          null,
+          [
+            [
+              [
+                "lit",
+                1
+              ]
+            ]
+          ],
+          null
+        ],
+        "x"
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/projections/0/1/2/0"
+  }
+}

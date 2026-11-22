@@ -2017,6 +2017,46 @@ impl QueryBuilder {
         }
     }
 
+    /// Rejects a WITH projection that is not a bare variable and has no alias.
+    ///
+    /// openCypher names an unaliased `WITH p.name` column `p.name`, which later
+    /// clauses cannot reference, and Neo4j rejects the statement with
+    /// "Expression in WITH must be aliased (use AS)". RETURN keeps its
+    /// alias-free property projections.
+    fn validate_with_projection_aliases(&self) -> Result<()> {
+        for (with_index, &with_handle) in self.with_clauses.iter().enumerate() {
+            let with_node = self.arena.get(with_handle)?;
+            let AstNode::WithClause { projections, .. } = with_node else {
+                continue;
+            };
+            for (projection_index, projection) in projections.iter().enumerate() {
+                if projection.alias.is_some() {
+                    continue;
+                }
+                let expression = self.arena.get(projection.expression)?;
+                // `field(var, "")` builds a property access with an empty
+                // property, which the emitters render as the bare variable.
+                let bare_variable = projection.aggregation.is_none()
+                    && match expression {
+                        AstNode::Identifier(_) => true,
+                        AstNode::PropertyAccess { target, property } => {
+                            property.is_empty()
+                                && matches!(self.arena.get(*target), Ok(AstNode::Identifier(_)))
+                        }
+                        _ => false,
+                    };
+                if bare_variable {
+                    continue;
+                }
+                let rendered = render_with_projection(&self.arena, expression, projection);
+                return Err(Error::InvalidClause(format!(
+                    "WITH projection `{rendered}` needs an alias (for example `{rendered} AS name`); only a bare variable may be projected without one (with_clauses[{with_index}].projections[{projection_index}])"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Finalizes the AST and returns the completed arena alongside the root statement handle,
     /// or returns an Error if AST validation or clause rules were violated.
     pub fn try_build(mut self) -> Result<(QueryAstArena, NodeHandle)> {
@@ -2037,6 +2077,8 @@ impl QueryBuilder {
         if let Some(err_msg) = self.build_error.take() {
             return Err(Error::InvalidClause(err_msg));
         }
+
+        self.validate_with_projection_aliases()?;
 
         let return_clause = if self.projections.is_empty() {
             None
@@ -2274,6 +2316,26 @@ impl QueryBuilder {
                 self.where_expr(remapped_pred);
             }
         }
+    }
+}
+
+/// Renders a WITH projection closely enough to name it in the alias error.
+fn render_with_projection(
+    arena: &QueryAstArena,
+    expression: &AstNode,
+    projection: &ProjectionItem,
+) -> String {
+    let base = match expression {
+        AstNode::Identifier(name) => name.clone(),
+        AstNode::PropertyAccess { target, property } => match arena.get(*target) {
+            Ok(AstNode::Identifier(variable)) => format!("{variable}.{property}"),
+            _ => "expression".to_string(),
+        },
+        _ => "expression".to_string(),
+    };
+    match projection.aggregation {
+        Some(func) => format!("{func}({base})"),
+        None => base,
     }
 }
 

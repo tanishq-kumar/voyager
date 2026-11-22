@@ -126,6 +126,7 @@ CONSTRUCT_SPECS: dict[str, dict[str, Any]] = {
             {
                 "spec_version": 1,
                 "projections": [
+                    ("expr", ("ident", "p"), None),
                     ("field", "p", "name", "n"),
                     ("agg", "p", "age", "avg", "avg_age"),
                 ],
@@ -212,7 +213,10 @@ def test_kitchen_sink_json_roundtrip(dialect: str) -> None:
         "with_clauses": [
             {
                 "spec_version": 1,
-                "projections": [("field", "p", "name", "n")],
+                "projections": [
+                    ("field", "p", "name", "n"),
+                    ("expr", ("ident", "row"), None),
+                ],
                 "order_by": [("p", "name", True)],
                 "limit": 5,
             }
@@ -240,7 +244,7 @@ def test_mixed_tuple_and_list_arrays_compile_identically() -> None:
         "matches": PERSON_MATCH,
         "with_clauses": [{"spec_version": 1, "projections": [("field", "p", "name", "n")]}],
         "projections": [("expr", ("ident", "n"), None)],
-        "order_by": [("p", "name", True)],
+        "order_by": [(("ident", "n"), True)],
     }
     # Same document, but every array position spelled as a JSON list.
     all_lists = json.loads(json.dumps(all_tuples))
@@ -261,7 +265,7 @@ def test_mixed_tuple_and_list_arrays_compile_identically() -> None:
         # With-clauses container as a tuple, its projections as lists.
         "with_clauses": ({"spec_version": 1, "projections": [["field", "p", "name", "n"]]},),
         "projections": [["expr", ("ident", "n"), None]],
-        "order_by": [("p", "name", True)],
+        "order_by": [(("ident", "n"), True)],
     }
     expected = compile_query_from_spec(all_tuples, "cypher")
     for name, spec in (("all_lists", all_lists), ("mixed", mixed)):

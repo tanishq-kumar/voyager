@@ -1,0 +1,94 @@
+{
+  "description": "A list of predicate expressions for where.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          [
+            "bin",
+            "gt",
+            [
+              "prop",
+              "p",
+              "age"
+            ],
+            [
+              "lit",
+              21
+            ]
+          ],
+          [
+            "bin",
+            "lt",
+            [
+              "prop",
+              "p",
+              "age"
+            ],
+            [
+              "lit",
+              65
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) WHERE (p.age > $p0) AND (p.age < $p1) RETURN p.name",
+      "parameters": {
+        "p0": 21,
+        "p1": 65
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE (p.age > $p0) AND (p.age < $p1) RETURN p.name $$, %s) AS (name agtype)",
+      "parameters": {
+        "p0": 21,
+        "p1": 65
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) WHERE (p.age > $p0) AND (p.age < $p1) RETURN p.name",
+      "parameters": {
+        "p0": 21,
+        "p1": 65
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE (p.age > $p0) AND (p.age < $p1) COLUMNS (p.name))",
+      "parameters": {
+        "p1": 65,
+        "p0": 21
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE (p.age > $p0) AND (p.age < $p1) COLUMNS (p.name))",
+      "parameters": {
+        "p0": 21,
+        "p1": 65
+      }
+    }
+  }
+}

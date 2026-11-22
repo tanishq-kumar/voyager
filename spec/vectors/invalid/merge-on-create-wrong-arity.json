@@ -1,0 +1,32 @@
+{
+  "description": "Merge assignment entries are exactly [variable, property, value].",
+  "spec": {
+    "spec_version": 1,
+    "mutations": [
+      [
+        "merge",
+        [
+          [
+            "node",
+            "c",
+            [
+              "Company"
+            ]
+          ]
+        ],
+        [
+          [
+            "c",
+            "name"
+          ]
+        ],
+        []
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/mutations/0/2/0"
+  }
+}

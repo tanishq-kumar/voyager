@@ -1,0 +1,65 @@
+{
+  "description": "A linear filter cannot read an alias a later WITH clause defines; linear clauses are emitted before WITH clauses.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "projections": [
+          [
+            "field",
+            "p",
+            "name",
+            "n"
+          ]
+        ]
+      }
+    ],
+    "linear_clauses": [
+      [
+        "filter",
+        [
+          "bin",
+          "gt",
+          [
+            "ident",
+            "n"
+          ],
+          [
+            "lit",
+            0
+          ]
+        ]
+      ]
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "ident",
+          "n"
+        ],
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/linear_clauses/0/1/2/1"
+  }
+}

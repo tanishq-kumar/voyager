@@ -1,0 +1,37 @@
+{
+  "description": "The 'call' alias for 'fn' is not a canonical tag.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "call",
+          "size",
+          []
+        ],
+        "x"
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/projections/0/1"
+  }
+}

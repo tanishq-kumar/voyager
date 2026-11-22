@@ -1,0 +1,51 @@
+{
+  "description": "Baseline MATCH plus a field projection.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        "user_name"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN p.name AS user_name",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name AS user_name $$) AS (user_name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN p.name AS user_name",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS user_name))",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS user_name))",
+      "parameters": {}
+    }
+  }
+}

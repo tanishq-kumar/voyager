@@ -1,0 +1,42 @@
+{
+  "description": "An aggregating RETURN only exposes the names it projects, so root order_by cannot read a pre-RETURN variable.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "agg",
+        "p",
+        "*",
+        "count",
+        "c"
+      ]
+    ],
+    "order_by": [
+      [
+        "p",
+        "age",
+        true
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/order_by/0/0"
+  }
+}

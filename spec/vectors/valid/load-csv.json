@@ -1,0 +1,57 @@
+{
+  "description": "LOAD CSV renders in openCypher and Apache AGE only.",
+  "spec": {
+    "spec_version": 1,
+    "load_csv": [
+      "https://example.com/nodes.csv",
+      true,
+      "row"
+    ],
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "row",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "row",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "LOAD CSV WITH HEADERS FROM $p0 AS row MATCH (row:Person) RETURN row.name",
+      "parameters": {
+        "p0": "https://example.com/nodes.csv"
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ LOAD CSV WITH HEADERS FROM $p0 AS row MATCH (row:Person) RETURN row.name $$, %s) AS (name agtype)",
+      "parameters": {
+        "p0": "https://example.com/nodes.csv"
+      }
+    },
+    "iso_gql": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

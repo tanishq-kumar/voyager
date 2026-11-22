@@ -1,0 +1,42 @@
+{
+  "description": "A RETURN with DISTINCT only exposes the names it projects, so root order_by cannot read a pre-RETURN variable.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        "name"
+      ]
+    ],
+    "distinct": true,
+    "order_by": [
+      [
+        "p",
+        "age",
+        true
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/order_by/0/0"
+  }
+}

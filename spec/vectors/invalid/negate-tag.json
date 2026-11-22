@@ -1,0 +1,39 @@
+{
+  "description": "Negation is not a top-level 'negate' tag.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "negate",
+          [
+            "lit",
+            1
+          ]
+        ],
+        "x"
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/projections/0/1"
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "description": "Object-wrapped expressions have a closed key set.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        {
+          "expr": [
+            "lit",
+            1
+          ],
+          "bogus": 1
+        },
+        "x"
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/projections/0/1/bogus"
+  }
+}

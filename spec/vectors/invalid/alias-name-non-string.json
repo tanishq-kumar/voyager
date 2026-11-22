@@ -1,0 +1,40 @@
+{
+  "description": "An alias expression name must be a string.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "alias",
+          [
+            "lit",
+            1
+          ],
+          5
+        ],
+        "x"
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/projections/0/1/2"
+  }
+}

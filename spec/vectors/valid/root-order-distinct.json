@@ -1,0 +1,74 @@
+{
+  "description": "Root DISTINCT and ORDER BY with boolean and string directions.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        "n"
+      ],
+      [
+        "field",
+        "p",
+        "age",
+        "a"
+      ]
+    ],
+    "distinct": true,
+    "order_by": [
+      [
+        [
+          "ident",
+          "a"
+        ],
+        false
+      ],
+      [
+        [
+          "ident",
+          "n"
+        ],
+        "ASC"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN DISTINCT p.name AS n, p.age AS a ORDER BY a DESC, n ASC",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN DISTINCT p.name AS n, p.age AS a ORDER BY a DESC, n ASC $$) AS (n agtype, a agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN DISTINCT p.name AS n, p.age AS a ORDER BY a DESC, n ASC",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n, p.age AS a)) ORDER BY a DESC, n ASC",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n, p.age AS a)) ORDER BY a DESC, n ASC",
+      "parameters": {}
+    }
+  }
+}

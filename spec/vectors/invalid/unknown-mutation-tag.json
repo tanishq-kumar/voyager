@@ -1,0 +1,16 @@
+{
+  "description": "Mutation tags are a closed enum.",
+  "spec": {
+    "spec_version": 1,
+    "mutations": [
+      [
+        "upsert"
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/mutations/0/0"
+  }
+}

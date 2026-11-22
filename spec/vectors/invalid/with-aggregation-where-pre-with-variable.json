@@ -1,0 +1,68 @@
+{
+  "description": "An aggregating WITH only exposes the names it projects, so its where cannot read a pre-WITH variable.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "projections": [
+          [
+            "field",
+            "p",
+            "name",
+            "name"
+          ],
+          [
+            "agg",
+            "p",
+            "*",
+            "count",
+            "c"
+          ]
+        ],
+        "where": [
+          "bin",
+          ">",
+          [
+            "prop",
+            "p",
+            "age"
+          ],
+          [
+            "lit",
+            18
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "ident",
+          "name"
+        ],
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/with_clauses/0/where/2/1"
+  }
+}

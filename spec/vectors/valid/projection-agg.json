@@ -1,0 +1,52 @@
+{
+  "description": "Aggregation projection with the exact lowercase function name.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "agg",
+        "p",
+        "age",
+        "avg",
+        "avg_age"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN AVG(p.age) AS avg_age",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN AVG(p.age) AS avg_age $$) AS (avg_age agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN AVG(p.age) AS avg_age",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT AVG(age) AS avg_age FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.age AS age))",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT AVG(age) AS avg_age FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.age AS age))",
+      "parameters": {}
+    }
+  }
+}

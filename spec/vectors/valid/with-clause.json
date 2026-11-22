@@ -1,0 +1,75 @@
+{
+  "description": "A WITH pipeline with distinct, order_by, skip and limit.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "projections": [
+          [
+            "field",
+            "p",
+            "name",
+            "n"
+          ]
+        ],
+        "distinct": true,
+        "order_by": [
+          [
+            [
+              "ident",
+              "n"
+            ],
+            true
+          ]
+        ],
+        "skip": 0,
+        "limit": 5
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "ident",
+          "n"
+        ],
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) WITH DISTINCT p.name AS n ORDER BY n ASC SKIP 0 LIMIT 5 RETURN n",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH DISTINCT p.name AS n ORDER BY n ASC SKIP 0 LIMIT 5 RETURN n $$) AS (n agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) WITH DISTINCT p.name AS n ORDER BY n ASC OFFSET 0 LIMIT 5 RETURN n",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

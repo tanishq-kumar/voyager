@@ -1,0 +1,60 @@
+{
+  "description": "A WITH clause's where may reference the names it projects, not an unknown variable.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "projections": [
+          [
+            "field",
+            "p",
+            "name",
+            "n"
+          ]
+        ],
+        "where": [
+          "bin",
+          "gt",
+          [
+            "ident",
+            "missing"
+          ],
+          [
+            "lit",
+            0
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "ident",
+          "n"
+        ],
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/with_clauses/0/where/2/1"
+  }
+}

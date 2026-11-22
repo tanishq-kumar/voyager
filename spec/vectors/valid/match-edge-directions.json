@@ -1,0 +1,108 @@
+{
+  "description": "Outgoing, incoming and undirected edges in one path.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "a",
+              [
+                "Person"
+              ]
+            ],
+            [
+              "edge",
+              "outgoing",
+              [
+                "KNOWS"
+              ],
+              "r1",
+              null,
+              null
+            ],
+            [
+              "node",
+              "b",
+              [
+                "Person"
+              ]
+            ],
+            [
+              "edge",
+              "incoming",
+              [
+                "KNOWS"
+              ],
+              "r2",
+              null,
+              null
+            ],
+            [
+              "node",
+              "c",
+              [
+                "Person"
+              ]
+            ],
+            [
+              "edge",
+              "undirected",
+              [
+                "KNOWS"
+              ],
+              "r3",
+              null,
+              null
+            ],
+            [
+              "node",
+              "d",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "a",
+        "name",
+        null
+      ],
+      [
+        "field",
+        "d",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (a:Person)-[r1:KNOWS]->(b:Person)<-[r2:KNOWS]-(c:Person)-[r3:KNOWS]-(d:Person) RETURN a.name, d.name",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (a:Person)-[r1:KNOWS]->(b:Person)<-[r2:KNOWS]-(c:Person)-[r3:KNOWS]-(d:Person) RETURN a.name, d.name $$) AS (name agtype, name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (a:Person)-[r1:KNOWS]->(b:Person)<-[r2:KNOWS]-(c:Person)-[r3:KNOWS]-(d:Person) RETURN a.name, d.name",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS Person) -[r1 IS KNOWS]-> (b IS Person) <-[r2 IS KNOWS]- (c IS Person) -[r3 IS KNOWS]- (d IS Person) COLUMNS (a.name, d.name))",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS Person) -[r1 IS KNOWS]-> (b IS Person) <-[r2 IS KNOWS]- (c IS Person) -[r3 IS KNOWS]- (d IS Person) COLUMNS (a.name, d.name))",
+      "parameters": {}
+    }
+  }
+}

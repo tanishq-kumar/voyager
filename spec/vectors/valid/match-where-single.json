@@ -1,0 +1,74 @@
+{
+  "description": "A single tagged expression for where.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "gt",
+          [
+            "prop",
+            "p",
+            "age"
+          ],
+          [
+            "lit",
+            21
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) WHERE p.age > $p0 RETURN p.name",
+      "parameters": {
+        "p0": 21
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE p.age > $p0 RETURN p.name $$, %s) AS (name agtype)",
+      "parameters": {
+        "p0": 21
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) WHERE p.age > $p0 RETURN p.name",
+      "parameters": {
+        "p0": 21
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.age > $p0 COLUMNS (p.name))",
+      "parameters": {
+        "p0": 21
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.age > $p0 COLUMNS (p.name))",
+      "parameters": {
+        "p0": 21
+      }
+    }
+  }
+}

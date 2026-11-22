@@ -20,6 +20,7 @@ from voyager_ogm import (
     Node,
     Query,
     Relationship,
+    col,
     fn,
     node,
     relationship,
@@ -204,13 +205,13 @@ QUERY_CORPUS: dict[str, Callable[[], Query]] = {
     "with_pipeline_and_filtering": lambda: (
         Query.match(Person("p"))
         .where(Person("p").age > 21)
-        .with_(Person("p").name, Person("p").age)
-        .where(Person("p").age < 50)
-        .return_(Person("p").name)
+        .with_(name=Person("p").name, age=Person("p").age)
+        .where(col("age") < 50)
+        .return_(col("name"))
         .limit(10)
     ),
     "with_distinct_pipeline": lambda: (
-        Query.match(Person("p")).with_(Person("p").city, distinct=True).return_(Person("p").city)
+        Query.match(Person("p")).with_(city=Person("p").city, distinct=True).return_(col("city"))
     ),
     # 5. Path Search Modes & Path Variables
     "path_mode_trail": lambda: (

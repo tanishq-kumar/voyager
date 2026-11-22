@@ -14,6 +14,7 @@ from typing import Any
 
 from voyager_ogm._voyager_rs import NativeQueryBuilder
 from voyager_ogm.expressions import (
+    SPEC_VERSION,
     AliasedExpr,
     BinaryExpr,
     Expression,
@@ -21,6 +22,7 @@ from voyager_ogm.expressions import (
     LiteralExpr,
     PropExpr,
     UnaryExpr,
+    _reject_aggregation,
     to_expression,
 )
 from voyager_ogm.models import (
@@ -214,9 +216,6 @@ def _resolve_fulltext_target(
         target_name = canonical_fulltext_index_name(entity_tag, [], dialect=dialect)
 
     return is_rel, target_name, entity_tag, model_props
-
-
-SPEC_VERSION: int = 1
 
 
 class Query:
@@ -1360,6 +1359,8 @@ class Query:
         """
         if not predicates:
             raise ValueError("where() requires at least one predicate condition")
+        for raw_pred in predicates:
+            _reject_aggregation(raw_pred)
 
         mode = self._native.clause_mode()
         if mode == "merge":
@@ -1416,6 +1417,38 @@ class Query:
         """Returns the underlying native query builder handle for subquery embedding."""
         return self._native
 
+    def to_spec_dict(self) -> dict[str, Any]:
+        """Serialises this query into a Query Spec v1 document.
+
+        The returned dictionary is JSON-serialisable (arrays are Python lists)
+        and validates against ``spec/query_spec.v1.schema.json``. Compiling it
+        with :func:`voyager_ogm.compile_query_from_spec` produces the same
+        statement and parameters as :meth:`compile` for every supported dialect.
+
+        Returns:
+            A Query Spec v1 document with ``spec_version`` at the root.
+
+        Raises:
+            VoyagerError: With code ``UNSUPPORTED_FEATURE`` when the query uses a
+                construct Query Spec v1 cannot represent without changing its
+                meaning (for example a procedure call), or ``INVALID_CLAUSE``
+                when the query has no clauses or cannot be built.
+        """
+        return self._native.to_spec_dict()
+
+    def to_json(self, **json_kwargs: Any) -> str:
+        """Serialises this query into a Query Spec v1 JSON string.
+
+        Args:
+            **json_kwargs: Keyword arguments forwarded to :func:`json.dumps`.
+
+        Returns:
+            The JSON text of :meth:`to_spec_dict`.
+        """
+        import json
+
+        return json.dumps(self.to_spec_dict(), **json_kwargs)
+
     def where_not(self, *predicates: Any) -> Query:
         """Applies negated filter predicates `NOT (pred)` to the current query path.
 
@@ -1430,6 +1463,8 @@ class Query:
         """
         if not predicates:
             raise ValueError("where_not() requires at least one predicate condition")
+        for raw_pred in predicates:
+            _reject_aggregation(raw_pred)
         if self._native.clause_mode() == "merge":
             raise ValueError(
                 "MERGE clause does not support WHERE predicates. "
@@ -1457,6 +1492,7 @@ class Query:
             The Query instance for fluent chaining.
         """
         for raw_assign in assignments:
+            _reject_aggregation(raw_assign)
             assign = (
                 self._resolve_expr(raw_assign)
                 if isinstance(raw_assign, (PredicateExpr, Expression, Field, BoundField))
@@ -1465,6 +1501,7 @@ class Query:
             if isinstance(assign, PredicateExpr):
                 self._native.on_create_set(assign.target, assign.field, assign.value)
         for key, val in kwargs.items():
+            _reject_aggregation(val)
             if "." in key:
                 var, prop = key.split(".", 1)
                 self._native.on_create_set(var, prop, val)
@@ -1481,6 +1518,7 @@ class Query:
             The Query instance for fluent chaining.
         """
         for raw_assign in assignments:
+            _reject_aggregation(raw_assign)
             assign = (
                 self._resolve_expr(raw_assign)
                 if isinstance(raw_assign, (PredicateExpr, Expression, Field, BoundField))
@@ -1489,6 +1527,7 @@ class Query:
             if isinstance(assign, PredicateExpr):
                 self._native.on_match_set(assign.target, assign.field, assign.value)
         for key, val in kwargs.items():
+            _reject_aggregation(val)
             if "." in key:
                 var, prop = key.split(".", 1)
                 self._native.on_match_set(var, prop, val)
@@ -1506,17 +1545,21 @@ class Query:
             The Query instance for fluent chaining.
         """
         for raw_assign in assignments:
+            _reject_aggregation(raw_assign)
             assign = (
                 self._resolve_expr(raw_assign)
                 if isinstance(raw_assign, (PredicateExpr, Expression, Field, BoundField))
                 else raw_assign
             )
             if isinstance(assign, PredicateExpr):
+                _reject_aggregation(assign.value)
                 self._native.set_property(assign.target, assign.field, assign.value)
             elif isinstance(assign, Node):
                 for field_name, val in assign.dirty_fields.items():
+                    _reject_aggregation(val)
                     self._native.set_property(assign.alias, field_name, val)
         for key, val in kwargs.items():
+            _reject_aggregation(val)
             if "." in key:
                 var, prop = key.split(".", 1)
                 self._native.set_property(var, prop, val)
@@ -1579,6 +1622,14 @@ class Query:
         field = self._resolve_expr(field)
         if isinstance(field, AliasedExpr):
             final_alias = field.alias if alias is None else alias
+            if isinstance(field.expr, AggregationExpr):
+                self._native.aggregate(
+                    field.expr.target_alias,
+                    field.expr.field_name,
+                    field.expr.func,
+                    final_alias,
+                )
+                return
             nat = getattr(field.expr, "_native_expr", None)
             expr_spec = field.expr.to_spec() if nat is None else nat
             self._native.select_expr(expr_spec, final_alias)
@@ -1680,6 +1731,7 @@ class Query:
         if len(args) == 2:
             var_name = str(args[0])
             expr = to_expression(args[1])
+            _reject_aggregation(expr)
             nat = getattr(expr, "_native_expr", None)
             expr_spec = expr.to_spec() if nat is None else nat
             self._native.let_(var_name, expr_spec)
@@ -1690,6 +1742,7 @@ class Query:
                 )
             for k, v in args[0].items():
                 expr = to_expression(v)
+                _reject_aggregation(expr)
                 nat = getattr(expr, "_native_expr", None)
                 expr_spec = expr.to_spec() if nat is None else nat
                 self._native.let_(k, expr_spec)
@@ -1700,6 +1753,7 @@ class Query:
 
         for k, v in kwargs.items():
             expr = to_expression(v)
+            _reject_aggregation(expr)
             nat = getattr(expr, "_native_expr", None)
             expr_spec = expr.to_spec() if nat is None else nat
             self._native.let_(k, expr_spec)
@@ -1727,6 +1781,7 @@ class Query:
         if not predicates:
             raise ValueError("linear_filter() requires at least one predicate expression")
         for pred in predicates:
+            _reject_aggregation(pred)
             nat = getattr(pred, "_native_expr", None)
             if nat is not None:
                 self._native.filter_(nat)
@@ -1793,6 +1848,7 @@ class Query:
             The Query instance for fluent chaining.
         """
         field = self._resolve_expr(field)
+        _reject_aggregation(field)
         if isinstance(field, BoundField):
             self._native.order_by(field.target_alias, field.field_name, ascending)
         elif isinstance(field, Expression) or hasattr(field, "to_spec"):

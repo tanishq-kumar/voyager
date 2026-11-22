@@ -1,0 +1,71 @@
+{
+  "description": "Node properties accept a literal and a parameter expression.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ],
+              {
+                "name": [
+                  "lit",
+                  "Alice"
+                ],
+                "age": [
+                  "param",
+                  "age"
+                ]
+              }
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person {name: $p0, age: $age}) RETURN p.name",
+      "parameters": {
+        "p0": "Alice"
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person {name: $p0, age: $age}) RETURN p.name $$, %s) AS (name agtype)",
+      "parameters": {
+        "p0": "Alice"
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person {name: $p0, age: $age}) RETURN p.name",
+      "parameters": {
+        "p0": "Alice"
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person WHERE p.name = $p0 AND p.age = $age) COLUMNS (p.name))",
+      "parameters": {
+        "p0": "Alice"
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person WHERE p.name = $p0 AND p.age = $age) COLUMNS (p.name))",
+      "parameters": {
+        "p0": "Alice"
+      }
+    }
+  }
+}

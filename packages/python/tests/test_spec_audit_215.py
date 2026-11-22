@@ -104,7 +104,14 @@ def test_with_clauses_and_mutations_do_not_end_in_with() -> None:
     spec = {
         "spec_version": 1,
         "matches": [{"spec_version": 1, "paths": PERSON_PATH}],
-        "with_clauses": [{"projections": [("field", "p", "name", "n")]}],
+        "with_clauses": [
+            {
+                "projections": [
+                    ("field", "p", "name", "n"),
+                    ("expr", ("ident", "p"), None),
+                ]
+            }
+        ],
         "mutations": [("set", "p", "age", ("lit", 30))],
     }
     assert compile_cypher(spec)["statement"].startswith("MATCH (p:Person) WITH")

@@ -668,6 +668,8 @@ class BoundField(Expression):
 class AggregationExpr(Expression):
     """Container for AST column aggregation expressions (e.g. COUNT, AVG)."""
 
+    _is_aggregation = True
+
     def __init__(
         self,
         target: str,

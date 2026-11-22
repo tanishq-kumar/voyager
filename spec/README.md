@@ -15,20 +15,26 @@ This formal ABI contract guarantees cross-language stability and deterministic t
 
 ## 1. Specification Versioning (`spec_version: 1`)
 
-Every query spec dictionary **must** carry a top-level integer attribute:
+Every query spec document **must** carry a top-level integer attribute:
 ```json
 {
   "spec_version": 1
 }
 ```
 
+`spec_version` is required only at the document root. Nested specs — each
+`matches[i]` and `with_clauses[i]` object, a nested spec passed to `exists` or
+`count`, and an object-wrapped expression — may omit it. If a nested object does
+declare it, it must be `1`; any other value is rejected at that nested
+`spec_version` key.
+
 ### Compatibility Rules
 1. **Major Version Invariance**: The native Rust compiler (`compile_query_from_spec`) and internal builders strictly reject unknown major versions:
-   - Any payload missing `"spec_version"` is rejected immediately with:
+   - Any payload missing a root `"spec_version"` is rejected immediately with:
      `Missing required 'spec_version' in query spec dictionary. Expected 'spec_version': 1.`
    - Any payload with an unsupported version (`spec_version: 2`) is rejected with:
      `Unsupported query spec_version: 2. Supported major versions: 1.`
-2. **Clause Versioning**: Individual clause dictionaries (`matches[i]`, `with_clauses[i]`) may optionally declare `"spec_version": 1`. If present, unknown values are rejected.
+2. **Clause Versioning**: A nested clause or expression object (`matches[i]`, `with_clauses[i]`, an `exists`/`count` subquery spec and an object-wrapped expression) may optionally declare `"spec_version": 1`. If present, unknown values are rejected at that nested key.
 
 ---
 
@@ -65,6 +71,18 @@ Examples:
 | `{"spec_version": 1, "matches": [{"paths": [[["node","n",["N"]],["edge","out",["E"],null,null,null,{},1]]]}]}` (8th edge item) | `/matches/0/paths/0/1/7` |
 | `{"spec_version": 1, "skip": -1, ...}` | `/skip` |
 
+### `null` means omitted
+
+At every optional key and optional array position, JSON `null` means the same as
+omitting the key. This covers root `load_csv`, `projections`, `distinct`,
+`order_by`, `skip`, `offset`, `limit` and `execution_mode`; match `optional`,
+`path_mode`, `path_variable` and `where`; with-clause `distinct`, `where`,
+`order_by`, `skip` and `limit`; the optional node and edge path-step items; and
+the nullable expression positions (`case` operand and else branch, `list_comp`
+where and map expressions, and `pattern_comp` where). Required keys do not accept
+`null`: root `spec_version`, `matches[i].paths`, `with_clauses[i].projections`,
+and the `expr` key of an object-wrapped expression.
+
 The following are rejected:
 
 - Unknown object keys at the root, in a match clause, in a with clause, and in
@@ -72,13 +90,32 @@ The following are rejected:
 - Wrong container types for `load_csv`, `unwinds`, `matches`, `paths`,
   `mutations`, `with_clauses`, `projections`, `order_by`, `linear_clauses`, and
   merge set lists.
-- Unknown enum values: `path_mode`, `execution_mode`, `linear_clauses` tags,
-  mutation tags, path step tags, projection tags, and aggregation functions.
-- Negative or boolean `skip` / `offset` / `limit` values.
+- Unknown or wrongly spelled enum values. `path_mode` (`trail`, `simple`,
+  `acyclic`, `walk`, `none`), `execution_mode` (`normal`, `explain`, `profile`,
+  `explain_and_profile`), edge `direction` (`outgoing`/`out`/`->`,
+  `incoming`/`in`/`<-`, `undirected`/`both`/`-`/`--`) and aggregation function
+  names (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `collect`) are
+  exact and case-sensitive. So are the mutation, path-step, projection and
+  `linear_clauses` tags.
+- The undocumented tag aliases `literal` (for `lit`) and `func` / `call` (for
+  `fn`). They are rejected as unknown expression tags; write the canonical `lit`
+  and `fn` tags.
+- Boolean, negative or non-integral `skip` / `offset` / `limit` values. An
+  integral JSON number such as `0.0` or `3.0` is accepted (the schema's
+  `integer` type accepts it). `skip` and `offset` are aliases of the same
+  position, so providing both is rejected at the second key in document order.
+- Negative `min_hops` / `max_hops` values. `min_hops` and `max_hops` both have
+  minimum 0; when `max_hops` is `null`, the traversal is exactly `min_hops`
+  hops. When `min_hops` is omitted or `null` and `max_hops` is set, the minimum
+  is 1.
 - A bare or untagged array in an expression position: an empty array, a non-string
   first element (for example `[1, 2, 3]`) or an unknown first string (for
   example `["propp", ...]` or `["red", "green"]`). Every expression array must
   be tagged (see [Expression arrays are always tagged](#expression-arrays-are-always-tagged)).
+- An `agg` array in an expression position. `agg` is a projection item only;
+  the error at the array's path says aggregations are only valid as projection
+  items instead of suggesting a literal spelling (see
+  [Aggregations are projection items only](#aggregations-are-projection-items-only)).
 - A path step `properties` item that is neither an object nor `null`, a
   non-null item past a step's documented shape (5th node item, 8th edge item),
   or a property value that is not a tagged expression.
@@ -103,6 +140,15 @@ The following are rejected:
   `/with_clauses/i/projections`) and a `matches[i].paths: []` empty list (error
   at `/matches/i/paths`). Both would otherwise drop or misattach their
   `where`/pagination.
+- A variable reference the fixed emission order cannot honour, such as a linear
+  filter reading an alias a later `WITH` defines, or a mutation after a `WITH`
+  targeting a variable that clause dropped. The error is at the identifier's own
+  pointer and names the variable (see
+  [Clause order and scope](#5-clause-order-and-scope)).
+- A `WITH` projection that is not a bare variable and has no alias, such as
+  `["field", "p", "name", null]` or `["agg", "p", "age", "count", null]`. The
+  error is at the projection item's pointer (see
+  [Clause order and scope](#5-clause-order-and-scope)).
 - Any item past a fixed-arity shape (see the shapes below): `load_csv`,
   `unwinds` entries, every mutation tag, every projection tag, `order_by`
   entries, `linear_clauses` entries, merge `ON CREATE SET` / `ON MATCH SET`
@@ -114,8 +160,8 @@ The following are rejected:
   `["ident", ""]` or `["param", ""]`.
 - A JSON object in an expression position that has no `expr` key. Only the
   `exists`, `count` and `pattern_comp` payloads accept a nested query spec or
-  path spec; every other object must be written as
-  `{"spec_version": 1, "expr": ...}`.
+  path spec; every other object must be written as `{"expr": ...}` (the nested
+  `spec_version` key is optional).
 - A compile-time build or emission failure. These raise `VoyagerError` too:
   `INVALID_SPEC` at the document root (`path == ""`) when the AST cannot be
   built or emitted, or `UNSUPPORTED_FEATURE` / `UNSUPPORTED_DIALECT` when the
@@ -126,9 +172,11 @@ Parameter names may be written with or without one leading `$`: `["param",
 "$name"]` and `["param", "name"]` both bind `$name`, and an `unwinds` entry
 `["$batch", "row"]` compiles to `UNWIND $batch AS row`, matching the Python
 SDK's `param()`. Exactly one `$` is stripped. An `["alias", expression, name]`
-name only takes effect where a projection carries an alias (the `expr`
-projection item); elsewhere the alias is validated and the inner expression is
-used.
+expression is only meaningful in a projection: an `expr` projection uses the
+name when its own alias is `null`, and the `alias` expression inside a
+projection item is the same as carrying that name. In every other expression
+position (`where`, `set`, function arguments, and so on) the name is validated
+as a string and the inner expression is used; no alias is emitted there.
 
 `INVALID_CLAUSE` remains the code for non-spec callers, such as the fluent
 Python/Rust builder API.
@@ -178,7 +226,7 @@ Python/Rust builder API.
     }
   ],
   "projections": [
-    ["field", "u", "name", "user_name"],
+    ["expr", ["ident", "user_name"], null],
     ["expr", ["ident", "friend_count"], "total"]
   ],
   "distinct": false,
@@ -218,7 +266,7 @@ Paths within `matches[i].paths` or `create`/`merge` mutations are sequences of s
 | Step Type | Shape | Description |
 | :--- | :--- | :--- |
 | **Node** | `["node", variable, labels, properties]` | Node pattern, e.g. `["node", "u", ["User", "Admin"]]`. `variable` can be `null` for anonymous nodes. `properties` is optional: an object mapping property names to [expressions](#4-expression-ast-descriptors), for example `{"name": ["lit", "Alice"]}`. Omitted, `null`, and `{}` all mean no properties; any other non-object is rejected. |
-| **Edge** | `["edge", dir, types, variable, min_hops, max_hops, properties]` | Directed or undirected relationship traversal. `dir` accepts `"outgoing"` (`"out"`, `"->"`), `"incoming"` (`"in"`, `"<-"`), and `"undirected"` (`"both"`, `"-"`, `"--"`), case-insensitively. `min_hops` and `max_hops` specify variable-length paths (`null` for 1 hop). `variable`, `min_hops`, `max_hops` and `properties` may be omitted (`["edge", dir, types]`) and default to `null`. `properties` follows the same rules as the node step. A non-null item after `properties` is rejected. |
+| **Edge** | `["edge", dir, types, variable, min_hops, max_hops, properties]` | Directed or undirected relationship traversal. `dir` accepts exactly `"outgoing"` (`"out"`, `"->"`), `"incoming"` (`"in"`, `"<-"`), and `"undirected"` (`"both"`, `"-"`, `"--"`); the spelling is case-sensitive. `min_hops` and `max_hops` specify variable-length paths and both have minimum 0. `max_hops: null` means exactly `min_hops` hops; when `min_hops` is omitted or `null` and `max_hops` is set, the minimum is 1. `variable`, `min_hops`, `max_hops` and `properties` may be omitted (`["edge", dir, types]`) and default to `null`. `properties` follows the same rules as the node step. A non-null item after `properties` is rejected. |
 
 Property values follow the same strict rule as every other expression
 position: each value must be a tagged expression such as `["lit", "Alice"]` or
@@ -240,15 +288,30 @@ Expression trees used in `where`, `set`, and projections support fine-grained op
 | **Property Access** | `["prop", var, property]` | Access entity property: `u.age` |
 | **Identifier** | `["ident", name]` | Variable or alias identifier: `friend_count` |
 | **Parameter** | `["param", name]` | Query parameter reference: `$param` |
-| **Literal** | `["lit", value]` | Scalar literal (`42`, `"Alice"`, `true`, `null`) |
-| **Binary Op** | `["bin", op, left, right]` | Binary operators: `eq` (`=`), `neq` (`!=`, `ne`, `<>`), `gt` (`>`), `gte` (`>=`, `ge`), `lt` (`<`), `lte` (`<=`, `le`), `and` (`&`), `or` (`\|`), `xor` (`^`), `add` (`+`), `sub` (`-`), `mul` (`*`), `div` (`/`), `mod` (`%`), `concat` (`\|\|`), `contains`, `starts_with` (`startswith`), `ends_with` (`endswith`), `regex` (`=~`), `in`, `not_in` (`not in`) |
-| **Unary Op** | `["unary", op, operand]` | `not` (`~`), `neg` (`-`), `is_null` (`is null`), `is_not_null` (`is not null`) |
+| **Literal** | `["lit", value]` | Any JSON value: a scalar (`42`, `"Alice"`, `true`, `null`), a list or an object |
+| **Binary Op** | `["bin", op, left, right]` | Binary operators (canonical lowercase spellings; the consumer also accepts the uppercase word spellings): `eq` (`=`), `neq` (`!=`, `ne`, `<>`), `gt` (`>`), `gte` (`>=`, `ge`), `lt` (`<`), `lte` (`<=`, `le`), `and` (`&`), `or` (`\|`), `xor` (`^`), `add` (`+`), `sub` (`-`), `mul` (`*`), `div` (`/`), `mod` (`%`), `concat` (`\|\|`), `contains`, `starts_with` (`startswith`), `ends_with` (`endswith`), `regex` (`=~`), `in`, `not_in` (`not in`). Any other operator is `INVALID_SPEC` at the operator element. |
+| **Unary Op** | `["unary", op, operand]` | `not` (`~`), unary minus as `["unary", "-", operand]` (the operator `neg` is an alias for `-`), `is_null` (`is null`), `is_not_null` (`is not null`). Negation has no top-level `neg` or `negate` tag. |
 | **Function** | `["fn", name, [args...]]` | Function call: `["fn", "toUpper", [["prop", "u", "name"]]]` |
 | **CASE WHEN** | `["case", operand, [[when, then]...], else]` | Conditional branching |
 | **List Literal** | `["list", [items...]]` | Literal list of expressions |
 | **Subquery Exists**| `["exists", subquery_spec]` | Existential graph subquery |
 | **Subquery Count** | `["count", subquery_spec]` | Scalar subquery count |
-| **Alias** | `["alias", inner, alias_name]` | Projection aliasing |
+| **Alias** | `["alias", inner, alias_name]` | Projection aliasing (only meaningful in projections) |
+
+The recursive payload positions are fully typed:
+
+- A `case` branch is exactly `[when, then]`; the `case` operand and else branch
+  are an expression or `null`.
+- `list_comp` is `["list_comp", variable, list_expr, where | null, map | null]`.
+- `pattern_comp` is `["pattern_comp", path, where | null, projection]`, where
+  `path` is a path-step list (the same shape as a `matches[i].paths` entry).
+- An `exists` or `count` payload is either a nested query spec object (the same
+  shape as the root document, with `spec_version` optional) or a path-step list.
+- `["lit", value]` accepts any JSON value.
+- A merge `ON CREATE SET` / `ON MATCH SET` entry is exactly
+  `[variable, property, value_expression]`.
+- A `bin` operator is one of the operators in the table above; anything else is
+  rejected at the operator element.
 
 ### Expression arrays are always tagged
 
@@ -316,6 +379,24 @@ as the projection's explicit alias); in any other expression position the name
 is validated and the inner expression is used. Every shape above is exact: an
 item past the documented length is `INVALID_SPEC` at the extra item's path.
 
+### Aggregations are projection items only
+
+`agg` is not an expression tag. It is accepted only as a projection item in
+root `projections` and `with_clauses[i].projections`. An `agg` array anywhere
+in an expression position (inside `where`, `order_by`, a `set` value, a
+function argument, a binary or unary expression, or a path property map) is
+rejected with `INVALID_SPEC` at the array's own path. The message names the
+misuse directly: aggregations are only valid as projection items, so move the
+aggregate into a projection list or a `WITH` clause. It is not the generic
+unknown-tag hint about `["lit", [...]]`.
+
+The Python fluent API raises the same rule at construction or at the call that
+uses the aggregation. `p.id.count() > 2`, `~p.id.count()`, `fn.size(p.id.count())`,
+`q.where(p.id.count())`, `q.order_by(p.id.count())` and `q.set(x=p.id.count())`
+raise `VoyagerError` with code `INVALID_CLAUSE` and the message
+"aggregations are only valid in WITH/RETURN projections".
+`q.return_(count=p.id.count())` and `q.with_(count=p.id.count())` remain valid.
+
 ### Linear clauses
 
 `linear_clauses` is an ordered list of clause entries emitted between the
@@ -330,7 +411,118 @@ Neither entry accepts extra items.
 
 ---
 
-## 5. DML Mutations
+## 5. Clause order and scope
+
+The consumer emits clauses in a fixed order, whatever order the document's keys
+use. Every variable reference must resolve at the point its clause is emitted;
+a spec that depends on a different order is rejected with `INVALID_SPEC` at the
+offending identifier (or at the expression containing it) instead of being
+silently reordered.
+
+The emission order is:
+
+1. `load_csv`
+2. `unwinds` (in list order)
+3. `matches` (in list order)
+4. `linear_clauses` (`let` and `filter`, in list order)
+5. `with_clauses` (in list order)
+6. `mutations` (in list order)
+7. the final `RETURN`: `projections`, then `order_by`, then `skip`/`offset` and
+   `limit`
+
+The scope rules follow that order:
+
+- A `load_csv` or `unwinds` alias is bound from its clause onward.
+- A match path binds its node variables, edge variables and `path_variable` for
+  the rest of the query. `matches[i].where` sees the variables of its own paths
+  and everything bound before the match.
+- A linear `let` binds its variable only from that entry onward. A `filter` sees
+  the bindings of the entries before it.
+- A `WITH` clause replaces the visible names with the ones it projects. A bare
+  variable projection without an alias (`["expr", ["ident", "p"], null]`) keeps
+  that variable. Every aliased projection keeps only its alias: a bare variable
+  projected as `["expr", ["ident", "p"], "x"]` keeps `x`, and
+  `["field", "p", "name", "n"]` keeps `n` and drops `p`. `load_csv`, `unwinds`,
+  match and `let` names are dropped by a `WITH` unless the clause projects them.
+- A `WITH` projection item that is not a bare variable must have an alias. The
+  consumer rejects an unaliased `["field", "p", "name", null]`, `["agg", ...]`
+  without an alias, or a non-identifier `expr` projection without an alias, at
+  the projection item's pointer. Only a bare variable may be projected without
+  one. `RETURN` projections keep working without aliases.
+- `with_clauses[i].where` and `with_clauses[i].order_by` see the names that
+  clause projects plus the names that were in scope before the `WITH`. When the
+  `WITH` is `DISTINCT` or contains an aggregation, both see only the projected
+  names, and a reference to a pre-`WITH` name is rejected with `INVALID_SPEC`:
+  a `WITH` with `DISTINCT` or an aggregation only exposes the names it projects.
+  The clauses after the `WITH` always see only the projected names.
+- Mutations and the final `projections` see the scope after the last `WITH`
+  (plus variables the earlier mutations created). Root `order_by` may
+  additionally use the names the `RETURN` projects. When the root `RETURN` is
+  `DISTINCT` or contains an aggregation, root `order_by` sees only the names the
+  `RETURN` projects.
+- Variables bound inside an `exists`/`count` subquery or a `pattern_comp` path
+  are local to that construct, though the construct may read outer variables.
+  A `list_comp` iteration variable is visible only in that comprehension's
+  `where` and map expressions.
+- Parameters (`param`) and literals (`lit`) never need a binding.
+
+### Filter after `WITH`
+
+`linear_clauses` is emitted before `with_clauses`, so a filter cannot read an
+alias that a later `WITH` defines. This document is rejected at
+`/linear_clauses/0/1/2/1`:
+
+```text
+{"spec_version": 1,
+ "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+ "with_clauses": [{"projections": [["field", "p", "name", "n"]]}],
+ "linear_clauses": [["filter", ["bin", "gt", ["ident", "n"], ["lit", 0]]]],
+ "projections": [["expr", ["ident", "n"], null]]}
+```
+
+The error says `variable 'n' is not in scope here: linear clauses are emitted
+before WITH clauses; move the reference into with_clauses[0].where ...`. Express
+the filter in the `WITH` that defines the alias:
+
+```json
+{
+  "spec_version": 1,
+  "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+  "with_clauses": [
+    {
+      "projections": [["field", "p", "name", "n"]],
+      "where": ["bin", "gt", ["ident", "n"], ["lit", 0]]
+    }
+  ],
+  "projections": [["expr", ["ident", "n"], null]]
+}
+```
+
+That compiles to `MATCH (p:Person) WITH p.name AS n WHERE n > $p0 RETURN n`.
+
+### Mutations after `WITH`
+
+Mutations are emitted after `with_clauses`, so they see the last `WITH`'s
+projected names. A mutation that targets a match variable the last `WITH` did
+not project is rejected at the mutation's target:
+
+```text
+{"spec_version": 1,
+ "matches": [{"paths": [[["node", "p", ["Person"]]], [["node", "q", ["Person"]]]]}],
+ "with_clauses": [{"projections": [["field", "p", "name", "n"]]}],
+ "mutations": [["set", "q", "age", ["lit", 30]]],
+ "projections": [["expr", ["ident", "n"], null]]}
+```
+
+The error is at `/mutations/0/1`: `variable 'q' is not in scope here: the last
+WITH clause (with_clauses[0]) does not project 'q'; add it to that clause's
+projections`. Add the bare variable `["expr", ["ident", "q"], null]` to the
+`WITH` projections (or move the mutation before the `WITH` by removing the
+`WITH` from the pipeline) to make the target visible.
+
+---
+
+## 6. DML Mutations
 
 Mutation tuples within `mutations`:
 
@@ -342,7 +534,7 @@ Mutation tuples within `mutations`:
 
 ---
 
-## 6. Target Dialect Parity
+## 7. Target Dialect Parity
 
 Any valid `spec` compiled with `compile_query_from_spec(spec, dialect="cypher" | "iso_gql" | "sql_pgq" | "apache_age")` produces the exact same parameter-isolated SQL/Cypher statement as the fluent `Query` builder API.
 

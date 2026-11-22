@@ -9,16 +9,36 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+_native_module: Any
 try:
-    from voyager_ogm._voyager_rs import AstExpr
+    import voyager_ogm._voyager_rs as _native_module
 
     HAS_VOYAGER_RS = True
 except ImportError:
-    AstExpr = None  # type: ignore[assignment,misc]
+    _native_module = None
     HAS_VOYAGER_RS = False
+
+# The native extension is always importable in a built installation; these
+# fallbacks keep the pure-Python expression tree importable for documentation
+# tooling that does not have the compiled module.
+AstExpr: Any = getattr(_native_module, "AstExpr", None)
+VoyagerError: Any = getattr(_native_module, "VoyagerError", ValueError)
 
 
 SPEC_VERSION: int = 1
+
+AGGREGATION_CONTEXT_MESSAGE = (
+    "aggregations are only valid in WITH/RETURN projections; "
+    "an AggregationExpr (for example p.id.count()) cannot be used inside "
+    "where(), a binary or unary expression, a function argument, order_by, "
+    "a set value, or another expression position"
+)
+
+
+def _reject_aggregation(value: Any) -> None:
+    """Raises when an aggregation is placed in a non-projection expression."""
+    if getattr(value, "_is_aggregation", False):
+        raise VoyagerError(AGGREGATION_CONTEXT_MESSAGE, code="INVALID_CLAUSE")
 
 
 class Expression:
@@ -271,6 +291,8 @@ class ListLiteralExpr(Expression):
     """List literal of expression items: `[expr1, expr2, ...]`."""
 
     def __init__(self, items: Sequence[Expression]) -> None:
+        for item in items:
+            _reject_aggregation(item)
         self.items = list(items)
 
     def to_spec(self) -> tuple[str, list[Any]]:
@@ -285,6 +307,8 @@ class BinaryExpr(Expression):
     """Binary expression connecting two expressions with an operator: `left OP right`."""
 
     def __init__(self, left: Expression, op: str, right: Expression) -> None:
+        _reject_aggregation(left)
+        _reject_aggregation(right)
         self.left = left
         self.op = op
         self.right = right
@@ -321,6 +345,7 @@ class UnaryExpr(Expression):
     """Unary prefix or postfix expression: `NOT expr`, `-expr`, `expr IS NULL`."""
 
     def __init__(self, op: str, operand: Expression) -> None:
+        _reject_aggregation(operand)
         self.op = op
         self.operand = operand
         if HAS_VOYAGER_RS and AstExpr is not None:
@@ -346,6 +371,8 @@ class FunctionExpr(Expression):
     """Function invocation expression: `func(arg1, arg2, ...)`."""
 
     def __init__(self, name: str, args: Sequence[Expression]) -> None:
+        for arg in args:
+            _reject_aggregation(arg)
         self.name = name
         self.args = list(args)
         if HAS_VOYAGER_RS and AstExpr is not None:
@@ -376,6 +403,11 @@ class CaseExpr(Expression):
         branches: Sequence[tuple[Expression, Expression]],
         else_expr: Expression | None = None,
     ) -> None:
+        _reject_aggregation(operand)
+        for when, then in branches:
+            _reject_aggregation(when)
+            _reject_aggregation(then)
+        _reject_aggregation(else_expr)
         self.operand = operand
         self.branches = list(branches)
         self.else_expr = else_expr
@@ -427,6 +459,9 @@ class ListCompExpr(Expression):
         where: Expression | None = None,
         map_expr: Expression | None = None,
     ) -> None:
+        _reject_aggregation(list_expr)
+        _reject_aggregation(where)
+        _reject_aggregation(map_expr)
         self.var = var
         self.list_expr = list_expr
         self.where = where
@@ -453,6 +488,8 @@ class PatternCompExpr(Expression):
         proj: Expression,
         where: Expression | None = None,
     ) -> None:
+        _reject_aggregation(proj)
+        _reject_aggregation(where)
         self.path = path
         self.proj = proj
         self.where = where

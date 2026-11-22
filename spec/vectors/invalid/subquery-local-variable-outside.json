@@ -1,0 +1,108 @@
+{
+  "description": "A variable bound inside an exists subquery is not in scope in the enclosing match.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      },
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "r",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "=",
+          [
+            "exists",
+            {
+              "matches": [
+                {
+                  "paths": [
+                    [
+                      [
+                        "node",
+                        "q",
+                        [
+                          "Person"
+                        ]
+                      ]
+                    ]
+                  ]
+                }
+              ],
+              "projections": [
+                [
+                  "field",
+                  "q",
+                  "name",
+                  null
+                ]
+              ]
+            }
+          ],
+          [
+            "lit",
+            true
+          ]
+        ]
+      },
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "s",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "=",
+          [
+            "ident",
+            "q"
+          ],
+          [
+            "lit",
+            1
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/2/where/2/1"
+  }
+}

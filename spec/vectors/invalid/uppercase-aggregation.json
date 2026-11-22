@@ -1,0 +1,35 @@
+{
+  "description": "Aggregation function names are exact lowercase.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "agg",
+        "p",
+        "id",
+        "COUNT",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/projections/0/3"
+  }
+}

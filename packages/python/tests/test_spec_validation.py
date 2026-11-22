@@ -480,7 +480,7 @@ RAW_VALUE_POSITIONS: dict[str, tuple[str, str, str]] = {
     "path_step.node[variable,labels]": (
         '{"spec_version": 1, "matches": [{"paths": '
         '[[["node", null, ["Person", "Admin"]]]]}], '
-        '"projections": [["field", "p", "name", null]]}',
+        '"projections": [["expr", ["lit", 1], "one"]]}',
         "cypher",
         "(:Person:Admin)",
     ),
@@ -566,12 +566,19 @@ RAW_VALUE_POSITIONS: dict[str, tuple[str, str, str]] = {
         "cypher",
         "ORDER BY p.age DESC, p.name ASC",
     ),
-    "pagination[skip,offset,limit]": (
+    "pagination[skip,limit]": (
         '{"spec_version": 1, "matches": [{"paths": [[["node", "p", ["Person"]]]]}], '
         '"projections": [["field", "p", "name", null]], '
-        '"skip": 0, "offset": 0, "limit": 50}',
+        '"skip": 0, "limit": 50}',
         "cypher",
         "SKIP 0 LIMIT 50",
+    ),
+    "pagination[offset,limit]": (
+        '{"spec_version": 1, "matches": [{"paths": [[["node", "p", ["Person"]]]]}], '
+        '"projections": [["field", "p", "name", null]], '
+        '"offset": 2, "limit": 50}',
+        "cypher",
+        "SKIP 2 LIMIT 50",
     ),
     "execution_mode": (
         '{"spec_version": 1, "matches": [{"paths": [[["node", "p", ["Person"]]]]}], '

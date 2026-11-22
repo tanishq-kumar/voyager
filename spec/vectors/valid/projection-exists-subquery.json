@@ -1,0 +1,67 @@
+{
+  "description": "exists payload is a nested spec without its own spec_version.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "exists",
+          {
+            "matches": [
+              {
+                "paths": [
+                  [
+                    [
+                      "node",
+                      "f",
+                      [
+                        "Person"
+                      ]
+                    ]
+                  ]
+                ]
+              }
+            ]
+          }
+        ],
+        "has_friend"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN EXISTS { MATCH (f:Person) } AS has_friend",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN EXISTS { MATCH (f:Person) } AS has_friend $$) AS (has_friend agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN EXISTS { MATCH (f:Person) } AS has_friend",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "description": "UNWIND parameter clause.",
+  "spec": {
+    "spec_version": 1,
+    "unwinds": [
+      [
+        "$batch",
+        "row"
+      ]
+    ],
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "UNWIND $batch AS row MATCH (p:Person) RETURN p.name",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ UNWIND $batch AS row MATCH (p:Person) RETURN p.name $$, %s) AS (name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "UNWIND $batch AS row MATCH (p:Person) RETURN p.name",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

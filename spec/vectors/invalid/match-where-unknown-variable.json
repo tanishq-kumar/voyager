@@ -1,0 +1,47 @@
+{
+  "description": "A match where cannot read a variable that no preceding clause binds.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "gt",
+          [
+            "prop",
+            "unknown",
+            "age"
+          ],
+          [
+            "lit",
+            0
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/where/2/1"
+  }
+}

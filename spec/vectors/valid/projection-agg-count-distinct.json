@@ -1,0 +1,52 @@
+{
+  "description": "count_distinct is the exact spelling, not countDistinct.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "agg",
+        "p",
+        "id",
+        "count_distinct",
+        "n"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN COUNT(DISTINCT p.id) AS n",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN COUNT(DISTINCT p.id) AS n $$) AS (n agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN COUNT(DISTINCT p.id) AS n",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT COUNT(DISTINCT id) AS n FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.id AS id))",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT COUNT(DISTINCT id) AS n FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.id AS id))",
+      "parameters": {}
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "description": "Unary NOT and unary minus, including ['unary', '-', operand].",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "unary",
+          "not",
+          [
+            "prop",
+            "p",
+            "active"
+          ]
+        ],
+        "inactive"
+      ],
+      [
+        "expr",
+        [
+          "unary",
+          "-",
+          [
+            "prop",
+            "p",
+            "age"
+          ]
+        ],
+        "negative_age"
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN NOT (p.active) AS inactive, -p.age AS negative_age",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN NOT (p.active) AS inactive, -p.age AS negative_age $$) AS (inactive agtype, negative_age agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN NOT (p.active) AS inactive, -p.age AS negative_age",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (NOT (p.active) AS inactive, -p.age AS negative_age))",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (NOT (p.active) AS inactive, -p.age AS negative_age))",
+      "parameters": {}
+    }
+  }
+}
