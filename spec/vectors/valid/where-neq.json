@@ -1,0 +1,74 @@
+{
+  "description": "Inequality compiles to the angle-bracket spelling on every dialect.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "neq",
+          [
+            "prop",
+            "p",
+            "age"
+          ],
+          [
+            "lit",
+            30
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) WHERE p.age <> $p0 RETURN p.name",
+      "parameters": {
+        "p0": 30
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE p.age <> $p0 RETURN p.name $$, %s) AS (name agtype)",
+      "parameters": {
+        "p0": 30
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) WHERE p.age <> $p0 RETURN p.name",
+      "parameters": {
+        "p0": 30
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.age <> $p0 COLUMNS (p.name))",
+      "parameters": {
+        "p0": 30
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.age <> $p0 COLUMNS (p.name))",
+      "parameters": {
+        "p0": 30
+      }
+    }
+  }
+}
