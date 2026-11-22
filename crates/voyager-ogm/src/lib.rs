@@ -29,6 +29,7 @@ pub mod emitters;
 pub mod error;
 pub mod optimizer;
 pub mod schema;
+mod scope;
 #[cfg(feature = "serde")]
 pub mod spec;
 #[cfg(feature = "serde")]

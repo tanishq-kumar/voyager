@@ -2059,7 +2059,23 @@ impl QueryBuilder {
 
     /// Finalizes the AST and returns the completed arena alongside the root statement handle,
     /// or returns an Error if AST validation or clause rules were violated.
-    pub fn try_build(mut self) -> Result<(QueryAstArena, NodeHandle)> {
+    ///
+    /// Both the fluent API and the Query Spec consumer finish through this
+    /// method, so variable scope is checked here for every query. A subquery
+    /// used as an expression is built with [`Self::build`] first (it cannot see
+    /// its enclosing scope yet) and is then checked as part of the enclosing
+    /// statement.
+    pub fn try_build(self) -> Result<(QueryAstArena, NodeHandle)> {
+        self.finish(true)
+    }
+
+    /// Finalizes a query fragment that will be embedded in a larger statement.
+    ///
+    /// Unlike [`Self::try_build`], this skips the variable-scope check: a
+    /// fragment such as a correlated subquery or pattern comprehension may read
+    /// names that only the enclosing query binds. Structural and alias
+    /// validation still run. Prefer [`Self::try_build`] for a complete query.
+    fn finish(mut self, check_scope: bool) -> Result<(QueryAstArena, NodeHandle)> {
         if let Some(err_msg) = self.build_error.take() {
             return Err(Error::InvalidClause(err_msg));
         }
@@ -2104,13 +2120,20 @@ impl QueryBuilder {
             return_clause,
         });
 
+        if check_scope {
+            crate::scope::validate_query_scope(&self.arena, root_handle)?;
+        }
+
         Ok((self.arena, root_handle))
     }
 
     /// Finalizes the AST and returns the completed arena alongside the root statement handle.
     /// Panics if AST construction rules were violated. Prefer [`Self::try_build`] for fallible queries.
+    ///
+    /// This is the unchecked-scope entry point used for embedded fragments; call
+    /// [`Self::try_build`] on the complete query to validate variable scope.
     pub fn build(self) -> (QueryAstArena, NodeHandle) {
-        self.try_build().expect("QueryBuilder::build failed")
+        self.finish(false).expect("QueryBuilder::build failed")
     }
 
     /// Returns an immutable reference to the internal arena.
