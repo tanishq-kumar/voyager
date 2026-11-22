@@ -896,6 +896,9 @@ class _SessionBase:
             The registered instance, an existing tracked instance with the same
             identity, or the node unchanged when tracking is disabled.
         """
+        if hasattr(node, "_validate_for_save"):
+            node._validate_for_save()
+
         if not self._enable_identity_map:
             return node
 
@@ -992,6 +995,9 @@ class _SessionBase:
 
         plans: list[tuple[type[Any], list[Any], BulkIngestionPlan]] = []
         for model_cls, nodes in dirty_by_model.items():
+            for n in nodes:
+                if hasattr(n, "_validate_for_save"):
+                    n._validate_for_save()
             resolved_key_field = self._resolve_key_field(model_cls, key_field)
             batch_data: list[dict[str, Any]] = []
             defaulted_records: list[set[str]] = []

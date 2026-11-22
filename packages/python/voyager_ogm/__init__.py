@@ -85,6 +85,7 @@ from voyager_ogm.ingestion import (
 from voyager_ogm.models import (
     BoundField,
     Field,
+    FieldConstraintError,
     Node,
     PredicateExpr,
     Relationship,
@@ -236,6 +237,7 @@ __all__ = [
     "Expression",
     "FalkorDBBridge",
     "Field",
+    "FieldConstraintError",
     "FullTextIndex",
     "FunctionExpr",
     "GraphQuery",

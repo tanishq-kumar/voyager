@@ -10,9 +10,13 @@ import datetime
 import difflib
 import inspect
 import logging
+import re
 import threading
+import types
+import typing
 import weakref
 from collections import defaultdict
+from collections.abc import Sequence
 from typing import Any, ClassVar, Generic, TypeVar, cast, dataclass_transform
 
 from voyager_ogm.expressions import (
@@ -138,20 +142,244 @@ def reset_alias_counters() -> None:
     _alias_state.counters = defaultdict(int)
 
 
+class SchemaValidationError(Exception):
+    """Raised when a graph entity or query topology fails schema validation."""
+
+
+class FieldConstraintError(SchemaValidationError, ValueError):
+    """Raised when a field value violates declared field constraints.
+
+    Attributes:
+        model: Model class or model name.
+        model_name: String name of the model.
+        field: Property name.
+        constraint: Name of the constraint violated ('pattern', 'ge', 'gt', 'le', 'lt', 'min_length', 'max_length', 'choices').
+        value: The offending value.
+    """
+
+    def __init__(
+        self,
+        model: type | str | None,
+        field: str,
+        constraint: str,
+        value: Any,
+        message: str | None = None,
+    ) -> None:
+        self.model = model
+        self.model_name = getattr(model, "__name__", str(model)) if model is not None else ""
+        self.field = field
+        self.constraint = constraint
+        self.value = value
+        if message is None:
+            prefix = f"{self.model_name}.{field}" if self.model_name else field
+            message = f"{prefix}: value {value!r} violates {constraint} constraint"
+        super().__init__(message)
+
+
+def _format_model_prop(model: Any, prop: str) -> str:
+    name = getattr(model, "__name__", str(model)) if model is not None else ""
+    return f"{name}.{prop}" if name else prop
+
+
+def _extract_base_types(type_hint: Any) -> set[type]:
+    """Extracts non-None concrete base types from a type hint."""
+    if type_hint is None or type_hint is typing.Any:
+        return set()
+
+    if isinstance(type_hint, str):
+        if type_hint in _BUILTIN_TYPES:
+            return {_BUILTIN_TYPES[type_hint]}
+        return set()
+
+    origin = typing.get_origin(type_hint)
+    if origin is not None:
+        if origin is typing.Union or (hasattr(types, "UnionType") and origin is types.UnionType):
+            args = typing.get_args(type_hint)
+            res: set[type] = set()
+            for arg in args:
+                if arg is not type(None):
+                    res.update(_extract_base_types(arg))
+            return res
+        if isinstance(origin, type):
+            return {origin}
+
+    if isinstance(type_hint, type):
+        return {type_hint}
+
+    return set()
+
+
+def _validate_field_declaration(cls: type, attr_name: str, field: Field[Any]) -> None:
+    """Validates Field constraint declarations against the class annotation at definition time."""
+    field._owner = cls
+    if field.name is None:
+        field.name = attr_name
+
+    # Check for empty ranges, negative lengths, invalid pattern if not already caught
+    if field.min_length is not None and field.min_length < 0:
+        raise FieldConstraintError(
+            cls,
+            attr_name,
+            "min_length",
+            field.min_length,
+            f"{cls.__name__}.{attr_name}: min_length cannot be negative ({field.min_length})",
+        )
+    if field.max_length is not None and field.max_length < 0:
+        raise FieldConstraintError(
+            cls,
+            attr_name,
+            "max_length",
+            field.max_length,
+            f"{cls.__name__}.{attr_name}: max_length cannot be negative ({field.max_length})",
+        )
+    if (
+        field.min_length is not None
+        and field.max_length is not None
+        and field.min_length > field.max_length
+    ):
+        raise FieldConstraintError(
+            cls,
+            attr_name,
+            "min_length",
+            field.min_length,
+            f"{cls.__name__}.{attr_name}: min_length ({field.min_length}) cannot be greater than max_length ({field.max_length})",
+        )
+    if field.choices is not None and len(field.choices) == 0:
+        raise FieldConstraintError(
+            cls,
+            attr_name,
+            "choices",
+            field.choices,
+            f"{cls.__name__}.{attr_name}: choices cannot be empty",
+        )
+    if field.ge is not None and field.le is not None and field.ge > field.le:
+        raise FieldConstraintError(
+            cls,
+            attr_name,
+            "ge",
+            field.ge,
+            f"{cls.__name__}.{attr_name}: ge ({field.ge}) cannot be greater than le ({field.le})",
+        )
+    if field.ge is not None and field.lt is not None and field.ge >= field.lt:
+        raise FieldConstraintError(
+            cls,
+            attr_name,
+            "ge",
+            field.ge,
+            f"{cls.__name__}.{attr_name}: ge ({field.ge}) cannot be greater than or equal to lt ({field.lt})",
+        )
+    if field.gt is not None and field.le is not None and field.gt >= field.le:
+        raise FieldConstraintError(
+            cls,
+            attr_name,
+            "gt",
+            field.gt,
+            f"{cls.__name__}.{attr_name}: gt ({field.gt}) cannot be greater than or equal to le ({field.le})",
+        )
+    if field.gt is not None and field.lt is not None and field.gt >= field.lt:
+        raise FieldConstraintError(
+            cls,
+            attr_name,
+            "gt",
+            field.gt,
+            f"{cls.__name__}.{attr_name}: gt ({field.gt}) cannot be greater than or equal to lt ({field.lt})",
+        )
+
+    # Check constraint compatibility with annotated type
+    type_hint = field.type_annotation
+    base_types = _extract_base_types(type_hint)
+    if not base_types:
+        return
+
+    type_name = getattr(type_hint, "__name__", str(type_hint))
+
+    # pattern: only str
+    if field.pattern is not None:
+        if not any(issubclass(t, str) for t in base_types if isinstance(t, type)):
+            raise FieldConstraintError(
+                cls,
+                attr_name,
+                "pattern",
+                field.pattern,
+                f"{cls.__name__}.{attr_name}: constraint 'pattern' is not supported for type '{type_name}'",
+            )
+
+    # ge, gt, le, lt: numeric (int, float), NOT bool
+    has_numeric = (
+        field.ge is not None or field.gt is not None or field.le is not None or field.lt is not None
+    )
+    if has_numeric:
+        c_name = (
+            "ge"
+            if field.ge is not None
+            else ("gt" if field.gt is not None else ("le" if field.le is not None else "lt"))
+        )
+        val = getattr(field, c_name)
+        if any(issubclass(t, bool) for t in base_types if isinstance(t, type)):
+            raise FieldConstraintError(
+                cls,
+                attr_name,
+                c_name,
+                val,
+                f"{cls.__name__}.{attr_name}: bool fields do not support numeric bounds",
+            )
+        if not any(issubclass(t, (int, float)) for t in base_types if isinstance(t, type)):
+            raise FieldConstraintError(
+                cls,
+                attr_name,
+                c_name,
+                val,
+                f"{cls.__name__}.{attr_name}: constraint '{c_name}' is not supported for type '{type_name}'",
+            )
+
+    # min_length, max_length: str and list
+    if field.min_length is not None or field.max_length is not None:
+        c_name = "min_length" if field.min_length is not None else "max_length"
+        val = getattr(field, c_name)
+        if not any(issubclass(t, (str, list)) for t in base_types if isinstance(t, type)):
+            raise FieldConstraintError(
+                cls,
+                attr_name,
+                c_name,
+                val,
+                f"{cls.__name__}.{attr_name}: constraint '{c_name}' is not supported for type '{type_name}'",
+            )
+
+
 class Field(Generic[_T]):
-    """Property descriptor supporting type-safe predicate expressions and schema reflection.
+    r"""Property descriptor supporting type-safe predicate expressions, value constraints, and schema reflection.
 
     Attributes:
         default: Default value if not assigned during model instantiation.
         name: Property key name in the underlying graph database.
         unique: Flag indicating a UNIQUE property database constraint.
         index: Flag indicating a database index should be created on this property.
+        primary_key: Convenience flag setting both unique=True and index=True (and nullable=False).
+        nullable: Whether the field can store null values. Defaults to True (False for primary_key).
         type_annotation: The resolved Python type class (e.g. `str`, `int`).
+        pattern: Regex pattern string or compiled Pattern for string validation.
+            Maps to JSON Schema keyword `pattern`.
+        ge: Numeric lower bound (greater than or equal).
+            Maps to JSON Schema keyword `minimum`.
+        gt: Numeric exclusive lower bound (strictly greater than).
+            Maps to JSON Schema keyword `exclusiveMinimum`.
+        le: Numeric upper bound (less than or equal).
+            Maps to JSON Schema keyword `maximum`.
+        lt: Numeric exclusive upper bound (strictly less than).
+            Maps to JSON Schema keyword `exclusiveMaximum`.
+        min_length: Minimum length for strings and lists.
+            Maps to JSON Schema keyword `minLength`.
+        max_length: Maximum length for strings and lists.
+            Maps to JSON Schema keyword `maxLength`.
+        choices: Allowed enumeration values compared by equality.
+            Maps to JSON Schema keyword `enum`.
 
     Example:
         >>> class Person(Node):
-        ...     name: str = Field(index=True)
-        ...     email: str = Field(unique=True)
+        ...     name: str = Field(min_length=1, max_length=200)
+        ...     email: str = Field(unique=True, pattern=r"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$")
+        ...     age: int = Field(ge=0, le=150)
+        ...     status: str = Field(choices=["active", "inactive"])
     """
 
     def __init__(
@@ -167,6 +395,14 @@ class Field(Generic[_T]):
         type_annotation: Any = None,
         index_type: str | None = None,
         description: str | None = None,
+        pattern: str | re.Pattern[str] | None = None,
+        ge: int | float | None = None,
+        gt: int | float | None = None,
+        le: int | float | None = None,
+        lt: int | float | None = None,
+        min_length: int | None = None,
+        max_length: int | None = None,
+        choices: Sequence[Any] | None = None,
     ) -> None:
         """Initializes a graph property Field descriptor.
 
@@ -181,6 +417,14 @@ class Field(Generic[_T]):
             type_annotation: Python type annotation class.
             index_type: Optional index type string ('BTREE', 'TEXT', 'POINT', 'VECTOR').
             description: Optional human-readable description of this property.
+            pattern: Regular expression pattern string or compiled Pattern (JSON Schema: pattern).
+            ge: Lower bound: greater than or equal (JSON Schema: minimum).
+            gt: Exclusive lower bound: strictly greater than (JSON Schema: exclusiveMinimum).
+            le: Upper bound: less than or equal (JSON Schema: maximum).
+            lt: Exclusive upper bound: strictly less than (JSON Schema: exclusiveMaximum).
+            min_length: Minimum length for string or list (JSON Schema: minLength).
+            max_length: Maximum length for string or list (JSON Schema: maxLength).
+            choices: Allowed values sequence compared by equality (JSON Schema: enum).
         """
         if default is not ... and default_factory is not None:
             raise TypeError("Field cannot specify both 'default' and 'default_factory'.")
@@ -198,6 +442,309 @@ class Field(Generic[_T]):
         else:
             self.type_annotation = type_annotation
         self._owner: type | None = None
+
+        # Value constraints (#282)
+        # 1. pattern check
+        self.pattern = pattern
+        self._compiled_pattern: re.Pattern[str] | None = None
+        if pattern is not None:
+            if isinstance(pattern, re.Pattern):
+                self._compiled_pattern = pattern
+            elif isinstance(pattern, str):
+                try:
+                    self._compiled_pattern = re.compile(pattern)
+                except re.error as exc:
+                    raise FieldConstraintError(
+                        None,
+                        name or "",
+                        "pattern",
+                        pattern,
+                        f"Invalid regex pattern {pattern!r}: {exc}",
+                    ) from exc
+            else:
+                raise FieldConstraintError(
+                    None,
+                    name or "",
+                    "pattern",
+                    pattern,
+                    f"pattern must be a str or compiled re.Pattern, got {type(pattern).__name__}",
+                )
+
+        # 2. bool is not allowed for numeric bounds (Requirement 2 & 4)
+        for bound_name, bound_val in (("ge", ge), ("gt", gt), ("le", le), ("lt", lt)):
+            if bound_val is not None:
+                if isinstance(bound_val, bool) or not isinstance(bound_val, (int, float)):
+                    raise FieldConstraintError(
+                        None,
+                        name or "",
+                        bound_name,
+                        bound_val,
+                        f"bool is not allowed for numeric {bound_name} constraint",
+                    )
+
+        # Range checks: ge/gt greater than le/lt (or empty range)
+        if ge is not None and le is not None and ge > le:
+            raise FieldConstraintError(
+                None,
+                name or "",
+                "ge",
+                ge,
+                f"ge ({ge}) cannot be greater than le ({le})",
+            )
+        if ge is not None and lt is not None and ge >= lt:
+            raise FieldConstraintError(
+                None,
+                name or "",
+                "ge",
+                ge,
+                f"ge ({ge}) cannot be greater than or equal to lt ({lt})",
+            )
+        if gt is not None and le is not None and gt >= le:
+            raise FieldConstraintError(
+                None,
+                name or "",
+                "gt",
+                gt,
+                f"gt ({gt}) cannot be greater than or equal to le ({le})",
+            )
+        if gt is not None and lt is not None and gt >= lt:
+            raise FieldConstraintError(
+                None,
+                name or "",
+                "gt",
+                gt,
+                f"gt ({gt}) cannot be greater than or equal to lt ({lt})",
+            )
+
+        self.ge = ge
+        self.gt = gt
+        self.le = le
+        self.lt = lt
+
+        # 3. min_length / max_length
+        if min_length is not None and min_length < 0:
+            raise FieldConstraintError(
+                None,
+                name or "",
+                "min_length",
+                min_length,
+                f"min_length cannot be negative ({min_length})",
+            )
+        if max_length is not None and max_length < 0:
+            raise FieldConstraintError(
+                None,
+                name or "",
+                "max_length",
+                max_length,
+                f"max_length cannot be negative ({max_length})",
+            )
+        if min_length is not None and max_length is not None and min_length > max_length:
+            raise FieldConstraintError(
+                None,
+                name or "",
+                "min_length",
+                min_length,
+                f"min_length ({min_length}) cannot be greater than max_length ({max_length})",
+            )
+
+        self.min_length = min_length
+        self.max_length = max_length
+
+        # 4. choices
+        if choices is not None:
+            if len(choices) == 0:
+                raise FieldConstraintError(
+                    None,
+                    name or "",
+                    "choices",
+                    choices,
+                    "choices cannot be empty",
+                )
+            self.choices: Sequence[Any] | None = list(choices)
+        else:
+            self.choices = None
+
+    def to_json_schema_constraints(self) -> dict[str, Any]:
+        """Returns declared value constraints mapped to JSON Schema keywords (#125).
+
+        Keyword mapping:
+            - pattern -> pattern
+            - ge -> minimum
+            - gt -> exclusiveMinimum
+            - le -> maximum
+            - lt -> exclusiveMaximum
+            - min_length -> minLength
+            - max_length -> maxLength
+            - choices -> enum
+
+        Returns:
+            Dictionary of JSON Schema keyword constraints.
+        """
+        mapping: dict[str, Any] = {}
+        if self.pattern is not None:
+            mapping["pattern"] = (
+                self.pattern if isinstance(self.pattern, str) else self.pattern.pattern
+            )
+        if self.ge is not None:
+            mapping["minimum"] = self.ge
+        if self.gt is not None:
+            mapping["exclusiveMinimum"] = self.gt
+        if self.le is not None:
+            mapping["maximum"] = self.le
+        if self.lt is not None:
+            mapping["exclusiveMaximum"] = self.lt
+        if self.min_length is not None:
+            mapping["minLength"] = self.min_length
+        if self.max_length is not None:
+            mapping["maxLength"] = self.max_length
+        if self.choices is not None:
+            mapping["enum"] = list(self.choices)
+        return mapping
+
+    def validate_value(self, value: Any, model: type | str | None = None) -> None:
+        """Validates a property value against this field's declared value constraints.
+
+        Args:
+            value: Property value to validate.
+            model: Optional owning model class or model name for error reporting.
+
+        Raises:
+            FieldConstraintError: If the value violates any declared constraint.
+        """
+        owner = model if model is not None else self._owner
+        prop_name = self.name or ""
+
+        # None handling: None skips all value constraint checks, regardless of nullable.
+        if value is None:
+            return
+
+        # pattern
+        if self._compiled_pattern is not None:
+            if not isinstance(value, str):
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "pattern",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: pattern constraint requires str, got {type(value).__name__}",
+                )
+            if not self._compiled_pattern.fullmatch(value):
+                pat_str = (
+                    self.pattern.pattern
+                    if isinstance(self.pattern, re.Pattern)
+                    else str(self.pattern)
+                )
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "pattern",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: value {value!r} does not match pattern {pat_str!r}",
+                )
+
+        # ge, gt, le, lt (bool must NOT pass as int)
+        has_numeric = (
+            self.ge is not None or self.gt is not None or self.le is not None or self.lt is not None
+        )
+        if has_numeric:
+            if isinstance(value, bool):
+                c_name = (
+                    "ge"
+                    if self.ge is not None
+                    else ("gt" if self.gt is not None else ("le" if self.le is not None else "lt"))
+                )
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    c_name,
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: bool value {value!r} is not allowed for numeric {c_name} constraint",
+                )
+            if not isinstance(value, (int, float)):
+                c_name = (
+                    "ge"
+                    if self.ge is not None
+                    else ("gt" if self.gt is not None else ("le" if self.le is not None else "lt"))
+                )
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    c_name,
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: value {value!r} is not numeric",
+                )
+            if self.ge is not None and value < self.ge:
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "ge",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: value {value!r} violates ge >= {self.ge}",
+                )
+            if self.gt is not None and value <= self.gt:
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "gt",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: value {value!r} violates gt > {self.gt}",
+                )
+            if self.le is not None and value > self.le:
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "le",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: value {value!r} violates le <= {self.le}",
+                )
+            if self.lt is not None and value >= self.lt:
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "lt",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: value {value!r} violates lt < {self.lt}",
+                )
+
+        # min_length, max_length
+        if self.min_length is not None or self.max_length is not None:
+            if not isinstance(value, (str, list)):
+                c_name = "min_length" if self.min_length is not None else "max_length"
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    c_name,
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: length constraints apply to str and list, got {type(value).__name__}",
+                )
+            length = len(value)
+            if self.min_length is not None and length < self.min_length:
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "min_length",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: length {length} is less than min_length {self.min_length}",
+                )
+            if self.max_length is not None and length > self.max_length:
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "max_length",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: length {length} is greater than max_length {self.max_length}",
+                )
+
+        # choices (compares by equality)
+        if self.choices is not None:
+            if not any(value == choice for choice in self.choices):
+                raise FieldConstraintError(
+                    owner,
+                    prop_name,
+                    "choices",
+                    value,
+                    f"{_format_model_prop(owner, prop_name)}: value {value!r} is not in choices {list(self.choices)!r}",
+                )
 
     @property
     def has_default(self) -> bool:
@@ -909,6 +1456,9 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
     for f in fields_map.values():
         f._owner = cls
 
+    for attr_name, field_desc in fields_map.items():
+        _validate_field_declaration(cls, attr_name, field_desc)
+
     cls._schema_fields = fields_map
     return fields_map
 
@@ -1211,6 +1761,10 @@ class Node:
         for k, v in values.items():
             hydrated_values[k] = _hydrate_field_value(schema.get(k), v)
         self._defaulted_fields = _apply_field_defaults(hydrated_values, schema)
+        for k, v in hydrated_values.items():
+            field_desc = schema.get(k)
+            if field_desc is not None:
+                field_desc.validate_value(v, self.__class__)
         self._values: dict[str, Any] = hydrated_values
         self._dirty_fields: dict[str, Any] = dict(hydrated_values)
         if session is not None and getattr(session, "identity_map_enabled", False):
@@ -1219,6 +1773,14 @@ class Node:
     def _attach_session(self, session: Any) -> None:
         """[Experimental] Attaches a session via weak reference for Active Record `.save()` ergonomics."""
         self._session_ref = weakref.ref(session)
+
+    def _validate_for_save(self) -> None:
+        """Validates all schema fields on this node before saving or flushing."""
+        schema = getattr(self, "_schema_fields", {})
+        for name, field_desc in schema.items():
+            if name in self._values:
+                val = self._values[name]
+                field_desc.validate_value(val, self.__class__)
 
     def save(self, session: Any = None, key_field: str | None = None) -> Any:
         """[Experimental] Persists dirty property changes to the database using Active Record ergonomics.
@@ -1241,6 +1803,7 @@ class Node:
         Raises:
             RuntimeError: If no session is passed and no session was previously attached.
         """
+        self._validate_for_save()
         active_session = session
         if active_session is None and self._session_ref is not None:
             active_session = self._session_ref()
@@ -1298,6 +1861,7 @@ class Node:
         Raises:
             RuntimeError: If no session is passed and no session was previously attached.
         """
+        self._validate_for_save()
         active_session = session
         if active_session is None and self._session_ref is not None:
             active_session = self._session_ref()
@@ -1368,7 +1932,9 @@ class Node:
             if not hasattr(self, "_defaulted_fields"):
                 self._defaulted_fields = set()
             if hasattr(self, "_schema_fields") and name in self._schema_fields:
-                value = _hydrate_field_value(self._schema_fields[name], value)
+                field_desc = self._schema_fields[name]
+                value = _hydrate_field_value(field_desc, value)
+                field_desc.validate_value(value, self.__class__)
             self._values[name] = value
             self._dirty_fields[name] = value
             self._defaulted_fields.discard(name)
@@ -1595,9 +2161,21 @@ class Relationship:
         for k, v in values.items():
             hydrated_values[k] = _hydrate_field_value(schema.get(k), v)
         self._defaulted_fields = _apply_field_defaults(hydrated_values, schema)
+        for k, v in hydrated_values.items():
+            field_desc = schema.get(k)
+            if field_desc is not None:
+                field_desc.validate_value(v, self.__class__)
         self._values = hydrated_values
         if auto_alias:
             _auto_aliased_relationships.add(self)
+
+    def _validate_for_save(self) -> None:
+        """Validates all schema fields on this relationship before saving or flushing."""
+        schema = getattr(self, "_schema_fields", {})
+        for name, field_desc in schema.items():
+            if name in self._values:
+                val = self._values[name]
+                field_desc.validate_value(val, self.__class__)
 
     @property
     def alias(self) -> str:
@@ -1629,7 +2207,9 @@ class Relationship:
             if not hasattr(self, "_defaulted_fields"):
                 self._defaulted_fields = set()
             if hasattr(self, "_schema_fields") and name in self._schema_fields:
-                value = _hydrate_field_value(self._schema_fields[name], value)
+                field_desc = self._schema_fields[name]
+                value = _hydrate_field_value(field_desc, value)
+                field_desc.validate_value(value, self.__class__)
             self._values[name] = value
             self._defaulted_fields.discard(name)
 

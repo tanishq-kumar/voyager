@@ -29,9 +29,11 @@ from voyager_ogm.models import (
     AggregationExpr,
     BoundField,
     Field,
+    FieldConstraintError,
     Node,
     PredicateExpr,
     Relationship,
+    SchemaValidationError,
     _get_next_alias,
     _native_merge_key_fields,
 )
@@ -91,10 +93,6 @@ class CompiledQuery:
     parameters: dict[str, Any]
     execution_mode: str = "normal"
     columns: list[ColumnMeta] = dc_field(default_factory=list)
-
-
-class SchemaValidationError(Exception):
-    """Raised when a graph query topology fails schema conformance validation."""
 
 
 @dataclass(frozen=True)
@@ -2189,6 +2187,7 @@ __all__ = [
     "CompiledQuery",
     "ConformanceDiagnostic",
     "ConformanceReport",
+    "FieldConstraintError",
     "Path",
     "Query",
     "SPEC_VERSION",
