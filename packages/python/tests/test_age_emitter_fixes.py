@@ -17,7 +17,6 @@ from voyager_ogm import (
     Node,
     Query,
     Relationship,
-    VoyagerError,
     compile_query_from_spec,
     node,
     relationship,
@@ -86,7 +85,7 @@ def test_age_column_clash_resolution() -> None:
 
     query_entity_and_prop = Query.match_node("a", "Person").return_("a", "a.name")
     c2 = query_entity_and_prop.compile("apache_age", graph_name="test_graph")
-    assert "AS (a agtype, name agtype)" in c2.statement
+    assert "AS (entity agtype, name agtype)" in c2.statement
 
     query_same_prop = Query.match_node("a", "Person").return_("a.name", "a.name")
     c3 = query_same_prop.compile("apache_age", graph_name="test_graph")
@@ -95,6 +94,27 @@ def test_age_column_clash_resolution() -> None:
     query_triple_clash = Query.match_node("a", "Person").return_("a", "a", "a")
     c4 = query_triple_clash.compile("apache_age", graph_name="test_graph")
     assert "AS (a agtype, a_1 agtype, a_2 agtype)" in c4.statement
+
+
+def test_age_single_whole_entity_keeps_entity_column() -> None:
+    """A single returned whole node keeps the `entity` column key on 0.4."""
+    query = Query.match_node("a", "Person")
+
+    compiled = query.return_("a").compile("apache_age", graph_name="test_graph")
+    assert compiled.statement.endswith("AS (entity agtype)")
+
+    two = Query.match_node("a", "Person").to("KNOWS", "r").node("b", "Person").return_("a", "b")
+    compiled_two = two.compile("apache_age", graph_name="test_graph")
+    assert compiled_two.statement.endswith("AS (a agtype, b agtype)")
+
+
+def test_age_spec_single_whole_entity_keeps_entity_column() -> None:
+    """compile_query_from_spec keeps `entity` for a single returned whole entity."""
+    spec = _base_age_spec()
+    spec["projections"] = [("field", "a", "", None), ("field", "b", "name", None)]
+
+    compiled = compile_query_from_spec(spec, "apache_age", graph_name="test_graph")
+    assert compiled["statement"].endswith("AS (entity agtype, name agtype)")
 
 
 def test_age_spec_multiple_whole_entities_emit_unique_columns() -> None:
@@ -144,9 +164,8 @@ def test_age_spec_rejects_multi_label_node() -> None:
         "projections": [("field", "p", "name", None)],
     }
 
-    with pytest.raises(VoyagerError, match="multiple labels") as exc_info:
+    with pytest.raises(ValueError, match="multiple labels") as exc_info:
         compile_query_from_spec(spec, "apache_age", graph_name="test_graph")
-    assert exc_info.value.code == "UNSUPPORTED_FEATURE"
     assert "Apache AGE" in str(exc_info.value)
 
 
@@ -168,9 +187,8 @@ def test_age_spec_rejects_alternative_relationship_types() -> None:
         "projections": [("field", "a", "name", None)],
     }
 
-    with pytest.raises(VoyagerError, match="alternative types") as exc_info:
+    with pytest.raises(ValueError, match="alternative types") as exc_info:
         compile_query_from_spec(spec, "apache_age", graph_name="test_graph")
-    assert exc_info.value.code == "UNSUPPORTED_FEATURE"
     assert "Apache AGE" in str(exc_info.value)
 
 

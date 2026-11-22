@@ -58,7 +58,7 @@ def _where_spec(operator: object) -> dict[str, object]:
         "matches": [
             {
                 "paths": [[["node", "p", ["Person"]]]],
-                "where": ["bin", operator, ["prop", "p", "age"], ["lit", 30]],
+                "where": [["bin", operator, ["prop", "p", "age"], ["lit", 30]]],
             }
         ],
         "projections": [["field", "p", "name", None]],
@@ -80,10 +80,12 @@ def _not_in_spec(operator: str) -> dict[str, object]:
             {
                 "paths": [[["node", "p", ["Person"]]]],
                 "where": [
-                    "bin",
-                    operator,
-                    ["prop", "p", "name"],
-                    ["lit", ["Mallory", "Eve"]],
+                    [
+                        "bin",
+                        operator,
+                        ["prop", "p", "name"],
+                        ["lit", ["Mallory", "Eve"]],
+                    ]
                 ],
             }
         ],

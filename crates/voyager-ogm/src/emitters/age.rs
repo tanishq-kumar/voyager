@@ -407,6 +407,12 @@ fn resolve_age_column_base_name(arena: &QueryAstArena, handle: NodeHandle) -> Re
     }
 }
 
+fn is_age_whole_entity(arena: &QueryAstArena, handle: NodeHandle) -> Result<bool> {
+    Ok(
+        matches!(arena.get(handle)?, AstNode::PropertyAccess { property, .. } if property.is_empty()),
+    )
+}
+
 impl AstVisitor for AgeEmitter {
     fn visit_query(&mut self, arena: &QueryAstArena, root: NodeHandle) -> Result<CompiledQuery> {
         if !is_valid_age_graph_name(&self.graph_name) {
@@ -433,10 +439,21 @@ impl AstVisitor for AgeEmitter {
             execution_mode = *mode;
             let ret_node = arena.get(*ret_handle)?;
             if let AstNode::ReturnClause { projections, .. } = ret_node {
+                // A single returned whole node or relationship keeps the
+                // `entity` column key used by earlier 0.4 releases; several get
+                // their variable names so the column list stays unique.
+                let mut whole_entities = 0usize;
+                for proj in projections {
+                    if proj.alias.is_none() && is_age_whole_entity(arena, proj.expression)? {
+                        whole_entities += 1;
+                    }
+                }
                 let mut used_names = std::collections::HashSet::new();
                 for proj in projections {
                     let base_name = if let Some(alias) = &proj.alias {
                         alias.clone()
+                    } else if whole_entities == 1 && is_age_whole_entity(arena, proj.expression)? {
+                        "entity".to_string()
                     } else {
                         resolve_age_column_base_name(arena, proj.expression)?
                     };

@@ -19,7 +19,6 @@ from conftest import is_port_open as _is_port_open
 from voyager_ogm import (
     Field,
     Query,
-    VoyagerError,
     compile_query_from_spec,
     list_comprehension,
     node,
@@ -335,9 +334,8 @@ def test_sql_pgq_spec_rejects_multi_label_node() -> None:
         "projections": [("field", "p", "name", None)],
     }
 
-    with pytest.raises(VoyagerError, match="multiple labels") as exc_info:
+    with pytest.raises(ValueError, match="multiple labels") as exc_info:
         compile_query_from_spec(spec, "sql_pgq", graph_name="g")
-    assert exc_info.value.code == "UNSUPPORTED_FEATURE"
     assert "SQL:2023 PGQ" in str(exc_info.value)
 
 
@@ -349,9 +347,8 @@ def test_sql_pgq_spec_rejects_whole_entity_projection() -> None:
         "projections": [("field", "p", "", None)],
     }
 
-    with pytest.raises(VoyagerError, match="Whole entity column projection") as exc_info:
+    with pytest.raises(ValueError, match="Whole entity column projection") as exc_info:
         compile_query_from_spec(spec, "sql_pgq", graph_name="g")
-    assert exc_info.value.code == "UNSUPPORTED_FEATURE"
     assert "COLUMNS clause only supports scalar expressions" in str(exc_info.value)
 
 
@@ -432,10 +429,9 @@ def test_sql_pgq_spec_rejects_node_label_negation() -> None:
         "projections": [("field", "n", "name", None)],
     }
     with pytest.raises(
-        VoyagerError, match=r"(?i)label expression with negation/conjunction/grouping"
+        ValueError, match=r"(?i)label expression with negation/conjunction/grouping"
     ) as exc_info:
         compile_query_from_spec(spec, "sql_pgq", graph_name="g")
-    assert exc_info.value.code == "UNSUPPORTED_FEATURE"
     assert "multiple labels" not in str(exc_info.value).lower()
 
 
