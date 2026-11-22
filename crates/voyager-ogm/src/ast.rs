@@ -177,7 +177,7 @@ impl fmt::Display for BinaryOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Eq => write!(f, "="),
-            Self::Neq => write!(f, "!="),
+            Self::Neq => write!(f, "<>"),
             Self::Lt => write!(f, "<"),
             Self::Lte => write!(f, "<="),
             Self::Gt => write!(f, ">"),

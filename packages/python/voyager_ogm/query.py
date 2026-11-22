@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any
 
-from voyager_ogm._voyager_rs import NativeQueryBuilder
+from voyager_ogm._voyager_rs import NativeQueryBuilder, VoyagerError
 from voyager_ogm.expressions import (
     AliasedExpr,
     BinaryExpr,
@@ -33,6 +33,14 @@ from voyager_ogm.models import (
     _get_next_alias,
     _native_merge_key_fields,
 )
+
+
+def _supported_set_forms_message(clause: str = "set") -> str:
+    return (
+        f"Supported forms: {clause}(p.city == value), "
+        f"a Node with changed fields, "
+        f'{clause}(**{{"p.city": value}})'
+    )
 
 
 class hybridmethod:  # noqa: N801
@@ -1446,52 +1454,74 @@ class Query:
                 self._native.where_expr(not_expr.to_spec())
         return self
 
-    def on_create_set(self, *assignments: PredicateExpr, **kwargs: Any) -> Query:
+    def _apply_set_items(
+        self,
+        method_name: str,
+        native_call: Any,
+        assignments: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        forms_msg = _supported_set_forms_message(method_name)
+        for raw_assign in assignments:
+            assign = (
+                self._resolve_expr(raw_assign)
+                if isinstance(raw_assign, (PredicateExpr, Expression, Field, BoundField))
+                else raw_assign
+            )
+            if (
+                isinstance(assign, PredicateExpr)
+                and assign.op in ("eq", "==")
+                and bool(getattr(assign, "target", None) and str(assign.target).strip())
+                and bool(getattr(assign, "field", None) and str(assign.field).strip())
+            ):
+                native_call(assign.target, assign.field, assign.value)
+            elif isinstance(assign, Node):
+                # A Node with no changed fields has nothing to write; that is not
+                # a dropped assignment, so it stays a no-op as before.
+                for field_name, val in assign.dirty_fields.items():
+                    native_call(assign.alias, field_name, val)
+            else:
+                raise VoyagerError(
+                    f"Invalid argument {raw_assign!r}. {forms_msg}",
+                    code="INVALID_CLAUSE",
+                )
+
+        for key, val in kwargs.items():
+            parts = key.split(".")
+            if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+                raise VoyagerError(
+                    f"Invalid argument {key}={val!r}. {forms_msg}",
+                    code="INVALID_CLAUSE",
+                )
+            var, prop = parts[0], parts[1]
+            native_call(var, prop, val)
+
+    def on_create_set(self, *assignments: PredicateExpr | Node, **kwargs: Any) -> Query:
         """Adds ON CREATE SET property assignments to the active MERGE block.
 
         Args:
-            *assignments: PredicateExpr assignments (e.g. `p.created_at == 2026`).
-            **kwargs: Property assignments for the active node.
+            *assignments: PredicateExpr assignments (e.g. `p.created_at == 2026`) or
+                Node instances with dirty tracked fields.
+            **kwargs: Property assignments for the active node (e.g. `{"p.created_at": 2026}`).
 
         Returns:
             The Query instance for fluent chaining.
         """
-        for raw_assign in assignments:
-            assign = (
-                self._resolve_expr(raw_assign)
-                if isinstance(raw_assign, (PredicateExpr, Expression, Field, BoundField))
-                else raw_assign
-            )
-            if isinstance(assign, PredicateExpr):
-                self._native.on_create_set(assign.target, assign.field, assign.value)
-        for key, val in kwargs.items():
-            if "." in key:
-                var, prop = key.split(".", 1)
-                self._native.on_create_set(var, prop, val)
+        self._apply_set_items("on_create_set", self._native.on_create_set, assignments, kwargs)
         return self
 
-    def on_match_set(self, *assignments: PredicateExpr, **kwargs: Any) -> Query:
+    def on_match_set(self, *assignments: PredicateExpr | Node, **kwargs: Any) -> Query:
         """Adds ON MATCH SET property assignments to the active MERGE block.
 
         Args:
-            *assignments: PredicateExpr assignments (e.g. `p.updated_at == 2026`).
-            **kwargs: Property assignments for the active node.
+            *assignments: PredicateExpr assignments (e.g. `p.updated_at == 2026`) or
+                Node instances with dirty tracked fields.
+            **kwargs: Property assignments for the active node (e.g. `{"p.updated_at": 2026}`).
 
         Returns:
             The Query instance for fluent chaining.
         """
-        for raw_assign in assignments:
-            assign = (
-                self._resolve_expr(raw_assign)
-                if isinstance(raw_assign, (PredicateExpr, Expression, Field, BoundField))
-                else raw_assign
-            )
-            if isinstance(assign, PredicateExpr):
-                self._native.on_match_set(assign.target, assign.field, assign.value)
-        for key, val in kwargs.items():
-            if "." in key:
-                var, prop = key.split(".", 1)
-                self._native.on_match_set(var, prop, val)
+        self._apply_set_items("on_match_set", self._native.on_match_set, assignments, kwargs)
         return self
 
     def set(self, *assignments: PredicateExpr | Node, **kwargs: Any) -> Query:
@@ -1505,21 +1535,7 @@ class Query:
         Returns:
             The Query instance for fluent chaining.
         """
-        for raw_assign in assignments:
-            assign = (
-                self._resolve_expr(raw_assign)
-                if isinstance(raw_assign, (PredicateExpr, Expression, Field, BoundField))
-                else raw_assign
-            )
-            if isinstance(assign, PredicateExpr):
-                self._native.set_property(assign.target, assign.field, assign.value)
-            elif isinstance(assign, Node):
-                for field_name, val in assign.dirty_fields.items():
-                    self._native.set_property(assign.alias, field_name, val)
-        for key, val in kwargs.items():
-            if "." in key:
-                var, prop = key.split(".", 1)
-                self._native.set_property(var, prop, val)
+        self._apply_set_items("set", self._native.set_property, assignments, kwargs)
         return self
 
     def delete(self, *targets: Node | Relationship | str) -> Query:

@@ -72,7 +72,7 @@ def _reset():
     ("expr_builder", "expected_fragment", "expected_params"),
     [
         (lambda p: p.age == 30, "p.age = $p0", {"p0": 30}),
-        (lambda p: p.age != 30, "p.age != $p0", {"p0": 30}),
+        (lambda p: p.age != 30, "p.age <> $p0", {"p0": 30}),
         (lambda p: p.age > 21, "p.age > $p0", {"p0": 21}),
         (lambda p: p.age >= 21, "p.age >= $p0", {"p0": 21}),
         (lambda p: p.age < 65, "p.age < $p0", {"p0": 65}),
@@ -80,7 +80,7 @@ def _reset():
         (lambda p: p.city.in_(["London", "Paris"]), "p.city IN $p0", {"p0": ["London", "Paris"]}),
         (
             lambda p: p.city.not_in(["Rome", "Tokyo"]),
-            "p.city NOT IN $p0",
+            "NOT (p.city IN $p0)",
             {"p0": ["Rome", "Tokyo"]},
         ),
         (lambda p: p.city.contains("don"), "p.city CONTAINS $p0", {"p0": "don"}),
@@ -179,7 +179,7 @@ def test_age_undirected_and_incoming_traversals():
     q_inc = Query.match(c).from_(WorksAt, "r").node(a).return_(c.name, a.name)
     c_inc = q_inc.compile("apache_age", graph_name="age_graph")
     assert "MATCH (c:Company)<-[r:WORKS_AT]-(a:Person) RETURN c.name, a.name" in c_inc.statement
-    assert "AS (name agtype, name agtype)" in c_inc.statement
+    assert "AS (name agtype, name_1 agtype)" in c_inc.statement
 
 
 # ---------------------------------------------------------------------------
