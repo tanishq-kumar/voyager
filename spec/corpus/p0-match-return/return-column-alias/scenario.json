@@ -8,7 +8,7 @@
     "scenario": "[2] Support column renaming"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "return-column-alias",
   "rows": "unordered",
   "targets": {
     "cypher": {

@@ -1,0 +1,27 @@
+{
+  "description": "Match1 [4]: three unlabeled nodes, only one with name 'bar'.",
+  "nodes": [
+    {
+      "id": "n0",
+      "labels": [],
+      "properties": {
+        "name": "bar"
+      }
+    },
+    {
+      "id": "n1",
+      "labels": [],
+      "properties": {
+        "name": "monkey"
+      }
+    },
+    {
+      "id": "n2",
+      "labels": [],
+      "properties": {
+        "firstname": "bar"
+      }
+    }
+  ],
+  "relationships": []
+}

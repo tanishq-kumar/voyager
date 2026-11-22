@@ -1,0 +1,40 @@
+{
+  "description": "Match2 [5]: an unlabeled node with two KNOWS relationships, one named monkey to A and one named woot to B.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": ["A"],
+      "properties": {}
+    },
+    {
+      "id": "m",
+      "labels": [],
+      "properties": {}
+    },
+    {
+      "id": "b",
+      "labels": ["B"],
+      "properties": {}
+    }
+  ],
+  "relationships": [
+    {
+      "id": "monkey",
+      "type": "KNOWS",
+      "start": "m",
+      "end": "a",
+      "properties": {
+        "name": "monkey"
+      }
+    },
+    {
+      "id": "woot",
+      "type": "KNOWS",
+      "start": "m",
+      "end": "b",
+      "properties": {
+        "name": "woot"
+      }
+    }
+  ]
+}

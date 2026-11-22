@@ -10,7 +10,7 @@
   "params": {
     "since": 2020
   },
-  "fixture": null,
+  "fixture": "match-relationship-property-parameter",
   "rows": "unordered",
   "targets": {
     "cypher": {

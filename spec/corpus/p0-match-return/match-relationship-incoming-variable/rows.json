@@ -1,0 +1,34 @@
+{
+  "columns": [
+    "a",
+    "r",
+    "b"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "node",
+        "labels": [
+          "A"
+        ],
+        "properties": {
+          "num": 1
+        }
+      },
+      {
+        "kind": "relationship",
+        "type": "R",
+        "properties": {}
+      },
+      {
+        "kind": "node",
+        "labels": [
+          "B"
+        ],
+        "properties": {
+          "num": 2
+        }
+      }
+    ]
+  ]
+}

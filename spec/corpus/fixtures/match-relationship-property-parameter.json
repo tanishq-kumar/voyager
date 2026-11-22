@@ -1,0 +1,26 @@
+{
+  "description": "Two nodes joined by a KNOWS relationship with since = 2020.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": [],
+      "properties": {}
+    },
+    {
+      "id": "b",
+      "labels": [],
+      "properties": {}
+    }
+  ],
+  "relationships": [
+    {
+      "id": "knows",
+      "type": "KNOWS",
+      "start": "a",
+      "end": "b",
+      "properties": {
+        "since": 2020
+      }
+    }
+  ]
+}

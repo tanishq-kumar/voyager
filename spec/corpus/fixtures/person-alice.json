@@ -1,0 +1,27 @@
+{
+  "description": "Two Person nodes (Alice, Bob) and one Company node for label and property predicates.",
+  "nodes": [
+    {
+      "id": "alice",
+      "labels": ["Person"],
+      "properties": {
+        "name": "Alice"
+      }
+    },
+    {
+      "id": "bob",
+      "labels": ["Person"],
+      "properties": {
+        "name": "Bob"
+      }
+    },
+    {
+      "id": "acme",
+      "labels": ["Company"],
+      "properties": {
+        "name": "Acme"
+      }
+    }
+  ],
+  "relationships": []
+}

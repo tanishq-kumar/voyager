@@ -8,7 +8,7 @@
     "scenario": "[5] Match relationship with inline property value"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match2-inline-rel-property",
   "rows": "unordered",
   "targets": {
     "cypher": {

@@ -8,7 +8,7 @@
     "scenario": "[3] Undirected match on simple relationship graph"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match3-simple",
   "rows": "unordered",
   "targets": {
     "cypher": {

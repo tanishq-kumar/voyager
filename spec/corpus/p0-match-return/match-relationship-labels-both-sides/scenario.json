@@ -8,7 +8,7 @@
     "scenario": "[2] Matching a relationship pattern using a label predicate on both sides"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match2-relationship-labels",
   "rows": "unordered",
   "targets": {
     "cypher": {

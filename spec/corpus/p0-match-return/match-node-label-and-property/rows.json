@@ -1,0 +1,18 @@
+{
+  "columns": [
+    "p"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "node",
+        "labels": [
+          "Person"
+        ],
+        "properties": {
+          "name": "Alice"
+        }
+      }
+    ]
+  ]
+}

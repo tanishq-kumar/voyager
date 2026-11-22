@@ -1,0 +1,13 @@
+{
+  "description": "Return4 [3]: a single unlabeled node with id = 42.",
+  "nodes": [
+    {
+      "id": "n",
+      "labels": [],
+      "properties": {
+        "id": 42
+      }
+    }
+  ],
+  "relationships": []
+}

@@ -8,7 +8,7 @@
     "scenario": "[2] Matching all nodes"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match1-all-nodes",
   "rows": "unordered",
   "targets": {
     "cypher": {

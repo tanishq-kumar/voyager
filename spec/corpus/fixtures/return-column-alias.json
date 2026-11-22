@@ -1,0 +1,11 @@
+{
+  "description": "Return4 [2]: a single node labelled Singleton.",
+  "nodes": [
+    {
+      "id": "n",
+      "labels": ["Singleton"],
+      "properties": {}
+    }
+  ],
+  "relationships": []
+}

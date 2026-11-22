@@ -1,0 +1,21 @@
+{
+  "description": "One A node, one B node and one unlabeled node for a single-label predicate.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": ["A"],
+      "properties": {}
+    },
+    {
+      "id": "b",
+      "labels": ["B"],
+      "properties": {}
+    },
+    {
+      "id": "n",
+      "labels": [],
+      "properties": {}
+    }
+  ],
+  "relationships": []
+}

@@ -1,0 +1,75 @@
+{
+  "description": "Match2 [2]: T1 A->B, T2 B->A, T3 B->B, T4 A->A between distinct nodes.",
+  "nodes": [
+    {
+      "id": "a0",
+      "labels": ["A"],
+      "properties": {}
+    },
+    {
+      "id": "b0",
+      "labels": ["B"],
+      "properties": {}
+    },
+    {
+      "id": "b1",
+      "labels": ["B"],
+      "properties": {}
+    },
+    {
+      "id": "a1",
+      "labels": ["A"],
+      "properties": {}
+    },
+    {
+      "id": "b2",
+      "labels": ["B"],
+      "properties": {}
+    },
+    {
+      "id": "b3",
+      "labels": ["B"],
+      "properties": {}
+    },
+    {
+      "id": "a2",
+      "labels": ["A"],
+      "properties": {}
+    },
+    {
+      "id": "a3",
+      "labels": ["A"],
+      "properties": {}
+    }
+  ],
+  "relationships": [
+    {
+      "id": "t1",
+      "type": "T1",
+      "start": "a0",
+      "end": "b0",
+      "properties": {}
+    },
+    {
+      "id": "t2",
+      "type": "T2",
+      "start": "b1",
+      "end": "a1",
+      "properties": {}
+    },
+    {
+      "id": "t3",
+      "type": "T3",
+      "start": "b2",
+      "end": "b3",
+      "properties": {}
+    },
+    {
+      "id": "t4",
+      "type": "T4",
+      "start": "a2",
+      "end": "a3",
+      "properties": {}
+    }
+  ]
+}

@@ -118,14 +118,22 @@ test-python:
 spec-check:
     uv run --no-sync pytest packages/python/tests/test_spec_vectors.py -v
 
-# Run Query Spec conformance corpus compile checks
+# Run Query Spec conformance corpus compile checks and fixture validation
 corpus:
-    uv run --no-sync pytest packages/python/tests/test_spec_corpus.py -v
+    uv run --no-sync pytest packages/python/tests/test_spec_corpus.py packages/python/tests/test_spec_corpus_fixtures.py -v
 
 # Rewrite expected files in spec/corpus from the current compiler for supported and known-diff targets
 corpus-update:
     uv run python scripts/update_corpus.py
     git diff --stat spec/corpus
+
+# Run the live corpus checks on one engine (neo4j, memgraph, falkordb, age, pg19) or all engines
+corpus-live engine=".":
+    uv run --no-sync python scripts/run_corpus_live.py {{engine}}
+
+# Record rows.json for one or more scenarios from the reference engine (Neo4j); all scenarios when omitted
+corpus-record-rows *scenario:
+    uv run python scripts/record_corpus_rows.py {{scenario}}
 
 # Run Relate embedded database integration tests
 test-relate:

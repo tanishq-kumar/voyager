@@ -1,0 +1,30 @@
+{
+  "description": "Match3 [5]: A {num: 1} -[REL {name: 'r'}]-> B {num: 2}.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": ["A"],
+      "properties": {
+        "num": 1
+      }
+    },
+    {
+      "id": "b",
+      "labels": ["B"],
+      "properties": {
+        "num": 2
+      }
+    }
+  ],
+  "relationships": [
+    {
+      "id": "rel",
+      "type": "REL",
+      "start": "a",
+      "end": "b",
+      "properties": {
+        "name": "r"
+      }
+    }
+  ]
+}

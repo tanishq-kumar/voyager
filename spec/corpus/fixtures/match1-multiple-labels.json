@@ -1,0 +1,60 @@
+{
+  "description": "Match1 [3]: nodes carrying every combination of the labels A, B and C plus unlabeled nodes.",
+  "nodes": [
+    {
+      "id": "abc",
+      "labels": ["A", "B", "C"],
+      "properties": {}
+    },
+    {
+      "id": "ab",
+      "labels": ["A", "B"],
+      "properties": {}
+    },
+    {
+      "id": "ac",
+      "labels": ["A", "C"],
+      "properties": {}
+    },
+    {
+      "id": "bc",
+      "labels": ["B", "C"],
+      "properties": {}
+    },
+    {
+      "id": "a",
+      "labels": ["A"],
+      "properties": {}
+    },
+    {
+      "id": "b",
+      "labels": ["B"],
+      "properties": {}
+    },
+    {
+      "id": "c",
+      "labels": ["C"],
+      "properties": {}
+    },
+    {
+      "id": "names",
+      "labels": [],
+      "properties": {
+        "name": ":A:B:C"
+      }
+    },
+    {
+      "id": "abc-prop",
+      "labels": [],
+      "properties": {
+        "abc": "abc"
+      }
+    },
+    {
+      "id": "empty",
+      "labels": [],
+      "properties": {}
+    }
+  ],
+  "relationships": []
+}

@@ -8,7 +8,7 @@
     "scenario": "[3] Aliasing expressions"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "return-property-alias",
   "rows": "unordered",
   "targets": {
     "cypher": {
