@@ -340,6 +340,37 @@ fn extract_optional_u32(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecMaxHops {
+    Null,
+    Exact(u32),
+    Unbounded,
+}
+
+fn extract_max_hops(val: &Value, path: &SpecPath) -> Result<SpecMaxHops, SpecError> {
+    match val {
+        Value::Null => Ok(SpecMaxHops::Null),
+        Value::String(s) if s == "unbounded" => Ok(SpecMaxHops::Unbounded),
+        Value::Number(number) if number.is_i64() || number.is_u64() => {
+            if let Some(integer) = number.as_u64()
+                && integer <= u64::from(u32::MAX)
+            {
+                return Ok(SpecMaxHops::Exact(integer as u32));
+            }
+            Err(expected_error(
+                val,
+                path,
+                "a non-negative integer, null, or 'unbounded'",
+            ))
+        }
+        _ => Err(expected_error(
+            val,
+            path,
+            "a non-negative integer, null, or 'unbounded'",
+        )),
+    }
+}
+
 /// Converts a JSON literal value into an AST literal.
 fn json_to_literal(value: &Value) -> Result<LiteralValue, String> {
     match value {
@@ -1187,12 +1218,8 @@ fn build_path_steps_into_builder(
                     None => None,
                 };
                 let max_hops = match array.get(5) {
-                    Some(item) => extract_optional_u32(
-                        item,
-                        &step_path.index(5),
-                        "a non-negative integer or null",
-                    )?,
-                    None => None,
+                    Some(item) => extract_max_hops(item, &step_path.index(5))?,
+                    None => SpecMaxHops::Null,
                 };
                 let properties = parse_step_properties(
                     builder,
@@ -1216,10 +1243,23 @@ fn build_path_steps_into_builder(
                         builder.edge_with_prop_exprs(edge_types, var, properties)
                     }
                 };
-                if min_hops.is_some() || max_hops.is_some() {
-                    let min = min_hops.unwrap_or(1);
-                    let max = max_hops.unwrap_or(min);
-                    builder.hops(min, max);
+                match (min_hops, max_hops) {
+                    (Some(min), SpecMaxHops::Exact(max)) => {
+                        builder.hops_opt(Some(min), Some(max));
+                    }
+                    (Some(min), SpecMaxHops::Unbounded) => {
+                        builder.hops_opt(Some(min), None);
+                    }
+                    (Some(min), SpecMaxHops::Null) => {
+                        builder.hops_opt(Some(min), Some(min));
+                    }
+                    (None, SpecMaxHops::Exact(max)) => {
+                        builder.hops_opt(Some(1), Some(max));
+                    }
+                    (None, SpecMaxHops::Unbounded) => {
+                        builder.hops_opt(Some(1), None);
+                    }
+                    (None, SpecMaxHops::Null) => {}
                 }
             }
             other => {
@@ -2975,6 +3015,14 @@ fn validate_spec_scope_inner(
                     }
                 }
                 "set" => {
+                    check_spec_arity_bounded(
+                        sequence,
+                        &entry_path,
+                        "mutation 'set'",
+                        3,
+                        4,
+                        "[set, variable, map] or [set, variable, property, value]",
+                    )?;
                     if let Some(variable) = array_string(sequence, 1) {
                         ensure_in_scope(
                             &variable,
@@ -2985,10 +3033,11 @@ fn validate_spec_scope_inner(
                             &hints,
                         )?;
                     }
-                    if let Some(value) = sequence.get(3) {
+                    let expr_idx = if sequence.len() == 3 { 2 } else { 3 };
+                    if let Some(value) = sequence.get(expr_idx) {
                         validate_expr_scope(
                             value,
-                            &entry_path.index(3),
+                            &entry_path.index(expr_idx),
                             scope,
                             clause,
                             last_with,
@@ -3682,15 +3731,22 @@ fn build_query_internal(
                         array,
                         &mut_path,
                         "mutation 'set'",
+                        3,
                         4,
-                        4,
-                        "[set, variable, property, value]",
+                        "[set, variable, map] or [set, variable, property, value]",
                     )?;
                     let var = extract_string(&array[1], &mut_path.index(1), "a string variable")?;
-                    let prop = extract_string(&array[2], &mut_path.index(2), "a string property")?;
-                    let value =
-                        value_to_node_handle(builder, &array[3], depth, &mut_path.index(3))?;
-                    builder.set_property_expr(var, prop, value);
+                    if array.len() == 3 {
+                        let value =
+                            value_to_node_handle(builder, &array[2], depth, &mut_path.index(2))?;
+                        builder.set_merge_expr(var, value);
+                    } else {
+                        let prop =
+                            extract_string(&array[2], &mut_path.index(2), "a string property")?;
+                        let value =
+                            value_to_node_handle(builder, &array[3], depth, &mut_path.index(3))?;
+                        builder.set_property_expr(var, prop, value);
+                    }
                 }
                 "delete" => {
                     check_spec_arity_bounded(

@@ -1,0 +1,68 @@
+{
+  "description": "Variable-length edge with open lower bound (omitted / null min_hops).",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ],
+            [
+              "edge",
+              "outgoing",
+              [
+                "KNOWS"
+              ],
+              "r",
+              null,
+              3
+            ],
+            [
+              "node",
+              "f",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person)-[r:KNOWS*1..3]->(f:Person) RETURN p.name",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person)-[r:KNOWS*1..3]->(f:Person) RETURN p.name $$) AS (name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person)-[r:KNOWS]->{1,3}(f:Person) RETURN p.name",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) -[r IS KNOWS]->{1,3} (f IS Person) COLUMNS (p.name))",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) -[r IS KNOWS]->{1,3} (f IS Person) COLUMNS (p.name))",
+      "parameters": {}
+    }
+  }
+}

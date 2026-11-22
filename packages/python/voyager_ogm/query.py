@@ -1235,17 +1235,33 @@ class Query:
         self._native.edge(types, edge_var, props)
         return self
 
-    def hops(self, min_hops: int, max_hops: int) -> Query:
-        """Sets variable-length path repetition (e.g. `*1..3`).
+    def hops(
+        self,
+        min_hops: int | None = None,
+        max_hops: int | str | None = None,
+    ) -> Query:
+        """Sets variable-length path repetition (e.g. `*1..3`, `*2..`).
 
         Args:
-            min_hops: Minimum number of relationship hops (e.g. 1).
-            max_hops: Maximum number of relationship hops (e.g. 3).
+            min_hops: Minimum number of relationship hops (e.g. 1). None defaults to 1 when max_hops is given.
+            max_hops: Maximum number of relationship hops (e.g. 3, or 'unbounded').
 
         Returns:
             The Query instance for fluent chaining.
         """
-        self._native.hops(min_hops, max_hops)
+        if max_hops == "unbounded" or max_hops is None:
+            max_val = None
+        elif isinstance(max_hops, int):
+            max_val = max_hops
+        else:
+            raise TypeError(
+                f"expected an int, 'unbounded', or None for max_hops, got {type(max_hops).__name__}"
+            )
+
+        if min_hops is None and max_val is not None:
+            min_hops = 1
+
+        self._native.hops(min_hops, max_val)
         return self
 
     @hybridmethod
@@ -1573,6 +1589,21 @@ class Query:
             The Query instance for fluent chaining.
         """
         self._apply_set_items("set", self._native.set_property, assignments, kwargs)
+        return self
+
+    def set_merge(self, target: Node | str, val_map: dict[str, Any] | Any) -> Query:
+        """Adds a SET target += map merge assignment to the active statement.
+
+        Args:
+            target: Node instance or entity variable string.
+            val_map: Map/dictionary of properties to merge, or a map expression.
+
+        Returns:
+            The Query instance for fluent chaining.
+        """
+        _reject_aggregation(val_map)
+        var = target.alias if isinstance(target, Node) else str(target)
+        self._native.set_merge(var, val_map)
         return self
 
     def delete(self, *targets: Node | Relationship | str) -> Query:

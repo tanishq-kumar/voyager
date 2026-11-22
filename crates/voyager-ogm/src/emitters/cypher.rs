@@ -134,6 +134,8 @@ impl CypherEmitter {
                 self.buffer.push('*');
                 if let Some(min) = min_hops {
                     self.buffer.push_str(&min.to_string());
+                } else if max_hops.is_some() {
+                    self.buffer.push('1');
                 }
                 self.buffer.push_str("..");
                 if let Some(max) = max_hops {

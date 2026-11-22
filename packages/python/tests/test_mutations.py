@@ -127,3 +127,46 @@ def test_python_model_dirty_tracking():
     assert "SET _person_0.age = $p1, _person_0.status = $p2" in compiled.statement
     assert compiled.parameters["p1"] == 26
     assert compiled.parameters["p2"] == "VERIFIED"
+
+
+def test_set_kwargs_preserves_main_behavior():
+    p = Person()
+    # On main, key without dot is ignored, does not do map merge
+    q_bare = Query.match(p).set(p={"city": "Berlin"}).return_(p)
+    compiled_bare = q_bare.compile("cypher")
+    assert "SET" not in compiled_bare.statement
+
+    # Key with dot assigns property
+    q_dot = Query.match(p).set(**{"_person_0.city": "Berlin"}).return_(p)
+    compiled_dot = q_dot.compile("cypher")
+    assert "SET _person_0.city = $p0" in compiled_dot.statement
+
+
+def test_set_merge_explicit_method():
+    p = Person()
+    query = Query.match(p).set_merge(p, {"city": "Berlin"}).return_(p)
+    compiled = query.compile("cypher")
+    assert "SET _person_0 += $p0" in compiled.statement
+    assert compiled.parameters["p0"] == {"city": "Berlin"}
+
+
+def test_open_hops_fluent_compilation():
+    p = Person()
+    f = Person()
+    rel = Follows()
+
+    # max_hops=3 emits *1..3 (main-compatible)
+    q_max = Query.match(p).to(rel).node(f).hops(max_hops=3).return_(f)
+    assert "*1..3" in q_max.compile("cypher").statement
+    assert "*1..3" in q_max.compile("age").statement
+    assert "{1,3}" in q_max.compile("iso_gql").statement
+
+    # min_hops=2 emits *2..
+    q_min = Query.match(p).to(rel).node(f).hops(min_hops=2).return_(f)
+    assert "*2.." in q_min.compile("cypher").statement
+    assert "*2.." in q_min.compile("age").statement
+    assert "{2,}" in q_min.compile("iso_gql").statement
+
+    # inf is rejected with TypeError
+    with pytest.raises(TypeError, match="expected an int, 'unbounded', or None for max_hops"):
+        Query.match(p).to(rel).node(f).hops(max_hops="inf")

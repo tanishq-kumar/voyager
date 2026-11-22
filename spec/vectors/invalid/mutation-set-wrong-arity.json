@@ -1,0 +1,40 @@
+{
+  "description": "SET mutation entries must be arity 3 or 4.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "mutations": [
+      [
+        "set",
+        "p"
+      ]
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/mutations/0"
+  }
+}

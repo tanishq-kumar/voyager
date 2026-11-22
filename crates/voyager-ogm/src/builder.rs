@@ -791,11 +791,16 @@ impl QueryBuilder {
         var: impl Into<String>,
         val_map: impl Into<LiteralValue>,
     ) -> &mut Self {
-        let target = self.ident(var);
         let value = self.literal(val_map);
+        self.set_merge_expr(var, value)
+    }
+
+    /// Adds a `SET var += expr` map merge assignment using an explicit AST expression handle.
+    pub fn set_merge_expr(&mut self, var: impl Into<String>, expr: NodeHandle) -> &mut Self {
+        let target = self.ident(var);
         let item = self.arena.alloc(AstNode::SetItem {
             target,
-            value,
+            value: expr,
             is_merge: true,
         });
         self.current_set_items.push(item);
@@ -1366,21 +1371,36 @@ impl QueryBuilder {
     /// A maximum smaller than the minimum cannot be expressed by any supported dialect,
     /// so it is recorded and surfaced from [`Self::try_build`] as [`Error::InvalidClause`].
     pub fn hops(&mut self, min: u32, max: u32) -> &mut Self {
-        if max < min {
+        self.hops_opt(Some(min), Some(max))
+    }
+
+    /// Configures optional or open variable-length hop repetition (e.g. `*2..`, `*1..3`).
+    ///
+    /// When `max` is `None`, the upper bound is unbounded (`*min..`).
+    /// When `min` is `None` and `max` is `Some`, `min` defaults to 1 (`*1..max`).
+    pub fn hops_opt(&mut self, min: Option<u32>, max: Option<u32>) -> &mut Self {
+        let min = if min.is_none() && max.is_some() {
+            Some(1)
+        } else {
+            min
+        };
+        if let (Some(min_val), Some(max_val)) = (min, max)
+            && max_val < min_val
+        {
             self.build_error = Some(format!(
-                "Invalid variable-length hop bounds: max_hops ({max}) must be greater than or equal to min_hops ({min})"
+                "Invalid variable-length hop bounds: max_hops ({max_val}) must be greater than or equal to min_hops ({min_val})"
             ));
         }
         if let Some(pending) = self.pending_edge.as_mut() {
-            pending.min_hops = Some(min);
-            pending.max_hops = Some(max);
+            pending.min_hops = min;
+            pending.max_hops = max;
         } else if let Some(&edge_handle) = self.current_edges.last()
             && let Ok(AstNode::EdgePattern {
                 min_hops, max_hops, ..
             }) = self.arena.get_mut(edge_handle)
         {
-            *min_hops = Some(min);
-            *max_hops = Some(max);
+            *min_hops = min;
+            *max_hops = max;
         }
         self
     }
@@ -2295,9 +2315,7 @@ impl QueryBuilder {
                                     }
                                 }
                                 if min_hops.is_some() || max_hops.is_some() {
-                                    let min = min_hops.unwrap_or(1);
-                                    let max = max_hops.unwrap_or(min);
-                                    self.hops(min, max);
+                                    self.hops_opt(*min_hops, *max_hops);
                                 }
 
                                 if let Ok(AstNode::NodePattern {

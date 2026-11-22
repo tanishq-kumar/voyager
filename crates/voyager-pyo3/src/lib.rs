@@ -1581,12 +1581,29 @@ fn build_path_steps_into_builder(
                     )?,
                     None => None,
                 };
-                let max_hops: Option<u32> = match optional_step_item(&tuple, 5)? {
-                    Some(item) => extract_required(
-                        &item,
-                        &step_path.index(5),
-                        "a non-negative integer or null",
-                    )?,
+                let max_hops: Option<Result<Option<u32>, ()>> = match optional_step_item(&tuple, 5)?
+                {
+                    Some(item) => {
+                        if item.is_none() {
+                            Some(Ok(None))
+                        } else if let Ok(s) = item.extract::<String>() {
+                            if s == "unbounded" {
+                                Some(Err(()))
+                            } else {
+                                return Err(PyTypeError::new_err(format!(
+                                    "expected a non-negative integer, null, or 'unbounded', got {}",
+                                    json_type_name(&item)
+                                )));
+                            }
+                        } else if let Ok(n) = item.extract::<u32>() {
+                            Some(Ok(Some(n)))
+                        } else {
+                            return Err(PyTypeError::new_err(format!(
+                                "expected a non-negative integer, null, or 'unbounded', got {}",
+                                json_type_name(&item)
+                            )));
+                        }
+                    }
                     None => None,
                 };
                 let properties = parse_step_properties(
@@ -1611,10 +1628,23 @@ fn build_path_steps_into_builder(
                         builder.edge_with_prop_exprs(edge_types, var, properties)
                     }
                 };
-                if min_hops.is_some() || max_hops.is_some() {
-                    let min = min_hops.unwrap_or(1);
-                    let max = max_hops.unwrap_or(min);
-                    builder.hops(min, max);
+                match (min_hops, max_hops) {
+                    (Some(min), Some(Ok(Some(max)))) => {
+                        builder.hops_opt(Some(min), Some(max));
+                    }
+                    (Some(min), Some(Err(()))) => {
+                        builder.hops_opt(Some(min), None);
+                    }
+                    (Some(min), Some(Ok(None)) | None) => {
+                        builder.hops_opt(Some(min), Some(min));
+                    }
+                    (None, Some(Ok(Some(max)))) => {
+                        builder.hops_opt(Some(1), Some(max));
+                    }
+                    (None, Some(Err(()))) => {
+                        builder.hops_opt(Some(1), None);
+                    }
+                    (None, Some(Ok(None)) | None) => {}
                 }
             }
             other => {
@@ -2091,8 +2121,14 @@ impl PyQueryBuilder {
         Ok(())
     }
 
-    fn hops(&mut self, min: u32, max: u32) {
-        self.inner.hops(min, max);
+    #[pyo3(signature = (min=None, max=None))]
+    fn hops(&mut self, min: Option<u32>, max: Option<u32>) {
+        let min = if min.is_none() && max.is_some() {
+            Some(1)
+        } else {
+            min
+        };
+        self.inner.hops_opt(min, max);
     }
 
     #[pyo3(signature = (variable=None))]
@@ -2377,6 +2413,12 @@ impl PyQueryBuilder {
     fn set_property(&mut self, var: String, prop: String, val: &Bound<'_, PyAny>) -> PyResult<()> {
         let lit = py_to_literal(val)?;
         self.inner.set_property(var, prop, lit);
+        Ok(())
+    }
+
+    fn set_merge(&mut self, var: String, val: &Bound<'_, PyAny>) -> PyResult<()> {
+        let lit = py_to_literal(val)?;
+        self.inner.set_merge(var, lit);
         Ok(())
     }
 
