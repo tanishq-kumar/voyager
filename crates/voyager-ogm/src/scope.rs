@@ -19,7 +19,9 @@
 //!   contains an aggregation;
 //! - mutations and `RETURN` see the scope after the last `WITH` (plus names the
 //!   earlier mutations created); root `ORDER BY` additionally sees the names
-//!   `RETURN` projects;
+//!   `RETURN` projects. A `WITH` or `RETURN` that is `DISTINCT` or aggregates
+//!   exposes only its projected columns, but its `WHERE`/`ORDER BY` may still
+//!   repeat a projected expression, exactly or inside a larger expression;
 //! - `EXISTS`/`COUNT` subqueries, pattern comprehensions and list
 //!   comprehensions bind their own variables locally while still being allowed
 //!   to read outer names;
@@ -36,7 +38,7 @@
 
 use std::collections::HashSet;
 
-use crate::ast::{AstNode, NodeHandle, ProjectionItem, QueryAstArena};
+use crate::ast::{AggregationFunc, AstNode, NodeHandle, ProjectionItem, QueryAstArena};
 use crate::error::{Error, Result};
 
 /// Expression nesting budget mirrored from the Query Spec consumer.
@@ -95,6 +97,19 @@ fn is_plain_identifier(name: &str) -> bool {
         _ => return false,
     }
     chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+/// The expression spelling of an aggregation function in emitted Cypher.
+fn aggregation_name(function: AggregationFunc) -> &'static str {
+    match function {
+        AggregationFunc::Count => "count",
+        AggregationFunc::CountDistinct => "count_distinct",
+        AggregationFunc::Sum => "sum",
+        AggregationFunc::Avg => "avg",
+        AggregationFunc::Min => "min",
+        AggregationFunc::Max => "max",
+        AggregationFunc::Collect => "collect",
+    }
 }
 
 /// Where a variable reference sits in the fixed emission order.
@@ -249,16 +264,38 @@ impl ScopeValidator<'_> {
         }
     }
 
-    /// True when `expression` repeats a non-aggregating RETURN projection.
+    /// True when `expression` repeats a projection of a `DISTINCT` or
+    /// aggregating clause.
     ///
-    /// A `RETURN DISTINCT`/aggregating clause collapses the visible names to
-    /// its projected columns, but Cypher still accepts `ORDER BY p.name` when
-    /// `p.name` is itself one of those columns.
-    fn matches_projection(&self, expression: NodeHandle, projections: &[ProjectionItem]) -> bool {
-        projections.iter().any(|item| {
-            item.aggregation.is_none()
-                && self.expressions_equivalent(expression, item.expression, 0)
-        })
+    /// Such a clause collapses the visible names to its projected columns, but
+    /// Cypher still accepts `ORDER BY p.name` when `p.name` is itself one of
+    /// those columns, and it accepts a larger expression built from a projected
+    /// expression (for example `ORDER BY toUpper(p.name)`).
+    fn projection_matches_expression(
+        &self,
+        expression: NodeHandle,
+        item: &ProjectionItem,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_SCOPE_DEPTH {
+            return false;
+        }
+        if let Some(function) = item.aggregation {
+            // `COUNT(DISTINCT x)` has no function-call expression spelling, so
+            // an ORDER BY cannot repeat it as an expression.
+            if function == AggregationFunc::CountDistinct {
+                return false;
+            }
+            let Ok(AstNode::FunctionCall { name, arguments }) = self.arena.get(expression) else {
+                return false;
+            };
+            if !name.eq_ignore_ascii_case(aggregation_name(function)) {
+                return false;
+            }
+            return arguments.len() == 1
+                && self.expressions_equivalent(arguments[0], item.expression, depth + 1);
+        }
+        self.expressions_equivalent(expression, item.expression, depth)
     }
 
     /// Structural expression equality, ignoring arena handle positions.
@@ -338,6 +375,72 @@ impl ScopeValidator<'_> {
                         .iter()
                         .zip(right_items.iter())
                         .all(|(&l, &r)| self.expressions_equivalent(l, r, depth + 1))
+            }
+            _ => false,
+        }
+    }
+
+    /// True when `expression` can be evaluated from the projected columns alone.
+    ///
+    /// Under `DISTINCT` or an aggregation Neo4j accepts an ORDER BY/WHERE
+    /// expression that repeats a projected expression, either exactly or as a
+    /// sub-expression of a larger expression (`p.city + 1`,
+    /// `toUpper(p.city)`), and also accepts property access on a projected
+    /// variable. Everything else must already be a projected name.
+    fn expression_is_derivable(
+        &self,
+        expression: NodeHandle,
+        projections: &[ProjectionItem],
+        scope: &Scope,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_SCOPE_DEPTH {
+            return true;
+        }
+        if projections
+            .iter()
+            .any(|item| self.projection_matches_expression(expression, item, depth))
+        {
+            return true;
+        }
+        let Ok(node) = self.arena.get(expression) else {
+            return true;
+        };
+        match node {
+            AstNode::Identifier(name) => scope.contains(name),
+            // `field(var, "")` renders as the bare variable and is treated as
+            // opaque everywhere else, so it is derivable here too.
+            AstNode::PropertyAccess { target, property } => {
+                property.is_empty()
+                    || self.expression_is_derivable(*target, projections, scope, depth + 1)
+            }
+            AstNode::Literal(_) | AstNode::Parameter(_) => true,
+            AstNode::BinaryExpression { left, right, op: _ } => {
+                self.expression_is_derivable(*left, projections, scope, depth + 1)
+                    && self.expression_is_derivable(*right, projections, scope, depth + 1)
+            }
+            AstNode::UnaryExpression { operand, .. } => {
+                self.expression_is_derivable(*operand, projections, scope, depth + 1)
+            }
+            AstNode::FunctionCall { arguments, .. } => arguments.iter().all(|&argument| {
+                self.expression_is_derivable(argument, projections, scope, depth + 1)
+            }),
+            AstNode::ListLiteral(items) => items
+                .iter()
+                .all(|&item| self.expression_is_derivable(item, projections, scope, depth + 1)),
+            AstNode::CaseExpression {
+                operand,
+                when_then_branches,
+                else_branch,
+            } => {
+                operand.is_none_or(|operand| {
+                    self.expression_is_derivable(operand, projections, scope, depth + 1)
+                }) && when_then_branches.iter().all(|&(when, then)| {
+                    self.expression_is_derivable(when, projections, scope, depth + 1)
+                        && self.expression_is_derivable(then, projections, scope, depth + 1)
+                }) && else_branch.is_none_or(|else_branch| {
+                    self.expression_is_derivable(else_branch, projections, scope, depth + 1)
+                })
             }
             _ => false,
         }
@@ -438,6 +541,7 @@ impl ScopeValidator<'_> {
                         only_projected,
                     },
                     last_with,
+                    only_projected.then_some(projections.as_slice()),
                     depth,
                 )?;
             }
@@ -445,6 +549,11 @@ impl ScopeValidator<'_> {
                 let mut order_scope = projected.clone();
                 if !only_projected {
                     order_scope.include(&before);
+                }
+                if only_projected
+                    && self.expression_is_derivable(expression, projections, &order_scope, 0)
+                {
+                    continue;
                 }
                 self.validate_expr(
                     expression,
@@ -491,11 +600,14 @@ impl ScopeValidator<'_> {
                 order_scope.bind(&name);
             }
             for &(expression, _) in order_by {
-                if only_projected && self.matches_projection(expression, projections) {
+                if only_projected
+                    && self.expression_is_derivable(expression, projections, &order_scope, 0)
+                {
                     // A RETURN DISTINCT/aggregating clause exposes only the
                     // names it projects, but `ORDER BY p.name` is accepted when
                     // `p.name` itself is a projected column (Neo4j evaluates
-                    // the repeated expression, not the pre-RETURN variable).
+                    // the repeated expression, not the pre-RETURN variable),
+                    // and so is a larger expression built from it.
                     continue;
                 }
                 self.validate_expr(
@@ -538,7 +650,7 @@ impl ScopeValidator<'_> {
             }
         }
         if let Some(where_clause) = where_clause {
-            self.validate_where(*where_clause, scope, Clause::Match, None, depth)?;
+            self.validate_where(*where_clause, scope, Clause::Match, None, None, depth)?;
         }
         Ok(())
     }
@@ -630,13 +742,20 @@ impl ScopeValidator<'_> {
         scope: &Scope,
         clause: Clause,
         last_with: Option<usize>,
+        projections: Option<&[ProjectionItem]>,
         depth: usize,
     ) -> Result<()> {
-        if let AstNode::WhereClause { root_predicate } = self.arena.get(handle)? {
-            self.validate_expr(*root_predicate, scope, clause, last_with, depth + 1)
+        let predicate = if let AstNode::WhereClause { root_predicate } = self.arena.get(handle)? {
+            *root_predicate
         } else {
-            self.validate_expr(handle, scope, clause, last_with, depth + 1)
+            handle
+        };
+        if let Some(projections) = projections
+            && self.expression_is_derivable(predicate, projections, scope, 0)
+        {
+            return Ok(());
         }
+        self.validate_expr(predicate, scope, clause, last_with, depth + 1)
     }
 
     fn validate_projection_item(
@@ -1083,6 +1202,63 @@ mod tests {
         builder.distinct(true);
         builder.order_by_property("p", "name", true);
         assert_accepted(builder);
+    }
+
+    #[test]
+    fn distinct_return_order_by_accepts_a_projected_subexpression() {
+        let mut builder = person_match();
+        builder.r#return().field("p", "city", None::<String>);
+        builder.distinct(true);
+        let city = builder.prop("p", "city");
+        let one = builder.literal(1);
+        let expression = builder.binary_expr(city, crate::ast::BinaryOp::Add, one);
+        builder.order_by(expression, true);
+        assert_accepted(builder);
+    }
+
+    #[test]
+    fn aggregating_return_order_by_accepts_a_repeated_aggregation() {
+        let mut builder = person_match();
+        let target = builder.ident("p");
+        builder.select_aggregate(target, crate::ast::AggregationFunc::Count, Some("c"));
+        let argument = builder.ident("p");
+        let repeated = builder.function("count", vec![argument]);
+        builder.order_by(repeated, true);
+        assert_accepted(builder);
+    }
+
+    #[test]
+    fn distinct_with_order_by_accepts_a_projected_expression() {
+        let mut builder = person_match();
+        builder.r#with().field("p", "city", Some("city"));
+        builder.distinct(true);
+        builder.order_by_property("p", "city", true);
+        builder.r#return().field("city", "", None::<String>);
+        assert_accepted(builder);
+    }
+
+    #[test]
+    fn distinct_with_where_accepts_a_projected_expression() {
+        let mut builder = person_match();
+        builder.r#with().field("p", "city", Some("city"));
+        builder.distinct(true);
+        let city = builder.prop("p", "city");
+        let predicate = builder.is_not_null_expr(city);
+        builder.where_expr(predicate);
+        builder.r#return().field("city", "", None::<String>);
+        assert_accepted(builder);
+    }
+
+    #[test]
+    fn distinct_return_order_by_rejects_a_partly_unprojected_subexpression() {
+        let mut builder = person_match();
+        builder.r#return().field("p", "city", None::<String>);
+        builder.distinct(true);
+        let city = builder.prop("p", "city");
+        let age = builder.prop("p", "age");
+        let expression = builder.binary_expr(city, crate::ast::BinaryOp::Add, age);
+        builder.order_by(expression, true);
+        assert_rejected(builder, "p", "root ORDER BY");
     }
 
     #[test]

@@ -455,11 +455,25 @@ The scope rules follow that order:
   names, and a reference to a pre-`WITH` name is rejected with `INVALID_SPEC`:
   a `WITH` with `DISTINCT` or an aggregation only exposes the names it projects.
   The clauses after the `WITH` always see only the projected names.
+- Under `DISTINCT` or an aggregation, `where` and `order_by` may still repeat a
+  projected expression. The expression may match a projection exactly
+  (`WITH DISTINCT p.city AS city ORDER BY p.city`) or appear inside a larger
+  expression (`WHERE p.city IS NOT NULL`, `ORDER BY p.city + 1`,
+  `ORDER BY toUpper(p.city)`), and property access on a projected variable is
+  allowed (`RETURN DISTINCT p ORDER BY p.city`). Every other pre-`WITH` or
+  pre-`RETURN` variable is still rejected, including a variable that appears
+  next to a projected expression (`ORDER BY p.city + p.age`). The repeated
+  expression is evaluated from the projected column, so an alias may also be
+  used directly.
 - Mutations and the final `projections` see the scope after the last `WITH`
   (plus variables the earlier mutations created). Root `order_by` may
   additionally use the names the `RETURN` projects. When the root `RETURN` is
   `DISTINCT` or contains an aggregation, root `order_by` sees only the names the
-  `RETURN` projects.
+  `RETURN` projects, with the same repeat-a-projected-expression rule as a
+  `WITH`: `RETURN DISTINCT p.city ORDER BY p.city` and
+  `RETURN p.city, COUNT(p) AS c ORDER BY p.city` are accepted, and a repeated
+  aggregate expression such as `RETURN COUNT(p) AS c ORDER BY count(p)` is
+  accepted too.
 - Variables bound inside an `exists`/`count` subquery or a `pattern_comp` path
   are local to that construct, though the construct may read outer variables.
   A `list_comp` iteration variable is visible only in that comprehension's

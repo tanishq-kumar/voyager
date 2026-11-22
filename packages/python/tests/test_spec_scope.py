@@ -659,3 +659,258 @@ def test_root_aggregation_order_by_sees_only_the_returned_names() -> None:
     error = assert_invalid(spec, "/order_by/0/0")
     message = str(error)
     assert "a RETURN with DISTINCT or an aggregation only exposes the names it projects" in message
+
+
+# ---------------------------------------------------------------------------
+# A DISTINCT/aggregating ORDER BY or WHERE may repeat a projected expression.
+# This table mirrors DISTINCT_ORDER_BY_CASES in test_fluent_scope.py.
+# ---------------------------------------------------------------------------
+
+DISTINCT_ORDER_BY_CASES: list[tuple[str, dict[str, Any], tuple[Any, ...]]] = [
+    (
+        "distinct-return-order-by-projected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [["field", "p", "city", None]],
+            "distinct": True,
+            "order_by": [["p", "city", True]],
+        },
+        (
+            "accept",
+            "MATCH (p:Person) RETURN DISTINCT p.city ORDER BY p.city ASC",
+            {},
+        ),
+    ),
+    (
+        "distinct-return-order-by-projected-subexpression",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [["field", "p", "city", None]],
+            "distinct": True,
+            "order_by": [[["bin", "+", ["prop", "p", "city"], ["lit", 1]], True]],
+        },
+        (
+            "accept",
+            "MATCH (p:Person) RETURN DISTINCT p.city ORDER BY p.city + $p0 ASC",
+            {"p0": 1},
+        ),
+    ),
+    (
+        "distinct-return-order-by-aliased-projected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [["field", "p", "city", "city"]],
+            "distinct": True,
+            "order_by": [["p", "city", True]],
+        },
+        (
+            "accept",
+            "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY p.city ASC",
+            {},
+        ),
+    ),
+    (
+        "distinct-return-order-by-unprojected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [["field", "p", "city", None]],
+            "distinct": True,
+            "order_by": [["p", "age", True]],
+        },
+        ("reject", "/order_by/0/0"),
+    ),
+    (
+        "distinct-return-order-by-bare-variable-when-only-property-projected",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [["field", "p", "city", None]],
+            "distinct": True,
+            "order_by": [[["ident", "p"], True]],
+        },
+        ("reject", "/order_by/0/0/1"),
+    ),
+    (
+        "distinct-return-order-by-partly-unprojected-subexpression",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [["field", "p", "city", None]],
+            "distinct": True,
+            "order_by": [
+                [
+                    [
+                        "bin",
+                        "+",
+                        ["prop", "p", "city"],
+                        ["prop", "p", "age"],
+                    ],
+                    True,
+                ]
+            ],
+        },
+        ("reject", "/order_by/0/0/2/1"),
+    ),
+    (
+        "aggregating-return-order-by-projected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [
+                ["field", "p", "city", None],
+                ["agg", "p", "*", "count", "c"],
+            ],
+            "order_by": [["p", "city", True]],
+        },
+        (
+            "accept",
+            "MATCH (p:Person) RETURN p.city, COUNT(p) AS c ORDER BY p.city ASC",
+            {},
+        ),
+    ),
+    (
+        "aggregating-return-order-by-repeated-aggregation",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [["agg", "p", "*", "count", "c"]],
+            "order_by": [[["fn", "count", [["ident", "p"]]], True]],
+        },
+        (
+            "accept",
+            "MATCH (p:Person) RETURN COUNT(p) AS c ORDER BY count(p) ASC",
+            {},
+        ),
+    ),
+    (
+        "aggregating-return-order-by-unprojected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "projections": [
+                ["field", "p", "city", None],
+                ["agg", "p", "*", "count", "c"],
+            ],
+            "order_by": [["p", "age", True]],
+        },
+        ("reject", "/order_by/0/0"),
+    ),
+    (
+        "distinct-with-order-by-projected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "with_clauses": [
+                {
+                    "distinct": True,
+                    "projections": [["field", "p", "city", "city"]],
+                    "order_by": [["p", "city", True]],
+                }
+            ],
+            "projections": [["expr", ["ident", "city"], None]],
+        },
+        (
+            "accept",
+            "MATCH (p:Person) WITH DISTINCT p.city AS city ORDER BY p.city ASC RETURN city",
+            {},
+        ),
+    ),
+    (
+        "aggregating-with-order-by-projected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "with_clauses": [
+                {
+                    "projections": [
+                        ["field", "p", "city", "city"],
+                        ["agg", "p", "*", "count", "c"],
+                    ],
+                    "order_by": [["p", "city", True]],
+                }
+            ],
+            "projections": [
+                ["expr", ["ident", "city"], None],
+                ["expr", ["ident", "c"], None],
+            ],
+        },
+        (
+            "accept",
+            "MATCH (p:Person) WITH p.city AS city, COUNT(p) AS c "
+            "ORDER BY p.city ASC RETURN city, c",
+            {},
+        ),
+    ),
+    (
+        "distinct-with-where-projected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "with_clauses": [
+                {
+                    "distinct": True,
+                    "projections": [["field", "p", "city", "city"]],
+                    "where": [["unary", "is_not_null", ["prop", "p", "city"]]],
+                }
+            ],
+            "projections": [["expr", ["ident", "city"], None]],
+        },
+        (
+            "accept",
+            "MATCH (p:Person) WITH DISTINCT p.city AS city WHERE p.city IS NOT NULL RETURN city",
+            {},
+        ),
+    ),
+    (
+        "distinct-with-order-by-unprojected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "with_clauses": [
+                {
+                    "distinct": True,
+                    "projections": [["field", "p", "city", "city"]],
+                    "order_by": [["p", "age", True]],
+                }
+            ],
+            "projections": [["expr", ["ident", "city"], None]],
+        },
+        ("reject", "/with_clauses/0/order_by/0/0"),
+    ),
+    (
+        "distinct-with-where-unprojected-field",
+        {
+            "spec_version": 1,
+            "matches": [{"paths": PERSON_PATH}],
+            "with_clauses": [
+                {
+                    "distinct": True,
+                    "projections": [["field", "p", "city", "city"]],
+                    "where": [["unary", "is_not_null", ["prop", "p", "age"]]],
+                }
+            ],
+            "projections": [["expr", ["ident", "city"], None]],
+        },
+        ("reject", "/with_clauses/0/where/0/2/1"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [case[1:] for case in DISTINCT_ORDER_BY_CASES],
+    ids=[case[0] for case in DISTINCT_ORDER_BY_CASES],
+)
+def test_distinct_order_by_table(spec: dict[str, Any], expected: tuple[Any, ...]) -> None:
+    """A DISTINCT/aggregating clause may repeat a projected expression."""
+    outcome = expected[0]
+    if outcome == "reject":
+        assert_invalid(spec, expected[1])
+        return
+    compiled = compile_cypher(spec)
+    assert compiled["statement"] == expected[1]
+    assert compiled["parameters"] == expected[2]

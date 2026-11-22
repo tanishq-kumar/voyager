@@ -537,3 +537,156 @@ def test_issue_287_corrected_with_where_still_compiles() -> None:
     assert compiled.statement == (
         "MATCH (p:Person) WITH p.name AS name WHERE p.age > $p0 RETURN name"
     )
+
+
+# ---------------------------------------------------------------------------
+# A DISTINCT/aggregating ORDER BY or WHERE may repeat a projected expression.
+# This table mirrors DISTINCT_ORDER_BY_CASES in test_spec_scope.py.
+# ---------------------------------------------------------------------------
+
+DISTINCT_ORDER_BY_CASES: list[tuple[str, Callable[[], Query], Any]] = [
+    (
+        "distinct-return-order-by-projected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(Person("p").city, distinct=True)
+            .order_by(Person("p").city)
+        ),
+        "MATCH (p:Person) RETURN DISTINCT p.city ORDER BY p.city ASC",
+    ),
+    (
+        "distinct-return-order-by-projected-subexpression",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(Person("p").city, distinct=True)
+            .order_by(Person("p").city + 1)
+        ),
+        "MATCH (p:Person) RETURN DISTINCT p.city ORDER BY p.city + $p0 ASC",
+    ),
+    (
+        "distinct-return-order-by-aliased-projected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(city=Person("p").city, distinct=True)
+            .order_by(Person("p").city)
+        ),
+        "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY p.city ASC",
+    ),
+    (
+        "distinct-return-order-by-unprojected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(Person("p").city, distinct=True)
+            .order_by(Person("p").age)
+        ),
+        ("p", "root ORDER BY"),
+    ),
+    (
+        "distinct-return-order-by-bare-variable-when-only-property-projected",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(Person("p").city, distinct=True)
+            .order_by(ident("p"))
+        ),
+        ("p", "root ORDER BY"),
+    ),
+    (
+        "distinct-return-order-by-partly-unprojected-subexpression",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(Person("p").city, distinct=True)
+            .order_by(Person("p").city + Person("p").age)
+        ),
+        ("p", "root ORDER BY"),
+    ),
+    (
+        "aggregating-return-order-by-projected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(city=Person("p").city, count=Person("p").count())
+            .order_by(Person("p").city)
+        ),
+        "MATCH (p:Person) RETURN p.city AS city, COUNT(p) AS count ORDER BY p.city ASC",
+    ),
+    (
+        "aggregating-return-order-by-repeated-aggregation",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(count=Person("p").count())
+            .order_by(fn.count(Person("p")))
+        ),
+        "MATCH (p:Person) RETURN COUNT(p) AS count ORDER BY count(p) ASC",
+    ),
+    (
+        "aggregating-return-order-by-unprojected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .return_(city=Person("p").city, count=Person("p").count())
+            .order_by(Person("p").age)
+        ),
+        ("p", "root ORDER BY"),
+    ),
+    (
+        "distinct-with-order-by-projected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .with_(city=Person("p").city, distinct=True)
+            .order_by(Person("p").city)
+            .return_("city")
+        ),
+        "MATCH (p:Person) WITH DISTINCT p.city AS city ORDER BY p.city ASC RETURN city",
+    ),
+    (
+        "aggregating-with-order-by-projected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .with_(city=Person("p").city, c=Person("p").count())
+            .order_by(Person("p").city)
+            .return_("city", "c")
+        ),
+        "MATCH (p:Person) WITH p.city AS city, COUNT(p) AS c ORDER BY p.city ASC RETURN city, c",
+    ),
+    (
+        "distinct-with-where-projected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .with_(city=Person("p").city, distinct=True)
+            .where(Person("p").city.is_not_null())
+            .return_("city")
+        ),
+        "MATCH (p:Person) WITH DISTINCT p.city AS city WHERE p.city IS NOT NULL RETURN city",
+    ),
+    (
+        "distinct-with-order-by-unprojected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .with_(city=Person("p").city, distinct=True)
+            .order_by(Person("p").age)
+            .return_("city")
+        ),
+        ("p", "WITH clause 1 ORDER BY"),
+    ),
+    (
+        "distinct-with-where-unprojected-field",
+        lambda: (
+            Query.match(Person(alias="p"))
+            .with_(city=Person("p").city, distinct=True)
+            .where(Person("p").age.is_not_null())
+            .return_("city")
+        ),
+        ("p", "WITH clause 1 WHERE"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("query_factory", "expected"),
+    [case[1:] for case in DISTINCT_ORDER_BY_CASES],
+    ids=[case[0] for case in DISTINCT_ORDER_BY_CASES],
+)
+def test_distinct_order_by_table(query_factory: Callable[[], Query], expected: Any) -> None:
+    """A DISTINCT/aggregating clause may repeat a projected expression."""
+    if isinstance(expected, tuple):
+        assert_invalid(query_factory(), *expected)
+    else:
+        assert_statement(query_factory(), expected)
