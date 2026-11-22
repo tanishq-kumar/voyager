@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   
   Code passing such arguments now gets an error instead of a query without the `SET`. The supported forms compile as before, and a `Node` with no changed fields is still a no-op. `on_create_set()` / `on_match_set()` also accept a `Node` with changed fields, like `set()`.
 
+### Security
+- **`url` updated to 2.5.9 (RUSTSEC-2026-0592)**: `url` 2.5.8 and earlier can overflow the stack in `Url::origin()` on nested `blob:` URLs. Voyager does not call `Url::origin()`; the update clears the advisory for builds that use the lockfile.
+
 ## [0.4.1] - 2026-11-21
 
 ### Changed
