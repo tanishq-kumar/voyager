@@ -1,0 +1,92 @@
+{
+  "description": "NOT IN lowers to a negated IN on graph dialects; SQL/PGQ keeps infix NOT IN.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "not_in",
+          [
+            "prop",
+            "p",
+            "name"
+          ],
+          [
+            "lit",
+            [
+              "Mallory",
+              "Eve"
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) WHERE NOT (p.name IN $p0) RETURN p.name",
+      "parameters": {
+        "p0": [
+          "Mallory",
+          "Eve"
+        ]
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE NOT (p.name IN $p0) RETURN p.name $$, %s) AS (name agtype)",
+      "parameters": {
+        "p0": [
+          "Mallory",
+          "Eve"
+        ]
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) WHERE NOT (p.name IN $p0) RETURN p.name",
+      "parameters": {
+        "p0": [
+          "Mallory",
+          "Eve"
+        ]
+      }
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.name NOT IN $p0 COLUMNS (p.name))",
+      "parameters": {
+        "p0": [
+          "Mallory",
+          "Eve"
+        ]
+      }
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.name NOT IN $p0 COLUMNS (p.name))",
+      "parameters": {
+        "p0": [
+          "Mallory",
+          "Eve"
+        ]
+      }
+    }
+  }
+}
