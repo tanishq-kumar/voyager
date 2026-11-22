@@ -1,0 +1,29 @@
+{
+  "id": "p1-filtering/where-parameter-eq",
+  "pack": "p1-filtering",
+  "description": "Equality against a string parameter.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match-where/MatchWhere1.feature",
+    "scenario": "[6] Filter node with a parameter in a property predicate on multi variables with one binding"
+  },
+  "params": {
+    "name": "Carol"
+  },
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

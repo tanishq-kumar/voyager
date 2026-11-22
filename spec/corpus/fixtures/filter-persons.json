@@ -1,0 +1,58 @@
+{
+  "description": "P1 filtering: five Person nodes with a shared name and age, partial city and nickname properties, and a boolean active flag.",
+  "nodes": [
+    {
+      "id": "alice",
+      "labels": ["Person"],
+      "properties": {
+        "name": "Alice",
+        "age": 30,
+        "city": "London",
+        "active": true
+      }
+    },
+    {
+      "id": "bob",
+      "labels": ["Person"],
+      "properties": {
+        "name": "Bob",
+        "age": 25,
+        "city": "Paris",
+        "nickname": "Bobby",
+        "active": false
+      }
+    },
+    {
+      "id": "carol",
+      "labels": ["Person"],
+      "properties": {
+        "name": "Carol",
+        "age": 40,
+        "nickname": "Caz",
+        "active": true
+      }
+    },
+    {
+      "id": "dave",
+      "labels": ["Person"],
+      "properties": {
+        "name": "Dave",
+        "age": 35,
+        "city": "Berlin",
+        "active": true
+      }
+    },
+    {
+      "id": "eve",
+      "labels": ["Person"],
+      "properties": {
+        "name": "Eve",
+        "age": 20,
+        "city": "London",
+        "nickname": "Evie",
+        "active": false
+      }
+    }
+  ],
+  "relationships": []
+}

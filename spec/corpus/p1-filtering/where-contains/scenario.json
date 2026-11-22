@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-contains",
+  "pack": "p1-filtering",
+  "description": "CONTAINS substring predicate.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "CONTAINS substring predicate"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

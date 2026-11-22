@@ -1,0 +1,33 @@
+{
+  "id": "p1-filtering/where-in-parameter",
+  "pack": "p1-filtering",
+  "description": "IN against a list supplied as a query parameter.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "IN with a list parameter"
+  },
+  "params": {
+    "names": [
+      "Bob",
+      "Carol",
+      "Nope"
+    ]
+  },
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

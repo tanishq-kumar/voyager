@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-not",
+  "pack": "p1-filtering",
+  "description": "Negated comparison filters out rows where the comparison is null (missing city).",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "NOT over a property comparison"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

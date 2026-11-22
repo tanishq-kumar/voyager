@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-lt",
+  "pack": "p1-filtering",
+  "description": "Less-than comparison on a node property.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "Property < literal predicate"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

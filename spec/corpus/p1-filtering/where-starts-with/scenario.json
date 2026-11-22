@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-starts-with",
+  "pack": "p1-filtering",
+  "description": "STARTS WITH string predicate.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "STARTS WITH prefix predicate"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

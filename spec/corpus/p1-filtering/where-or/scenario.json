@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-or",
+  "pack": "p1-filtering",
+  "description": "Disjunctive predicate over two property comparisons.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match-where/MatchWhere1.feature",
+    "scenario": "[10] Filter node with disjunctive property predicate on single variables with multiple bindings"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

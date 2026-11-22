@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-null-or",
+  "pack": "p1-filtering",
+  "description": "Three-valued OR: a null comparison OR a true predicate keeps the row.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match-where/MatchWhere5.feature",
+    "scenario": "[4] Do not filter out on null if the OR'd predicate evaluates to true"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

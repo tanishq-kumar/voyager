@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-eq",
+  "pack": "p1-filtering",
+  "description": "Equality comparison on a node property.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match-where/MatchWhere1.feature",
+    "scenario": "[3] Filter node with property predicate on a single variable with multiple bindings"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

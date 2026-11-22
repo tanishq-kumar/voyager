@@ -1,0 +1,52 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "n",
+            [
+              "Person"
+            ]
+          ]
+        ]
+      ],
+      "where": [
+        "bin",
+        "in",
+        [
+          "prop",
+          "n",
+          "name"
+        ],
+        [
+          "list",
+          [
+            [
+              "lit",
+              "Alice"
+            ],
+            [
+              "lit",
+              "Bob"
+            ],
+            [
+              "lit",
+              "Eve"
+            ]
+          ]
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "field",
+      "n",
+      "name",
+      null
+    ]
+  ]
+}

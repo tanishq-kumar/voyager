@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-null-comparison",
+  "pack": "p1-filtering",
+  "description": "A comparison against a missing property is null and filters the row out.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match-where/MatchWhere5.feature",
+    "scenario": "[1] Filter out on null"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

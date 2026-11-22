@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-is-not-null",
+  "pack": "p1-filtering",
+  "description": "IS NOT NULL on a property that is absent on two nodes.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "IS NOT NULL property predicate"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "id": "p1-filtering/where-not-over-in",
+  "pack": "p1-filtering",
+  "description": "Negated IN predicate; rows where IN is null would be filtered, but name is always present.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "NOT over IN"
+  },
+  "params": {
+    "names": [
+      "Bob",
+      "Carol"
+    ]
+  },
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

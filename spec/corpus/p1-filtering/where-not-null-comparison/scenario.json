@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-not-null-comparison",
+  "pack": "p1-filtering",
+  "description": "NOT over a comparison against a missing property stays null and filters the row.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "NOT over a comparison with null"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-and",
+  "pack": "p1-filtering",
+  "description": "Conjunctive predicate with two property comparisons.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match-where/MatchWhere2.feature",
+    "scenario": "[1] Filter nodes with conjunctive two-part property predicate on multi variables with multiple bindings"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}
