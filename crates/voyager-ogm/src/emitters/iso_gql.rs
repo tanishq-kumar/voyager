@@ -331,6 +331,20 @@ impl IsoGqlEmitter {
                         feature: "regular expression match operator '=~'".to_string(),
                     });
                 }
+                if matches!(op, BinaryOp::NotIn) {
+                    if nested {
+                        self.buffer.push('(');
+                    }
+                    self.buffer.push_str("NOT (");
+                    self.emit_expression(arena, *left, true)?;
+                    self.buffer.push_str(" IN ");
+                    self.emit_expression(arena, *right, true)?;
+                    self.buffer.push(')');
+                    if nested {
+                        self.buffer.push(')');
+                    }
+                    return Ok(());
+                }
                 if nested {
                     self.buffer.push('(');
                 }

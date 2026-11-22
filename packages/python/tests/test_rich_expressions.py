@@ -197,7 +197,7 @@ def test_list_comprehension() -> None:
 
     q = Query.match(p).return_(p.name, comp.as_("clean_skills"))
     compiled = q.compile("cypher")
-    assert "[x IN p.skills WHERE x != $p0 | toUpper(x)] AS clean_skills" in compiled.statement
+    assert "[x IN p.skills WHERE x <> $p0 | toUpper(x)] AS clean_skills" in compiled.statement
     assert compiled.parameters["p0"] == "Legacy"
 
 
@@ -262,7 +262,7 @@ def test_branching_graph_topologies_multi_pattern() -> None:
     assert "MATCH (p:Person)-[" in compiled.statement
     assert "]->(m:Movie), (d:Person)-[" in compiled.statement
     assert "]->(m:Movie)" in compiled.statement
-    assert "WHERE p.name != d.name" in compiled.statement
+    assert "WHERE p.name <> d.name" in compiled.statement
     assert "RETURN p.name, d.name, m.title" in compiled.statement
 
 

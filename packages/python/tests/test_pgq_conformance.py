@@ -79,7 +79,7 @@ def _reset():
     ("expr_builder", "expected_fragment", "expected_params"),
     [
         (lambda p: p.age == 30, "p.age = $p0", {"p0": 30}),
-        (lambda p: p.age != 30, "p.age != $p0", {"p0": 30}),
+        (lambda p: p.age != 30, "p.age <> $p0", {"p0": 30}),
         (lambda p: p.age > 21, "p.age > $p0", {"p0": 21}),
         (lambda p: p.age >= 21, "p.age >= $p0", {"p0": 21}),
         (lambda p: p.age < 65, "p.age < $p0", {"p0": 65}),

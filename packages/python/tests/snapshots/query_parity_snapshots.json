@@ -135,7 +135,7 @@
         "p0": "London",
         "p1": "Bob"
       },
-      "statement": "MATCH (p:Person) WHERE (p.city = $p0) AND (p.name != $p1) RETURN p.name",
+      "statement": "MATCH (p:Person) WHERE (p.city = $p0) AND (p.name <> $p1) RETURN p.name",
       "status": "ok"
     },
     "iso_gql": {
@@ -144,7 +144,7 @@
         "p0": "London",
         "p1": "Bob"
       },
-      "statement": "MATCH (p:Person) WHERE (p.city = $p0) AND (p.name != $p1) RETURN p.name",
+      "statement": "MATCH (p:Person) WHERE (p.city = $p0) AND (p.name <> $p1) RETURN p.name",
       "status": "ok"
     },
     "sql_pgq": {
@@ -153,7 +153,7 @@
         "p0": "London",
         "p1": "Bob"
       },
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE (p.city = $p0) AND (p.name != $p1) COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE (p.city = $p0) AND (p.name <> $p1) COLUMNS (p.name))",
       "status": "ok"
     }
   },
@@ -230,7 +230,7 @@
           "Mallory"
         ]
       },
-      "statement": "MATCH (p:Person) WHERE (p.city IN $p0) AND (p.name NOT IN $p1) RETURN p.name",
+      "statement": "MATCH (p:Person) WHERE (p.city IN $p0) AND (NOT (p.name IN $p1)) RETURN p.name",
       "status": "ok"
     },
     "iso_gql": {
@@ -245,7 +245,7 @@
           "Mallory"
         ]
       },
-      "statement": "MATCH (p:Person) WHERE (p.city IN $p0) AND (p.name NOT IN $p1) RETURN p.name",
+      "statement": "MATCH (p:Person) WHERE (p.city IN $p0) AND (NOT (p.name IN $p1)) RETURN p.name",
       "status": "ok"
     },
     "sql_pgq": {
