@@ -18,7 +18,7 @@ Pick the package that matches what you are building:
 | Use Voyager from Python (query builder, OGM, Arrow/Polars, database bridges) | [`voyager-ogm` on PyPI](https://pypi.org/project/voyager-ogm/) | `pip install voyager-ogm` |
 | Compile queries in Rust (openCypher, ISO GQL, SQL:2023 PGQ) | [`voyager-ogm` on crates.io](https://crates.io/crates/voyager-ogm) | `cargo add voyager-ogm` |
 | Use native Bolt, PostgreSQL, and Redis drivers from Rust | [`voyager-drivers` on crates.io](https://crates.io/crates/voyager-drivers) | `cargo add voyager-drivers` |
-| Run the `voyager` diagnostics CLI | [`voyager-cli` on crates.io](https://crates.io/crates/voyager-cli) | `cargo install voyager-cli` |
+| Compile and validate Query Specs and check connections with the `voyager` CLI | [`voyager-cli` on crates.io](https://crates.io/crates/voyager-cli) | `cargo install voyager-cli` |
 
 ### Python
 
@@ -148,7 +148,7 @@ cargo add voyager-drivers --no-default-features --features bolt
 
 A URI or client that targets a protocol whose feature is disabled returns a `NetError` naming the missing feature. The `testkit` feature is opt-in and intended for tests.
 
-#### `voyager-cli`: the `voyager` binary
+#### `voyager-cli`: the `voyager` and `voy` binaries
 
 [![crates.io](https://img.shields.io/crates/v/voyager-cli.svg)](https://crates.io/crates/voyager-cli)
 
@@ -156,11 +156,55 @@ A URI or client that targets a protocol whose feature is disabled returns a `Net
 cargo install voyager-cli
 ```
 
-Check the installed version:
+`cargo install` installs both `voyager` and the short alias `voy`. Check the
+installed version with either:
 
 ```bash
 voyager --version
+voy --version
 ```
+
+The CLI works on Query Spec v1 JSON; it does not parse query text. Compile a
+document from a file or stdin:
+
+```bash
+voyager compile query.spec.json --dialect iso_gql
+cat query.spec.json | voyager compile - --dialect sql_pgq --format json
+```
+
+`--format text` (the default) prints only the statement to stdout and puts
+parameters behind `--show-params` on stderr. `--format json` prints
+`{"statement", "parameters", "columns"}` and adds `warnings` when the consumer
+returns any. Dialects are `cypher`, `age`, `iso_gql`, `sql_pgq` and `duck_pgq`.
+
+Validate a document without emitting a statement:
+
+```bash
+voyager validate query.spec.json
+```
+
+Validation is silent on success. On failure it prints
+`<json-pointer>: <message> (<ERROR_CODE>)` to stderr and exits `1`, so it works
+as a CI gate.
+
+`doctor` reports build facts, or checks a live connection:
+
+```bash
+voyager doctor
+voyager doctor --uri bolt://localhost:7687 --username neo4j --password-env NEO4J_PASSWORD
+voyager doctor --uri age://postgres:secret@localhost:5455/voyager_graph
+voyager doctor --uri redis://localhost:6379
+```
+
+Without `--uri` it reports the CLI and engine versions, the driver protocol
+features compiled into the binary, and the supported dialects. With `--uri` it
+connects through `voyager-drivers`, pings the server, and reports the protocol,
+server version, matching dialect and ping round-trip latency. Passwords come
+from `--password-env` or the URI userinfo, never from the command line.
+
+Exit codes are `0` for success, `1` for an invalid spec or rejected compilation,
+`2` for a usage error, `3` for a doctor connection/check failure, and `4` for an
+input/output error. Every subcommand lists them in `--help`.
 
 For local development setup (building the Python extension from source, test databases, and contribution guidelines), see [**CONTRIBUTING.md**](https://github.com/tanishq-kumar/voyager/blob/main/CONTRIBUTING.md).
 

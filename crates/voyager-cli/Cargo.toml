@@ -1,6 +1,6 @@
 [package]
 name = "voyager-cli"
-description = "Diagnostic command-line interface for Voyager OGM (the `voyager` binary)"
+description = "Command-line interface for Voyager OGM (the `voyager` and `voy` binaries)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,15 +10,28 @@ repository.workspace = true
 keywords = ["cli", "graph", "cypher", "database", "ogm"]
 categories = ["command-line-utilities", "database"]
 readme = "README.md"
+default-run = "voyager"
 
 [[bin]]
 name = "voyager"
 path = "src/main.rs"
 
+[[bin]]
+name = "voy"
+path = "src/bin/voy.rs"
+
 [lints]
 workspace = true
 
+[features]
+default = ["bolt", "postgres", "redis"]
+bolt = ["voyager-drivers/bolt"]
+postgres = ["voyager-drivers/postgres"]
+redis = ["voyager-drivers/redis"]
+
 [dependencies]
 voyager-ogm = { workspace = true, features = ["serde", "arrow"] }
+voyager-drivers = { workspace = true, default-features = false }
 clap = { workspace = true }
-miette = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
