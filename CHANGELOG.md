@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-22
+
 ### Fixed
 - **SQL/PGQ parameter binding in Python bridges (#226)**: `PostgresBridge._format_pgq_statement` now binds `GRAPH_TABLE` parameters positionally as `%s` placeholders like standard SQL instead of interpolating parameter values directly into the SQL statement, supporting prepared statements, duplicate parameter names, and preventing injection from hostile values. `DuckDbBridge` safely encodes values for `GRAPH_TABLE` queries as typed SQL literals (strings with quote-doubling, ints, floats including `'nan'::DOUBLE` / `'inf'::DOUBLE`, booleans, `NULL`, dates, datetimes, times, lists, and maps) and raises `TypeError` for unsupported parameter types, working around DuckPGQ's lack of prepared parameter support inside table function ASTs.
 - **Native PostgreSQL list parameter encoding (#283)**: `prepare_postgres_statement` and `value_to_text` in the native PostgreSQL driver now encode JSON array parameters as PostgreSQL array literal text (`{elem,elem}`) with double-quoting and backslash-escaping for strings, `NULL` for null elements, nested arrays, unquoted numbers and booleans, and quoted JSON text for nested maps, instead of sending JSON text (`[...]`). This enables list parameters to be bound where PostgreSQL expects an array (such as `= ANY($1)` or array columns in plain SQL and `GRAPH_TABLE`), matching the behaviour of the `psycopg` bridge while preserving JSON encoding for top-level maps and Apache AGE parameter maps.
@@ -385,7 +387,9 @@ Breaking changes in the 0.4 line are marked **Breaking** in the sections below (
 
 
 
-[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.4.1...HEAD
+
+[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/tanishq-kumar/voyager/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tanishq-kumar/voyager/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tanishq-kumar/voyager/compare/v0.4.0-alpha.8...v0.4.0
 [0.4.0-alpha.8]: https://github.com/tanishq-kumar/voyager/compare/v0.4.0-alpha.7...v0.4.0-alpha.8
