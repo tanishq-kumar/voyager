@@ -57,13 +57,21 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Show build facts, or check a database connection with --uri
-    #[command(after_help = EXIT_HELP)]
+    #[command(
+        long_about = "Show build facts, or check a database connection with --uri.\n\n\
+                      Credentials are optional. With no username and no password, doctor connects \
+                      without authentication: Bolt uses the `none` authentication scheme and Redis \
+                      skips AUTH. PostgreSQL still requires a username. Put the username in the URI \
+                      userinfo or pass --username, and read the password from an environment \
+                      variable with --password-env. A password without a username is an error.",
+        after_help = EXIT_HELP
+    )]
     Doctor {
         /// Connection URI to check (bolt://, neo4j://, postgresql://, age://, redis://, falkordb://)
         #[arg(long)]
         uri: Option<String>,
 
-        /// Username for the connection check (overrides the URI userinfo)
+        /// Username for the connection check (overrides the URI userinfo); omit it for servers that do not authenticate
         #[arg(long)]
         username: Option<String>,
 
@@ -382,10 +390,6 @@ fn apply_credentials(
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<(), Failure> {
-    if username.is_none() && password.is_none() {
-        return Ok(());
-    }
-
     let (mut current_user, mut current_password) = match &parsed.auth {
         Auth::Basic {
             username, password, ..
@@ -401,9 +405,23 @@ fn apply_credentials(
     }
 
     if current_user.is_empty() {
-        return Err(Failure::check(
-            "doctor: a username is required; put it in the URI or pass --username",
-        ));
+        if !current_password.is_empty() {
+            return Err(Failure::check(
+                "doctor: a password needs a username; put the username in the URI or pass --username",
+            ));
+        }
+        return match parsed.protocol {
+            // PostgreSQL has no anonymous login: the startup message must name a role.
+            DatabaseProtocol::Postgres => Err(Failure::check(
+                "doctor: PostgreSQL requires a username; put it in the URI (for example postgresql://user@host:5432/database) or pass --username",
+            )),
+            // Bolt sends the `none` authentication scheme and Redis skips AUTH, which is
+            // what servers without authentication expect.
+            _ => {
+                parsed.auth = Auth::None;
+                Ok(())
+            }
+        };
     }
 
     parsed.auth = Auth::Basic {
@@ -704,5 +722,58 @@ mod tests {
         assert_eq!(features.contains("bolt"), cfg!(feature = "bolt"));
         assert_eq!(features.contains("postgres"), cfg!(feature = "postgres"));
         assert_eq!(features.contains("redis"), cfg!(feature = "redis"));
+    }
+
+    #[test]
+    fn username_is_optional_for_bolt_and_redis() {
+        for uri in ["bolt://localhost:7687", "redis://localhost:6379"] {
+            let mut parsed = ParsedUri::parse(uri).expect("parse URI");
+            apply_credentials(&mut parsed, None, None).expect("no credentials needed");
+            assert_eq!(parsed.auth, Auth::None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn postgres_without_a_username_is_rejected() {
+        let mut parsed = ParsedUri::parse("postgresql://localhost:5432/graph").expect("parse URI");
+        let failure = apply_credentials(&mut parsed, None, None).expect_err("username required");
+        assert_eq!(failure.code, EXIT_CHECK);
+        assert!(
+            failure.message.contains("requires a username"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("--username"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn password_without_a_username_is_rejected() {
+        let mut parsed = ParsedUri::parse("bolt://localhost:7687").expect("parse URI");
+        let failure =
+            apply_credentials(&mut parsed, None, Some("secret")).expect_err("username required");
+        assert_eq!(failure.code, EXIT_CHECK);
+        assert!(
+            failure.message.contains("needs a username"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn username_without_a_password_is_kept() {
+        let mut parsed = ParsedUri::parse("bolt://localhost:7687").expect("parse URI");
+        apply_credentials(&mut parsed, Some("memgraph"), None).expect("username is enough");
+        assert_eq!(
+            parsed.auth,
+            Auth::Basic {
+                username: "memgraph".to_string(),
+                password: String::new(),
+                realm: None,
+            }
+        );
     }
 }

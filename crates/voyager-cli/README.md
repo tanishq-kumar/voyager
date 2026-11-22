@@ -131,6 +131,7 @@ fails the check with a message naming the missing feature.
 ```bash
 voyager doctor --uri bolt://localhost:7687 --username neo4j --password-env NEO4J_PASSWORD
 voyager doctor --uri age://postgres:secret@localhost:5455/voyager_graph
+voyager doctor --uri bolt://localhost:7688
 voyager doctor --uri redis://localhost:6379
 ```
 
@@ -144,10 +145,30 @@ sends a `ping` (a trivial round trip), and reports:
 - the matching dialect (`cypher`, `age` or `sql_pgq`);
 - the ping round-trip latency in milliseconds.
 
-Passwords are never accepted on the command line. Take the password from an
-environment variable with `--password-env VAR`, or embed credentials in the URI
-userinfo. The CLI does not prompt for a password. An unset environment variable
-is a check failure (exit `3`). `--username` overrides the URI username.
+### Credentials
+
+Credentials are optional. A URI can carry them in its userinfo, `--username`
+overrides the URI username, and `--password-env VAR` reads the password from an
+environment variable. Passwords are never accepted on the command line and the
+CLI does not prompt for one; an unset environment variable is a check failure
+(exit `3`).
+
+With no username and no password, `doctor` connects without authentication.
+Each protocol does this differently:
+
+| Protocol | No credentials |
+| :--- | :--- |
+| Bolt (`bolt://`, `neo4j://`, `memgraph://`) | Sends the Bolt `none` authentication scheme. Servers with authentication enabled reject this. |
+| Redis/FalkorDB (`redis://`, `falkordb://`) | Sends `HELLO 3` without `AUTH`. Servers with a password reject this with `WRONGPASS`/`NOAUTH`. |
+| PostgreSQL/AGE (`postgresql://`, `age://`) | Not possible: the startup message must name a role, so a username is required. |
+
+So `voyager doctor --uri bolt://localhost:7688` checks a Memgraph instance that
+has authentication disabled, and `voyager doctor --uri redis://localhost:6379`
+checks a FalkorDB instance that has no password. PostgreSQL URIs must name a
+user, either in the URI (`postgresql://postgres@localhost:5432/voyager_graph`)
+or with `--username`. A password without a username is an error. For servers
+that do require authentication, keep the credentials in the URI or pass
+`--username` plus `--password-env`.
 
 DuckDB is embedded and has no network endpoint, so `doctor --uri duckdb://...`
 reports that it cannot be checked. SQL/PGQ itself is checked only through
