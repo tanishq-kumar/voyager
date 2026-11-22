@@ -43,15 +43,15 @@ fn test_pgq_single_node_and_where_conformance() {
 #[test]
 fn test_pgq_all_operator_translations() {
     let ops = [
-        (BinaryOp::Eq, "=", LiteralValue::Int64(30)),
-        (BinaryOp::Neq, "!=", LiteralValue::Int64(30)),
-        (BinaryOp::Gt, ">", LiteralValue::Int64(21)),
-        (BinaryOp::Gte, ">=", LiteralValue::Int64(21)),
-        (BinaryOp::Lt, "<", LiteralValue::Int64(65)),
-        (BinaryOp::Lte, "<=", LiteralValue::Int64(65)),
+        (BinaryOp::Eq, "p.age = $p0", LiteralValue::Int64(30)),
+        (BinaryOp::Neq, "p.age <> $p0", LiteralValue::Int64(30)),
+        (BinaryOp::Gt, "p.age > $p0", LiteralValue::Int64(21)),
+        (BinaryOp::Gte, "p.age >= $p0", LiteralValue::Int64(21)),
+        (BinaryOp::Lt, "p.age < $p0", LiteralValue::Int64(65)),
+        (BinaryOp::Lte, "p.age <= $p0", LiteralValue::Int64(65)),
         (
             BinaryOp::In,
-            "IN",
+            "p.age IN $p0",
             LiteralValue::List(vec![
                 LiteralValue::String("London".into()),
                 LiteralValue::String("Paris".into()),
@@ -59,12 +59,12 @@ fn test_pgq_all_operator_translations() {
         ),
         (
             BinaryOp::NotIn,
-            "NOT IN",
+            "p.age NOT IN $p0",
             LiteralValue::List(vec![LiteralValue::String("Rome".into())]),
         ),
     ];
 
-    for (op, op_str, lit) in ops {
+    for (op, predicate, lit) in ops {
         let mut builder = QueryBuilder::new();
         builder
             .match_node(Some("p"), vec!["Person"])
@@ -76,7 +76,7 @@ fn test_pgq_all_operator_translations() {
         let res = pgq.visit_query(&arena, root).unwrap();
 
         assert!(
-            res.statement.contains(&format!("p.age {op_str} $p0")),
+            res.statement.contains(predicate),
             "Failed for op {op:?}: {}",
             res.statement
         );

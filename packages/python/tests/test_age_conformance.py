@@ -72,7 +72,7 @@ def _reset():
     ("expr_builder", "expected_fragment", "expected_params"),
     [
         (lambda p: p.age == 30, "p.age = $p0", {"p0": 30}),
-        (lambda p: p.age != 30, "p.age != $p0", {"p0": 30}),
+        (lambda p: p.age != 30, "p.age <> $p0", {"p0": 30}),
         (lambda p: p.age > 21, "p.age > $p0", {"p0": 21}),
         (lambda p: p.age >= 21, "p.age >= $p0", {"p0": 21}),
         (lambda p: p.age < 65, "p.age < $p0", {"p0": 65}),
@@ -80,7 +80,7 @@ def _reset():
         (lambda p: p.city.in_(["London", "Paris"]), "p.city IN $p0", {"p0": ["London", "Paris"]}),
         (
             lambda p: p.city.not_in(["Rome", "Tokyo"]),
-            "p.city NOT IN $p0",
+            "NOT (p.city IN $p0)",
             {"p0": ["Rome", "Tokyo"]},
         ),
         (lambda p: p.city.contains("don"), "p.city CONTAINS $p0", {"p0": "don"}),

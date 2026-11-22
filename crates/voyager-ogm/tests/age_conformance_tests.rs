@@ -34,15 +34,15 @@ fn test_age_single_node_and_projections() {
 #[test]
 fn test_age_all_operators_and_like_translations() {
     let ops = [
-        (BinaryOp::Eq, "=", LiteralValue::Int64(30)),
-        (BinaryOp::Neq, "!=", LiteralValue::Int64(30)),
-        (BinaryOp::Gt, ">", LiteralValue::Int64(21)),
-        (BinaryOp::Gte, ">=", LiteralValue::Int64(21)),
-        (BinaryOp::Lt, "<", LiteralValue::Int64(65)),
-        (BinaryOp::Lte, "<=", LiteralValue::Int64(65)),
+        (BinaryOp::Eq, "p.age = $p0", LiteralValue::Int64(30)),
+        (BinaryOp::Neq, "p.age <> $p0", LiteralValue::Int64(30)),
+        (BinaryOp::Gt, "p.age > $p0", LiteralValue::Int64(21)),
+        (BinaryOp::Gte, "p.age >= $p0", LiteralValue::Int64(21)),
+        (BinaryOp::Lt, "p.age < $p0", LiteralValue::Int64(65)),
+        (BinaryOp::Lte, "p.age <= $p0", LiteralValue::Int64(65)),
         (
             BinaryOp::In,
-            "IN",
+            "p.age IN $p0",
             LiteralValue::List(vec![
                 LiteralValue::String("London".into()),
                 LiteralValue::String("Paris".into()),
@@ -50,27 +50,27 @@ fn test_age_all_operators_and_like_translations() {
         ),
         (
             BinaryOp::NotIn,
-            "NOT IN",
+            "NOT (p.age IN $p0)",
             LiteralValue::List(vec![LiteralValue::String("Rome".into())]),
         ),
         (
             BinaryOp::Contains,
-            "CONTAINS",
+            "p.age CONTAINS $p0",
             LiteralValue::String("don".into()),
         ),
         (
             BinaryOp::StartsWith,
-            "STARTS WITH",
+            "p.age STARTS WITH $p0",
             LiteralValue::String("Al".into()),
         ),
         (
             BinaryOp::EndsWith,
-            "ENDS WITH",
+            "p.age ENDS WITH $p0",
             LiteralValue::String("ce".into()),
         ),
     ];
 
-    for (op, op_str, lit) in ops {
+    for (op, predicate, lit) in ops {
         let mut builder = QueryBuilder::new();
         builder
             .match_node(Some("p"), vec!["Person"])
@@ -82,7 +82,7 @@ fn test_age_all_operators_and_like_translations() {
         let res = age.visit_query(&arena, root).unwrap();
 
         assert!(
-            res.statement.contains(&format!("p.age {op_str} $p0")),
+            res.statement.contains(predicate),
             "Failed for AGE op {op:?}: {}",
             res.statement
         );

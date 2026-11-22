@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - positional values that are not an assignment such as `p.city == value` or a `Node`. This includes comparisons such as `p.city > 10`, which were written as `SET p.city = 10`.
   
   Code passing such arguments now gets an error instead of a query without the `SET`. The supported forms compile as before, and a `Node` with no changed fields is still a no-op. `on_create_set()` / `on_match_set()` also accept a `Node` with changed fields, like `set()`.
+- **Inequality compiles to `<>` (#301)**: `neq`, `ne`, `!=` and `<>` inputs now emit `<>` instead of `!=` on Cypher, Apache AGE, ISO GQL and SQL/PGQ, so Neo4j, FalkorDB and Apache AGE accept the statement.
+- **`not_in` compiles to `NOT (x IN list)` (#302)**: `.not_in(...)` and Query Spec `not_in` now emit `NOT (x IN list)` on Cypher, Apache AGE and ISO GQL; SQL/PGQ keeps infix `NOT IN` for now (#303).
 
 ### Security
 - **`url` updated to 2.5.9 (RUSTSEC-2026-0592)**: `url` 2.5.8 and earlier can overflow the stack in `Url::origin()` on nested `blob:` URLs. Voyager does not call `Url::origin()`; the update clears the advisory for builds that use the lockfile.
