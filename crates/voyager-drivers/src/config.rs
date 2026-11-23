@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::tls::TlsOptions;
 use crate::uri::ParsedUri;
 
 /// Authentication schemes supported by database wire protocols.
@@ -28,14 +29,18 @@ pub enum Auth {
 }
 
 /// Transport Layer Security (TLS) configuration modes.
+///
+/// PostgreSQL refines this with [`SslMode`](crate::tls::SslMode) (`?sslmode=`), which follows libpq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TlsMode {
     /// Plaintext TCP connection without TLS encryption.
     #[default]
     Disabled,
-    /// TLS encryption with strict system certificate authority verification.
+    /// TLS with the server certificate verified against the trusted roots (the system store, or
+    /// [`TlsOptions::ca_file`]) and the hostname (`bolt+s`, `neo4j+s`, `rediss`, `postgresql+s`).
     Required,
-    /// TLS encryption with self-signed certificate acceptance (useful for local development).
+    /// TLS that accepts any server certificate (`bolt+ssc`, `neo4j+ssc`, `?tls=insecure`): the
+    /// traffic is encrypted but the server is not authenticated. For development only.
     SelfSigned,
 }
 
@@ -120,6 +125,10 @@ pub struct ConnectionConfig {
     pub database: Option<String>,
     /// Transport security mode.
     pub tls: TlsMode,
+    /// TLS settings (CA bundle, client certificate, server name). Fields set here win over the
+    /// matching URI parameters.
+    #[serde(default)]
+    pub tls_options: TlsOptions,
     /// Physical TCP socket connection timeout. Default is 10s.
     pub connect_timeout: Duration,
     /// Maximum execution timeout for any single query on the wire. Default is 30s.
@@ -135,6 +144,7 @@ impl Default for ConnectionConfig {
             auth: Auth::None,
             database: None,
             tls: TlsMode::Disabled,
+            tls_options: TlsOptions::default(),
             connect_timeout: Duration::from_secs(10),
             query_timeout: Some(Duration::from_secs(30)),
             pool: PoolConfig::default(),
@@ -154,6 +164,7 @@ impl ConnectionConfig {
             config.auth = parsed.auth;
             config.database = parsed.database;
             config.tls = parsed.tls;
+            config.tls_options = TlsOptions::from_params(&parsed.params);
             if let Some(t) = parsed
                 .params
                 .get("connect_timeout")
@@ -185,6 +196,19 @@ impl ConnectionConfig {
     /// Sets the target database or graph name.
     pub fn with_database(mut self, database: impl Into<String>) -> Self {
         self.database = Some(database.into());
+        self
+    }
+
+    /// Sets the TLS mode. A TLS mode requested by the URI scheme is never downgraded: the
+    /// connection uses TLS when either this or the URI asks for it.
+    pub fn with_tls(mut self, mode: TlsMode) -> Self {
+        self.tls = mode;
+        self
+    }
+
+    /// Sets the TLS options (CA bundle, client certificate and key, server name override).
+    pub fn with_tls_options(mut self, options: TlsOptions) -> Self {
+        self.tls_options = options;
         self
     }
 

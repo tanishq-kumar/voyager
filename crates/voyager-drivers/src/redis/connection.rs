@@ -12,11 +12,12 @@ use crate::redis::codec::{read_resp_value, write_command};
 use crate::redis::graph::FalkorQueryResult;
 use crate::redis::resp::RespValue;
 use crate::redis::transaction::{RedisTransaction, format_cypher_with_params};
+use crate::tls::{NetStream, TlsOptions, TlsVerification};
 use crate::uri::ParsedUri;
 
 /// Connection to a Redis / FalkorDB server implementing [`AsyncConnection`].
 pub struct RedisConnection {
-    stream: TcpStream,
+    stream: NetStream,
     uri: ParsedUri,
     buffer: BytesMut,
     is_resp3: bool,
@@ -29,20 +30,27 @@ pub struct RedisConnection {
 
 impl RedisConnection {
     /// Asynchronously establishes a new connection to Redis / FalkorDB based on the parsed URI.
+    ///
+    /// `rediss://`, `falkordbs://` and `valkeys://` (or `?tls=true`) connect over TLS with the
+    /// server certificate verified; `?tls=insecure` accepts any certificate. TLS settings come
+    /// from the URI parameters (see [`TlsOptions::from_params`]).
     pub async fn connect(uri: &ParsedUri) -> Result<Self> {
-        if uri.tls != crate::config::TlsMode::Disabled {
-            return Err(NetError::TlsError(format!(
-                "TLS encryption requested for Redis/FalkorDB endpoint '{}', but native TLS transport is not enabled. Plaintext downgrade rejected.",
-                uri.host
-            )));
+        Self::connect_with_tls(uri, &TlsOptions::new()).await
+    }
+
+    /// Like [`connect`](Self::connect), with TLS options that win over the URI parameters.
+    pub async fn connect_with_tls(uri: &ParsedUri, tls_options: &TlsOptions) -> Result<Self> {
+        if uri.tls != crate::config::TlsMode::Disabled && !crate::tls::TLS_AVAILABLE {
+            return Err(crate::tls::tls_unavailable(uri.protocol, &uri.host));
         }
+        let tls_options = tls_options.clone().or(TlsOptions::from_params(&uri.params));
         let timeout_secs = uri
             .params
             .get("connect_timeout")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(5);
         let timeout_dur = std::time::Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout_dur, Self::connect_raw(uri)).await {
+        match tokio::time::timeout(timeout_dur, Self::connect_raw(uri, &tls_options)).await {
             Ok(res) => res,
             Err(_) => Err(NetError::Timeout(format!(
                 "Connection or handshake to Redis/FalkorDB host at {} timed out after {:?}",
@@ -52,7 +60,7 @@ impl RedisConnection {
         }
     }
 
-    async fn connect_raw(uri: &ParsedUri) -> Result<Self> {
+    async fn connect_raw(uri: &ParsedUri, tls_options: &TlsOptions) -> Result<Self> {
         let socket_addr = uri.socket_addr();
         let stream = TcpStream::connect(&socket_addr).await.map_err(|e| {
             NetError::ConnectionFailed(format!(
@@ -63,6 +71,14 @@ impl RedisConnection {
 
         // Disable Nagle's algorithm for low-latency graph query execution
         let _ = stream.set_nodelay(true);
+
+        let stream = match TlsVerification::for_mode(uri.tls) {
+            Some(verification) => {
+                crate::tls::upgrade(stream, uri.protocol, &uri.host, verification, tls_options)
+                    .await?
+            }
+            None => NetStream::Plain(stream),
+        };
 
         // Resolve default graph name: from database segment, query params, or default
         let default_graph = if let Some(db) = &uri.database {
@@ -191,6 +207,11 @@ impl RedisConnection {
         }
 
         Ok(())
+    }
+
+    /// Returns whether the connection is encrypted with TLS.
+    pub fn is_tls(&self) -> bool {
+        self.stream.is_tls()
     }
 
     /// Returns `true` if this connection negotiated RESP3.

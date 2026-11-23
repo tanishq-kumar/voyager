@@ -1,4 +1,4 @@
-//! Bolt asynchronous connection implementation over raw TCP streams.
+//! Bolt asynchronous connection implementation over TCP or TLS streams.
 
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
@@ -19,6 +19,7 @@ use super::stream::{encode_chunks, read_message_frame_buffered, write_message_fr
 use crate::config::{Auth, ConnectionConfig};
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
+use crate::tls::{NetStream, TlsVerification};
 use crate::uri::ParsedUri;
 
 /// Magic 4-byte header sent at the start of every Bolt TCP connection (`0x60 0x60 0xB0 0x17`).
@@ -42,7 +43,7 @@ pub struct BoltVersion {
 }
 
 /// Physical asynchronous Bolt connection managing socket I/O, PackStream framing, and state.
-pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = TcpStream> {
+pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = NetStream> {
     stream: S,
     read_buf: BytesMut,
     version: BoltVersion,
@@ -57,22 +58,31 @@ pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = TcpS
     pub query_timeout: Option<Duration>,
 }
 
-impl BoltConnection<TcpStream> {
-    /// Establishes a new physical TCP connection to the target Bolt endpoint and performs handshake/auth.
+impl BoltConnection<NetStream> {
+    /// Establishes a new connection to the target Bolt endpoint and performs handshake/auth.
+    ///
+    /// TLS is used when the URI scheme (`bolt+s`, `neo4j+ssc`, ...) or `config.tls` asks for
+    /// it; a TLS request is never downgraded to plaintext. Without the `tls` Cargo feature a
+    /// TLS request fails with [`NetError::TlsError`].
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
         let uri = ParsedUri::parse(&config.uri)?;
-        if config.tls != crate::config::TlsMode::Disabled
-            || uri.tls != crate::config::TlsMode::Disabled
-        {
-            return Err(NetError::TlsError(format!(
-                "TLS encryption requested for Bolt endpoint '{}', but native TLS transport is not enabled. Plaintext downgrade rejected.",
-                uri.host
-            )));
+        let mode = if config.tls != crate::config::TlsMode::Disabled {
+            config.tls
+        } else {
+            uri.tls
+        };
+        if mode != crate::config::TlsMode::Disabled && !crate::tls::TLS_AVAILABLE {
+            return Err(crate::tls::tls_unavailable(uri.protocol, &uri.host));
         }
         let addr = uri.socket_addr();
 
         debug!("Connecting to Bolt server at {}", addr);
-        match timeout(config.connect_timeout, Self::connect_raw(config, &uri)).await {
+        match timeout(
+            config.connect_timeout,
+            Self::connect_raw(config, &uri, mode),
+        )
+        .await
+        {
             Ok(res) => res,
             Err(_) => Err(NetError::Timeout(format!(
                 "Connection or handshake to Bolt server at {} timed out after {:?}",
@@ -81,7 +91,16 @@ impl BoltConnection<TcpStream> {
         }
     }
 
-    async fn connect_raw(config: &ConnectionConfig, uri: &ParsedUri) -> Result<Self> {
+    /// Returns whether the connection is encrypted with TLS.
+    pub fn is_tls(&self) -> bool {
+        self.stream.is_tls()
+    }
+
+    async fn connect_raw(
+        config: &ConnectionConfig,
+        uri: &ParsedUri,
+        mode: crate::config::TlsMode,
+    ) -> Result<Self> {
         let addr = uri.socket_addr();
         let stream = TcpStream::connect(&addr).await.map_err(|e| {
             NetError::ConnectionFailed(format!("Failed to connect to {}: {}", addr, e))
@@ -89,7 +108,18 @@ impl BoltConnection<TcpStream> {
 
         // Disable Nagle's algorithm to eliminate 40-200ms delayed-ACK packet stalls
         let _ = stream.set_nodelay(true);
-        let mut stream = stream;
+
+        // Bolt starts TLS before the handshake preamble.
+        let mut stream = match TlsVerification::for_mode(mode) {
+            Some(verification) => {
+                let options = config
+                    .tls_options
+                    .clone()
+                    .or(crate::tls::TlsOptions::from_params(&uri.params));
+                crate::tls::upgrade(stream, uri.protocol, &uri.host, verification, &options).await?
+            }
+            None => NetStream::Plain(stream),
+        };
 
         // 1. Send Handshake
         let mut handshake_bytes = Vec::with_capacity(20);

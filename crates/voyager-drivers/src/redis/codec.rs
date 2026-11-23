@@ -5,8 +5,7 @@
 //! and pipelined batch execution over raw TCP.
 
 use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::{NetError, Result};
@@ -66,8 +65,11 @@ impl Encoder<RespValue> for RespCodec {
     }
 }
 
-/// Asynchronously reads a single `RespValue` from a raw TCP stream, accumulating into `buffer`.
-pub async fn read_resp_value(stream: &mut TcpStream, buffer: &mut BytesMut) -> Result<RespValue> {
+/// Asynchronously reads a single `RespValue` from a TCP or TLS stream, accumulating into `buffer`.
+pub async fn read_resp_value<S>(stream: &mut S, buffer: &mut BytesMut) -> Result<RespValue>
+where
+    S: AsyncRead + Unpin,
+{
     loop {
         // Attempt to parse existing buffered data
         if !buffer.is_empty()
@@ -105,7 +107,10 @@ pub async fn read_resp_value(stream: &mut TcpStream, buffer: &mut BytesMut) -> R
 }
 
 /// Asynchronously writes a Redis command array of string arguments over the TCP stream.
-pub async fn write_command(stream: &mut TcpStream, args: &[&str]) -> Result<()> {
+pub async fn write_command<S>(stream: &mut S, args: &[&str]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let payload = RespValue::encode_command(args);
     stream.write_all(&payload).await.map_err(|e| {
         NetError::ConnectionFailed(format!("Failed to write RESP command to socket: {}", e))
@@ -118,7 +123,10 @@ pub async fn write_command(stream: &mut TcpStream, args: &[&str]) -> Result<()> 
 }
 
 /// Asynchronously writes a command with raw byte arguments over the TCP stream.
-pub async fn write_command_raw(stream: &mut TcpStream, args: &[&[u8]]) -> Result<()> {
+pub async fn write_command_raw<S>(stream: &mut S, args: &[&[u8]]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut buf = BytesMut::new();
     let header = format!("*{}\r\n", args.len());
     buf.put_slice(header.as_bytes());

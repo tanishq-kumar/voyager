@@ -23,6 +23,7 @@ pub mod pool;
 pub mod postgres;
 #[cfg(feature = "redis")]
 pub mod redis;
+pub mod tls;
 pub mod uri;
 
 // Re-exports
@@ -60,4 +61,5 @@ pub use redis::{
     FalkorNode, FalkorQueryResult, FalkorRelationship, FalkorStatistics, RedisConnection,
     RedisTransaction, RespCodec, RespValue,
 };
+pub use tls::{NetStream, SslMode, TLS_AVAILABLE, TlsOptions, TlsVerification};
 pub use uri::{DatabaseProtocol, ParsedUri};

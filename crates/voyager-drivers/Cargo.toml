@@ -32,16 +32,21 @@ sha2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
 
 [lints]
 workspace = true
 
 [features]
-default = ["bolt", "postgres", "redis", "arrow"]
+default = ["bolt", "postgres", "redis", "arrow", "tls"]
 bolt = []
 postgres = ["dep:md-5", "dep:sha2", "dep:hmac", "dep:base64", "dep:hex"]
 redis = ["dep:tokio-util"]
 arrow = ["voyager-ogm/arrow", "dep:arrow-select"]
+# TLS for every network protocol (bolt+s, rediss, PostgreSQL sslmode) via rustls.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-native-certs"]
 testkit = ["bolt"]
 bench-driver = []
 
@@ -51,6 +56,11 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.6"
 # Used only by the head-to-head comparative driver benchmarks
 neo4rs = "0.8.0"
+# Generates throwaway certificates for the in-process TLS tests
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# TLS stub servers for the in-process TLS tests
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [[bin]]
 name = "testkit_backend"
@@ -166,6 +176,16 @@ required-features = ["redis"]
 name = "security_audit_tests"
 path = "tests/security_audit_tests.rs"
 required-features = ["bolt", "postgres", "redis", "testkit"]
+
+[[test]]
+name = "tls_tests"
+path = "tests/tls_tests.rs"
+required-features = ["bolt", "postgres", "redis"]
+
+[[test]]
+name = "live_tls_tests"
+path = "tests/live_tls_tests.rs"
+required-features = ["bolt", "postgres", "redis"]
 
 [[test]]
 name = "testkit_tests"

@@ -180,12 +180,15 @@ impl ParsedUri {
             "postgresql+s" | "postgres+s" | "age+s" => {
                 (DatabaseProtocol::Postgres, TlsMode::Required)
             }
+            "postgresql+ssc" | "postgres+ssc" | "age+ssc" => {
+                (DatabaseProtocol::Postgres, TlsMode::SelfSigned)
+            }
             "redis" | "falkordb" | "valkey" => (DatabaseProtocol::Redis, TlsMode::Disabled),
             "rediss" | "falkordbs" | "valkeys" => (DatabaseProtocol::Redis, TlsMode::Required),
             "duckdb" => (DatabaseProtocol::DuckDb, TlsMode::Disabled),
             other => {
                 return Err(NetError::InvalidUri(format!(
-                    "Unsupported database URI scheme '{}'. Supported schemes: bolt://, neo4j://, memgraph://, postgresql://, age://, redis://, falkordb://, valkey://, duckdb://",
+                    "Unsupported database URI scheme '{}'. Supported schemes: bolt://, neo4j://, memgraph://, postgresql://, age://, redis://, falkordb://, valkey://, duckdb:// (TLS: bolt+s, bolt+ssc, neo4j+s, neo4j+ssc, memgraph+s, memgraph+ssc, postgresql+s, postgresql+ssc, age+s, age+ssc, rediss, falkordbs, valkeys)",
                     other
                 )));
             }
@@ -247,6 +250,8 @@ impl ParsedUri {
                 _ => {}
             }
         } else if let Some(sslmode) = params.get("sslmode") {
+            // Coarse mapping only: PostgreSQL resolves the exact libpq behaviour from
+            // `sslmode` itself (see `tls::SslMode`).
             match sslmode.to_lowercase().as_str() {
                 "require" | "verify-ca" | "verify-full" => tls = TlsMode::Required,
                 "prefer" | "allow" => tls = TlsMode::Required,

@@ -318,7 +318,12 @@ class NativeQueryResult:
     def to_dicts(self) -> list[dict[str, Any]]: ...
 
 class NativeClient:
-    """Native asynchronous Rust network client managing connection pooling and wire protocols."""
+    """Native asynchronous Rust network client managing connection pooling and wire protocols.
+
+    TLS is chosen by the URI: ``bolt+s://``, ``bolt+ssc://``, ``rediss://`` and PostgreSQL
+    ``?sslmode=...``, with ``tls_ca_file`` (``sslrootcert``), ``tls_cert_file`` (``sslcert``),
+    ``tls_key_file`` (``sslkey``) and ``tls_server_name`` query parameters.
+    """
 
     def __init__(self, uri: str, min_idle: int = 1, max_size: int = 10) -> None: ...
     @property

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use super::connection::BoltConnection;
@@ -44,7 +44,7 @@ struct TestkitSession {
     database: Option<String>,
     bookmarks: Vec<String>,
     last_bookmark: Option<String>,
-    conn: Mutex<BoltConnection<TcpStream>>,
+    conn: Mutex<BoltConnection>,
 }
 
 /// Active driver in TestKit backend.

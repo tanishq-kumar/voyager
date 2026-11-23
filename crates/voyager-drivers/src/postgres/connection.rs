@@ -3,8 +3,9 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Instant;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::debug;
 
 use crate::config::Auth;
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
@@ -18,11 +19,12 @@ use crate::postgres::message::{
     AuthenticationRequest, BackendMessage, FrontendMessage, StartupMessage, TransactionStatus,
 };
 use crate::postgres::params::{PreparedPostgresStatement, prepare_postgres_statement};
+use crate::tls::{NetStream, SslMode, TlsOptions};
 use crate::uri::ParsedUri;
 
 /// Asynchronous physical connection to a PostgreSQL database server or Apache AGE instance.
 pub struct PostgresConnection {
-    stream: TcpStream,
+    stream: NetStream,
     uri: ParsedUri,
     server_parameters: HashMap<String, String>,
     backend_pid: i32,
@@ -33,22 +35,35 @@ pub struct PostgresConnection {
     last_command_tag: Option<String>,
 }
 
+/// The 8-byte SSLRequest packet: length 8 and the request code 80877103.
+const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F];
+
 impl PostgresConnection {
     /// Asynchronously establishes a new connection to PostgreSQL / Apache AGE based on the parsed URI.
+    ///
+    /// TLS follows libpq's `sslmode` (see [`SslMode`]): `disable`, `allow`, `prefer`,
+    /// `require`, `verify-ca`, `verify-full`, with `sslrootcert`, `sslcert` and `sslkey`.
+    /// Only `prefer` continues in plaintext when the server answers the SSLRequest with `N`.
     pub async fn connect(uri: &ParsedUri) -> Result<Self> {
-        if uri.tls != crate::config::TlsMode::Disabled {
-            return Err(NetError::TlsError(format!(
-                "TLS encryption requested for PostgreSQL endpoint '{}', but native TLS transport is not enabled. Plaintext downgrade rejected.",
-                uri.host
-            )));
+        Self::connect_with_tls(uri, &TlsOptions::new()).await
+    }
+
+    /// Like [`connect`](Self::connect), with TLS options that win over the URI parameters.
+    pub async fn connect_with_tls(uri: &ParsedUri, tls_options: &TlsOptions) -> Result<Self> {
+        let ssl_mode = SslMode::from_uri(uri)?;
+        if ssl_mode.may_use_tls() && !crate::tls::TLS_AVAILABLE {
+            return Err(crate::tls::tls_unavailable(uri.protocol, &uri.host));
         }
+        let tls_options = tls_options.clone().or(TlsOptions::from_params(&uri.params));
         let timeout_secs = uri
             .params
             .get("connect_timeout")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(5);
         let timeout_dur = std::time::Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout_dur, Self::connect_raw(uri)).await {
+        match tokio::time::timeout(timeout_dur, Self::connect_raw(uri, ssl_mode, &tls_options))
+            .await
+        {
             Ok(res) => res,
             Err(_) => Err(NetError::Timeout(format!(
                 "Connection or handshake to PostgreSQL host at {} timed out after {:?}",
@@ -58,7 +73,74 @@ impl PostgresConnection {
         }
     }
 
-    async fn connect_raw(uri: &ParsedUri) -> Result<Self> {
+    /// Returns whether the connection is encrypted with TLS.
+    pub fn is_tls(&self) -> bool {
+        self.stream.is_tls()
+    }
+
+    async fn connect_raw(uri: &ParsedUri, ssl_mode: SslMode, tls: &TlsOptions) -> Result<Self> {
+        if ssl_mode == SslMode::Allow {
+            // libpq `allow`: plaintext first, TLS only when the server rejects that attempt.
+            return match Self::connect_once(uri, ssl_mode, tls, false).await {
+                Err(NetError::AuthenticationFailed(reason)) => {
+                    debug!(
+                        "plaintext attempt rejected ({reason}); retrying with TLS (sslmode=allow)"
+                    );
+                    Self::connect_once(uri, ssl_mode, tls, true).await
+                }
+                other => other,
+            };
+        }
+        Self::connect_once(uri, ssl_mode, tls, ssl_mode.requests_tls_first()).await
+    }
+
+    /// Sends an SSLRequest and starts TLS on `S`, continues in plaintext on `N` for `prefer`,
+    /// and fails otherwise.
+    async fn negotiate_tls(
+        mut tcp: TcpStream,
+        uri: &ParsedUri,
+        ssl_mode: SslMode,
+        tls: &TlsOptions,
+    ) -> Result<NetStream> {
+        tcp.write_all(&SSL_REQUEST).await?;
+        tcp.flush().await?;
+        let mut reply = [0u8; 1];
+        tcp.read_exact(&mut reply).await.map_err(|e| {
+            NetError::ConnectionFailed(format!(
+                "PostgreSQL host at {} closed the connection after SSLRequest: {e}",
+                uri.socket_addr()
+            ))
+        })?;
+        match reply[0] {
+            b'S' => {
+                let verification = ssl_mode.verification(tls.ca_file.is_some());
+                crate::tls::upgrade(tcp, uri.protocol, &uri.host, verification, tls).await
+            }
+            b'N' if ssl_mode.accepts_plaintext_fallback() => {
+                debug!(
+                    "PostgreSQL host at {} does not support TLS; continuing in plaintext (sslmode=prefer)",
+                    uri.socket_addr()
+                );
+                Ok(NetStream::Plain(tcp))
+            }
+            b'N' => Err(NetError::TlsError(format!(
+                "PostgreSQL host at {} does not support TLS (it answered the SSLRequest with 'N'), but sslmode={} requires it",
+                uri.socket_addr(),
+                ssl_mode.as_str()
+            ))),
+            other => Err(NetError::ProtocolError(format!(
+                "unexpected reply 0x{other:02x} to SSLRequest from PostgreSQL host at {}",
+                uri.socket_addr()
+            ))),
+        }
+    }
+
+    async fn connect_once(
+        uri: &ParsedUri,
+        ssl_mode: SslMode,
+        tls: &TlsOptions,
+        use_tls: bool,
+    ) -> Result<Self> {
         let socket_addr = uri.socket_addr();
         let stream = TcpStream::connect(&socket_addr).await.map_err(|e| {
             NetError::ConnectionFailed(format!(
@@ -69,6 +151,12 @@ impl PostgresConnection {
 
         // Optimize latency: disable Nagle's algorithm
         let _ = stream.set_nodelay(true);
+
+        let stream = if use_tls {
+            Self::negotiate_tls(stream, uri, ssl_mode, tls).await?
+        } else {
+            NetStream::Plain(stream)
+        };
 
         let query_timeout = uri
             .params

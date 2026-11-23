@@ -24,10 +24,12 @@ path = "src/bin/voy.rs"
 workspace = true
 
 [features]
-default = ["bolt", "postgres", "redis"]
+default = ["bolt", "postgres", "redis", "tls"]
 bolt = ["voyager-drivers/bolt"]
 postgres = ["voyager-drivers/postgres"]
 redis = ["voyager-drivers/redis"]
+# TLS connections (bolt+s, rediss, PostgreSQL sslmode) for `voyager doctor --uri`
+tls = ["voyager-drivers/tls"]
 
 [dependencies]
 voyager-ogm = { workspace = true, features = ["serde", "arrow"] }

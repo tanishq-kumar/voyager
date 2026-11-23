@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
 use voyager_drivers::bolt::BoltConnection;
@@ -24,8 +23,8 @@ struct LiveBoltFactory {
 }
 
 #[async_trait::async_trait]
-impl ConnectionFactory<BoltConnection<TcpStream>> for LiveBoltFactory {
-    async fn create(&self) -> voyager_drivers::Result<BoltConnection<TcpStream>> {
+impl ConnectionFactory<BoltConnection> for LiveBoltFactory {
+    async fn create(&self) -> voyager_drivers::Result<BoltConnection> {
         BoltConnection::connect(&self.config).await
     }
 }

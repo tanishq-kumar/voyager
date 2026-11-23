@@ -117,14 +117,16 @@ $ voyager doctor
 voyager 0.4.0
 voyager-ogm 0.4.0
 driver protocol features: bolt, postgres, redis
+TLS: enabled (rustls; bolt+s, rediss, PostgreSQL sslmode)
 supported dialects: cypher, age, iso_gql, sql_pgq, duck_pgq
 connection checks: run `voyager doctor --uri <URI>`
 ```
 
 `driver protocol features` lists the driver protocols compiled into this
 binary. Builds can opt out with Cargo features (`--no-default-features` and then
-`bolt`, `postgres` and/or `redis`). A URI for a protocol that is not compiled in
-fails the check with a message naming the missing feature.
+`bolt`, `postgres`, `redis` and/or `tls`). A URI for a protocol that is not compiled in
+fails the check with a message naming the missing feature; so does a TLS URI in a
+build without `tls`.
 
 ### Connection check
 
@@ -133,7 +135,16 @@ voyager doctor --uri bolt://localhost:7687 --username neo4j --password-env NEO4J
 voyager doctor --uri age://postgres:secret@localhost:5455/voyager_graph
 voyager doctor --uri bolt://localhost:7688
 voyager doctor --uri redis://localhost:6379
+voyager doctor --uri 'bolt+s://neo4j@db.example.com:7687' --password-env NEO4J_PASSWORD
+voyager doctor --uri 'rediss://cache.internal:6380?tls_ca_file=/etc/voyager/ca.pem'
+voyager doctor --uri 'postgresql://app@pg.internal/graph?sslmode=verify-full&sslrootcert=/etc/voyager/ca.pem' --password-env PGPASSWORD
 ```
+
+TLS URIs (`bolt+s://`, `bolt+ssc://`, `rediss://`, PostgreSQL `sslmode`) work as in
+`voyager-drivers`; a private CA, a client certificate or a server name override are
+URI parameters (`tls_ca_file` / `sslrootcert`, `tls_cert_file` / `sslcert`,
+`tls_key_file` / `sslkey`, `tls_server_name`). The reported protocol ends in
+`over TLS` when the connection is encrypted.
 
 With `--uri`, `doctor` parses the URI, connects through `voyager-drivers`,
 sends a `ping` (a trivial round trip), and reports:

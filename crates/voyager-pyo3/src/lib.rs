@@ -3507,6 +3507,10 @@ pub struct PyNativeClient {
 #[pymethods]
 impl PyNativeClient {
     /// Creates a new `NativeClient` connecting to the given URI with connection pooling.
+    ///
+    /// TLS is chosen by the URI: `bolt+s://`, `rediss://`, PostgreSQL `?sslmode=...`, with
+    /// `tls_ca_file` / `sslrootcert`, `tls_cert_file` / `sslcert`, `tls_key_file` / `sslkey`
+    /// and `tls_server_name` parameters.
     #[new]
     #[pyo3(signature = (uri, min_idle=1, max_size=10))]
     fn new(uri: &str, min_idle: usize, max_size: usize) -> PyResult<Self> {
