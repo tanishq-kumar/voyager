@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQL/PGQ ORDER BY on expressions outside GRAPH_TABLE (#319)**: ordering expressions that are not returned columns are now evaluated inside `GRAPH_TABLE` `COLUMNS` under an internal alias and selected only as returned columns in the outer query, so pattern variables are in scope on PostgreSQL 19 and DuckPGQ.
 - **SQL/PGQ ORDER BY on non-returned properties (#320)**: ordering by a property that is not projected now exposes it in `GRAPH_TABLE` `COLUMNS` under an internal alias, avoiding missing-column errors in the outer query on PostgreSQL 19 and DuckPGQ.
 
+### Security
+- **Credentials no longer appear in `Debug` output (#326)**: `Auth`, `ParsedUri` and `ConnectionConfig` format with a hand-written `Debug` that shows a configured password or token as `"***"` (and an empty one as `None`), redacting URI userinfo and credential-named query parameters, and a malformed-URI error no longer echoes the password. Serialised configurations still contain the secret so they round-trip, and the type docs say so.
+
 ## [0.4.2] - 2026-11-22
 
 ### Fixed

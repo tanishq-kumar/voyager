@@ -2,12 +2,17 @@
 
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
+use std::fmt;
 
 use super::packstream::{BoltValue, PackStream};
 use crate::error::{NetError, Result};
+use crate::redact::is_sensitive_key;
 
 /// Bolt protocol request messages sent from client to database server.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` redacts the `credentials` entry, so a logged request never prints the
+/// password.
+#[derive(Clone, PartialEq)]
 pub enum BoltRequest {
     /// Handshake authentication and metadata initialization (`0x01`).
     Hello {
@@ -53,6 +58,56 @@ pub enum BoltRequest {
     Reset,
     /// Gracefully closes the connection socket (`0x02`).
     Goodbye,
+}
+
+/// Credential dictionary with credential values replaced by `"***"`.
+struct RedactedAuth<'a>(&'a HashMap<String, BoltValue>);
+
+impl fmt::Debug for RedactedAuth<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = f.debug_map();
+        for (key, value) in self.0 {
+            if key == "credentials" || is_sensitive_key(key) {
+                map.entry(key, &"***");
+            } else {
+                map.entry(key, value);
+            }
+        }
+        map.finish()
+    }
+}
+
+impl fmt::Debug for BoltRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hello { extra } => f
+                .debug_struct("Hello")
+                .field("extra", &RedactedAuth(extra))
+                .finish(),
+            Self::Logon { auth } => f
+                .debug_struct("Logon")
+                .field("auth", &RedactedAuth(auth))
+                .finish(),
+            Self::Logoff => f.write_str("Logoff"),
+            Self::Run {
+                query,
+                params,
+                extra,
+            } => f
+                .debug_struct("Run")
+                .field("query", query)
+                .field("params", params)
+                .field("extra", extra)
+                .finish(),
+            Self::Pull { extra } => f.debug_struct("Pull").field("extra", extra).finish(),
+            Self::Discard { extra } => f.debug_struct("Discard").field("extra", extra).finish(),
+            Self::Begin { extra } => f.debug_struct("Begin").field("extra", extra).finish(),
+            Self::Commit => f.write_str("Commit"),
+            Self::Rollback => f.write_str("Rollback"),
+            Self::Reset => f.write_str("Reset"),
+            Self::Goodbye => f.write_str("Goodbye"),
+        }
+    }
 }
 
 impl BoltRequest {
@@ -408,5 +463,33 @@ impl BoltResponse {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logon_debug_redacts_credentials() {
+        let request = BoltRequest::logon(Some(("neo4j", "s3cr3t-326")));
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("s3cr3t-326"), "{rendered}");
+        assert!(rendered.contains("principal"), "{rendered}");
+        assert!(rendered.contains("scheme"), "{rendered}");
+        assert!(rendered.contains("\"credentials\": \"***\""), "{rendered}");
+    }
+
+    #[test]
+    fn legacy_hello_debug_redacts_credentials() {
+        let request = BoltRequest::hello_legacy(
+            "Voyager-OGM/test",
+            Some(("neo4j", "s3cr3t-326")),
+            Some("neo4j"),
+        );
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("s3cr3t-326"), "{rendered}");
+        assert!(rendered.contains("\"credentials\": \"***\""), "{rendered}");
+        assert!(rendered.contains("\"db\": String(\"neo4j\")"), "{rendered}");
     }
 }
