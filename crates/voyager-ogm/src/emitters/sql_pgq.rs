@@ -605,34 +605,134 @@ impl SqlPgqEmitter {
                     variable: Some(v2), ..
                 }),
             ) => v1 == v2,
+            (
+                Ok(AstNode::BinaryExpression {
+                    left: l1,
+                    op: op1,
+                    right: r1,
+                }),
+                Ok(AstNode::BinaryExpression {
+                    left: l2,
+                    op: op2,
+                    right: r2,
+                }),
+            ) => {
+                op1 == op2
+                    && self.expressions_match(arena, *l1, *l2)
+                    && self.expressions_match(arena, *r1, *r2)
+            }
+            (
+                Ok(AstNode::UnaryExpression {
+                    op: op1,
+                    operand: o1,
+                }),
+                Ok(AstNode::UnaryExpression {
+                    op: op2,
+                    operand: o2,
+                }),
+            ) => op1 == op2 && self.expressions_match(arena, *o1, *o2),
+            (Ok(AstNode::Literal(lit1)), Ok(AstNode::Literal(lit2))) => lit1 == lit2,
+            (Ok(AstNode::Parameter(p1)), Ok(AstNode::Parameter(p2))) => p1 == p2,
             _ => false,
         }
     }
 
-    fn resolve_projected_column_name(
+    fn resolve_returned_column_name(
         &self,
         arena: &QueryAstArena,
         expr_handle: NodeHandle,
         projections: &[ProjectionItem],
-    ) -> String {
+    ) -> Option<String> {
         for proj in projections {
             if self.expressions_match(arena, proj.expression, expr_handle) {
                 if let Some(alias) = &proj.alias {
-                    return alias.clone();
+                    return Some(alias.clone());
                 } else if let Ok(AstNode::PropertyAccess { property, .. }) =
                     arena.get(proj.expression)
                 {
-                    return property.clone();
+                    return Some(property.clone());
+                } else if let Ok(AstNode::Identifier(id)) = arena.get(proj.expression) {
+                    return Some(id.clone());
+                }
+            }
+        }
+        for proj in projections {
+            if let Some(func) = proj.aggregation {
+                if let Ok(AstNode::FunctionCall { name, arguments }) = arena.get(expr_handle) {
+                    let func_name_matches = match func {
+                        AggregationFunc::Count => name.eq_ignore_ascii_case("count"),
+                        AggregationFunc::CountDistinct => name.eq_ignore_ascii_case("count"),
+                        AggregationFunc::Sum => name.eq_ignore_ascii_case("sum"),
+                        AggregationFunc::Avg => name.eq_ignore_ascii_case("avg"),
+                        AggregationFunc::Min => name.eq_ignore_ascii_case("min"),
+                        AggregationFunc::Max => name.eq_ignore_ascii_case("max"),
+                        AggregationFunc::Collect => name.eq_ignore_ascii_case("collect"),
+                    };
+                    if arguments.len() == 1
+                        && func_name_matches
+                        && self.expressions_match(arena, proj.expression, arguments[0])
+                    {
+                        if let Some(alias) = &proj.alias {
+                            return Some(alias.clone());
+                        } else {
+                            let base = self.get_expr_leaf_name(arena, proj.expression);
+                            return Some(format!("{func:?}({base})").to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(AstNode::Identifier(id)) = arena.get(expr_handle) {
+            for proj in projections {
+                if let Some(alias) = &proj.alias {
+                    if alias == id {
+                        return Some(alias.clone());
+                    }
+                } else if let Ok(AstNode::PropertyAccess { property, .. }) =
+                    arena.get(proj.expression)
+                {
+                    if property == id {
+                        return Some(property.clone());
+                    }
+                } else if let Ok(AstNode::Identifier(proj_id)) = arena.get(proj.expression) {
+                    if proj_id == id {
+                        return Some(proj_id.clone());
+                    }
                 }
             }
         }
         if let Ok(AstNode::PropertyAccess { property, .. }) = arena.get(expr_handle) {
-            return property.clone();
+            for proj in projections {
+                if let Some(alias) = &proj.alias {
+                    if alias == property {
+                        return Some(alias.clone());
+                    }
+                }
+            }
         }
-        if let Ok(AstNode::Identifier(id)) = arena.get(expr_handle) {
-            return id.clone();
+        None
+    }
+
+    fn get_projection_column_name(
+        &self,
+        arena: &QueryAstArena,
+        proj: &ProjectionItem,
+        idx: usize,
+    ) -> String {
+        if let Some(alias) = &proj.alias {
+            alias.clone()
+        } else if let Ok(AstNode::PropertyAccess { property, .. }) = arena.get(proj.expression) {
+            property.clone()
+        } else if let Ok(AstNode::Identifier(id)) = arena.get(proj.expression) {
+            id.clone()
+        } else {
+            let leaf = self.get_expr_leaf_name(arena, proj.expression);
+            if !leaf.is_empty() {
+                leaf
+            } else {
+                format!("col_{idx}")
+            }
         }
-        String::new()
     }
 
     fn get_expr_leaf_name(&self, arena: &QueryAstArena, expr_handle: NodeHandle) -> String {
@@ -968,6 +1068,13 @@ impl AstVisitor for SqlPgqEmitter {
 
             self.validate_matches(arena, matches)?;
 
+            if projections_list.is_empty() {
+                return Err(Error::EmissionError(
+                    "SQL:PGQ GRAPH_TABLE queries require at least one projection; add a RETURN clause with at least one field or expression."
+                        .to_string(),
+                ));
+            }
+
             for proj in &projections_list {
                 if proj.aggregation.is_none() {
                     if let Some(var) = self.is_whole_entity_expression(arena, proj.expression)? {
@@ -982,6 +1089,68 @@ impl AstVisitor for SqlPgqEmitter {
             }
 
             let has_aggregates = projections_list.iter().any(|p| p.aggregation.is_some());
+
+            let mut hidden_columns: Vec<(NodeHandle, String)> = Vec::new();
+            let mut order_by_compiled: Vec<(String, bool)> = Vec::new();
+
+            if let Some(order_by) = order_by_clause
+                && !order_by.is_empty()
+            {
+                let mut returned_names: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for (idx, proj) in projections_list.iter().enumerate() {
+                    returned_names.insert(self.get_projection_column_name(arena, proj, idx));
+                }
+
+                let mut alias_counter = 0;
+                for (order_expr, is_asc) in order_by {
+                    if let Some(col_name) =
+                        self.resolve_returned_column_name(arena, *order_expr, &projections_list)
+                    {
+                        order_by_compiled.push((col_name, *is_asc));
+                    } else {
+                        if let Some(var) = self.is_whole_entity_expression(arena, *order_expr)? {
+                            return Err(Error::UnsupportedFeature {
+                                dialect: "sql_pgq".to_string(),
+                                feature: format!(
+                                    "Whole entity column projection ('{var}') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables"
+                                ),
+                            });
+                        }
+                        let existing = hidden_columns
+                            .iter()
+                            .find(|(expr, _)| self.expressions_match(arena, *expr, *order_expr));
+                        let alias = if let Some((_, alias)) = existing {
+                            alias.clone()
+                        } else {
+                            loop {
+                                let candidate = format!("_ord_{alias_counter}");
+                                alias_counter += 1;
+                                if !returned_names.contains(&candidate) {
+                                    hidden_columns.push((*order_expr, candidate.clone()));
+                                    break candidate;
+                                }
+                            }
+                        };
+                        order_by_compiled.push((alias, *is_asc));
+                    }
+                }
+            }
+
+            if !hidden_columns.is_empty() {
+                if distinct {
+                    return Err(Error::UnsupportedFeature {
+                        dialect: "sql_pgq".to_string(),
+                        feature: "ORDER BY on non-projected expressions with DISTINCT - SQL/PGQ requires ordering expressions under DISTINCT to be projected columns to preserve DISTINCT semantics".to_string(),
+                    });
+                }
+                if has_aggregates {
+                    return Err(Error::UnsupportedFeature {
+                        dialect: "sql_pgq".to_string(),
+                        feature: "ORDER BY on unprojected expressions with aggregation - SQL/PGQ requires ordering expressions in aggregating queries to appear in the projection or GROUP BY".to_string(),
+                    });
+                }
+            }
 
             if has_aggregates {
                 let mut inner_columns: Vec<(String, String)> = Vec::new();
@@ -1088,6 +1257,40 @@ impl AstVisitor for SqlPgqEmitter {
                         self.buffer.push_str(key);
                     }
                 }
+            } else if !hidden_columns.is_empty() {
+                self.buffer.push_str(prefix);
+                self.buffer.push_str("SELECT ");
+                for (i, proj) in projections_list.iter().enumerate() {
+                    if i > 0 {
+                        self.buffer.push_str(", ");
+                    }
+                    self.buffer
+                        .push_str(&self.get_projection_column_name(arena, proj, i));
+                }
+                self.buffer.push_str(" FROM GRAPH_TABLE (");
+                self.buffer.push_str(&self.graph_name);
+                self.buffer.push_str(" MATCH ");
+
+                self.emit_matches_and_where(arena, matches)?;
+
+                self.buffer.push_str(" COLUMNS (");
+                for (i, proj) in projections_list.iter().enumerate() {
+                    if i > 0 {
+                        self.buffer.push_str(", ");
+                    }
+                    self.emit_expression(arena, proj.expression, false)?;
+                    if let Some(alias) = &proj.alias {
+                        self.buffer.push_str(" AS ");
+                        self.buffer.push_str(alias);
+                    }
+                }
+                for (expr, alias) in &hidden_columns {
+                    self.buffer.push_str(", ");
+                    self.emit_expression(arena, *expr, false)?;
+                    self.buffer.push_str(" AS ");
+                    self.buffer.push_str(alias);
+                }
+                self.buffer.push_str("))");
             } else {
                 self.buffer.push_str(prefix);
                 self.buffer.push_str(if distinct {
@@ -1100,32 +1303,17 @@ impl AstVisitor for SqlPgqEmitter {
 
                 self.emit_matches_and_where(arena, matches)?;
 
-                if projections_list.is_empty() {
-                    return Err(Error::EmissionError(
-                        "SQL:PGQ GRAPH_TABLE queries require at least one projection; add a RETURN clause with at least one field or expression."
-                            .to_string(),
-                    ));
-                }
-
                 self.emit_columns(arena, &projections_list)?;
                 self.buffer.push(')');
             }
 
-            if let Some(order_by) = order_by_clause
-                && !order_by.is_empty()
-            {
+            if !order_by_compiled.is_empty() {
                 self.buffer.push_str(" ORDER BY ");
-                for (i, (order_expr, is_asc)) in order_by.iter().enumerate() {
+                for (i, (col, is_asc)) in order_by_compiled.iter().enumerate() {
                     if i > 0 {
                         self.buffer.push_str(", ");
                     }
-                    let resolved =
-                        self.resolve_projected_column_name(arena, *order_expr, &projections_list);
-                    if !resolved.is_empty() {
-                        self.buffer.push_str(&resolved);
-                    } else {
-                        self.emit_expression(arena, *order_expr, false)?;
-                    }
+                    self.buffer.push_str(col);
                     if *is_asc {
                         self.buffer.push_str(" ASC");
                     } else {
@@ -1494,6 +1682,153 @@ mod tests {
                         "Relationship type expression with negation/conjunction/grouping"
                     )
                 );
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_pgq_order_by_expression_exposed_in_columns() {
+        let mut builder = QueryBuilder::new();
+        let age = builder.prop("p", "age");
+        let one = builder.literal(LiteralValue::Int64(1));
+        let age_plus_one = builder.binary_expr(age, BinaryOp::Add, one);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .field("p", "age", None::<String>)
+            .order_by(age_plus_one, true);
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name, age FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC"
+        );
+        assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
+    }
+
+    #[test]
+    fn sql_pgq_order_by_non_returned_property_exposed_in_columns() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .order_by_asc("p", "age");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC"
+        );
+        assert!(compiled.parameters.is_empty());
+    }
+
+    #[test]
+    fn sql_pgq_order_by_returned_property_stays_select_star() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .field("p", "age", None::<String>)
+            .order_by_asc("p", "age");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.age)) ORDER BY age ASC"
+        );
+        assert!(compiled.parameters.is_empty());
+    }
+
+    #[test]
+    fn sql_pgq_order_by_multiple_mixed_keys() {
+        let mut builder = QueryBuilder::new();
+        let age = builder.prop("p", "age");
+        let one = builder.literal(LiteralValue::Int64(1));
+        let age_plus_one = builder.binary_expr(age, BinaryOp::Add, one);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .field("p", "city", None::<String>)
+            .order_by_asc("p", "age")
+            .order_by_desc("p", "city")
+            .order_by(age_plus_one, true);
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name, city FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) ORDER BY _ord_0 ASC, city DESC, _ord_1 ASC"
+        );
+        assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
+    }
+
+    #[test]
+    fn sql_pgq_order_by_duplicate_non_returned_key_reuses_alias() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .order_by_asc("p", "age")
+            .order_by_desc("p", "age");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC, _ord_0 DESC"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_order_by_distinct_with_non_returned_key_rejected() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .distinct(true)
+            .order_by_asc("p", "age");
+
+        let (arena, root) = builder.build();
+        let err = SqlPgqEmitter::new("g")
+            .visit_query(&arena, root)
+            .unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "sql_pgq");
+                assert!(feature.contains("ORDER BY on non-projected expressions with DISTINCT"));
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_pgq_order_by_aggregation_with_non_returned_key_rejected() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "city", None::<String>)
+            .select_property_aggregate("p", "name", AggregationFunc::Count, Some("total"))
+            .order_by_asc("p", "age");
+
+        let (arena, root) = builder.build();
+        let err = SqlPgqEmitter::new("g")
+            .visit_query(&arena, root)
+            .unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "sql_pgq");
+                assert!(feature.contains("ORDER BY on unprojected expressions with aggregation"));
             }
             other => panic!("Expected UnsupportedFeature, got {other:?}"),
         }
