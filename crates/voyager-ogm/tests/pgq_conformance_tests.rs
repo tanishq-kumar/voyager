@@ -51,7 +51,7 @@ fn test_pgq_all_operator_translations() {
         (BinaryOp::Lte, "p.age <= $p0", LiteralValue::Int64(65)),
         (
             BinaryOp::In,
-            "p.age IN $p0",
+            "p.age = ANY($p0)",
             LiteralValue::List(vec![
                 LiteralValue::String("London".into()),
                 LiteralValue::String("Paris".into()),
@@ -59,7 +59,7 @@ fn test_pgq_all_operator_translations() {
         ),
         (
             BinaryOp::NotIn,
-            "p.age NOT IN $p0",
+            "p.age <> ALL($p0)",
             LiteralValue::List(vec![LiteralValue::String("Rome".into())]),
         ),
     ];

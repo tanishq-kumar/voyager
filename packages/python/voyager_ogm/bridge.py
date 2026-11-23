@@ -1311,6 +1311,25 @@ def _encode_duckdb_literal(v: Any) -> str:
     )
 
 
+def _literal_substitution(sql: str) -> Callable[[re.Match[str]], str]:
+    """Returns a ``re.sub`` replacement that emits ``sql`` literally."""
+
+    def replace(_match: re.Match[str]) -> str:
+        return sql
+
+    return replace
+
+
+def _encode_duckdb_in_tuple(values: Sequence[Any]) -> str:
+    """Encodes a non-empty Python sequence as a SQL scalar tuple for ``IN``.
+
+    ``x IN [a, b]`` (a DuckDB list) does not propagate a NULL list element
+    through ``NOT IN`` like SQL ``IN`` does, so DuckPGQ membership rewrites use
+    a scalar tuple (``x IN (a, b)``) instead.
+    """
+    return "(" + ", ".join(_encode_duckdb_literal(v) for v in values) + ")"
+
+
 class DuckDbBridge:
     """Synchronous DuckDB driver bridge with zero-copy Polars / Arrow output."""
 
@@ -1327,6 +1346,34 @@ class DuckDbBridge:
     ) -> tuple[str, dict[str, Any]]:
         """Interpolates parameters for DuckPGQ GRAPH_TABLE queries where native parameter binding is unsupported."""
         if "GRAPH_TABLE" in statement and parameters:
+            # DuckPGQ's GRAPH_TABLE grammar has no ANY/ALL keyword, so the
+            # SQL/PGQ `x = ANY($n)` / `x <> ALL($n)` forms for a list parameter
+            # are rewritten to a scalar `IN (...)` tuple. The list is known
+            # here, so an empty list becomes FALSE/TRUE like the emitter emits
+            # for an empty literal list.
+            stmt = statement
+            for key, value in parameters.items():
+                if not isinstance(value, (list, tuple)):
+                    continue
+                if value:
+                    positive = f" IN {_encode_duckdb_in_tuple(value)}"
+                    negative = f" NOT IN {_encode_duckdb_in_tuple(value)}"
+                else:
+                    # `IN ()` is invalid; FALSE/TRUE is the emitter's empty-list
+                    # rendering, kept as a valid comparison of the left operand.
+                    positive = " IN (NULL) AND FALSE"
+                    negative = " IN (NULL) OR TRUE"
+                stmt = re.sub(
+                    rf"(?<![<>=!])\s*=\s+ANY\(\s*\${re.escape(key)}\s*\)",
+                    _literal_substitution(positive),
+                    stmt,
+                )
+                stmt = re.sub(
+                    rf"(?<![<>=!])\s*<>\s+ALL\(\s*\${re.escape(key)}\s*\)",
+                    _literal_substitution(negative),
+                    stmt,
+                )
+
             regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
 
             def repl(m: re.Match[str]) -> str:
@@ -1335,7 +1382,7 @@ class DuckDbBridge:
                     return _encode_duckdb_literal(parameters[key])
                 return m.group(0)
 
-            stmt = regex.sub(repl, statement)
+            stmt = regex.sub(repl, stmt)
             return stmt, {}
         return statement, parameters
 
