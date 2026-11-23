@@ -273,6 +273,12 @@ impl SqlPgqEmitter {
                 Ok(())
             }
             AstNode::BinaryExpression { left, op, right } => {
+                if matches!(op, BinaryOp::In | BinaryOp::NotIn) {
+                    return self.emit_membership(arena, *left, *op, *right, nested);
+                }
+                if *op == BinaryOp::Xor {
+                    return self.emit_xor(arena, *left, *right, nested);
+                }
                 if nested {
                     self.buffer.push('(');
                 }
@@ -451,6 +457,87 @@ impl SqlPgqEmitter {
         let res = self.emit_expression(arena, handle, false);
         let expr_str = std::mem::replace(&mut self.buffer, saved_buffer);
         res.map(|_| expr_str)
+    }
+
+    /// Emits `IN` / `NOT IN` in the spellings PostgreSQL and DuckDB accept.
+    ///
+    /// A literal list becomes `x IN (a, b)` (and `x NOT IN (a, b)`); an empty
+    /// literal list becomes `FALSE` (`TRUE` when negated), because `IN ()` is
+    /// not valid SQL and Cypher's membership in an empty list is always false.
+    /// Any other operand is a parameter or a list-valued expression, which is
+    /// rendered as `x = ANY($p)` (`x <> ALL($p)` when negated).
+    fn emit_membership(
+        &mut self,
+        arena: &QueryAstArena,
+        left: NodeHandle,
+        op: BinaryOp,
+        right: NodeHandle,
+        nested: bool,
+    ) -> Result<()> {
+        let negated = matches!(op, BinaryOp::NotIn);
+        if let AstNode::ListLiteral(items) = arena.get(right)? {
+            if items.is_empty() {
+                self.buffer.push_str(if negated { "TRUE" } else { "FALSE" });
+                return Ok(());
+            }
+            if nested {
+                self.buffer.push('(');
+            }
+            self.emit_expression(arena, left, true)?;
+            self.buffer
+                .push_str(if negated { " NOT IN (" } else { " IN (" });
+            for (i, &item) in items.iter().enumerate() {
+                if i > 0 {
+                    self.buffer.push_str(", ");
+                }
+                self.emit_expression(arena, item, true)?;
+            }
+            self.buffer.push(')');
+            if nested {
+                self.buffer.push(')');
+            }
+            return Ok(());
+        }
+
+        if nested {
+            self.buffer.push('(');
+        }
+        self.emit_expression(arena, left, true)?;
+        self.buffer
+            .push_str(if negated { " <> ALL(" } else { " = ANY(" });
+        self.emit_expression(arena, right, true)?;
+        self.buffer.push(')');
+        if nested {
+            self.buffer.push(')');
+        }
+        Ok(())
+    }
+
+    /// Lowers `XOR` to SQL, which has no XOR operator.
+    ///
+    /// `(a OR b) AND NOT (a AND b)` has the same three-valued result as Cypher
+    /// `XOR`, including when one or both operands are `NULL`. Each operand is
+    /// rendered once, so a parameter used by the expansion keeps its name and
+    /// the bridges bind it once (or once per occurrence, as they already do).
+    fn emit_xor(
+        &mut self,
+        arena: &QueryAstArena,
+        left: NodeHandle,
+        right: NodeHandle,
+        nested: bool,
+    ) -> Result<()> {
+        let left_sql = self.render_expression_to_string(arena, left)?;
+        let right_sql = self.render_expression_to_string(arena, right)?;
+        if nested {
+            self.buffer.push('(');
+        }
+        self.buffer.push_str(&format!(
+            "(({left_sql}) OR ({right_sql})) AND NOT (({left_sql}) AND ({right_sql}))"
+        ));
+        if nested {
+            self.buffer.push(')');
+        }
+        Ok(())
     }
 
     fn emit_where(&mut self, arena: &QueryAstArena, handle: NodeHandle) -> Result<()> {
@@ -1188,6 +1275,156 @@ mod tests {
             }
             other => panic!("Expected UnsupportedFeature, got {other:?}"),
         }
+    }
+
+    fn compile_in_predicate(
+        right: NodeHandle,
+        op: BinaryOp,
+        mut builder: QueryBuilder,
+    ) -> CompiledQuery {
+        let name = builder.prop("p", "name");
+        let predicate = builder.binary_expr(name, op, right);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .where_predicate(predicate)
+            .field("p", "name", None::<String>);
+        let (arena, root) = builder.build();
+        SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap()
+    }
+
+    #[test]
+    fn sql_pgq_in_literal_list_uses_parenthesised_values() {
+        let mut builder = QueryBuilder::new();
+        let alice = builder.literal(LiteralValue::String("Alice".into()));
+        let bob = builder.literal(LiteralValue::String("Bob".into()));
+        let list = builder.list_literal(vec![alice, bob]);
+        let compiled = compile_in_predicate(list, BinaryOp::In, builder);
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name IN ($p0, $p1) COLUMNS (p.name))"
+        );
+        assert_eq!(
+            compiled.parameters.get("p0"),
+            Some(&LiteralValue::String("Alice".into()))
+        );
+        assert_eq!(
+            compiled.parameters.get("p1"),
+            Some(&LiteralValue::String("Bob".into()))
+        );
+    }
+
+    #[test]
+    fn sql_pgq_not_in_literal_list_uses_parenthesised_values() {
+        let mut builder = QueryBuilder::new();
+        let alice = builder.literal(LiteralValue::String("Alice".into()));
+        let list = builder.list_literal(vec![alice]);
+        let compiled = compile_in_predicate(list, BinaryOp::NotIn, builder);
+
+        assert!(
+            compiled
+                .statement
+                .contains("WHERE p.name NOT IN ($p0) COLUMNS"),
+            "statement was {}",
+            compiled.statement
+        );
+    }
+
+    #[test]
+    fn sql_pgq_in_empty_literal_list_is_a_constant() {
+        let mut builder = QueryBuilder::new();
+        let list = builder.list_literal(vec![]);
+        let compiled = compile_in_predicate(list, BinaryOp::In, builder);
+        assert!(
+            compiled.statement.contains("WHERE FALSE COLUMNS"),
+            "statement was {}",
+            compiled.statement
+        );
+        assert!(compiled.parameters.is_empty());
+
+        let mut builder = QueryBuilder::new();
+        let list = builder.list_literal(vec![]);
+        let compiled = compile_in_predicate(list, BinaryOp::NotIn, builder);
+        assert!(
+            compiled.statement.contains("WHERE TRUE COLUMNS"),
+            "statement was {}",
+            compiled.statement
+        );
+        assert!(compiled.parameters.is_empty());
+    }
+
+    #[test]
+    fn sql_pgq_in_parameter_uses_any_and_not_in_uses_all() {
+        for (op, expected) in [
+            (BinaryOp::In, "p.name = ANY($names)"),
+            (BinaryOp::NotIn, "p.name <> ALL($names)"),
+        ] {
+            let mut builder = QueryBuilder::new();
+            let param = builder.param("names");
+            let compiled = compile_in_predicate(param, op, builder);
+            assert!(
+                compiled.statement.contains(expected),
+                "statement was {}",
+                compiled.statement
+            );
+            assert!(compiled.parameters.is_empty());
+        }
+    }
+
+    #[test]
+    fn sql_pgq_not_over_in_literal_list_stays_negated() {
+        let mut builder = QueryBuilder::new();
+        let name = builder.prop("p", "name");
+        let alice = builder.literal(LiteralValue::String("Alice".into()));
+        let list = builder.list_literal(vec![alice]);
+        let predicate = builder.binary_expr(name, BinaryOp::In, list);
+        let predicate = builder.unary_expr(UnaryOp::Not, predicate);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .where_predicate(predicate)
+            .field("p", "name", None::<String>);
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert!(
+            compiled
+                .statement
+                .contains("WHERE NOT (p.name IN ($p0)) COLUMNS"),
+            "statement was {}",
+            compiled.statement
+        );
+    }
+
+    #[test]
+    fn sql_pgq_xor_lowers_without_the_keyword_and_reuses_parameters() {
+        let mut builder = QueryBuilder::new();
+        let age = builder.prop("p", "age");
+        let min = builder.param("min_age");
+        let lower = builder.binary_expr(age, BinaryOp::Gt, min);
+        let city = builder.prop("p", "city");
+        let paris = builder.literal(LiteralValue::String("Paris".into()));
+        let upper = builder.binary_expr(city, BinaryOp::Eq, paris);
+        let xor = builder.binary_expr(lower, BinaryOp::Xor, upper);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .where_predicate(xor)
+            .field("p", "name", None::<String>);
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert!(
+            compiled.statement.contains(
+                "WHERE ((p.age > $min_age) OR (p.city = $p0)) AND NOT ((p.age > $min_age) AND (p.city = $p0))"
+            ),
+            "statement was {}",
+            compiled.statement
+        );
+        assert!(!compiled.statement.contains(" XOR "));
+        assert_eq!(compiled.parameters.len(), 1);
+        assert_eq!(
+            compiled.parameters.get("p0"),
+            Some(&LiteralValue::String("Paris".into()))
+        );
     }
 
     #[test]

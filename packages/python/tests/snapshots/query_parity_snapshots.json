@@ -260,7 +260,7 @@
           "Mallory"
         ]
       },
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE (p.city IN $p0) AND (p.name NOT IN $p1) COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE (p.city = ANY($p0)) AND (p.name <> ALL($p1)) COLUMNS (p.name))",
       "status": "ok"
     }
   },
