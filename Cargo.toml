@@ -24,7 +24,9 @@ repository = "https://github.com/tanishq-kumar/voyager"
 [workspace.dependencies]
 # Internal workspace crates
 voyager-ogm = { path = "crates/voyager-ogm", version = "0.5.0-alpha.0" }
-voyager-drivers = { path = "crates/voyager-drivers", version = "0.5.0-alpha.0" }
+# default-features = false here, so a member can choose its own protocols
+# (an inherited dependency cannot turn its defaults off).
+voyager-drivers = { path = "crates/voyager-drivers", version = "0.5.0-alpha.0", default-features = false }
 
 # Asynchronous Network Runtime
 tokio = { version = "1.43", features = ["full"] }
