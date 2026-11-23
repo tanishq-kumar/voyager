@@ -174,7 +174,7 @@ def test_string_contains_predicate():
     compiled_pgq = query.compile("sql_pgq", graph_name="social")
     expected_pgq = (
         "SELECT * FROM GRAPH_TABLE (social MATCH (p IS Person) "
-        "WHERE p.name LIKE '%' || $p0 || '%' "
+        "WHERE strpos(p.name, $p0) > 0 "
         "COLUMNS (p.name))"
     )
     assert compiled_pgq.statement == expected_pgq

@@ -114,7 +114,7 @@ fn test_sql_pgq_emitter_like_translation() {
 
     assert_eq!(
         compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (social_network MATCH (p IS Person) WHERE p.name LIKE '%' || $p0 || '%' COLUMNS (p.name AS name))"
+        "SELECT * FROM GRAPH_TABLE (social_network MATCH (p IS Person) WHERE strpos(p.name, $p0) > 0 COLUMNS (p.name AS name))"
     );
     assert_eq!(
         compiled.parameters.get("p0"),

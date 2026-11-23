@@ -282,22 +282,37 @@ impl SqlPgqEmitter {
                 if nested {
                     self.buffer.push('(');
                 }
+                if matches!(
+                    op,
+                    BinaryOp::Contains | BinaryOp::StartsWith | BinaryOp::EndsWith
+                ) {
+                    // Wildcard-free functions: LIKE would read `%` and `_` in the
+                    // search value as wildcards, while Cypher matches it literally.
+                    // A NULL operand still yields NULL.
+                    let left_sql = self.render_expression_to_string(arena, *left)?;
+                    let right_sql = self.render_expression_to_string(arena, *right)?;
+                    match op {
+                        BinaryOp::Contains => {
+                            self.buffer
+                                .push_str(&format!("strpos({left_sql}, {right_sql}) > 0"));
+                        }
+                        BinaryOp::StartsWith => {
+                            self.buffer
+                                .push_str(&format!("starts_with({left_sql}, {right_sql})"));
+                        }
+                        _ => {
+                            self.buffer.push_str(&format!(
+                                "right({left_sql}, length({right_sql})) = {right_sql}"
+                            ));
+                        }
+                    }
+                    if nested {
+                        self.buffer.push(')');
+                    }
+                    return Ok(());
+                }
                 self.emit_expression(arena, *left, true)?;
                 match op {
-                    BinaryOp::Contains => {
-                        self.buffer.push_str(" LIKE '%' || ");
-                        self.emit_expression(arena, *right, true)?;
-                        self.buffer.push_str(" || '%'");
-                    }
-                    BinaryOp::StartsWith => {
-                        self.buffer.push_str(" LIKE ");
-                        self.emit_expression(arena, *right, true)?;
-                        self.buffer.push_str(" || '%'");
-                    }
-                    BinaryOp::EndsWith => {
-                        self.buffer.push_str(" LIKE '%' || ");
-                        self.emit_expression(arena, *right, true)?;
-                    }
                     BinaryOp::Concat => {
                         self.buffer.push_str(" || ");
                         self.emit_expression(arena, *right, true)?;
@@ -1148,6 +1163,34 @@ impl AstVisitor for SqlPgqEmitter {
 mod tests {
     use super::*;
     use crate::builder::QueryBuilder;
+
+    fn string_predicate_statement(op: BinaryOp, value: &str) -> (String, String) {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .where_property("p", "name", op, value)
+            .field("p", "name", None::<String>);
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("g");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+        let p0 = compiled.parameters.get("p0").cloned().unwrap();
+        (compiled.statement, format!("{p0:?}"))
+    }
+
+    #[test]
+    fn sql_pgq_string_predicates_avoid_like_wildcards() {
+        let cases = [
+            (BinaryOp::StartsWith, "starts_with(p.name, $p0)"),
+            (BinaryOp::Contains, "strpos(p.name, $p0) > 0"),
+            (BinaryOp::EndsWith, "right(p.name, length($p0)) = $p0"),
+        ];
+        for (op, expected) in cases {
+            let (statement, param) = string_predicate_statement(op, "10%_\\x");
+            assert!(statement.contains(expected), "{statement}");
+            assert!(!statement.contains("LIKE"), "{statement}");
+            assert!(param.contains("10%_"), "{param}");
+        }
+    }
 
     #[test]
     fn sql_pgq_rejects_multi_label_node_patterns() {
