@@ -1114,6 +1114,11 @@ fn export_expression(arena: &QueryAstArena, handle: NodeHandle) -> SpecExportRes
                 text(property),
             ]))
         }
+        AstNode::LabelPredicate { variable, labels } => Ok(SpecValue::Array(vec![
+            text("label"),
+            text(variable),
+            SpecValue::Array(labels.iter().map(text).collect()),
+        ])),
         AstNode::Literal(value) => export_literal(value),
         AstNode::Identifier(name) => Ok(SpecValue::Array(vec![text("ident"), text(name)])),
         AstNode::Parameter(name) => Ok(SpecValue::Array(vec![text("param"), text(name)])),

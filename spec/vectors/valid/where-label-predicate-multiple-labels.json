@@ -1,0 +1,57 @@
+{
+  "description": "Several labels in one label predicate mean all of them, like Cypher i:A:B.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "i",
+              [
+                "Node"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "label",
+          "i",
+          [
+            "A",
+            "B"
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "i",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (i:Node) WHERE i:A:B RETURN i.name",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (i:Node) WHERE label(i) = 'A' AND label(i) = 'B' RETURN i.name $$) AS (name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (i:Node) WHERE i IS A&B RETURN i.name",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

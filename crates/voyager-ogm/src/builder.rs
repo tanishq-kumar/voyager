@@ -257,6 +257,21 @@ impl QueryBuilder {
         })
     }
 
+    /// Allocates a label predicate expression: `variable:Label1:Label2`.
+    ///
+    /// Every label must be present on the bound node or relationship, matching
+    /// the Cypher conjunction spelling `variable:Label1:Label2`.
+    pub fn label_predicate(
+        &mut self,
+        variable: impl Into<String>,
+        labels: Vec<String>,
+    ) -> NodeHandle {
+        self.arena.alloc(AstNode::LabelPredicate {
+            variable: variable.into(),
+            labels,
+        })
+    }
+
     /// Allocates a binary comparison, math, or logical expression.
     #[inline(always)]
     pub fn binary_expr(&mut self, left: NodeHandle, op: BinaryOp, right: NodeHandle) -> NodeHandle {
@@ -2607,6 +2622,7 @@ fn remap_ast_node(node: &mut AstNode, offset: u32) {
             }
         }
         AstNode::Literal(_) | AstNode::Identifier(_) | AstNode::Parameter(_) => {}
+        AstNode::LabelPredicate { .. } => {}
     }
 }
 

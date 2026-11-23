@@ -385,6 +385,16 @@ impl PyAstExpr {
     }
 
     #[staticmethod]
+    fn label(variable: String, labels: Vec<String>) -> Self {
+        let mut b = QueryBuilder::new();
+        let h = b.label_predicate(variable, labels);
+        Self {
+            arena: b.into_arena(),
+            handle: h,
+        }
+    }
+
+    #[staticmethod]
     fn literal(val: &Bound<'_, PyAny>) -> PyResult<Self> {
         let lit = py_to_literal(val)?;
         let mut b = QueryBuilder::new();

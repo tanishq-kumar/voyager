@@ -249,6 +249,17 @@ fn validate_node_identifiers(
                 validate_identifier("property name", property)?;
             }
         }
+        AstNode::LabelPredicate { variable, labels } => {
+            validate_identifier("label predicate variable", variable)?;
+            if labels.is_empty() {
+                return Err(Error::InvalidClause(
+                    "Invalid label predicate: at least one label is required".to_string(),
+                ));
+            }
+            for label in labels {
+                validate_identifier("label name", label)?;
+            }
+        }
         AstNode::Literal(_) => {}
         // `col("n.uuid")` from the fluent API is emitted verbatim as a variable/property path,
         // so identifier expressions accept dotted names while still rejecting injection syntax.

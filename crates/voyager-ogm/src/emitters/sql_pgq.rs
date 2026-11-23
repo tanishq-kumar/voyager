@@ -24,6 +24,7 @@ fn ast_node_kind(node: &AstNode) -> &'static str {
         AstNode::CountSubquery { .. } => "CountSubquery",
         AstNode::ListLiteral(_) => "ListLiteral",
         AstNode::PropertyAccess { .. } => "PropertyAccess",
+        AstNode::LabelPredicate { .. } => "LabelPredicate",
         AstNode::Literal(_) => "Literal",
         AstNode::Identifier(_) => "Identifier",
         AstNode::Parameter(_) => "Parameter",
@@ -264,6 +265,11 @@ impl SqlPgqEmitter {
                 }
                 Ok(())
             }
+            AstNode::LabelPredicate { .. } => Err(Error::UnsupportedFeature {
+                dialect: "sql_pgq".to_string(),
+                feature: "Label predicate expressions (label) - SQL:2023 PGQ GRAPH_TABLE only supports a label test inside an element pattern, not in a WHERE clause"
+                    .to_string(),
+            }),
             AstNode::Literal(lit) => {
                 let param_name = format!("p{}", self.param_counter);
                 self.param_counter += 1;

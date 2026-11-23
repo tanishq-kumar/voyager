@@ -1,0 +1,41 @@
+{
+  "description": "A label predicate cannot read a variable that no preceding clause binds.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "i",
+              [
+                "Node"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "label",
+          "unknown",
+          [
+            "TextNode"
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "i",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/where/1"
+  }
+}
