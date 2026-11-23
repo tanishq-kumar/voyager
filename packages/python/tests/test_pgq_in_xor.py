@@ -9,6 +9,7 @@ cases, plus the XOR three-valued result.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pytest
@@ -29,7 +30,8 @@ try:
 except ImportError:
     pass
 
-POSTGRES19_URI = "postgresql://postgres:voyagerpass123@127.0.0.1:5456/voyager_graph"
+HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+POSTGRES19_URI = f"postgresql://postgres:voyagerpass123@{HOST}:5456/voyager_graph"
 GRAPH = "fix303_304_graph"
 PERSON = "fix303_304_person"
 
@@ -339,10 +341,10 @@ class TestPostgres19InXor:
     def pg19(self):
         if psycopg is None:
             pytest.skip("psycopg is not installed in this environment")
-        if not _is_port_open("127.0.0.1", 5456):
+        if not _is_port_open(HOST, 5456):
             pytest.skip("PostgreSQL 19 container not available on port 5456")
         conn_str = (
-            "host=127.0.0.1 port=5456 user=postgres password=voyagerpass123 "
+            f"host={HOST} port=5456 user=postgres password=voyagerpass123 "
             "dbname=voyager_graph connect_timeout=3"
         )
         try:
