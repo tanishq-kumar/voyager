@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-24
+
 ### Deprecated
 - **Unquoted SQL/PGQ labels**: from 0.5.0, SQL/PGQ quotes labels in the generated `CREATE PROPERTY GRAPH` DDL and in queries (`IS "Person"`), so labels are case-exact as in Cypher and reserved words such as `User` and `Order` work as labels. A property graph created with unquoted mixed-case labels will need to be re-created with `DROP PROPERTY GRAPH` and the DDL from `SchemaManager.generate_pgq_ddl(...)`; tables and data are not affected. 0.4.x keeps unquoted labels.
 
@@ -402,7 +404,9 @@ Breaking changes in the 0.4 line are marked **Breaking** in the sections below (
 
 
 
-[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.4.2...HEAD
+
+[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/tanishq-kumar/voyager/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tanishq-kumar/voyager/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tanishq-kumar/voyager/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tanishq-kumar/voyager/compare/v0.4.0-alpha.8...v0.4.0
