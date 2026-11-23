@@ -2006,7 +2006,7 @@ class Relationship:
         cls,
         type_name: str | None = None,
         type_: str | None = None,
-        direction: str = "outgoing",
+        direction: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initializes Relationship subclass metadata.
@@ -2015,30 +2015,54 @@ class Relationship:
             type_name: Database edge type string. Defaults to uppercase class name.
             type_: Alias for type_name.
             direction: Traversal direction ('outgoing', 'incoming', 'undirected').
-            **kwargs: Extra keyword arguments passed to super.
+                Defaults to a class-body ``__direction__``, then 'outgoing'.
+            **kwargs: Endpoint keywords (``source_node``/``target_node`` model
+                classes, or ``source_labels``/``target_labels`` and their
+                ``from_labels``/``to_labels`` aliases) and the ``type`` alias;
+                anything else is passed to super.
 
         Note:
             Precedence for the effective type is: an explicit ``type_name``/
             ``type_``/``type`` keyword, then a class-body ``__type__``
             declaration, then the uppercase class name. A decorator argument is
             explicit at the use site and therefore overrides class-body
-            declarations.
+            declarations. Endpoints and direction follow the same rule: keywords
+            first, then class-body ``__source_labels__``/``__target_labels__``/
+            ``__direction__`` (which ``@relationship`` sets), then no endpoints
+            and 'outgoing'.
         """
+        own = {
+            key: kwargs.pop(key)
+            for key in (
+                "type",
+                "source_labels",
+                "from_labels",
+                "source_node",
+                "target_labels",
+                "to_labels",
+                "target_node",
+            )
+            if key in kwargs
+        }
         super().__init_subclass__(**kwargs)
         declared_type = _resolve_declared_type(cls)
         resolved_type = (
-            type_name or type_ or kwargs.get("type") or declared_type or cls.__name__.upper()
+            type_name or type_ or own.get("type") or declared_type or cls.__name__.upper()
         )
         cls.__type__ = resolved_type
-        cls.__direction__ = direction
-        source_labels = kwargs.get("source_labels") or kwargs.get("from_labels")
-        if not source_labels and "source_node" in kwargs:
-            src = kwargs["source_node"]
+        cls.__direction__ = direction or cls.__dict__.get("__direction__") or "outgoing"
+        source_labels = own.get("source_labels") or own.get("from_labels")
+        if not source_labels and "source_node" in own:
+            src = own["source_node"]
             source_labels = getattr(src, "__labels__", [getattr(src, "__name__", str(src))])
-        target_labels = kwargs.get("target_labels") or kwargs.get("to_labels")
-        if not target_labels and "target_node" in kwargs:
-            tgt = kwargs["target_node"]
+        if not source_labels:
+            source_labels = cls.__dict__.get("__source_labels__")
+        target_labels = own.get("target_labels") or own.get("to_labels")
+        if not target_labels and "target_node" in own:
+            tgt = own["target_node"]
             target_labels = getattr(tgt, "__labels__", [getattr(tgt, "__name__", str(tgt))])
+        if not target_labels:
+            target_labels = cls.__dict__.get("__target_labels__")
         cls.__source_labels__ = list(source_labels) if source_labels else []
         cls.__target_labels__ = list(target_labels) if target_labels else []
         cls._cached_type = cls.__type__

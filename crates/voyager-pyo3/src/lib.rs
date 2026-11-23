@@ -4219,6 +4219,45 @@ impl PyNativeCircuitRouter {
     }
 }
 
+/// Maps a Python field type annotation to a [`FieldType`].
+///
+/// `Optional[T]` and `T | None` map to the type of `T`; any other union maps to
+/// [`FieldType::Any`]. Other annotations are named by their `__name__`.
+fn annotation_field_type(ann: &Bound<'_, PyAny>) -> PyResult<FieldType> {
+    if ann.is_none() {
+        return Ok(FieldType::Any);
+    }
+    if let Ok(s) = ann.extract::<String>() {
+        return Ok(FieldType::parse_str(&s));
+    }
+    let py = ann.py();
+    let typing = py.import("typing")?;
+    let origin = typing.call_method1("get_origin", (ann,))?;
+    let is_union = !origin.is_none()
+        && (origin.is(&typing.getattr("Union")?)
+            || origin.is(&py.import("types")?.getattr("UnionType")?));
+    if is_union {
+        let none_type = py.None().bind(py).get_type();
+        let args = typing.call_method1("get_args", (ann,))?;
+        let mut members = Vec::new();
+        for arg in args.try_iter()? {
+            let arg = arg?;
+            if !arg.is(&none_type) {
+                members.push(arg);
+            }
+        }
+        return match members.as_slice() {
+            [single] => annotation_field_type(single),
+            _ => Ok(FieldType::Any),
+        };
+    }
+    if ann.hasattr("__name__")? {
+        let s: String = ann.getattr("__name__")?.extract()?;
+        return Ok(FieldType::parse_str(&s));
+    }
+    Ok(FieldType::Any)
+}
+
 fn parse_field_descriptor(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<FieldDescriptor> {
     if let Ok(dict) = obj.cast::<PyDict>() {
         let field_name = if let Some(n) = dict.get_item("name")? {
@@ -4441,17 +4480,7 @@ fn parse_field_descriptor(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<FieldD
         };
 
         let field_type = if obj.hasattr("type_annotation")? {
-            let ann = obj.getattr("type_annotation")?;
-            if ann.is_none() {
-                FieldType::Any
-            } else if let Ok(s) = ann.extract::<String>() {
-                FieldType::parse_str(&s)
-            } else if ann.hasattr("__name__")? {
-                let s: String = ann.getattr("__name__")?.extract()?;
-                FieldType::parse_str(&s)
-            } else {
-                FieldType::Any
-            }
+            annotation_field_type(&obj.getattr("type_annotation")?)?
         } else if obj.hasattr("type")? {
             let t = obj.getattr("type")?;
             if let Ok(s) = t.extract::<String>() {
