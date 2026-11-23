@@ -108,8 +108,8 @@ fn test_fluent_query_builder_simple_match() {
             assert!(!distinct);
             assert_eq!(projections.len(), 2);
             assert_eq!(order_by.len(), 1);
-            assert_eq!(*limit, Some(10));
-            assert_eq!(*skip, Some(5));
+            assert_eq!(*limit, Some(PaginationValue::Count(10)));
+            assert_eq!(*skip, Some(PaginationValue::Count(5)));
         } else {
             panic!("Expected ReturnClause");
         }
@@ -238,8 +238,8 @@ fn test_intuitive_builder_aliases() {
         } = ret
         {
             assert_eq!(projections.len(), 2);
-            assert_eq!(*limit, Some(25));
-            assert_eq!(*skip, Some(10));
+            assert_eq!(*limit, Some(PaginationValue::Count(25)));
+            assert_eq!(*skip, Some(PaginationValue::Count(10)));
             assert_eq!(order_by.len(), 1);
             assert!(!order_by[0].1); // descending = false
         }
@@ -382,7 +382,7 @@ fn test_memgraph_gqlalchemy_chaining_style() {
         } = ret
         {
             assert_eq!(projections.len(), 3);
-            assert_eq!(*limit, Some(10));
+            assert_eq!(*limit, Some(PaginationValue::Count(10)));
         }
     }
 }

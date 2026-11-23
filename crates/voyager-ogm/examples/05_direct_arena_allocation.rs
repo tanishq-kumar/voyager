@@ -52,7 +52,7 @@ fn main() {
         }],
         order_by: vec![],
         skip: None,
-        limit: Some(10),
+        limit: Some(voyager_ogm::ast::PaginationValue::Count(10)),
     });
 
     // 4. Combine into root QueryStatement

@@ -2511,12 +2511,45 @@ impl PyQueryBuilder {
         self.inner.limit(limit);
     }
 
+    fn limit_param(&mut self, name: String) -> PyResult<()> {
+        let name = strip_leading_dollar(name);
+        if name.is_empty() {
+            return Err(PyValueError::new_err(
+                "Pagination parameter name must be a non-empty string",
+            ));
+        }
+        self.inner.limit_param(name);
+        Ok(())
+    }
+
     fn skip(&mut self, skip: u64) {
         self.inner.skip(skip);
     }
 
+    fn skip_param(&mut self, name: String) -> PyResult<()> {
+        let name = strip_leading_dollar(name);
+        if name.is_empty() {
+            return Err(PyValueError::new_err(
+                "Pagination parameter name must be a non-empty string",
+            ));
+        }
+        self.inner.skip_param(name);
+        Ok(())
+    }
+
     fn offset(&mut self, offset: u64) {
         self.inner.offset(offset);
+    }
+
+    fn offset_param(&mut self, name: String) -> PyResult<()> {
+        let name = strip_leading_dollar(name);
+        if name.is_empty() {
+            return Err(PyValueError::new_err(
+                "Pagination parameter name must be a non-empty string",
+            ));
+        }
+        self.inner.offset_param(name);
+        Ok(())
     }
 
     fn let_(&mut self, variable: String, expr: &Bound<'_, PyAny>) -> PyResult<()> {

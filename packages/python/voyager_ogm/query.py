@@ -20,6 +20,7 @@ from voyager_ogm.expressions import (
     Expression,
     FunctionExpr,
     LiteralExpr,
+    ParamExpr,
     PropExpr,
     UnaryExpr,
     _reject_aggregation,
@@ -1921,11 +1922,12 @@ class Query:
         """
         return self.order_by(field, ascending=False)
 
-    def limit(self, count: int) -> Query:
+    def limit(self, count: int | ParamExpr) -> Query:
         """Limits the maximum number of returned rows.
 
         Args:
-            count: Maximum number of rows to return. Must be non-negative.
+            count: Maximum number of rows to return. A non-negative integer, or
+                ``param("name")`` to bind the limit at execution time.
 
         Returns:
             The Query instance for fluent chaining.
@@ -1933,16 +1935,20 @@ class Query:
         Raises:
             ValueError: If count is negative.
         """
+        if isinstance(count, ParamExpr):
+            self._native.limit_param(count.name)
+            return self
         if count < 0:
             raise ValueError(f"limit count must be non-negative, got {count}")
         self._native.limit(count)
         return self
 
-    def skip(self, count: int) -> Query:
+    def skip(self, count: int | ParamExpr) -> Query:
         """Skips the first N rows for pagination.
 
         Args:
-            count: Number of rows to skip. Must be non-negative.
+            count: Number of rows to skip. A non-negative integer, or
+                ``param("name")`` to bind the offset at execution time.
 
         Returns:
             The Query instance for fluent chaining.
@@ -1950,16 +1956,20 @@ class Query:
         Raises:
             ValueError: If count is negative.
         """
+        if isinstance(count, ParamExpr):
+            self._native.skip_param(count.name)
+            return self
         if count < 0:
             raise ValueError(f"skip count must be non-negative, got {count}")
         self._native.skip(count)
         return self
 
-    def offset(self, count: int) -> Query:
+    def offset(self, count: int | ParamExpr) -> Query:
         """Skips the first N rows for pagination (SQL/GQL alias for skip).
 
         Args:
-            count: Number of rows to skip. Must be non-negative.
+            count: Number of rows to skip. A non-negative integer, or
+                ``param("name")`` to bind the offset at execution time.
 
         Returns:
             The Query instance for fluent chaining.
@@ -1967,6 +1977,9 @@ class Query:
         Raises:
             ValueError: If count is negative.
         """
+        if isinstance(count, ParamExpr):
+            self._native.offset_param(count.name)
+            return self
         if count < 0:
             raise ValueError(f"offset count must be non-negative, got {count}")
         return self.skip(count)

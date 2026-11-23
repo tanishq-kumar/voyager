@@ -1,0 +1,66 @@
+{
+  "description": "skip and limit accept a parameter reference.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ],
+    "order_by": [
+      [
+        "p",
+        "name",
+        true
+      ]
+    ],
+    "skip": [
+      "param",
+      "s"
+    ],
+    "limit": [
+      "param",
+      "l"
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN p.name ORDER BY p.name ASC SKIP $s LIMIT $l",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name ORDER BY p.name ASC SKIP $s LIMIT $l $$, %s) AS (name agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN p.name ORDER BY p.name ASC OFFSET $s LIMIT $l",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) ORDER BY name ASC LIMIT $l OFFSET $s",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) ORDER BY name ASC LIMIT $l OFFSET $s",
+      "parameters": {}
+    }
+  }
+}
