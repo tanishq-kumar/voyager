@@ -21,8 +21,10 @@ impl fmt::Debug for Secret<'_> {
 }
 
 /// A credential byte string rendered as `"***"`, or `None` when it is empty.
+#[cfg(feature = "postgres")]
 pub(crate) struct SecretBytes<'a>(pub(crate) &'a [u8]);
 
+#[cfg(feature = "postgres")]
 impl fmt::Debug for SecretBytes<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.is_empty() {
