@@ -1,0 +1,63 @@
+name: Re-run Jobs Without a Runner
+
+# GitHub-hosted runners (macOS in particular) are sometimes unavailable: a job waits
+# for a runner and then ends as failed or cancelled without running a single step.
+# When a CI or Release run finishes like that, re-run only its failed jobs, up to
+# two more attempts. Jobs that ran and failed (a real test failure) are never retried.
+#
+# This workflow does not check out or run any code from the triggering run, so it is
+# safe for runs from forks; it only asks GitHub to re-run jobs of that run.
+
+on:
+  workflow_run:
+    workflows: [CI, Release]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  rerun:
+    name: Re-run jobs that never got a runner
+    if: >-
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'cancelled') &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-run failed jobs if every failure had no runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          jobs_json="$(gh api --paginate \
+            "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${ATTEMPT}/jobs?per_page=100" \
+            --jq '.jobs[]')"
+
+          # A job never got a runner when it failed or was cancelled without any step
+          # that started. The CI Gate is excluded: it fails because of the others.
+          no_runner="$(echo "${jobs_json}" | jq -r '
+            select((.conclusion == "failure" or .conclusion == "cancelled") and .name != "CI Gate")
+            | select(([.steps[]? | select(.status != "queued" and .conclusion != "skipped")] | length) == 0)
+            | .name')"
+          ran_and_failed="$(echo "${jobs_json}" | jq -r '
+            select((.conclusion == "failure" or .conclusion == "cancelled") and .name != "CI Gate")
+            | select(([.steps[]? | select(.status != "queued" and .conclusion != "skipped")] | length) > 0)
+            | .name')"
+
+          if [[ -z "${no_runner}" ]]; then
+            echo "No job of run ${RUN_ID} (attempt ${ATTEMPT}) failed for lack of a runner; nothing to re-run."
+            exit 0
+          fi
+          if [[ -n "${ran_and_failed}" ]]; then
+            echo "Run ${RUN_ID} also has jobs that ran and failed; not re-running automatically:"
+            echo "${ran_and_failed}"
+            exit 0
+          fi
+          echo "Jobs that never got a runner in run ${RUN_ID} (attempt ${ATTEMPT}):"
+          echo "${no_runner}"
+          gh run rerun "${RUN_ID}" --repo "${REPO}" --failed
+          echo "Requested a re-run of the failed jobs (attempt $((ATTEMPT + 1)))."
