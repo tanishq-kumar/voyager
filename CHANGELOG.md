@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+- **Unquoted SQL/PGQ labels**: from 0.5.0, SQL/PGQ quotes labels in the generated `CREATE PROPERTY GRAPH` DDL and in queries (`IS "Person"`), so labels are case-exact as in Cypher and reserved words such as `User` and `Order` work as labels. A property graph created with unquoted mixed-case labels will need to be re-created with `DROP PROPERTY GRAPH` and the DDL from `SchemaManager.generate_pgq_ddl(...)`; tables and data are not affected. 0.4.x keeps unquoted labels.
+
+### Fixed
+- **SQL/PGQ and DuckPGQ `IN` with a list or list parameter (#303)**: the emitter now writes `x IN (a, b)` for a literal list and `x = ANY($p)` for a list parameter (`NOT IN (a, b)` / `x <> ALL($p)` when negated); an empty literal list compiles to `FALSE` (`TRUE` for `NOT IN`). The DuckDB bridge rewrites the parameter forms to a scalar `IN (...)` tuple because DuckPGQ's `GRAPH_TABLE` grammar has no `ANY`/`ALL`.
+- **SQL/PGQ and DuckPGQ `XOR` lowering (#304)**: `XOR` now compiles to `((a) OR (b)) AND NOT ((a) AND (b))` instead of the unsupported keyword, preserving the three-valued result when either side is NULL.
+- **SQL/PGQ string predicate placeholder escaping in PostgresBridge (#305)**: `PostgresBridge._format_pgq_statement` now escapes literal `%` characters as `%%` when query parameters are bound positionally as `%s`, preventing `psycopg` from misinterpreting `LIKE` wildcard patterns (such as in `STARTS WITH`, `ENDS WITH`, and `CONTAINS`) as invalid formatting placeholders.
+- **SQL/PGQ string predicates match the search value literally (#318)**: `STARTS WITH`, `ENDS WITH` and `CONTAINS` compile to `starts_with`, `right`/`length` and `strpos` instead of `LIKE`, so `%`, `_` and `\` in the search value are no longer wildcards on PostgreSQL 19 and DuckPGQ.
+- **SQL/PGQ ORDER BY on expressions outside GRAPH_TABLE (#319)**: ordering expressions that are not returned columns are now evaluated inside `GRAPH_TABLE` `COLUMNS` under an internal alias and selected only as returned columns in the outer query, so pattern variables are in scope on PostgreSQL 19 and DuckPGQ.
+- **SQL/PGQ ORDER BY on non-returned properties (#320)**: ordering by a property that is not projected now exposes it in `GRAPH_TABLE` `COLUMNS` under an internal alias, avoiding missing-column errors in the outer query on PostgreSQL 19 and DuckPGQ.
+
+### Security
+- **Credentials no longer appear in `Debug` output (#326)**: `Auth`, `ParsedUri` and `ConnectionConfig` format with a hand-written `Debug` that shows a configured password or token as `"***"` (and an empty one as `None`), redacting URI userinfo and credential-named query parameters, and a malformed-URI error no longer echoes the password. Serialised configurations still contain the secret so they round-trip, and the type docs say so.
+
 ## [0.4.2] - 2026-11-22
 
 ### Fixed

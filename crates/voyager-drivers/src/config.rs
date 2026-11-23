@@ -1,12 +1,19 @@
 //! Configuration options for connection pools, TLS, authentication, and database engines.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::Duration;
 
+use crate::redact::{Secret, redact_uri};
 use crate::uri::ParsedUri;
 
 /// Authentication schemes supported by database wire protocols.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// `Debug` never prints a password or token: a configured secret appears as
+/// `"***"` and an empty one as `None`. Serialisation is not redacted, because a
+/// serialised configuration is expected to round-trip; treat `Serialize` output
+/// of this type (and of [`ConnectionConfig`]) as secret material and never log it.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Auth {
     /// No authentication credentials.
     #[default]
@@ -25,6 +32,28 @@ pub enum Auth {
         /// Secret token string.
         token: String,
     },
+}
+
+impl fmt::Debug for Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Basic {
+                username,
+                password,
+                realm,
+            } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &Secret(password))
+                .field("realm", realm)
+                .finish(),
+            Self::Bearer { token } => f
+                .debug_struct("Bearer")
+                .field("token", &Secret(token))
+                .finish(),
+        }
+    }
 }
 
 /// Transport Layer Security (TLS) configuration modes.
@@ -110,7 +139,13 @@ impl PoolConfig {
 }
 
 /// Comprehensive connection options for an engine instance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` never prints a password or token: the URI's userinfo and the
+/// credentials in [`Auth`] are redacted. Serialisation is not redacted, because
+/// a serialised configuration is expected to round-trip; a serialised
+/// `ConnectionConfig` contains the password in clear text, so treat it as secret
+/// material and never log it.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     /// Target connection URI (e.g. `bolt://localhost:7687` or `postgresql://localhost:5455/postgres`).
     pub uri: String,
@@ -126,6 +161,20 @@ pub struct ConnectionConfig {
     pub query_timeout: Option<Duration>,
     /// Asynchronous connection pool settings.
     pub pool: PoolConfig,
+}
+
+impl fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionConfig")
+            .field("uri", &redact_uri(&self.uri))
+            .field("auth", &self.auth)
+            .field("database", &self.database)
+            .field("tls", &self.tls)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("query_timeout", &self.query_timeout)
+            .field("pool", &self.pool)
+            .finish()
+    }
 }
 
 impl Default for ConnectionConfig {
@@ -198,5 +247,77 @@ impl ConnectionConfig {
     pub fn with_pool(mut self, pool: PoolConfig) -> Self {
         self.pool = pool;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A value distinctive enough that an accidental leak is unmistakable.
+    const SECRET: &str = "s3cr3t-326";
+
+    #[test]
+    fn auth_basic_debug_redacts_password() {
+        let auth = Auth::Basic {
+            username: "neo4j".to_string(),
+            password: SECRET.to_string(),
+            realm: Some("native".to_string()),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(rendered.contains("username: \"neo4j\""), "{rendered}");
+        assert!(rendered.contains("password: \"***\""), "{rendered}");
+        assert!(rendered.contains("realm: Some(\"native\")"), "{rendered}");
+    }
+
+    #[test]
+    fn auth_bearer_debug_redacts_token() {
+        let auth = Auth::Bearer {
+            token: SECRET.to_string(),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(rendered.contains("token: \"***\""), "{rendered}");
+    }
+
+    #[test]
+    fn auth_absent_secret_debug_prints_none() {
+        let empty_password = Auth::Basic {
+            username: "neo4j".to_string(),
+            password: String::new(),
+            realm: None,
+        };
+        assert_eq!(
+            format!("{empty_password:?}"),
+            r#"Basic { username: "neo4j", password: None, realm: None }"#
+        );
+        assert_eq!(format!("{:?}", Auth::None), "None");
+        assert_eq!(
+            format!(
+                "{:?}",
+                Auth::Bearer {
+                    token: String::new()
+                }
+            ),
+            "Bearer { token: None }"
+        );
+    }
+
+    #[cfg(feature = "bolt")]
+    #[test]
+    fn connection_config_debug_redacts_uri_and_auth() {
+        let config = ConnectionConfig::from_uri(format!("bolt://neo4j:{SECRET}@db:7687/movies"));
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(
+            rendered.contains("bolt://neo4j:***@db:7687/movies"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("password: \"***\""), "{rendered}");
+        assert!(
+            rendered.contains("database: Some(\"movies\")"),
+            "{rendered}"
+        );
     }
 }

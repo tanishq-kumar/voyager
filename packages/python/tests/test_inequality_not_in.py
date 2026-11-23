@@ -45,7 +45,7 @@ def test_not_in_compiles_to_negated_in(dialect: str) -> None:
         .compile(dialect, graph_name="g")
     )
     if dialect in ("sql_pgq", "duckpgq"):
-        expected = "p.name NOT IN $p0"
+        expected = "p.name <> ALL($p0)"
     else:
         expected = "NOT (p.name IN $p0)"
     assert expected in compiled.statement
@@ -98,7 +98,7 @@ def _not_in_spec(operator: str) -> dict[str, object]:
 def test_spec_not_in_spellings_still_compile(dialect: str, spelling: str) -> None:
     compiled = compile_query_from_spec(_not_in_spec(spelling), dialect, graph_name="g")
     if dialect in ("sql_pgq", "duckpgq"):
-        expected = "p.name NOT IN $p0"
+        expected = "p.name <> ALL($p0)"
     else:
         expected = "NOT (p.name IN $p0)"
     assert expected in compiled["statement"]

@@ -174,6 +174,7 @@ Define models with Python type annotations and build queries once. Voyager compi
 
 - **openCypher**: Neo4j, Memgraph, FalkorDB, AWS Neptune.
 - **SQL:2023 PGQ (`GRAPH_TABLE`)**: DuckDB DuckPGQ, PostgreSQL (19+).
+  - **Upcoming change in 0.5.0:** SQL/PGQ will quote labels, both in the generated `CREATE PROPERTY GRAPH` DDL (`LABEL "Person"`) and in queries (`IS "Person"`), so labels become case-exact as in Cypher and reserved words such as `User` work. A property graph created with unquoted mixed-case labels will need to be re-created from the generated DDL; tables and data are not affected.
 - **ISO GQL (ISO/IEC 39075:2024)**: The official international graph query standard.
 
 **Example:** [Multi-dialect compilation](https://github.com/tanishq-kumar/voyager/blob/main/examples/python/08_multi_dialect_compilation.py) and [enterprise dialects & multi-label DDL](https://github.com/tanishq-kumar/voyager/blob/main/examples/python/09_enterprise_dialects.py).
