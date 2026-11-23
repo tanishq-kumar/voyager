@@ -1917,7 +1917,10 @@ class PostgresBridge:
                 return "%s"
             return m.group(0)
 
-        stmt = regex.sub(repl, statement)
+        escaped_stmt = statement.replace("%", "%%")
+        stmt = regex.sub(repl, escaped_stmt)
+        if not ordered_params:
+            return statement, ()
         return stmt, ordered_params
 
     def execute(
@@ -1934,7 +1937,7 @@ class PostgresBridge:
         """
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         with self.conn.cursor() as cur:
-            cur.execute(stmt, params)
+            cur.execute(stmt, params or None)
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
@@ -1955,7 +1958,7 @@ class PostgresBridge:
         """
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         with self.conn.cursor() as cur:
-            cur.execute(stmt, params)
+            cur.execute(stmt, params or None)
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
@@ -1989,7 +1992,7 @@ class PostgresBridge:
                     batch_data = b.get("batch", [])
                     total_records += len(batch_data)
                     stmt, params = self._format_pgq_statement(statement, b)
-                    cur.execute(stmt, params)
+                    cur.execute(stmt, params or None)
             else:
                 statement = plan_or_statement.statement
                 for batch_item in plan_or_statement:
@@ -1999,7 +2002,7 @@ class PostgresBridge:
                     stmt, params = self._format_pgq_statement(
                         batch_item.statement, batch_item.parameters
                     )
-                    cur.execute(stmt, params)
+                    cur.execute(stmt, params or None)
         return BulkExecutionResult(
             total_batches=total_batches,
             total_records=total_records,
@@ -2101,7 +2104,7 @@ class PostgresBridgeTransaction:
     def _execute_sql(self, statement: str, parameters: Sequence[Any] = ()) -> str | None:
         """Executes a control statement and returns its command tag."""
         with self._bridge.conn.cursor() as cur:
-            cur.execute(statement, parameters)
+            cur.execute(statement, parameters or None)
             return getattr(cur, "statusmessage", None)
 
     def execute(
@@ -2112,7 +2115,7 @@ class PostgresBridgeTransaction:
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
-                cur.execute(stmt, params)
+                cur.execute(stmt, params or None)
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
@@ -2130,7 +2133,7 @@ class PostgresBridgeTransaction:
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
-                cur.execute(stmt, params)
+                cur.execute(stmt, params or None)
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
@@ -2161,7 +2164,7 @@ class PostgresBridgeTransaction:
                     for b in batch_list:
                         total_records += len(b.get("batch", []))
                         stmt, params = self._bridge._format_pgq_statement(statement, b)
-                        cur.execute(stmt, params)
+                        cur.execute(stmt, params or None)
                 else:
                     statement = plan_or_statement.statement
                     for batch_item in plan_or_statement:
@@ -2170,7 +2173,7 @@ class PostgresBridgeTransaction:
                         stmt, params = self._bridge._format_pgq_statement(
                             batch_item.statement, batch_item.parameters
                         )
-                        cur.execute(stmt, params)
+                        cur.execute(stmt, params or None)
         except BaseException:
             self._mark_failed()
             raise
