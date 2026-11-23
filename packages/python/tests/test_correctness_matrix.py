@@ -153,8 +153,8 @@ def test_sql_pgq_multi_hop_compilation_accuracy():
 
     compiled = query.compile("sql_pgq", graph_name="hollywood")
     expected = (
-        "SELECT * FROM GRAPH_TABLE (hollywood MATCH (p IS Person) "
-        "-[r IS PRODUCED]->{1,4} (m IS Movie) "
+        'SELECT * FROM GRAPH_TABLE (hollywood MATCH (p IS "Person") '
+        '-[r IS "PRODUCED"]->{1,4} (m IS "Movie") '
         "WHERE (p.age > $p0) AND (m.budget >= $p1) "
         "COLUMNS (p.name, m.title, m.budget AS total_budget)) "
         "ORDER BY name ASC LIMIT 25"

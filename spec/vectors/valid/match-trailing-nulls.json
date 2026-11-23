@@ -63,11 +63,11 @@
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) -[ IS KNOWS]-> (f IS Person) COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") -[ IS \"KNOWS\"]-> (f IS \"Person\") COLUMNS (p.name))",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) -[ IS KNOWS]-> (f IS Person) COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") -[ IS \"KNOWS\"]-> (f IS \"Person\") COLUMNS (p.name))",
       "parameters": {}
     }
   }

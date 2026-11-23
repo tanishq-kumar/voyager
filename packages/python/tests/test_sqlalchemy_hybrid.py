@@ -432,10 +432,10 @@ class TestSQLAlchemyHybridBridge:
         ddl = pg.generate_create_ddl()
         assert "CREATE PROPERTY GRAPH enterprise_catalog" in ddl
         assert "VERTEX TABLES (" in ddl
-        assert "users LABEL User" in ddl
+        assert '"users" LABEL "User"' in ddl
         assert "EDGE TABLES (" in ddl
-        assert "follows" in ddl
-        assert "SOURCE KEY (follower_id) REFERENCES users" in ddl
+        assert '"follows"' in ddl
+        assert 'SOURCE KEY ("follower_id") REFERENCES "users" ("id")' in ddl
 
         # Dynamic Voyager Node / Relationship generation
         node_models, rel_models = pg.to_voyager_models()

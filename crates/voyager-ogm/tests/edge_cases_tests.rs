@@ -319,7 +319,7 @@ fn test_sql_pgq_like_and_case_insensitive_translation() {
     let res = pgq.visit_query(&arena, root).unwrap();
     assert_eq!(
         res.statement,
-        "SELECT * FROM GRAPH_TABLE (crm_graph MATCH (c IS Customer) WHERE strpos(c.email, $p0) > 0 COLUMNS (c.email)) LIMIT 50"
+        "SELECT * FROM GRAPH_TABLE (crm_graph MATCH (c IS \"Customer\") WHERE strpos(c.email, $p0) > 0 COLUMNS (c.email)) LIMIT 50"
     );
     assert_eq!(
         res.parameters.get("p0"),

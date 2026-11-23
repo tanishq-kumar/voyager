@@ -1564,7 +1564,7 @@ class TestPostgres19LiveMatrix:
             )
             compiled = q.compile("sql_pgq", graph_name="live_pgq_graph")
             assert (
-                "FROM GRAPH_TABLE (live_pgq_graph MATCH (a IS MatrixUser) -[r IS MATRIX_FOLLOWS]-> (b IS MatrixUser)"
+                'FROM GRAPH_TABLE (live_pgq_graph MATCH (a IS "MatrixUser") -[r IS "MATRIX_FOLLOWS"]-> (b IS "MatrixUser")'
                 in compiled.statement
             )
 

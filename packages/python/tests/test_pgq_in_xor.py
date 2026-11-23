@@ -377,17 +377,17 @@ class TestPostgres19InXor:
         bridge = PostgresBridge(pg19)
         old_statements = [
             (
-                f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS Person) "
+                f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "Person") '
                 "WHERE p.name IN ['Alice', 'Bob'] COLUMNS (p.name))",
                 {},
             ),
             (
-                f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS Person) "
+                f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "Person") '
                 "WHERE p.name IN $names COLUMNS (p.name))",
                 {"names": ["Alice", "Bob"]},
             ),
             (
-                f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS Person) "
+                f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "Person") '
                 "WHERE (p.age > 30) XOR (p.city = 'Paris') COLUMNS (p.name))",
                 {},
             ),

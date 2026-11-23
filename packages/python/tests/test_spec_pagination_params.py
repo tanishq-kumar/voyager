@@ -45,12 +45,12 @@ def _with_pagination(**pagination: Any) -> dict[str, Any]:
         ("iso_gql", "MATCH (p:Person) RETURN p.name OFFSET $s LIMIT $l"),
         (
             "sql_pgq",
-            "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) "
+            'SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS "Person") '
             "COLUMNS (p.name)) LIMIT $l OFFSET $s",
         ),
         (
             "duckpgq",
-            "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) "
+            'SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS "Person") '
             "COLUMNS (p.name)) LIMIT $l OFFSET $s",
         ),
     ],

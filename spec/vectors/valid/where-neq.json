@@ -59,13 +59,13 @@
       }
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.age <> $p0 COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") WHERE p.age <> $p0 COLUMNS (p.name))",
       "parameters": {
         "p0": 30
       }
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.age <> $p0 COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") WHERE p.age <> $p0 COLUMNS (p.name))",
       "parameters": {
         "p0": 30
       }

@@ -1,10 +1,11 @@
 """Live tests: ``introspect_schema`` against ``export_schema`` on each engine.
 
-Each test creates the schema of the models below with the DDL Voyager
-generates (hand-written tables for PostgreSQL 19, whose generated property
-graph DDL is not used here), inserts two nodes and one relationship,
-introspects the database, compares every fact the engine reports with
-``export_schema`` for the same models, and drops everything afterwards.
+Each test creates the schema of the models below, inserts a few nodes and
+relationships, introspects the database, compares every fact the engine reports
+with ``export_schema`` for the same models, and drops everything afterwards.
+The PostgreSQL 19 case builds its tables with the generated naming rule and
+creates the property graph from the generated DDL, then queries it with the
+SQL/PGQ emitter.
 
 Set ``VOYAGER_TEST_HOST`` to run against another machine (default
 ``127.0.0.1``); a test is skipped when its port is not reachable.
@@ -23,6 +24,7 @@ from voyager_ogm import (
     Field,
     NativeClient,
     Node,
+    Query,
     Relationship,
     export_schema,
     introspect_schema,
@@ -34,8 +36,11 @@ from voyager_ogm.schema import SchemaManager
 pytestmark = pytest.mark.live
 
 HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
-PERSON = "IxPyPerson"
+# The label deliberately differs from the class name.
+PERSON = "IxPyHuman"
+COMPANY = "IxPyCompany"
 KNOWS = "IX_PY_KNOWS"
+WORKS_AT = "IX_PY_WORKS_AT"
 
 
 @node(PERSON)
@@ -46,17 +51,30 @@ class IxPyPerson(Node):
     age: int = 0
 
 
+@node(COMPANY)
+class IxPyCompany(Node):
+    cid: str = Field(primary_key=True)
+    name: str | None = Field(default=None, index=True)
+
+
 @relationship(KNOWS, source_labels=[PERSON], target_labels=[PERSON])
 class IxPyKnows(Relationship):
     since: int = Field(index=True)
 
 
-MODELS: list[Any] = [IxPyPerson, IxPyKnows]
+@relationship(WORKS_AT, source_labels=[PERSON], target_labels=[COMPANY])
+class IxPyWorksAt(Relationship):
+    since: int = Field()
+
+
+MODELS: list[Any] = [IxPyPerson, IxPyCompany, IxPyKnows, IxPyWorksAt]
 
 CREATE_DATA = (
-    f"CREATE (:{PERSON} {{pid: 'p1', email: 'a@x', name: 'A', age: 1}})"
+    f"CREATE (p1:{PERSON} {{pid: 'p1', email: 'a@x', name: 'A', age: 1}})"
     f"-[:{KNOWS} {{since: 2020}}]->"
-    f"(:{PERSON} {{pid: 'p2', email: 'b@x', name: 'B', age: 2}})"
+    f"(p2:{PERSON} {{pid: 'p2', email: 'b@x', name: 'B', age: 2}}),"
+    f"(p2)-[:{WORKS_AT} {{since: 2021}}]->"
+    f"(:{COMPANY} {{cid: 'c1', name: 'Acme'}})"
 )
 
 
@@ -145,6 +163,7 @@ def neo4j() -> Iterator[tuple[NativeClient, str]]:
     client = NativeClient(uri, min_idle=1, max_size=2)
     yield client, uri
     client.execute_sync(f"MATCH (n:{PERSON}) DETACH DELETE n")
+    client.execute_sync(f"MATCH (n:{COMPANY}) DETACH DELETE n")
     _run_all(client.execute_sync, SchemaManager.generate_drop_constraint_ddl(*MODELS))
     _run_all(client.execute_sync, SchemaManager.generate_drop_index_ddl(*MODELS))
     client.close()
@@ -179,6 +198,7 @@ def memgraph() -> Iterator[tuple[NativeClient, str]]:
     client = NativeClient(uri, min_idle=1, max_size=2)
     yield client, uri
     client.execute_sync(f"MATCH (n:{PERSON}) DETACH DELETE n")
+    client.execute_sync(f"MATCH (n:{COMPANY}) DETACH DELETE n")
     for statement in SchemaManager.generate_drop_constraint_ddl(
         *MODELS, dialect="memgraph"
     ) + SchemaManager.generate_drop_index_ddl(*MODELS, dialect="memgraph"):
@@ -254,9 +274,9 @@ def postgres19() -> Iterator[tuple[NativeClient, str]]:
     client = NativeClient(base, min_idle=1, max_size=2)
     graph = f"ix_py_g_{os.getpid()}"
     yield client, f"{base}?graph={graph}"
-    client.execute_sync(f"DROP PROPERTY GRAPH IF EXISTS {graph}")
-    client.execute_sync(f'DROP TABLE IF EXISTS "{KNOWS.lower()}"')
-    client.execute_sync(f'DROP TABLE IF EXISTS "{PERSON.lower()}"')
+    client.execute_sync(f"DROP PROPERTY GRAPH IF EXISTS {graph} CASCADE")
+    for table in (WORKS_AT.lower(), KNOWS.lower(), COMPANY.lower(), PERSON.lower()):
+        client.execute_sync(f'DROP TABLE IF EXISTS "{table}" CASCADE')
     client.close()
 
 
@@ -265,29 +285,70 @@ def test_live_postgresql_19_matches_export_schema(
 ) -> None:
     client, uri = postgres19
     graph = uri.rsplit("graph=", 1)[1]
-    person, knows = PERSON.lower(), KNOWS.lower()
-    # Tables are named after the label, as the generated constraint and index
-    # DDL expects.
+    person, company = PERSON.lower(), COMPANY.lower()
+    knows, works_at = KNOWS.lower(), WORKS_AT.lower()
+    # Tables are named after the vertex label and edge type in lower case, the
+    # same rule the generated constraint, index and property-graph DDL uses.
+    # Edge columns are src_<key> and dst_<key>, so a self-relationship has two
+    # distinct endpoint columns.
     client.execute_sync(
         f'CREATE TABLE "{person}" (pid text PRIMARY KEY, email text, name text, age bigint)'
     )
+    client.execute_sync(f'CREATE TABLE "{company}" (cid text PRIMARY KEY, name text)')
     client.execute_sync(
-        f'CREATE TABLE "{knows}" (src text REFERENCES "{person}" (pid), '
-        f'dst text REFERENCES "{person}" (pid), since bigint, PRIMARY KEY (src, dst))'
+        f'CREATE TABLE "{knows}" (src_pid text REFERENCES "{person}" (pid), '
+        f'dst_pid text REFERENCES "{person}" (pid), since bigint, '
+        f"PRIMARY KEY (src_pid, dst_pid))"
+    )
+    client.execute_sync(
+        f'CREATE TABLE "{works_at}" (src_pid text REFERENCES "{person}" (pid), '
+        f'dst_cid text REFERENCES "{company}" (cid), since bigint, '
+        f"PRIMARY KEY (src_pid, dst_cid))"
     )
     _run_all(
         client.execute_sync,
         SchemaManager.generate_constraint_ddl(*MODELS, dialect="postgres")
         + SchemaManager.generate_index_ddl(*MODELS, dialect="postgres"),
     )
-    client.execute_sync(
-        f"CREATE PROPERTY GRAPH {graph} "
-        f'VERTEX TABLES ("{person}" KEY (pid) LABEL "{PERSON}" PROPERTIES (pid, email, name, age)) '
-        f'EDGE TABLES ("{knows}" KEY (src, dst) '
-        f'SOURCE KEY (src) REFERENCES "{person}" (pid) '
-        f'DESTINATION KEY (dst) REFERENCES "{person}" (pid) '
-        f'LABEL "{KNOWS}" PROPERTIES (since))'
+    # Build the property graph from the generated DDL instead of by hand.
+    client.execute_sync(SchemaManager.generate_pgq_ddl(graph, *MODELS))
+    _run_all(
+        client.execute_sync,
+        [
+            f'INSERT INTO "{person}" (pid, email, name, age) '
+            "VALUES ('p1', 'a@x', 'A', 1), ('p2', 'b@x', 'B', 2)",
+            f"INSERT INTO \"{company}\" (cid, name) VALUES ('c1', 'Acme')",
+            f"INSERT INTO \"{knows}\" (src_pid, dst_pid, since) VALUES ('p1', 'p2', 2020)",
+            f"INSERT INTO \"{works_at}\" (src_pid, dst_cid, since) VALUES ('p2', 'c1', 2021)",
+        ],
     )
+
+    # Query the generated graph with the SQL/PGQ emitter's output, including
+    # the self-relationship and the relationship between the two models.
+    p1, p2, c1 = IxPyPerson("p1"), IxPyPerson("p2"), IxPyCompany("c1")
+    friend_query = (
+        Query.match(p1)
+        .to(IxPyKnows, var="k")
+        .node(p2)
+        .where(p1.pid == "p1")
+        .return_(person_name=p1.name, friend_name=p2.name)
+        .compile("sql_pgq", graph_name=graph)
+    )
+    friend_rows = client.execute_sync(friend_query.statement, friend_query.parameters).to_dicts()
+    assert friend_rows == [{"person_name": "A", "friend_name": "B"}]
+
+    employer_query = (
+        Query.match(p1)
+        .to(IxPyWorksAt, var="w")
+        .node(c1)
+        .where(p1.pid == "p2")
+        .return_(person_name=p1.name, company_name=c1.name)
+        .compile("sql_pgq", graph_name=graph)
+    )
+    employer_rows = client.execute_sync(
+        employer_query.statement, employer_query.parameters
+    ).to_dicts()
+    assert employer_rows == [{"person_name": "B", "company_name": "Acme"}]
 
     live = introspect_schema(uri)
     assert live["source"]["engine"] == "postgresql"

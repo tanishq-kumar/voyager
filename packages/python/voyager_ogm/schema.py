@@ -322,6 +322,44 @@ def _split_models(
     return nodes, rels
 
 
+def _node_labels(spec: Any) -> list[str]:
+    """Returns a node spec's labels, whether it is a model class or a schema dict."""
+    if isinstance(spec, dict):
+        return [str(label) for label in spec.get("labels") or []]
+    return [str(label) for label in getattr(spec, "__labels__", []) or []]
+
+
+def _relationship_endpoint_labels(spec: Any) -> list[str]:
+    """Returns a relationship spec's declared source and target labels."""
+    if isinstance(spec, dict):
+        sources = spec.get("source_labels") or spec.get("from_labels") or []
+        targets = spec.get("target_labels") or spec.get("to_labels") or []
+    else:
+        sources = getattr(spec, "__source_labels__", []) or []
+        targets = getattr(spec, "__target_labels__", []) or []
+    return [str(label) for label in (*sources, *targets)]
+
+
+def _add_pgq_endpoint_nodes(nodes: list[Any], rels: list[Any]) -> None:
+    """Adds the registered endpoint node of every relationship to ``nodes`` in place.
+
+    A relationship model alone does not carry its endpoint's primary key, so
+    the property-graph emitter needs the endpoint node schema to reference the
+    real key column. Schemas that cannot be resolved are left to the emitter's
+    ``id`` fallback.
+    """
+    registry = SchemaRegistry.global_registry()
+    known = {label for node in nodes for label in _node_labels(node)}
+    for rel in rels:
+        for label in _relationship_endpoint_labels(rel):
+            if not label or label in known:
+                continue
+            endpoint = registry.get_node_by_label(label) or registry.get_node(label)
+            if endpoint is not None:
+                nodes.append(endpoint)
+                known.add(label)
+
+
 def _resolve_model_specs(
     *models: type[Node] | type[Relationship] | dict[str, Any] | str,
 ) -> list[tuple[Literal["node", "rel"], Any]]:
@@ -1168,6 +1206,7 @@ class SchemaManager:
             Executable `CREATE PROPERTY GRAPH` statement.
         """
         nodes, rels = _split_models(models)
+        _add_pgq_endpoint_nodes(nodes, rels)
         return emit_pgq_property_graph_ddl(graph_name, nodes, rels)
 
     @staticmethod

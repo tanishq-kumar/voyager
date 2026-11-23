@@ -1638,16 +1638,44 @@ impl SchemaRegistry {
     }
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for specified model names.
+    ///
+    /// Endpoint node schemas are added automatically for every selected
+    /// relationship, so an edge requested on its own still references each
+    /// endpoint node's real key column.
     pub fn generate_pgq_ddl_for(&self, graph_name: &str, model_names: &[&str]) -> Result<String> {
         let all_nodes = self.node_schemas();
         let all_rels = self.relationship_schemas();
-        let (filtered_nodes, filtered_rels) =
+        let (mut filtered_nodes, filtered_rels) =
             Self::filter_models(&all_nodes, &all_rels, Some(model_names));
+        Self::add_pgq_endpoint_nodes(&all_nodes, &filtered_rels, &mut filtered_nodes);
         crate::emitters::ddl::emit_pgq_property_graph_ddl(
             graph_name,
             &filtered_nodes,
             &filtered_rels,
         )
+    }
+
+    /// Adds the endpoint node schemas of `relationships` that are not already selected.
+    fn add_pgq_endpoint_nodes<'a>(
+        all_nodes: &'a [NodeSchema],
+        relationships: &[&RelationshipSchema],
+        selected: &mut Vec<&'a NodeSchema>,
+    ) {
+        for rel in relationships {
+            for label in rel.source_labels.iter().chain(rel.target_labels.iter()) {
+                let already = selected.iter().any(|node| {
+                    node.labels.iter().any(|node_label| node_label == label) || &node.name == label
+                });
+                if already {
+                    continue;
+                }
+                if let Some(node) = all_nodes.iter().find(|node| {
+                    node.labels.iter().any(|node_label| node_label == label) || &node.name == label
+                }) {
+                    selected.push(node);
+                }
+            }
+        }
     }
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `DROP PROPERTY GRAPH` statement.

@@ -48,6 +48,10 @@ fn ast_node_kind(node: &AstNode) -> &'static str {
 }
 
 /// Emits standardized ISO/IEC 9075-16:2023 SQL:PGQ `GRAPH_TABLE` queries.
+///
+/// Labels in `IS` patterns are double-quoted (for example `IS "User"`), so
+/// PostgreSQL 19 matches the declared label spelling exactly, the same
+/// case-exact rule Cypher uses.
 #[derive(Debug)]
 pub struct SqlPgqEmitter {
     graph_name: String,
@@ -851,7 +855,7 @@ impl SqlPgqEmitter {
 
     fn validate_edge_label_expression(expr: &LabelExpression) -> Result<()> {
         if expr.is_simple_disjunction() {
-            // Single type or plain disjunction: -[r IS KNOWS]-> or -[r IS KNOWS | HATES]->
+            // Single type or plain disjunction: -[r IS "KNOWS"]-> or -[r IS "KNOWS" | "HATES"]->
             Ok(())
         } else {
             Err(Error::UnsupportedFeature {
@@ -1445,7 +1449,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS Person) COLUMNS (p.name AS actor))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS \"Person\") COLUMNS (p.name AS actor))"
         );
     }
 
@@ -1467,7 +1471,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS Person) -[r IS KNOWS | HATES]-> (b IS Person) COLUMNS (a.name, b.name))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\" | \"HATES\"]-> (b IS \"Person\") COLUMNS (a.name, b.name))"
         );
     }
 
@@ -1487,7 +1491,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (n IS Person | Company) COLUMNS (n.name))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (n IS \"Person\" | \"Company\") COLUMNS (n.name))"
         );
     }
 
@@ -1539,7 +1543,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name IN ($p0, $p1) COLUMNS (p.name))"
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") WHERE p.name IN ($p0, $p1) COLUMNS (p.name))"
         );
         assert_eq!(
             compiled.parameters.get("p0"),
@@ -1710,7 +1714,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name, age FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC"
+            "SELECT name, age FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC"
         );
         assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
     }
@@ -1728,7 +1732,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC"
+            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC"
         );
         assert!(compiled.parameters.is_empty());
     }
@@ -1747,7 +1751,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.age)) ORDER BY age ASC"
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY age ASC"
         );
         assert!(compiled.parameters.is_empty());
     }
@@ -1771,7 +1775,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name, city FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) ORDER BY _ord_0 ASC, city DESC, _ord_1 ASC"
+            "SELECT name, city FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) ORDER BY _ord_0 ASC, city DESC, _ord_1 ASC"
         );
         assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
     }
@@ -1790,7 +1794,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC, _ord_0 DESC"
+            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC, _ord_0 DESC"
         );
     }
 

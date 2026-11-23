@@ -48,7 +48,7 @@ fn sql_pgq_uses_angle_bracket_inequality() {
     let mut pgq = SqlPgqEmitter::new("g");
     assert_eq!(
         pgq.visit_query(&arena, root).unwrap().statement,
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.age <> $p0 COLUMNS (p.name))"
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") WHERE p.age <> $p0 COLUMNS (p.name))"
     );
 }
 
@@ -103,6 +103,6 @@ fn sql_pgq_lowers_not_in_to_not_all() {
     let mut pgq = SqlPgqEmitter::new("g");
     assert_eq!(
         pgq.visit_query(&arena, root).unwrap().statement,
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name <> ALL($p0) COLUMNS (p.name))"
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") WHERE p.name <> ALL($p0) COLUMNS (p.name))"
     );
 }

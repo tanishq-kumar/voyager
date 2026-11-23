@@ -621,7 +621,7 @@ fn test_label_expression_ast_dialects_emission() {
     use voyager_ogm::emitters::{CypherEmitter, IsoGqlEmitter, SqlPgqEmitter};
     use voyager_ogm::visitor::AstVisitor;
 
-    // Test 1: Complex nested node expression: (Person | Company) & !Inactive
+    // Test 1: Complex nested node expression: (Person | "Company") & !Inactive
     let complex_expr = LabelExpression::parse("(Person | Company) & !Inactive").unwrap();
     let mut b = QueryBuilder::new();
     let n_id = b.ident("n");
@@ -687,7 +687,7 @@ fn test_label_expression_ast_dialects_emission() {
     let pgq1_disj_compiled = pgq.visit_query(&arena1_disj, root1_disj).unwrap();
     assert_eq!(
         pgq1_disj_compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (n IS Person | Company) COLUMNS (n.name))"
+        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (n IS \"Person\" | \"Company\") COLUMNS (n.name))"
     );
 
     // Test 2: Edge traversal with disjunction: -[r:KNOWS|FOLLOWS]->
@@ -737,7 +737,7 @@ fn test_label_expression_ast_dialects_emission() {
     let mut pgq3 = SqlPgqEmitter::new("voyager_graph");
     assert_eq!(
         pgq3.visit_query(&arena3, root3).unwrap().statement,
-        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (a IS User) -[r IS KNOWS | FOLLOWS]-> (b IS User) COLUMNS (a.id))"
+        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (a IS \"User\") -[r IS \"KNOWS\" | \"FOLLOWS\"]-> (b IS \"User\") COLUMNS (a.id))"
     );
 
     // Test 4: Edge traversal with negation rejected for SQL:PGQ:

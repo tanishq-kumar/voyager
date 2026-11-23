@@ -99,7 +99,7 @@ def test_order_by_expression_compiles_inside_columns(dialect: str) -> None:
         Query.match(p).return_(p.name, p.age).order_by(p.age + 1).compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f"SELECT name, age FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT name, age FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC"
     )
     assert compiled.statement == expected
@@ -111,7 +111,7 @@ def test_order_by_non_returned_property_compiles_inside_columns(dialect: str) ->
     p = Person(alias="p")
     compiled = Query.match(p).return_(p.name).order_by(p.age).compile(dialect, graph_name=GRAPH)
     expected = (
-        f"SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC"
     )
     assert compiled.statement == expected
@@ -125,7 +125,7 @@ def test_order_by_returned_property_stays_select_star(dialect: str) -> None:
         Query.match(p).return_(p.name, p.age).order_by(p.age).compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.age)) ORDER BY age ASC"
     )
     assert compiled.statement == expected
@@ -144,7 +144,7 @@ def test_order_by_multiple_mixed_keys_compiles(dialect: str) -> None:
         .compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f"SELECT name, city FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT name, city FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) "
         "ORDER BY _ord_0 ASC, city DESC, _ord_1 ASC"
     )
@@ -163,7 +163,7 @@ def test_order_by_duplicate_key_reuses_alias(dialect: str) -> None:
         .compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f"SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC, _ord_0 DESC"
     )
     assert compiled.statement == expected

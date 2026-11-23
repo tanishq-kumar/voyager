@@ -132,8 +132,8 @@ def test_fluent_query_sql_pgq_compilation():
 
     compiled = query.compile("sql_pgq", graph_name="cinema_graph")
     expected = (
-        "SELECT * FROM GRAPH_TABLE (cinema_graph MATCH (p IS Person) "
-        "-[r IS ACTEDIN]-> (m IS Film) "
+        'SELECT * FROM GRAPH_TABLE (cinema_graph MATCH (p IS "Person") '
+        '-[r IS "ACTEDIN"]-> (m IS "Film") '
         "WHERE p.age > $p0 "
         "COLUMNS (p.name, m.title)) "
         "LIMIT 20"
@@ -173,7 +173,7 @@ def test_string_contains_predicate():
 
     compiled_pgq = query.compile("sql_pgq", graph_name="social")
     expected_pgq = (
-        "SELECT * FROM GRAPH_TABLE (social MATCH (p IS Person) "
+        'SELECT * FROM GRAPH_TABLE (social MATCH (p IS "Person") '
         "WHERE strpos(p.name, $p0) > 0 "
         "COLUMNS (p.name))"
     )

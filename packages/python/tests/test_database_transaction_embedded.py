@@ -143,7 +143,7 @@ def test_duckdb_duckpgq_graph_table_parameters_inside_transaction():
     with session.transaction() as tx:
         tx.execute("INSERT INTO Person VALUES (3, 'Charlie', 'London')")
         rows = tx.execute(
-            "SELECT * FROM GRAPH_TABLE (tx_graph MATCH (p IS Person) "
+            'SELECT * FROM GRAPH_TABLE (tx_graph MATCH (p IS "Person") '
             "WHERE p.city = $city COLUMNS (p.name))",
             {"city": "London"},
         )
