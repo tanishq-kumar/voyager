@@ -293,13 +293,72 @@ fn help_documents_exit_codes_for_the_root_and_subcommands() {
         vec!["doctor", "--help"],
         vec!["compile", "--help"],
         vec!["validate", "--help"],
+        vec!["introspect", "--help"],
     ] {
         let output = run(&args);
         assert!(output.status.success(), "{}", stderr(&output));
         let text = stdout(&output);
         assert!(text.contains("Exit codes:"), "{args:?}: {text}");
-        assert!(text.contains("3  doctor connection"), "{args:?}: {text}");
+        assert!(
+            text.contains("3  connection, check or catalog query failure"),
+            "{args:?}: {text}"
+        );
+        assert!(
+            text.contains("5  engine not supported by introspect"),
+            "{args:?}: {text}"
+        );
     }
+}
+
+#[test]
+fn introspect_requires_a_uri() {
+    let output = run(&["introspect"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--uri"), "{}", stderr(&output));
+}
+
+#[test]
+fn introspect_unsupported_engine_exits_five() {
+    let output = run(&["introspect", "--uri", "duckdb:///tmp/voyager-introspect.db"]);
+    assert_eq!(output.status.code(), Some(5), "{}", stderr(&output));
+    let message = stderr(&output);
+    assert!(
+        message.starts_with(
+            "introspect: Dialect 'DuckDB' does not support feature: live schema introspection"
+        ),
+        "{message}"
+    );
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
+fn introspect_connection_failure_exits_three() {
+    // Port 1 on localhost refuses connections.
+    let output = run(&[
+        "introspect",
+        "--uri",
+        "bolt://127.0.0.1:1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).starts_with("introspect: "),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
+fn introspect_postgres_without_a_username_exits_three() {
+    let output = run(&["introspect", "--uri", "postgresql://127.0.0.1:1/db?graph=g"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("introspect: PostgreSQL requires a username"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]

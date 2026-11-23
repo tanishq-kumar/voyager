@@ -202,9 +202,18 @@ connects through `voyager-drivers`, pings the server, and reports the protocol,
 server version, matching dialect and ping round-trip latency. Passwords come
 from `--password-env` or the URI userinfo, never from the command line.
 
+`introspect` prints a live database's graph schema (Neo4j, Memgraph, FalkorDB
+and PostgreSQL 19 property graphs) as text, or with `--format json` in the shape
+of `export_schema`:
+
+```bash
+voyager introspect --uri bolt://localhost:7688 --format json
+```
+
 Exit codes are `0` for success, `1` for an invalid spec or rejected compilation,
-`2` for a usage error, `3` for a doctor connection/check failure, and `4` for an
-input/output error. Every subcommand lists them in `--help`.
+`2` for a usage error, `3` for a connection, check or catalog query failure, `4`
+for an input/output error, and `5` for an engine `introspect` does not support.
+Every subcommand lists them in `--help`.
 
 For local development setup (building the Python extension from source, test databases, and contribution guidelines), see [**CONTRIBUTING.md**](https://github.com/tanishq-kumar/voyager/blob/main/CONTRIBUTING.md).
 
@@ -424,7 +433,7 @@ Models are registered under a module-qualified identity (`package.module.Model`)
 
 `Field(description="...")` and a model-level `__description__` record documentation on schema entities. They are metadata only: generated DDL and compiled queries are unchanged, and `NativeSchemaRegistry.to_json()` snapshots include a `description` key only where one was set (fields and models without one have no `description` key). A subclass does not inherit its parent's `__description__` (field descriptions travel with the inherited `Field` objects). `examples/python/13_schema_ddl_and_indexes.py` prints a snapshot showing both cases.
 
-`export_schema([Person, Movie, ActedIn])` returns the declared models as a JSON-serialisable dict (labels, relationship types and endpoints, property types, flags, defaults, descriptions and `Field` value constraints), and `Person.to_json_schema()` emits a JSON Schema draft 2020-12 document for one model.
+`export_schema([Person, Movie, ActedIn])` returns the declared models as a JSON-serialisable dict (labels, relationship types and endpoints, property types, flags, defaults, descriptions and `Field` value constraints), and `Person.to_json_schema()` emits a JSON Schema draft 2020-12 document for one model. `introspect_schema("bolt://localhost:7687")` reads the same structure from a live database (Neo4j, Memgraph, FalkorDB, PostgreSQL 19 property graphs), so the two can be compared.
 
 ---
 
