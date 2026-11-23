@@ -859,8 +859,8 @@ impl AstVisitor for SqlPgqEmitter {
                     distinct = *return_distinct;
                     projections_list = projections.clone();
                     order_by_clause = Some(order_by);
-                    limit_clause = *limit;
-                    skip_clause = *skip;
+                    limit_clause = limit.clone();
+                    skip_clause = skip.clone();
                 }
             }
 

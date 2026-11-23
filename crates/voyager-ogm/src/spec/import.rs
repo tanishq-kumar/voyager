@@ -36,7 +36,8 @@ use std::fmt;
 use serde_json::{Map, Value};
 
 use crate::ast::{
-    AggregationFunc, BinaryOp, Direction, LiteralValue, NodeHandle, PathMode, UnaryOp,
+    AggregationFunc, BinaryOp, Direction, LiteralValue, NodeHandle, PaginationValue, PathMode,
+    UnaryOp,
 };
 use crate::builder::QueryBuilder;
 use crate::cache::global_query_cache;
@@ -3330,6 +3331,46 @@ fn reject_unknown_keys(
     Ok(())
 }
 
+/// Parses a pagination position: a non-negative integer literal or a
+/// `["param", name]` reference.
+fn parse_pagination(
+    val: &Value,
+    path: &SpecPath,
+    field: &str,
+) -> Result<PaginationValue, SpecError> {
+    if let Value::Array(array) = val {
+        check_spec_arity_bounded(
+            array,
+            path,
+            &format!("'{field}' parameter"),
+            2,
+            2,
+            "[param, name]",
+        )?;
+        let tag = extract_string(&array[0], &path.index(0), "the string tag 'param'")?;
+        if tag != "param" {
+            return Err(make_spec_err(
+                &path.index(0),
+                format!(
+                    "Invalid '{field}': expected a non-negative integer or [\"param\", name], got the tag '{tag}'."
+                ),
+            ));
+        }
+        let name = extract_string(&array[1], &path.index(1), "a string name")?;
+        let name = strip_leading_dollar(name);
+        if name.is_empty() {
+            return Err(make_spec_err(
+                &path.index(1),
+                format!("Invalid '{field}': the parameter name must be a non-empty string."),
+            ));
+        }
+        return Ok(PaginationValue::Parameter(name));
+    }
+    Ok(PaginationValue::Count(parse_non_negative(
+        val, path, field,
+    )?))
+}
+
 /// Parses a non-negative `skip` / `offset` / `limit` value.
 fn parse_non_negative(val: &Value, path: &SpecPath, field: &str) -> Result<u64, SpecError> {
     if val.is_boolean() {
@@ -3944,14 +3985,26 @@ fn build_query_internal(
             if let Some(skip_item) = with_dict.get("skip")
                 && !skip_item.is_null()
             {
-                let skip = parse_non_negative(skip_item, &item_path.key("skip"), "skip")?;
-                builder.skip(skip);
+                match parse_pagination(skip_item, &item_path.key("skip"), "skip")? {
+                    PaginationValue::Count(skip) => {
+                        builder.skip(skip);
+                    }
+                    PaginationValue::Parameter(name) => {
+                        builder.skip_param(name);
+                    }
+                }
             }
             if let Some(limit_item) = with_dict.get("limit")
                 && !limit_item.is_null()
             {
-                let limit = parse_non_negative(limit_item, &item_path.key("limit"), "limit")?;
-                builder.limit(limit);
+                match parse_pagination(limit_item, &item_path.key("limit"), "limit")? {
+                    PaginationValue::Count(limit) => {
+                        builder.limit(limit);
+                    }
+                    PaginationValue::Parameter(name) => {
+                        builder.limit_param(name);
+                    }
+                }
             }
         }
     }
@@ -4049,22 +4102,40 @@ fn build_query_internal(
     if let Some(skip_item) = spec.get("skip")
         && !skip_item.is_null()
     {
-        let skip = parse_non_negative(skip_item, &path.key("skip"), "skip")?;
-        builder.skip(skip);
+        match parse_pagination(skip_item, &path.key("skip"), "skip")? {
+            PaginationValue::Count(skip) => {
+                builder.skip(skip);
+            }
+            PaginationValue::Parameter(name) => {
+                builder.skip_param(name);
+            }
+        }
     }
 
     if let Some(offset_item) = spec.get("offset")
         && !offset_item.is_null()
     {
-        let offset = parse_non_negative(offset_item, &path.key("offset"), "offset")?;
-        builder.offset(offset);
+        match parse_pagination(offset_item, &path.key("offset"), "offset")? {
+            PaginationValue::Count(offset) => {
+                builder.offset(offset);
+            }
+            PaginationValue::Parameter(name) => {
+                builder.offset_param(name);
+            }
+        }
     }
 
     if let Some(limit_item) = spec.get("limit")
         && !limit_item.is_null()
     {
-        let limit = parse_non_negative(limit_item, &path.key("limit"), "limit")?;
-        builder.limit(limit);
+        match parse_pagination(limit_item, &path.key("limit"), "limit")? {
+            PaginationValue::Count(limit) => {
+                builder.limit(limit);
+            }
+            PaginationValue::Parameter(name) => {
+                builder.limit_param(name);
+            }
+        }
     }
 
     if let Some(linear_item) = spec.get("linear_clauses") {
@@ -4774,6 +4845,104 @@ mod tests {
             "{:?}",
             result.warnings
         );
+    }
+
+    fn compile_dialect(spec: &Value, dialect: &str) -> Result<SpecCompileResult, SpecError> {
+        compile(
+            spec,
+            dialect,
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn pagination_parameters_compile_in_every_dialect() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "projections": [["field", "p", "name", null]],
+            "skip": ["param", "s"],
+            "limit": ["param", "$l"]
+        });
+        let cases = [
+            ("cypher", "MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l"),
+            (
+                "age",
+                "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l $$, %s) AS (name agtype)",
+            ),
+            (
+                "iso_gql",
+                "MATCH (p:Person) RETURN p.name OFFSET $s LIMIT $l",
+            ),
+            (
+                "sql_pgq",
+                "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) LIMIT $l OFFSET $s",
+            ),
+            (
+                "duckpgq",
+                "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) LIMIT $l OFFSET $s",
+            ),
+        ];
+        for (dialect, statement) in cases {
+            let compiled = compile_dialect(&spec, dialect).unwrap();
+            assert_eq!(compiled.compiled.statement, statement, "{dialect}");
+            assert!(compiled.compiled.parameters.is_empty(), "{dialect}");
+        }
+    }
+
+    #[test]
+    fn pagination_parameters_compile_inside_with() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "with_clauses": [{
+                "projections": [["field", "p", "name", "n"]],
+                "skip": ["param", "ws"],
+                "limit": ["param", "wl"]
+            }],
+            "projections": [["expr", ["ident", "n"], null]],
+            "skip": ["param", "s"],
+            "limit": ["param", "l"]
+        });
+        let compiled = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            compiled.compiled.statement,
+            "MATCH (p:Person) WITH p.name AS n SKIP $ws LIMIT $wl RETURN n SKIP $s LIMIT $l"
+        );
+    }
+
+    #[test]
+    fn malformed_pagination_parameter_reports_its_pointer() {
+        let base = base_spec();
+        let cases = [
+            (json!(["param"]), "/limit"),
+            (json!(["param", 1]), "/limit/1"),
+            (json!(["param", ""]), "/limit/1"),
+            (json!(["param", "l", null]), "/limit/2"),
+            (json!(["lit", "l"]), "/limit/0"),
+        ];
+        for (value, pointer) in cases {
+            let mut spec = base.clone();
+            spec["limit"] = value.clone();
+            let error = compile_cypher(&spec).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidSpec, "{value}");
+            assert_eq!(error.path(), Some(pointer), "{value}");
+        }
+
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "with_clauses": [{
+                "projections": [["field", "p", "name", "n"]],
+                "skip": ["param"]
+            }],
+            "projections": [["expr", ["ident", "n"], null]]
+        });
+        let error = compile_cypher(&spec).unwrap_err();
+        assert_eq!(error.path(), Some("/with_clauses/0/skip"));
     }
 
     #[test]

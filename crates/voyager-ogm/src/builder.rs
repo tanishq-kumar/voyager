@@ -28,7 +28,7 @@ use std::collections::HashSet;
 
 use crate::ast::{
     AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LabelExpression, LiteralValue,
-    NodeHandle, PathMode, ProjectionItem, QueryAstArena, UnaryOp,
+    NodeHandle, PaginationValue, PathMode, ProjectionItem, QueryAstArena, UnaryOp,
 };
 use crate::error::{Error, Result};
 use crate::schema::{DdlDialect, resolve_fulltext_search};
@@ -111,8 +111,8 @@ pub struct QueryBuilder {
     projections: Vec<ProjectionItem>,
     order_bys: Vec<(NodeHandle, bool)>,
     distinct: bool,
-    limit: Option<u64>,
-    skip: Option<u64>,
+    limit: Option<PaginationValue>,
+    skip: Option<PaginationValue>,
     build_error: Option<String>,
     last_merged_variable: Option<String>,
 }
@@ -1686,8 +1686,8 @@ impl QueryBuilder {
             distinct,
             projections,
             order_by,
-            skip,
-            limit,
+            skip: skip.map(PaginationValue::Count),
+            limit: limit.map(PaginationValue::Count),
             where_clause,
         });
         self.with_clauses.push(with_handle);
@@ -1869,13 +1869,29 @@ impl QueryBuilder {
 
     /// Sets query result limit.
     pub fn limit(&mut self, limit: u64) -> &mut Self {
-        self.limit = Some(limit);
+        self.limit = Some(PaginationValue::Count(limit));
+        self
+    }
+
+    /// Sets a bound query parameter as the result limit: `LIMIT $name`.
+    pub fn limit_param(&mut self, name: impl Into<String>) -> &mut Self {
+        self.limit = Some(PaginationValue::Parameter(strip_parameter_marker(
+            name.into(),
+        )));
         self
     }
 
     /// Sets query pagination offset / skip.
     pub fn skip(&mut self, skip: u64) -> &mut Self {
-        self.skip = Some(skip);
+        self.skip = Some(PaginationValue::Count(skip));
+        self
+    }
+
+    /// Sets a bound query parameter as the pagination offset: `SKIP $name` / `OFFSET $name`.
+    pub fn skip_param(&mut self, name: impl Into<String>) -> &mut Self {
+        self.skip = Some(PaginationValue::Parameter(strip_parameter_marker(
+            name.into(),
+        )));
         self
     }
 
@@ -1883,6 +1899,12 @@ impl QueryBuilder {
     #[inline(always)]
     pub fn offset(&mut self, offset: u64) -> &mut Self {
         self.skip(offset)
+    }
+
+    /// Sets a bound query parameter as the pagination offset.
+    #[inline(always)]
+    pub fn offset_param(&mut self, offset: impl Into<String>) -> &mut Self {
+        self.skip_param(offset)
     }
 
     /// Adds a `LET variable = expression` linear statement (ISO GQL standard).
@@ -2392,6 +2414,14 @@ fn render_with_projection(
     match projection.aggregation {
         Some(func) => format!("{func}({base})"),
         None => base,
+    }
+}
+
+/// Strips one leading `$` from a parameter name, matching the spec consumer.
+fn strip_parameter_marker(name: String) -> String {
+    match name.strip_prefix('$') {
+        Some(stripped) => stripped.to_string(),
+        None => name,
     }
 }
 

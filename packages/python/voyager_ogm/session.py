@@ -19,8 +19,10 @@ from voyager_ogm.bridge import (
     MockBridge,
     create_bridge,
     validate_graph_name,
+    validate_pagination_parameters,
 )
 from voyager_ogm.config import get_config
+from voyager_ogm.expressions import ParamExpr
 from voyager_ogm.ingestion import (
     BulkIngestionPlan,
     create_bulk_create_plan,
@@ -1084,6 +1086,7 @@ class _SessionBase:
         else:
             stmt = str(query_or_statement)
 
+        validate_pagination_parameters(stmt, params)
         params = {k: serialize_param_value(v) for k, v in params.items()}
         return stmt, params, q_obj
 
@@ -1198,12 +1201,12 @@ class _BoundQueryBase(Generic[_T_Session]):
         new_q = self._query.return_(*items)
         return self._spawn(new_q)
 
-    def limit(self, limit: int) -> Self:
+    def limit(self, limit: int | ParamExpr) -> Self:
         """Limits the maximum number of result records."""
         new_q = self._query.limit(limit)
         return self._spawn(new_q)
 
-    def skip(self, skip: int) -> Self:
+    def skip(self, skip: int | ParamExpr) -> Self:
         """Skips the specified number of records (OFFSET)."""
         new_q = self._query.skip(skip)
         return self._spawn(new_q)

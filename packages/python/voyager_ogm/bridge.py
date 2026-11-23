@@ -12,6 +12,7 @@ import datetime
 import inspect
 import json
 import math
+import operator
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -23,6 +24,45 @@ import polars as pl
 
 from voyager_ogm.ingestion import BulkIngestionPlan
 from voyager_ogm.types import unwrap_spatial_param
+
+_PAGINATION_PARAMETER_PATTERN = re.compile(
+    r"\b(?:SKIP|OFFSET|LIMIT)\s+\$([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE
+)
+
+
+def validate_pagination_parameters(statement: str, parameters: Mapping[str, Any] | None) -> None:
+    """Rejects negative or non-integer values bound to pagination parameters.
+
+    Engines disagree on a bad ``SKIP``/``OFFSET``/``LIMIT`` binding: Neo4j and
+    Memgraph raise, while Apache AGE, PostgreSQL and DuckDB silently truncate a
+    fractional value. Validating before dispatch gives every dialect the same
+    clear failure and keeps the error independent of the target database.
+
+    Args:
+        statement: Compiled statement, before dialect-specific parameter rewriting.
+        parameters: Bound parameter values.
+
+    Raises:
+        ValueError: If a parameter bound to ``SKIP``, ``OFFSET`` or ``LIMIT`` is
+            not a non-negative integer.
+    """
+    if not parameters:
+        return
+    for name in sorted(set(_PAGINATION_PARAMETER_PATTERN.findall(statement))):
+        if name not in parameters:
+            continue
+        value = parameters[name]
+        try:
+            # operator.index accepts every true integer type (int, NumPy and
+            # Polars integers) and rejects floats, strings and Decimal.
+            count = None if isinstance(value, bool) else operator.index(value)
+        except TypeError:
+            count = None
+        if count is None or count < 0:
+            raise ValueError(
+                f"Pagination parameter '${name}' must be a non-negative integer, "
+                f"got {type(value).__name__} {value!r}"
+            )
 
 
 @dataclass
@@ -346,6 +386,7 @@ class MockBridge:
         Returns:
             List of record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = unwrap_spatial_param(parameters or {})
         self.executed_queries.append((statement, params))
         if self._canned_results:
@@ -367,6 +408,7 @@ class MockBridge:
         Returns:
             Polars DataFrame.
         """
+        validate_pagination_parameters(statement, parameters)
         params = unwrap_spatial_param(parameters or {})
         self.executed_queries.append((statement, params))
         if self._canned_results:
@@ -696,6 +738,7 @@ class Neo4jBoltBridge:
         Returns:
             List of record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = _adapt_bolt_parameters(parameters or {})
         session_kwargs = {"database": self.database} if self.database else {}
         with self.driver.session(**session_kwargs) as session:
@@ -851,6 +894,7 @@ class Neo4jBoltTransaction:
             raise RuntimeError("transaction is aborted; roll back before executing more statements")
         if not self.is_active:
             raise ValueError("Cannot execute query on inactive transaction")
+        validate_pagination_parameters(statement, parameters)
         try:
             result = self._tx.run(statement, _adapt_bolt_parameters(parameters or {}))
             return [_normalize_bolt_record(record) for record in result]
@@ -982,6 +1026,7 @@ class AsyncNeo4jBoltBridge:
         Returns:
             List of record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = _adapt_bolt_parameters(parameters or {})
         session_kwargs = {"database": self.database} if self.database else {}
         async with self.driver.session(**session_kwargs) as session:
@@ -1326,6 +1371,7 @@ class DuckDbBridge:
         self, statement: str, parameters: dict[str, Any]
     ) -> tuple[str, dict[str, Any]]:
         """Interpolates parameters for DuckPGQ GRAPH_TABLE queries where native parameter binding is unsupported."""
+        validate_pagination_parameters(statement, parameters)
         if "GRAPH_TABLE" in statement and parameters:
             regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
 
@@ -1850,6 +1896,7 @@ class PostgresBridge:
         self, statement: str, parameters: dict[str, Any]
     ) -> tuple[str, list[Any] | tuple[Any, ...]]:
         """Formats statement and parameters for PostgreSQL execution."""
+        validate_pagination_parameters(statement, parameters)
         if not parameters:
             return statement, ()
 
@@ -2394,6 +2441,7 @@ class FalkorDBBridge:
         Returns:
             List of record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = _adapt_falkordb_parameters(parameters or {})
         try:
             res = self.graph.query(statement, params)
@@ -2700,6 +2748,7 @@ class RelateBridge:
         Returns:
             List of normalized record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = _adapt_relate_parameters(parameters or {})
         res = self.con.execute(statement, params)
         if hasattr(res, "fetchall"):

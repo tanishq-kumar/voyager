@@ -9,7 +9,7 @@
 
 use crate::ast::{
     AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LiteralValue, NodeHandle,
-    PathMode, ProjectionItem, QueryAstArena, UnaryOp,
+    PaginationValue, PathMode, ProjectionItem, QueryAstArena, UnaryOp,
 };
 use std::fmt;
 
@@ -729,8 +729,8 @@ fn push_common_projection_members(
     arena: &QueryAstArena,
     distinct: bool,
     order_by: &[(NodeHandle, bool)],
-    skip: Option<u64>,
-    limit: Option<u64>,
+    skip: Option<PaginationValue>,
+    limit: Option<PaginationValue>,
     where_clause: Option<NodeHandle>,
 ) -> SpecExportResult<()> {
     if distinct {
@@ -743,12 +743,22 @@ fn push_common_projection_members(
         members.push(("order_by".to_string(), export_order_by(arena, order_by)?));
     }
     if let Some(skip) = skip {
-        members.push(("skip".to_string(), SpecValue::Int(skip as i64)));
+        members.push(("skip".to_string(), export_pagination(&skip)));
     }
     if let Some(limit) = limit {
-        members.push(("limit".to_string(), SpecValue::Int(limit as i64)));
+        members.push(("limit".to_string(), export_pagination(&limit)));
     }
     Ok(())
+}
+
+fn export_pagination(value: &PaginationValue) -> SpecValue {
+    match value {
+        PaginationValue::Count(count) => SpecValue::Int(*count as i64),
+        PaginationValue::Parameter(name) => SpecValue::Array(vec![
+            SpecValue::String("param".to_string()),
+            SpecValue::String(name.clone()),
+        ]),
+    }
 }
 
 fn export_return_members(
@@ -774,8 +784,8 @@ fn export_return_members(
         arena,
         *distinct,
         order_by,
-        *skip,
-        *limit,
+        skip.clone(),
+        limit.clone(),
         None,
     )?;
     Ok(members)
@@ -802,8 +812,8 @@ fn export_with(arena: &QueryAstArena, handle: NodeHandle) -> SpecExportResult<Sp
         arena,
         *distinct,
         order_by,
-        *skip,
-        *limit,
+        skip.clone(),
+        limit.clone(),
         *where_clause,
     )?;
     Ok(SpecValue::Object(members))

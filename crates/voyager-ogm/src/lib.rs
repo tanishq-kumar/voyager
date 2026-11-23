@@ -40,7 +40,7 @@ pub mod visitor;
 
 pub use ast::{
     AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LabelExpression, LiteralValue,
-    NodeHandle, ProjectionItem, QueryAstArena,
+    NodeHandle, PaginationValue, ProjectionItem, QueryAstArena,
 };
 pub use bridge::{DatabaseBridge, MockDatabaseBridge, QueryResult, QuerySummary};
 pub use builder::QueryBuilder;

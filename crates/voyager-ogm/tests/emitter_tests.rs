@@ -422,6 +422,37 @@ fn test_iso_gql_emitter_with_where_order_by_offset_limit() {
 }
 
 #[test]
+fn test_pagination_parameters_emit_as_parameters() {
+    let mut builder = QueryBuilder::new();
+    builder
+        .r#match()
+        .node(Some("p"), vec!["Person"])
+        .r#return()
+        .field("p", "name", None::<&str>)
+        .skip_param("s")
+        .limit_param("l");
+    let (arena, root) = builder.build();
+
+    let mut cypher = CypherEmitter::new();
+    assert_eq!(
+        cypher.visit_query(&arena, root).unwrap().statement,
+        "MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l"
+    );
+
+    let mut iso = IsoGqlEmitter::new();
+    assert_eq!(
+        iso.visit_query(&arena, root).unwrap().statement,
+        "MATCH (p:Person) RETURN p.name OFFSET $s LIMIT $l"
+    );
+
+    let mut pgq = SqlPgqEmitter::new("graph");
+    assert_eq!(
+        pgq.visit_query(&arena, root).unwrap().statement,
+        "SELECT * FROM GRAPH_TABLE (graph MATCH (p IS Person) COLUMNS (p.name)) LIMIT $l OFFSET $s"
+    );
+}
+
+#[test]
 fn test_empty_with_is_safely_ignored() {
     let mut builder = QueryBuilder::new();
     builder

@@ -83,6 +83,42 @@ where and map expressions, and `pattern_comp` where). Required keys do not accep
 `null`: root `spec_version`, `matches[i].paths`, `with_clauses[i].projections`,
 and the `expr` key of an object-wrapped expression.
 
+### Pagination values
+
+`skip`, `offset` and `limit` accept either a non-negative integral JSON number
+or a parameter reference `["param", name]`, at the document root and inside a
+`with_clauses[i]` object. The parameter name follows the same rule as every
+other `param` expression: one leading `$` is stripped, and an empty name is
+rejected.
+
+```json
+{
+  "spec_version": 1,
+  "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+  "projections": [["field", "p", "name", null]],
+  "order_by": [["p", "name", true]],
+  "skip": ["param", "s"],
+  "limit": ["param", "l"]
+}
+```
+
+This compiles to `MATCH (p:Person) RETURN p.name AS ... ORDER BY p.name ASC
+SKIP $s LIMIT $l` in openCypher and Apache AGE, to `OFFSET $s LIMIT $l` in ISO
+GQL, and to `LIMIT $l OFFSET $s` in SQL:PGQ. The parameter remains a parameter
+in the compiled statement; bind `s` and `l` when the statement executes. A
+bound value must be a non-negative integer. The Python execution path checks
+this before dispatch, because Apache AGE, PostgreSQL and DuckDB otherwise
+truncate a fractional value instead of raising.
+
+The fluent API accepts the same form through `param()`:
+
+```python
+q = Query.match(p).return_(p.name).skip(param("s")).limit(param("l"))
+```
+
+`Query.to_spec_dict()` serialises those values back as `["param", "s"]` and
+`["param", "l"]`, so the fluent query and its spec compile identically.
+
 The following are rejected:
 
 - Unknown object keys at the root, in a match clause, in a with clause, and in
@@ -100,10 +136,12 @@ The following are rejected:
 - The undocumented tag aliases `literal` (for `lit`) and `func` / `call` (for
   `fn`). They are rejected as unknown expression tags; write the canonical `lit`
   and `fn` tags.
-- Boolean, negative or non-integral `skip` / `offset` / `limit` values. An
+- Boolean, negative or non-integral `skip` / `offset` / `limit` literals. An
   integral JSON number such as `0.0` or `3.0` is accepted (the schema's
   `integer` type accepts it). `skip` and `offset` are aliases of the same
   position, so providing both is rejected at the second key in document order.
+  A malformed parameter array, such as `["param"]` or `["param", 7]`, is
+  rejected at its own JSON Pointer.
 - Negative `min_hops` / `max_hops` values. `min_hops` has minimum 0; `max_hops`
   has minimum 0 or may be `"unbounded"` for open upper bounds. When
   `max_hops` is `null`, the traversal is exactly `min_hops` hops. When

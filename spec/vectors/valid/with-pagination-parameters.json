@@ -1,0 +1,79 @@
+{
+  "description": "skip and limit accept parameters inside a WITH clause and at the root.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "with_clauses": [
+      {
+        "projections": [
+          [
+            "field",
+            "p",
+            "name",
+            "n"
+          ]
+        ],
+        "skip": [
+          "param",
+          "ws"
+        ],
+        "limit": [
+          "param",
+          "wl"
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "expr",
+        [
+          "ident",
+          "n"
+        ],
+        null
+      ]
+    ],
+    "skip": [
+      "param",
+      "s"
+    ],
+    "limit": [
+      "param",
+      "l"
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) WITH p.name AS n SKIP $ws LIMIT $wl RETURN n SKIP $s LIMIT $l",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH p.name AS n SKIP $ws LIMIT $wl RETURN n SKIP $s LIMIT $l $$, %s) AS (n agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) WITH p.name AS n OFFSET $ws LIMIT $wl RETURN n OFFSET $s LIMIT $l",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

@@ -256,6 +256,26 @@ impl fmt::Display for LiteralValue {
     }
 }
 
+/// A pagination value for `SKIP`/`OFFSET` and `LIMIT`: a literal row count or a
+/// query parameter that is bound at execution time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum PaginationValue {
+    /// Literal non-negative row count.
+    Count(u64),
+    /// Query parameter name without the leading `$`.
+    Parameter(String),
+}
+
+impl fmt::Display for PaginationValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Count(count) => write!(f, "{count}"),
+            Self::Parameter(name) => write!(f, "${name}"),
+        }
+    }
+}
+
 /// Standard aggregation functions supported across graph query dialects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -945,10 +965,10 @@ pub enum AstNode {
         projections: Vec<ProjectionItem>,
         /// Order by clauses: `(expression_handle, is_ascending)`
         order_by: Vec<(NodeHandle, bool)>,
-        /// Skip / Offset count
-        skip: Option<u64>,
-        /// Limit count
-        limit: Option<u64>,
+        /// Skip / Offset count or parameter
+        skip: Option<PaginationValue>,
+        /// Limit count or parameter
+        limit: Option<PaginationValue>,
     },
     /// Database procedure / function call (e.g. `CALL apoc.path.subgraphNodes(...) YIELD node`).
     ProcedureCall {
@@ -1020,10 +1040,10 @@ pub enum AstNode {
         projections: Vec<ProjectionItem>,
         /// Order by clauses: `(expression_handle, is_ascending)`
         order_by: Vec<(NodeHandle, bool)>,
-        /// Skip / Offset count
-        skip: Option<u64>,
-        /// Limit count
-        limit: Option<u64>,
+        /// Skip / Offset count or parameter
+        skip: Option<PaginationValue>,
+        /// Limit count or parameter
+        limit: Option<PaginationValue>,
         /// Optional WHERE filter attached directly to this WITH clause
         where_clause: Option<NodeHandle>,
     },

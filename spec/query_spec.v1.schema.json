@@ -70,19 +70,25 @@
           "items": { "$ref": "#/$defs/OrderByItem" }
         },
         "skip": {
-          "description": "Pagination skip / offset count. An integral JSON number such as 0 or 0.0 is accepted. null means omitted. Do not also set offset.",
-          "type": ["integer", "null"],
-          "minimum": 0
+          "description": "Pagination skip / offset count: an integral JSON number such as 0 or 0.0, or [\"param\", name] to bind it at execution time. null means omitted. Do not also set offset.",
+          "oneOf": [
+            { "$ref": "#/$defs/PaginationValue" },
+            { "type": "null" }
+          ]
         },
         "offset": {
-          "description": "Alias for skip. An integral JSON number such as 0 or 0.0 is accepted. null means omitted. Setting both skip and offset is INVALID_SPEC at the second key.",
-          "type": ["integer", "null"],
-          "minimum": 0
+          "description": "Alias for skip: an integral JSON number, or [\"param\", name] to bind it at execution time. null means omitted. Setting both skip and offset is INVALID_SPEC at the second key.",
+          "oneOf": [
+            { "$ref": "#/$defs/PaginationValue" },
+            { "type": "null" }
+          ]
         },
         "limit": {
-          "description": "Pagination maximum result rows. An integral JSON number such as 3 or 3.0 is accepted. null means omitted.",
-          "type": ["integer", "null"],
-          "minimum": 0
+          "description": "Pagination maximum result rows: an integral JSON number such as 3 or 3.0, or [\"param\", name] to bind it at execution time. null means omitted.",
+          "oneOf": [
+            { "$ref": "#/$defs/PaginationValue" },
+            { "type": "null" }
+          ]
         },
         "execution_mode": {
           "description": "Query plan execution mode. The spelling is exact. null means omitted.",
@@ -152,14 +158,18 @@
           "items": { "$ref": "#/$defs/OrderByItem" }
         },
         "skip": {
-          "description": "Pagination skip / offset count. An integral JSON number is accepted. null means omitted.",
-          "type": ["integer", "null"],
-          "minimum": 0
+          "description": "Pagination skip / offset count: an integral JSON number, or [\"param\", name] to bind it at execution time. null means omitted.",
+          "oneOf": [
+            { "$ref": "#/$defs/PaginationValue" },
+            { "type": "null" }
+          ]
         },
         "limit": {
-          "description": "Pagination maximum result rows. An integral JSON number is accepted. null means omitted.",
-          "type": ["integer", "null"],
-          "minimum": 0
+          "description": "Pagination maximum result rows: an integral JSON number, or [\"param\", name] to bind it at execution time. null means omitted.",
+          "oneOf": [
+            { "$ref": "#/$defs/PaginationValue" },
+            { "type": "null" }
+          ]
         }
       },
       "additionalProperties": false
@@ -285,6 +295,22 @@
             { "type": ["string", "null"] }
           ],
           "minItems": 5,
+          "items": false
+        }
+      ]
+    },
+    "PaginationValue": {
+      "description": "A pagination count: a non-negative integral JSON number, or a query parameter reference [\"param\", name]. The consumer rejects a malformed array at its JSON Pointer.",
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        {
+          "type": "array",
+          "prefixItems": [
+            { "type": "string", "const": "param" },
+            { "type": "string", "minLength": 1 }
+          ],
+          "minItems": 2,
+          "maxItems": 2,
           "items": false
         }
       ]

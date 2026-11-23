@@ -2,7 +2,7 @@
 
 use crate::ast::{
     AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LiteralValue, NodeHandle,
-    PathMode, ProjectionItem, QueryAstArena, UnaryOp,
+    PaginationValue, PathMode, ProjectionItem, QueryAstArena, UnaryOp,
 };
 use crate::error::{Error, Result};
 use crate::visitor::{AstVisitor, ColumnMeta, CompiledQuery};
@@ -696,8 +696,8 @@ impl IsoGqlEmitter {
         projections: &[ProjectionItem],
         distinct: bool,
         order_by: &[(NodeHandle, bool)],
-        skip: Option<u64>,
-        limit: Option<u64>,
+        skip: Option<PaginationValue>,
+        limit: Option<PaginationValue>,
     ) -> Result<()> {
         self.buffer.push_str(" RETURN ");
         if distinct {
@@ -1127,7 +1127,14 @@ impl AstVisitor for IsoGqlEmitter {
                     limit,
                 } = ret_node
                 {
-                    self.emit_return(arena, projections, *distinct, order_by, *skip, *limit)?;
+                    self.emit_return(
+                        arena,
+                        projections,
+                        *distinct,
+                        order_by,
+                        skip.clone(),
+                        limit.clone(),
+                    )?;
                     columns = ColumnMeta::from_projections(arena, projections);
                 }
             }
