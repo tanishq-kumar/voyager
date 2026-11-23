@@ -21,6 +21,7 @@ pub mod native_transaction;
 pub mod pool;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+mod redact;
 #[cfg(feature = "redis")]
 pub mod redis;
 pub mod uri;
