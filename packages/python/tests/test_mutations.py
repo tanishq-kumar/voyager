@@ -1,7 +1,7 @@
 """Tests for DML Mutations (CREATE, MERGE, SET, DELETE, REMOVE) and Model Dirty Tracking."""
 
 import pytest
-from voyager_ogm import Query, node, relationship
+from voyager_ogm import Query, VoyagerError, node, relationship
 from voyager_ogm.models import reset_alias_counters
 
 
@@ -129,12 +129,12 @@ def test_python_model_dirty_tracking():
     assert compiled.parameters["p2"] == "VERIFIED"
 
 
-def test_set_kwargs_preserves_main_behavior():
+def test_set_kwargs_bare_map_is_rejected_not_merged():
     p = Person()
-    # On main, key without dot is ignored, does not do map merge
-    q_bare = Query.match(p).set(p={"city": "Berlin"}).return_(p)
-    compiled_bare = q_bare.compile("cypher")
-    assert "SET" not in compiled_bare.statement
+    # A key without a dot is not a map merge (use set_merge); since #295 it raises
+    with pytest.raises(VoyagerError) as exc_info:
+        Query.match(p).set(p={"city": "Berlin"})
+    assert exc_info.value.code == "INVALID_CLAUSE"
 
     # Key with dot assigns property
     q_dot = Query.match(p).set(**{"_person_0.city": "Berlin"}).return_(p)
