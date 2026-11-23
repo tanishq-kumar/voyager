@@ -166,8 +166,13 @@ impl ParsedUri {
             });
         }
 
-        let parsed = Url::parse(trimmed)
-            .map_err(|e| NetError::InvalidUri(format!("Malformed URI '{}': {}", trimmed, e)))?;
+        let parsed = Url::parse(trimmed).map_err(|e| {
+            NetError::InvalidUri(format!(
+                "Malformed URI '{}': {}",
+                redact_credentials(trimmed),
+                e
+            ))
+        })?;
 
         let scheme = parsed.scheme().to_lowercase();
         let (protocol, default_tls) = match scheme.as_str() {
@@ -210,10 +215,23 @@ impl ParsedUri {
             Auth::None
         };
 
-        // Extract query parameters
+        // Extract query parameters. TLS parameter names are matched case-insensitively
+        // (stored lower-cased), and a TLS parameter given twice must repeat the same value.
         let mut params: HashMap<String, String> = HashMap::new();
         for (k, v) in parsed.query_pairs() {
-            params.insert(k.to_string(), v.to_string());
+            let lower = k.to_ascii_lowercase();
+            if crate::tls::TLS_PARAMETERS.contains(&lower.as_str()) {
+                if let Some(previous) = params.get(&lower)
+                    && *previous != v
+                {
+                    return Err(NetError::InvalidUri(format!(
+                        "TLS parameter '{lower}' is given more than once with different values ('{previous}' and '{v}')"
+                    )));
+                }
+                params.insert(lower, v.into_owned());
+            } else {
+                params.insert(k.into_owned(), v.into_owned());
+            }
         }
 
         // Database catalog / graph extraction
@@ -240,25 +258,10 @@ impl ParsedUri {
             database = Some(graph_param.clone());
         }
 
-        // Resolve TLS mode from query parameters if present (e.g. ?ssl=true or ?sslmode=require)
-        let mut tls = default_tls;
-        if let Some(ssl) = params.get("ssl").or_else(|| params.get("tls")) {
-            match ssl.to_lowercase().as_str() {
-                "true" | "1" | "require" | "required" => tls = TlsMode::Required,
-                "self-signed" | "ssc" | "allow_invalid" | "insecure" => tls = TlsMode::SelfSigned,
-                "false" | "0" | "disable" | "disabled" => tls = TlsMode::Disabled,
-                _ => {}
-            }
-        } else if let Some(sslmode) = params.get("sslmode") {
-            // Coarse mapping only: PostgreSQL resolves the exact libpq behaviour from
-            // `sslmode` itself (see `tls::SslMode`).
-            match sslmode.to_lowercase().as_str() {
-                "require" | "verify-ca" | "verify-full" => tls = TlsMode::Required,
-                "prefer" | "allow" => tls = TlsMode::Required,
-                "disable" => tls = TlsMode::Disabled,
-                _ => {}
-            }
-        }
+        // Resolve the TLS mode from the scheme and the TLS parameters (?ssl=, ?tls=,
+        // ?sslmode=, ?sslrootcert=system). A parameter may strengthen a TLS scheme but never
+        // weaken it, and contradictory parameters are rejected.
+        let tls = crate::tls::resolve_uri_tls(&scheme, default_tls, &params)?;
 
         protocol.ensure_enabled()?;
 
@@ -299,13 +302,31 @@ impl FromStr for ParsedUri {
 }
 
 impl fmt::Display for ParsedUri {
+    /// Shows the URI with any user name and password replaced by `***`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{} ({}) [db: {:?}, tls: {:?}]",
-            self.raw, self.protocol, self.database, self.tls
+            redact_credentials(&self.raw),
+            self.protocol,
+            self.database,
+            self.tls
         )
     }
+}
+
+/// Replaces the user information (user name and password) of a URI with `***`, so the URI
+/// can appear in errors and logs. Everything between `://` and the last `@` is replaced,
+/// which also covers malformed URIs whose password contains `/`, `?`, `#` or `@`.
+pub fn redact_credentials(uri: &str) -> String {
+    let Some(at) = uri.rfind('@') else {
+        return uri.to_string();
+    };
+    let start = uri.find("://").map_or(0, |index| index + 3);
+    if start > at {
+        return uri.to_string();
+    }
+    format!("{}***{}", &uri[..start], &uri[at..])
 }
 
 #[cfg(test)]
@@ -324,6 +345,20 @@ mod tests {
             }
             Err(other) => panic!("unexpected parse error for {uri}: {other}"),
         }
+    }
+
+    #[test]
+    fn redact_credentials_hides_user_information() {
+        assert_eq!(
+            redact_credentials("postgresql://user:SECRET@h:5432/db"),
+            "postgresql://***@h:5432/db"
+        );
+        assert_eq!(
+            redact_credentials("vn:bolt://neo4j:pa/ss@word@h:7687?x=1"),
+            "vn:bolt://***@h:7687?x=1"
+        );
+        assert_eq!(redact_credentials("bolt://h:7687"), "bolt://h:7687");
+        assert_eq!(redact_credentials("bolt:user:pw@h"), "***@h");
     }
 
     #[test]

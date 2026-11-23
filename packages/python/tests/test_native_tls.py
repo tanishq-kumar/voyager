@@ -44,6 +44,22 @@ def test_tls_uri_is_accepted_without_connecting() -> None:
     client.close()
 
 
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "bolt+s://localhost:1?tls=false",
+        "rediss://localhost:1?ssl=false",
+        "postgresql+s://postgres@localhost:1/db?sslmode=disable",
+        "postgresql://postgres@localhost:1/db?sslmode=require&sslmode=disable",
+        "postgresql://postgres@localhost:1/db?sslmode=require&tls_ca_file=system",
+    ],
+)
+def test_weakening_tls_parameters_are_rejected(uri: str) -> None:
+    # A parameter never turns a TLS scheme or a TLS sslmode into plaintext.
+    with pytest.raises(Exception, match="(?i)weaken|conflicting|more than once|system requires"):
+        NativeClient(uri, min_idle=0).close()
+
+
 @pytest.mark.live
 @pytest.mark.parametrize(
     ("port", "uri", "query"),
@@ -56,10 +72,16 @@ def test_tls_uri_is_accepted_without_connecting() -> None:
             "?sslmode=verify-full&sslrootcert={ca}",
             "SELECT 1 AS n",
         ),
+        (
+            5456,
+            "postgresql://postgres:voyagerpass123@{host}:5456/voyager_graph"
+            "?sslmode=verify-full&sslrootcert={ca}&sslnegotiation=direct",
+            "SELECT 1 AS n",
+        ),
         # Ping only, so no FalkorDB graph is created.
         (6380, "rediss://{host}:6380?tls_ca_file={ca}", None),
     ],
-    ids=["neo4j", "memgraph", "postgres19", "falkordb"],
+    ids=["neo4j", "memgraph", "postgres19", "postgres19-direct", "falkordb"],
 )
 def test_live_native_client_over_tls(port: int, uri: str, query: str | None) -> None:
     ca = _require(port)

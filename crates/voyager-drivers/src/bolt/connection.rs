@@ -65,13 +65,19 @@ impl BoltConnection<NetStream> {
     /// it; a TLS request is never downgraded to plaintext. Without the `tls` Cargo feature a
     /// TLS request fails with [`NetError::TlsError`].
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
+        use crate::config::TlsMode;
         let uri = ParsedUri::parse(&config.uri)?;
-        let mode = if config.tls != crate::config::TlsMode::Disabled {
-            config.tls
-        } else {
-            uri.tls
+        let mode = match (config.tls, uri.tls) {
+            (TlsMode::Disabled, uri_mode) => uri_mode,
+            (TlsMode::SelfSigned, TlsMode::Required) => {
+                return Err(NetError::TlsError(format!(
+                    "ConnectionConfig asks for TlsMode::SelfSigned, which would weaken the verified TLS that the URI for '{}' requires",
+                    uri.host
+                )));
+            }
+            (config_mode, _) => config_mode,
         };
-        if mode != crate::config::TlsMode::Disabled && !crate::tls::TLS_AVAILABLE {
+        if mode != TlsMode::Disabled && !crate::tls::TLS_AVAILABLE {
             return Err(crate::tls::tls_unavailable(uri.protocol, &uri.host));
         }
         let addr = uri.socket_addr();

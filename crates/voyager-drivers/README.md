@@ -101,10 +101,20 @@ These URI parameters apply to every protocol; the libpq names are accepted every
 
 | Parameter | Alias | Meaning |
 | :--- | :--- | :--- |
-| `tls_ca_file` | `sslrootcert` | PEM file with the trusted CA certificates (`sslrootcert=system`: the system store) |
+| `tls_ca_file` | `sslrootcert` | PEM file with the trusted CA certificates (`system`: the system store, and implies verified TLS) |
 | `tls_cert_file` | `sslcert` | PEM client certificate chain, for mutual TLS |
 | `tls_key_file` | `sslkey` | PEM private key for the client certificate (PKCS#8, PKCS#1 or SEC1) |
 | `tls_server_name` | | name sent as SNI and verified against the certificate, instead of the URI host |
+
+A parameter can strengthen the TLS that the scheme asks for (`bolt+ssc://…?tls=true`,
+`postgresql://…?ssl=true`) but never weaken it: `bolt+s://…?tls=false`,
+`rediss://…?tls=insecure`, `postgresql+s://…?sslmode=require` and
+`postgresql://…?sslmode=require&ssl=false` are rejected with `NetError::InvalidUri` before
+anything is sent. Two TLS parameters that disagree are rejected too: the same parameter
+given twice with different values, two aliases with different values (`tls_ca_file` and
+`sslrootcert`), or `ssl` / `tls` / `sslmode` / `sslrootcert=system` asking for different
+levels. TLS parameter names are case-insensitive (`SSLMODE=require` works); their values are
+not (`sslmode=REQUIRE` is an error, as in libpq).
 
 ```text
 bolt+s://neo4j:secret@db.example.com:7687
@@ -151,11 +161,29 @@ existing URIs unchanged.
 | `verify-full` | TLS | error | CA chain and hostname |
 
 As in libpq, giving `sslrootcert` makes `require` (and `allow`/`prefer`) verify the chain like
-`verify-ca`, and `sslrootcert=system` defaults to `verify-full` and rejects weaker modes. Unlike
+`verify-ca`, and `sslrootcert=system` (or `tls_ca_file=system`) defaults to `verify-full` and
+rejects weaker modes. `allow` retries with TLS after any failure of the plaintext attempt, and
+data the server sends after its `S` / `N` reply, before the TLS handshake, is rejected. Unlike
 libpq, a TLS handshake or certificate failure under `prefer` is an error; only the server's
 `N` reply leads to plaintext. `verify-ca` / `verify-full` without `sslrootcert` use the system
 roots (libpq would read `~/.postgresql/root.crt`; default files under `~/.postgresql/` are not
-read). `sslnegotiation=direct` is not supported.
+read).
+
+`sslnegotiation` chooses how TLS starts, as in libpq 17:
+
+| `sslnegotiation` | Behaviour |
+| :--- | :--- |
+| `postgres` (default) | send an SSLRequest, start TLS after the server answers `S` (every PostgreSQL version) |
+| `direct` | start TLS immediately, without an SSLRequest, with the ALPN protocol `postgresql`; PostgreSQL 17 or later |
+
+`direct` saves a round trip and needs `sslmode=require`, `verify-ca` or `verify-full` (a
+weaker `sslmode` is rejected, as in libpq). A server older than PostgreSQL 17 does not
+understand it and the connection fails with a TLS error; a server that completes the
+handshake without selecting the `postgresql` ALPN protocol is refused.
+
+```text
+postgresql://app:secret@pg.example.com/graph?sslmode=verify-full&sslrootcert=/etc/voyager/ca.pem&sslnegotiation=direct
+```
 
 ## Related projects
 

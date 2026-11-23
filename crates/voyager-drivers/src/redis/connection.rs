@@ -135,32 +135,44 @@ impl RedisConnection {
             None => write_command(&mut self.stream, &["HELLO", "3"]).await,
         };
 
+        // The server must answer HELLO (a map, or an error from a server without RESP3);
+        // a connection that closes or never answers is not a working session.
+        hello_result.map_err(|e| {
+            NetError::ConnectionFailed(format!(
+                "Redis/FalkorDB host at {}: cannot send HELLO: {e}",
+                self.uri.socket_addr()
+            ))
+        })?;
+        let hello_reply = read_resp_value(&mut self.stream, &mut self.buffer)
+            .await
+            .map_err(|e| {
+                NetError::ConnectionFailed(format!(
+                    "Redis/FalkorDB host at {} did not answer HELLO: {e}",
+                    self.uri.socket_addr()
+                ))
+            })?;
         let mut switched_to_resp3 = false;
-        if hello_result.is_ok()
-            && let Ok(resp) = read_resp_value(&mut self.stream, &mut self.buffer).await
-        {
-            match resp {
-                RespValue::Map(pairs) => {
-                    self.is_resp3 = true;
-                    switched_to_resp3 = true;
-                    for (k, v) in pairs {
-                        self.server_info.insert(k.to_string_lossy(), v);
+        match hello_reply {
+            RespValue::Map(pairs) => {
+                self.is_resp3 = true;
+                switched_to_resp3 = true;
+                for (k, v) in pairs {
+                    self.server_info.insert(k.to_string_lossy(), v);
+                }
+            }
+            RespValue::Array(Some(items)) => {
+                // Some servers reply with flat arrays to HELLO
+                self.is_resp3 = true;
+                switched_to_resp3 = true;
+                for chunk in items.chunks(2) {
+                    if chunk.len() == 2 {
+                        self.server_info
+                            .insert(chunk[0].to_string_lossy(), chunk[1].clone());
                     }
                 }
-                RespValue::Array(Some(items)) => {
-                    // Some servers reply with flat arrays to HELLO
-                    self.is_resp3 = true;
-                    switched_to_resp3 = true;
-                    for chunk in items.chunks(2) {
-                        if chunk.len() == 2 {
-                            self.server_info
-                                .insert(chunk[0].to_string_lossy(), chunk[1].clone());
-                        }
-                    }
-                }
-                _ => {
-                    // Server rejected HELLO 3 (e.g. unknown command), fall back to RESP2
-                }
+            }
+            _ => {
+                // Server rejected HELLO 3 (e.g. unknown command), fall back to RESP2
             }
         }
 

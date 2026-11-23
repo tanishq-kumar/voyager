@@ -10,10 +10,15 @@
 //!
 //! | Parameter | Aliases | Meaning |
 //! |-----------|---------|---------|
-//! | `tls_ca_file` | `sslrootcert` | PEM bundle of trusted CA certificates (replaces the system roots); `system` selects the system roots |
+//! | `tls_ca_file` | `sslrootcert` | PEM bundle of trusted CA certificates (replaces the system roots); `system` selects the system roots and implies verified TLS |
 //! | `tls_cert_file` | `sslcert` | PEM client certificate chain for mutual TLS |
 //! | `tls_key_file` | `sslkey` | PEM private key (PKCS#8, PKCS#1 or SEC1) for the client certificate |
 //! | `tls_server_name` | | Name sent as SNI and checked against the server certificate instead of the URI host |
+//! | `sslnegotiation` | | PostgreSQL only: `postgres` (SSLRequest, default) or `direct` (PostgreSQL 17+) |
+//!
+//! Parameter names are matched case-insensitively. A parameter may strengthen the TLS that the
+//! scheme asks for but never weaken it, and contradictory TLS parameters are rejected with
+//! [`NetError::InvalidUri`].
 
 use std::collections::HashMap;
 use std::io;
@@ -187,8 +192,9 @@ impl SslMode {
     /// An explicit `?sslmode=` wins. Otherwise the scheme and `?ssl=` / `?tls=` decide:
     /// `postgresql+s://` or `?ssl=true` is `verify-full`, `postgresql+ssc://` or
     /// `?ssl=insecure` is `require` (encrypted, unverified), and a plain URI is `disable`.
-    /// `sslrootcert=system` defaults to `verify-full` and rejects weaker explicit modes, as
-    /// libpq does.
+    /// `sslrootcert=system` (or `tls_ca_file=system`) defaults to `verify-full` and rejects
+    /// weaker explicit modes, as libpq does. [`ParsedUri::parse`] already rejects an `sslmode`
+    /// weaker than the TLS the scheme or another parameter asks for.
     pub fn from_uri(uri: &ParsedUri) -> Result<Self> {
         let mode = match uri.params.get("sslmode") {
             Some(value) => Self::parse(value)?,
@@ -198,16 +204,26 @@ impl SslMode {
                 TlsMode::SelfSigned => Self::Require,
             },
         };
-        if uri.params.get("sslrootcert").map(String::as_str) == Some("system") {
+        if let Some(name) = system_root_parameter(&uri.params) {
             return match uri.params.get("sslmode") {
                 None => Ok(Self::VerifyFull),
                 Some(_) if mode == Self::VerifyFull => Ok(mode),
                 Some(value) => Err(NetError::InvalidUri(format!(
-                    "sslrootcert=system requires sslmode=verify-full (got sslmode={value})"
+                    "{name}=system requires sslmode=verify-full (got sslmode={value})"
                 ))),
             };
         }
         Ok(mode)
+    }
+
+    fn strength(self) -> TlsStrength {
+        match self {
+            Self::Disable => TlsStrength::Plaintext,
+            Self::Allow | Self::Prefer => TlsStrength::Opportunistic,
+            Self::Require => TlsStrength::Encrypted,
+            Self::VerifyCa => TlsStrength::ChainVerified,
+            Self::VerifyFull => TlsStrength::Verified,
+        }
     }
 
     /// Whether the first connection attempt sends an SSLRequest.
@@ -242,6 +258,197 @@ impl SslMode {
             }
         }
     }
+}
+
+/// PostgreSQL `sslnegotiation` (libpq 17+): how a TLS session is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SslNegotiation {
+    /// Send an SSLRequest and start TLS after the server answers `S` (every PostgreSQL version).
+    #[default]
+    Postgres,
+    /// Start TLS immediately, without an SSLRequest, offering the ALPN protocol `postgresql`
+    /// (PostgreSQL 17 and later). Only allowed with `sslmode` `require`, `verify-ca` or
+    /// `verify-full`, as in libpq.
+    Direct,
+}
+
+impl SslNegotiation {
+    /// ALPN protocol name PostgreSQL requires for direct TLS negotiation.
+    pub const ALPN: &'static [u8] = b"postgresql";
+
+    /// Resolves `?sslnegotiation=` for a URI whose effective `sslmode` is `mode`.
+    pub fn from_uri(uri: &ParsedUri, mode: SslMode) -> Result<Self> {
+        match uri.params.get("sslnegotiation").map(String::as_str) {
+            None | Some("postgres") => Ok(Self::Postgres),
+            Some("direct") => match mode {
+                SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => Ok(Self::Direct),
+                weak => Err(NetError::InvalidUri(format!(
+                    "weak sslmode \"{}\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")",
+                    weak.as_str()
+                ))),
+            },
+            Some(other) => Err(NetError::InvalidUri(format!(
+                "invalid sslnegotiation value '{other}' (expected postgres or direct)"
+            ))),
+        }
+    }
+}
+
+/// How much protection a TLS setting asks for; used to reject URI parameters that would
+/// weaken the TLS requested by the scheme or by another parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TlsStrength {
+    /// No TLS (`ssl=false`, `sslmode=disable`).
+    Plaintext,
+    /// TLS that may fall back to plaintext (`sslmode=allow` / `prefer`).
+    Opportunistic,
+    /// TLS without certificate verification (`+ssc`, `ssl=insecure`, `sslmode=require`).
+    Encrypted,
+    /// TLS with the chain verified but not the hostname (`sslmode=verify-ca`).
+    ChainVerified,
+    /// TLS with chain and hostname verified (`+s`, `ssl=true`, `sslmode=verify-full`,
+    /// `sslrootcert=system`).
+    Verified,
+}
+
+impl TlsStrength {
+    fn of_mode(mode: TlsMode) -> Self {
+        match mode {
+            TlsMode::Disabled => Self::Plaintext,
+            TlsMode::SelfSigned => Self::Encrypted,
+            TlsMode::Required => Self::Verified,
+        }
+    }
+}
+
+/// URI parameters that configure TLS. Their names are matched case-insensitively
+/// ([`ParsedUri::parse`] stores them lower-cased), and giving one twice with different
+/// values is an error.
+pub const TLS_PARAMETERS: &[&str] = &[
+    "ssl",
+    "tls",
+    "sslmode",
+    "sslnegotiation",
+    "sslrootcert",
+    "tls_ca_file",
+    "sslcert",
+    "tls_cert_file",
+    "sslkey",
+    "tls_key_file",
+    "tls_server_name",
+];
+
+/// Pairs of parameter names that set the same option.
+const TLS_ALIASES: &[(&str, &str)] = &[
+    ("tls_ca_file", "sslrootcert"),
+    ("tls_cert_file", "sslcert"),
+    ("tls_key_file", "sslkey"),
+];
+
+/// Returns the name of the root-certificate parameter set to `system`, if any.
+fn system_root_parameter(params: &HashMap<String, String>) -> Option<&'static str> {
+    ["sslrootcert", "tls_ca_file"]
+        .into_iter()
+        .find(|name| params.get(*name).map(String::as_str) == Some("system"))
+}
+
+/// Parses an `ssl` / `tls` parameter value.
+fn parse_ssl_flag(name: &str, value: &str) -> Result<TlsMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "require" | "required" => Ok(TlsMode::Required),
+        "self-signed" | "ssc" | "allow_invalid" | "insecure" => Ok(TlsMode::SelfSigned),
+        "false" | "0" | "disable" | "disabled" => Ok(TlsMode::Disabled),
+        _ => Err(NetError::InvalidUri(format!(
+            "invalid {name} value '{value}' (expected true, false or insecure)"
+        ))),
+    }
+}
+
+/// Resolves the coarse [`TlsMode`] of a URI from its scheme and its TLS parameters, and
+/// rejects parameters that contradict each other or weaken the TLS the scheme asks for.
+///
+/// `params` must hold the TLS parameter names lower-cased (as [`ParsedUri::parse`] stores
+/// them). A TLS scheme (`bolt+s`, `rediss`, `postgresql+ssc`, ...) can be strengthened by a
+/// parameter but never weakened: `bolt+s://…?tls=false`, `rediss://…?tls=insecure` and
+/// `postgresql+s://…?sslmode=require` are errors. Two parameters that ask for different TLS
+/// levels (`?ssl=true&sslmode=require`, `?sslrootcert=system&sslmode=require`) are errors too,
+/// as are two aliases (`tls_ca_file` / `sslrootcert`, ...) with different values.
+pub(crate) fn resolve_uri_tls(
+    scheme: &str,
+    scheme_tls: TlsMode,
+    params: &HashMap<String, String>,
+) -> Result<TlsMode> {
+    for (name, alias) in TLS_ALIASES {
+        if let (Some(a), Some(b)) = (params.get(*name), params.get(*alias))
+            && a != b
+        {
+            return Err(NetError::InvalidUri(format!(
+                "conflicting TLS parameters {name}={a} and {alias}={b} (they set the same option)"
+            )));
+        }
+    }
+
+    let mut explicit: Vec<(String, TlsStrength)> = Vec::new();
+    let mut flag_mode = None;
+    for name in ["ssl", "tls"] {
+        if let Some(value) = params.get(name) {
+            let mode = parse_ssl_flag(name, value)?;
+            explicit.push((format!("{name}={value}"), TlsStrength::of_mode(mode)));
+            if flag_mode.is_some_and(|previous| previous != mode) {
+                return Err(NetError::InvalidUri(format!(
+                    "conflicting TLS parameters ssl={} and tls={}",
+                    params["ssl"], params["tls"]
+                )));
+            }
+            flag_mode = Some(mode);
+        }
+    }
+    let sslmode = match params.get("sslmode") {
+        Some(value) => {
+            let mode = SslMode::parse(value)?;
+            explicit.push((format!("sslmode={value}"), mode.strength()));
+            Some(mode)
+        }
+        None => None,
+    };
+    let system_root = system_root_parameter(params);
+    if let Some(name) = system_root {
+        explicit.push((format!("{name}=system"), TlsStrength::Verified));
+    }
+
+    if let Some((first, first_strength)) = explicit.first()
+        && let Some((other, _)) = explicit
+            .iter()
+            .find(|(_, strength)| strength != first_strength)
+    {
+        return Err(NetError::InvalidUri(format!(
+            "conflicting TLS parameters {first} and {other} ask for different TLS levels"
+        )));
+    }
+
+    if scheme_tls != TlsMode::Disabled {
+        let required = TlsStrength::of_mode(scheme_tls);
+        if let Some((weaker, _)) = explicit.iter().find(|(_, strength)| *strength < required) {
+            let what = if scheme_tls == TlsMode::Required {
+                "verified TLS"
+            } else {
+                "TLS"
+            };
+            return Err(NetError::InvalidUri(format!(
+                "{weaker} would weaken the {what} that the {scheme}:// scheme requires; remove the parameter or use a scheme without TLS"
+            )));
+        }
+    }
+
+    Ok(match (flag_mode, sslmode) {
+        (Some(mode), _) => mode,
+        // Coarse mapping for Bolt and Redis; PostgreSQL resolves the exact libpq behaviour
+        // from `sslmode` itself (see `SslMode::from_uri`).
+        (None, Some(SslMode::Disable)) => TlsMode::Disabled,
+        (None, Some(_)) => TlsMode::Required,
+        (None, None) if system_root.is_some() => TlsMode::Required,
+        (None, None) => scheme_tls,
+    })
 }
 
 /// Error returned when a TLS connection is requested from a build without the `tls` feature.
@@ -362,13 +569,25 @@ pub async fn upgrade(
     verification: TlsVerification,
     options: &TlsOptions,
 ) -> Result<NetStream> {
+    upgrade_with_alpn(tcp, protocol, host, verification, options, None).await
+}
+
+/// Like [`upgrade`], offering one ALPN protocol and requiring the server to select it.
+pub(crate) async fn upgrade_with_alpn(
+    tcp: TcpStream,
+    protocol: DatabaseProtocol,
+    host: &str,
+    verification: TlsVerification,
+    options: &TlsOptions,
+    alpn: Option<&[u8]>,
+) -> Result<NetStream> {
     #[cfg(feature = "tls")]
     {
-        rustls_impl::connect(tcp, protocol, host, verification, options).await
+        rustls_impl::connect(tcp, protocol, host, verification, options, alpn).await
     }
     #[cfg(not(feature = "tls"))]
     {
-        let _ = (tcp, verification, options);
+        let _ = (tcp, verification, options, alpn);
         Err(tls_unavailable(protocol, host))
     }
 }
@@ -384,13 +603,95 @@ pub fn validate(
     #[cfg(feature = "tls")]
     {
         let _ = protocol;
-        rustls_impl::client_config(host, verification, options).map(|_| ())
+        rustls_impl::client_config(host, verification, options, None).map(|_| ())
     }
     #[cfg(not(feature = "tls"))]
     {
         let _ = (verification, options);
         Err(tls_unavailable(protocol, host))
     }
+}
+
+/// Splits one DER element off `input`: returns its tag, its contents and the remaining bytes.
+/// Only single-byte tags and lengths of up to four bytes are accepted (enough for X.509).
+#[cfg(feature = "tls")]
+fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        let count = usize::from(first & 0x7F);
+        if count == 0 || count > 4 || rest.len() < count {
+            return None;
+        }
+        let (bytes, rest) = rest.split_at(count);
+        let len = bytes
+            .iter()
+            .fold(0usize, |acc, byte| (acc << 8) | usize::from(*byte));
+        (len, rest)
+    };
+    if rest.len() < len {
+        return None;
+    }
+    let (contents, rest) = rest.split_at(len);
+    Some((tag, contents, rest))
+}
+
+/// Reads the keyUsage extension of an X.509 certificate (DER). Returns `None` when the
+/// certificate has no keyUsage extension (or cannot be walked), otherwise whether the
+/// `digitalSignature` bit is set.
+#[cfg(feature = "tls")]
+fn leaf_key_usage_allows_signing(certificate: &[u8]) -> Option<bool> {
+    const SEQUENCE: u8 = 0x30;
+    const EXTENSIONS: u8 = 0xA3;
+    const KEY_USAGE_OID: [u8; 3] = [0x55, 0x1D, 0x0F];
+
+    let (SEQUENCE, certificate, _) = der_element(certificate)? else {
+        return None;
+    };
+    let (SEQUENCE, mut tbs, _) = der_element(certificate)? else {
+        return None;
+    };
+    while !tbs.is_empty() {
+        let (tag, contents, rest) = der_element(tbs)?;
+        tbs = rest;
+        if tag != EXTENSIONS {
+            continue;
+        }
+        let (SEQUENCE, mut extensions, _) = der_element(contents)? else {
+            return None;
+        };
+        while !extensions.is_empty() {
+            let (tag, extension, rest) = der_element(extensions)?;
+            extensions = rest;
+            if tag != SEQUENCE {
+                return None;
+            }
+            let (0x06, oid, mut fields) = der_element(extension)? else {
+                return None;
+            };
+            if oid != KEY_USAGE_OID {
+                continue;
+            }
+            let (mut tag, mut value, rest) = der_element(fields)?;
+            if tag == 0x01 {
+                // the optional `critical` BOOLEAN
+                fields = rest;
+                (tag, value, _) = der_element(fields)?;
+            }
+            if tag != 0x04 {
+                return None;
+            }
+            let (0x03, bits, _) = der_element(value)? else {
+                return None;
+            };
+            // bits[0] is the count of unused bits; digitalSignature is the first named bit.
+            return Some(bits.get(1).is_some_and(|byte| byte & 0x80 != 0));
+        }
+        return None;
+    }
+    None
 }
 
 #[cfg(feature = "tls")]
@@ -485,6 +786,7 @@ mod rustls_impl {
         host: &str,
         verification: TlsVerification,
         options: &TlsOptions,
+        alpn: Option<&[u8]>,
     ) -> Result<(Arc<ClientConfig>, ServerName<'static>)> {
         let provider = provider();
         let builder = ClientConfig::builder_with_provider(provider.clone())
@@ -492,8 +794,7 @@ mod rustls_impl {
             .map_err(|error| NetError::TlsError(format!("TLS configuration error: {error}")))?;
 
         let builder = match verification {
-            TlsVerification::Full => builder.with_root_certificates(roots(options)?),
-            TlsVerification::CaOnly => {
+            TlsVerification::Full | TlsVerification::CaOnly => {
                 let inner = WebPkiServerVerifier::builder_with_provider(roots(options)?, provider)
                     .build()
                     .map_err(|error| {
@@ -501,7 +802,10 @@ mod rustls_impl {
                     })?;
                 builder
                     .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(CaOnlyVerifier { inner }))
+                    .with_custom_certificate_verifier(Arc::new(CheckedVerifier {
+                        inner,
+                        check_hostname: verification == TlsVerification::Full,
+                    }))
             }
             TlsVerification::None => {
                 builder
@@ -512,7 +816,7 @@ mod rustls_impl {
             }
         };
 
-        let config = match (&options.client_cert_file, &options.client_key_file) {
+        let mut config = match (&options.client_cert_file, &options.client_key_file) {
             (Some(cert_file), Some(key_file)) => {
                 let chain = read_certs(cert_file, "client")?;
                 let key = PrivateKeyDer::from_pem_file(key_file).map_err(|error| {
@@ -548,6 +852,9 @@ mod rustls_impl {
         let server_name = ServerName::try_from(name.to_string()).map_err(|error| {
             NetError::TlsError(format!("invalid TLS server name '{name}': {error}"))
         })?;
+        if let Some(protocol) = alpn {
+            config.alpn_protocols = vec![protocol.to_vec()];
+        }
         Ok((Arc::new(config), server_name))
     }
 
@@ -557,8 +864,9 @@ mod rustls_impl {
         host: &str,
         verification: TlsVerification,
         options: &TlsOptions,
+        alpn: Option<&[u8]>,
     ) -> Result<NetStream> {
-        let (config, server_name) = client_config(host, verification, options)?;
+        let (config, server_name) = client_config(host, verification, options, alpn)?;
         let shown_name = server_name.to_str().into_owned();
         let stream = TlsConnector::from(config)
             .connect(server_name, tcp)
@@ -568,17 +876,27 @@ mod rustls_impl {
                     "TLS handshake with {protocol} endpoint '{host}' (server name '{shown_name}') failed: {error}"
                 ))
             })?;
+        if let Some(expected) = alpn
+            && stream.get_ref().1.alpn_protocol() != Some(expected)
+        {
+            return Err(NetError::TlsError(format!(
+                "{protocol} endpoint '{host}' completed the TLS handshake without selecting the ALPN protocol '{}'",
+                String::from_utf8_lossy(expected)
+            )));
+        }
         Ok(NetStream::Tls(Box::new(stream)))
     }
 
-    /// Verifies the chain against the trusted roots and ignores a hostname mismatch
-    /// (PostgreSQL `verify-ca`).
+    /// Verifies the chain against the trusted roots (rustls-webpki), optionally the hostname
+    /// (PostgreSQL `verify-ca` skips it), and that a leaf certificate with a keyUsage
+    /// extension allows `digitalSignature`, which every TLS key exchange rustls supports needs.
     #[derive(Debug)]
-    struct CaOnlyVerifier {
+    struct CheckedVerifier {
         inner: Arc<WebPkiServerVerifier>,
+        check_hostname: bool,
     }
 
-    impl ServerCertVerifier for CaOnlyVerifier {
+    impl ServerCertVerifier for CheckedVerifier {
         fn verify_server_cert(
             &self,
             end_entity: &CertificateDer<'_>,
@@ -587,7 +905,7 @@ mod rustls_impl {
             ocsp_response: &[u8],
             now: UnixTime,
         ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-            match self.inner.verify_server_cert(
+            let verified = match self.inner.verify_server_cert(
                 end_entity,
                 intermediates,
                 server_name,
@@ -597,9 +915,15 @@ mod rustls_impl {
                 Err(rustls::Error::InvalidCertificate(
                     CertificateError::NotValidForName
                     | CertificateError::NotValidForNameContext { .. },
-                )) => Ok(ServerCertVerified::assertion()),
-                other => other,
+                )) if !self.check_hostname => ServerCertVerified::assertion(),
+                other => other?,
+            };
+            if super::leaf_key_usage_allows_signing(end_entity.as_ref()) == Some(false) {
+                return Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+                    rustls::OtherError(Arc::new(KeyUsageError)),
+                )));
             }
+            Ok(verified)
         }
 
         fn verify_tls12_signature(
@@ -624,6 +948,28 @@ mod rustls_impl {
             self.inner.supported_verify_schemes()
         }
     }
+
+    /// The server certificate's keyUsage extension does not allow `digitalSignature`.
+    /// `Debug` prints the message too, because rustls shows this error with `{:?}`.
+    struct KeyUsageError;
+
+    impl KeyUsageError {
+        const MESSAGE: &'static str = "server certificate keyUsage does not allow digitalSignature, which TLS server authentication needs";
+    }
+
+    impl std::fmt::Display for KeyUsageError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(Self::MESSAGE)
+        }
+    }
+
+    impl std::fmt::Debug for KeyUsageError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(Self::MESSAGE)
+        }
+    }
+
+    impl std::error::Error for KeyUsageError {}
 
     /// Accepts any server certificate. The handshake signatures are still checked, so the
     /// session is bound to the certificate the server presented; only its identity is unverified.
@@ -691,8 +1037,28 @@ mod tests {
             ("age+s://h/db", SslMode::VerifyFull),
             ("postgresql://h/db?ssl=true", SslMode::VerifyFull),
             ("postgresql://h/db?ssl=insecure", SslMode::Require),
-            ("postgresql+s://h/db?sslmode=require", SslMode::Require),
+            (
+                "postgresql+s://h/db?sslmode=verify-full",
+                SslMode::VerifyFull,
+            ),
+            ("postgresql+ssc://h/db?sslmode=verify-ca", SslMode::VerifyCa),
+            ("postgresql://h/db?SSLMODE=require", SslMode::Require),
+            ("postgresql://h/db?SslMode=verify-full", SslMode::VerifyFull),
+            (
+                "postgresql://h/db?sslmode=require&sslmode=require",
+                SslMode::Require,
+            ),
+            (
+                "postgresql://h/db?ssl=true&sslmode=verify-full",
+                SslMode::VerifyFull,
+            ),
             ("postgresql://h/db?sslrootcert=system", SslMode::VerifyFull),
+            ("postgresql://h/db?tls_ca_file=system", SslMode::VerifyFull),
+            ("postgresql://h/db?TLS_CA_FILE=system", SslMode::VerifyFull),
+            (
+                "postgresql+ssc://h/db?tls_ca_file=system",
+                SslMode::VerifyFull,
+            ),
             (
                 "postgresql://h/db?sslrootcert=system&sslmode=verify-full",
                 SslMode::VerifyFull,
@@ -709,11 +1075,277 @@ mod tests {
             "postgresql://h/db?sslmode=required",
             "postgresql://h/db?sslmode=VERIFY-FULL",
             "postgresql://h/db?sslrootcert=system&sslmode=require",
+            "postgresql://h/db?tls_ca_file=system&sslmode=require",
+            "postgresql://h/db?tls_ca_file=system&sslmode=verify-ca",
+            "postgresql://h/db?tls_ca_file=system&sslmode=prefer",
+            "postgresql://h/db?tls_ca_file=system&sslmode=disable",
+            "postgresql://h/db?tls_ca_file=system&ssl=insecure",
         ] {
             assert!(
                 matches!(pg(uri), Err(NetError::InvalidUri(_))),
                 "{uri} should be rejected"
             );
+        }
+    }
+
+    /// A TLS scheme, an `sslmode` that requires TLS, or `sslrootcert=system` is never weakened
+    /// by another parameter, whatever its spelling or position.
+    #[test]
+    fn weakening_tls_parameters_are_rejected() {
+        let tls_schemes = [
+            "bolt+s",
+            "neo4j+s",
+            "memgraph+s",
+            "bolt+ssc",
+            "neo4j+ssc",
+            "memgraph+ssc",
+            "rediss",
+            "falkordbs",
+            "valkeys",
+            "postgresql+s",
+            "postgres+s",
+            "age+s",
+            "postgresql+ssc",
+            "age+ssc",
+        ];
+        let weakening = [
+            "tls=false",
+            "ssl=false",
+            "ssl=0",
+            "tls=0",
+            "ssl=disable",
+            "tls=disabled",
+            "TLS=false",
+            "Ssl=false",
+            "sslmode=disable",
+            "SSLMODE=disable",
+            "sslmode=allow",
+            "sslmode=prefer",
+        ];
+        for scheme in tls_schemes {
+            for query in weakening {
+                let uri = format!("{scheme}://u:pw@h:1/db?{query}");
+                match ParsedUri::parse(&uri) {
+                    Err(NetError::InvalidUri(message)) => {
+                        assert!(message.contains("weaken"), "{uri}: {message}");
+                        assert!(!message.contains("pw"), "{uri}: {message}");
+                    }
+                    other => panic!("{uri}: expected InvalidUri, got {other:?}"),
+                }
+            }
+        }
+        // A verified scheme is not weakened to "encrypted but unverified" either.
+        for uri in [
+            "bolt+s://h?tls=insecure",
+            "rediss://h?ssl=ssc",
+            "neo4j+s://h?sslmode=require",
+            "postgresql+s://h/db?sslmode=require",
+            "postgresql+s://h/db?sslmode=verify-ca",
+            "age+s://h/db?ssl=allow_invalid",
+        ] {
+            assert!(
+                matches!(ParsedUri::parse(uri), Err(NetError::InvalidUri(_))),
+                "{uri} should be rejected"
+            );
+        }
+        // An sslmode that requires TLS is not weakened by ssl / tls, in either order.
+        for query in [
+            "sslmode=require&ssl=false",
+            "ssl=false&sslmode=require",
+            "sslmode=verify-full&tls=0",
+            "sslmode=verify-ca&tls=insecure",
+            "ssl=true&sslmode=require",
+            "ssl=true&sslmode=prefer",
+            "sslrootcert=system&ssl=false",
+        ] {
+            for scheme in ["postgresql", "bolt", "redis"] {
+                let uri = format!("{scheme}://h/db?{query}");
+                assert!(
+                    matches!(ParsedUri::parse(&uri), Err(NetError::InvalidUri(_))),
+                    "{uri} should be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_and_conflicting_tls_parameters_are_rejected() {
+        for uri in [
+            "postgresql://h/db?sslmode=verify-full&sslmode=disable",
+            "postgresql://h/db?sslmode=require&sslmode=disable",
+            "postgresql://h/db?sslmode=require&SSLMODE=disable",
+            "bolt://h?tls=true&tls=false",
+            "bolt://h?ssl=true&tls=false",
+            "rediss://h?tls_ca_file=/a.pem&tls_ca_file=/b.pem",
+            "postgresql://h/db?sslrootcert=/ca.pem&tls_ca_file=system",
+            "postgresql://h/db?sslrootcert=/a.pem&tls_ca_file=/b.pem",
+            "bolt+s://h?sslcert=/a.pem&tls_cert_file=/b.pem",
+            "bolt+s://h?sslkey=/a.key&TLS_KEY_FILE=/b.key",
+            "bolt+s://h?tls_server_name=a&tls_server_name=b",
+            "postgresql://h/db?sslnegotiation=direct&sslnegotiation=postgres",
+            "bolt://h?tls=maybe",
+            "bolt://h?sslmode=verify",
+        ] {
+            assert!(
+                matches!(ParsedUri::parse(uri), Err(NetError::InvalidUri(_))),
+                "{uri} should be rejected"
+            );
+        }
+        // Repeating a parameter with the same value, or giving both aliases the same value, is fine.
+        let uri = ParsedUri::parse(
+            "bolt+s://h?tls_ca_file=/ca.pem&sslrootcert=/ca.pem&tls=true&tls=true",
+        )
+        .unwrap();
+        assert_eq!(uri.tls, TlsMode::Required);
+        assert_eq!(
+            TlsOptions::from_params(&uri.params).ca_file,
+            Some(PathBuf::from("/ca.pem"))
+        );
+    }
+
+    #[test]
+    fn strengthening_tls_parameters_keep_working() {
+        let cases = [
+            ("bolt://h?tls=true", TlsMode::Required),
+            ("bolt://h?TLS=true", TlsMode::Required),
+            ("bolt://h?ssl=insecure", TlsMode::SelfSigned),
+            ("bolt://h?sslmode=require", TlsMode::Required),
+            ("bolt://h?tls_ca_file=system", TlsMode::Required),
+            ("bolt+ssc://h?tls=true", TlsMode::Required),
+            ("bolt+ssc://h?tls=insecure", TlsMode::SelfSigned),
+            ("bolt+s://h?tls=true", TlsMode::Required),
+            ("bolt+s://h?sslmode=verify-full", TlsMode::Required),
+            ("redis://h?ssl=1", TlsMode::Required),
+            ("rediss://h?tls_ca_file=system", TlsMode::Required),
+            ("postgresql://h/db?sslmode=disable", TlsMode::Disabled),
+            ("postgresql://h/db?ssl=false", TlsMode::Disabled),
+            (
+                "postgresql+ssc://h/db?sslmode=verify-full",
+                TlsMode::Required,
+            ),
+            ("bolt://h?tls_ca_file=/ca.pem", TlsMode::Disabled),
+        ];
+        for (uri, expected) in cases {
+            assert_eq!(ParsedUri::parse(uri).unwrap().tls, expected, "{uri}");
+        }
+        // Non-TLS parameters keep their case and last-wins behaviour.
+        let uri = ParsedUri::parse("bolt://h?Routing=a&Routing=b").unwrap();
+        assert_eq!(uri.params.get("Routing").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn sslnegotiation_follows_libpq() {
+        let resolve = |uri: &str| -> Result<SslNegotiation> {
+            let uri = ParsedUri::parse(uri)?;
+            SslNegotiation::from_uri(&uri, SslMode::from_uri(&uri)?)
+        };
+        for (uri, expected) in [
+            (
+                "postgresql://h/db?sslmode=require",
+                SslNegotiation::Postgres,
+            ),
+            (
+                "postgresql://h/db?sslmode=require&sslnegotiation=postgres",
+                SslNegotiation::Postgres,
+            ),
+            (
+                "postgresql://h/db?sslmode=require&sslnegotiation=direct",
+                SslNegotiation::Direct,
+            ),
+            (
+                "postgresql://h/db?sslmode=verify-ca&sslnegotiation=direct",
+                SslNegotiation::Direct,
+            ),
+            (
+                "postgresql+s://h/db?sslnegotiation=direct",
+                SslNegotiation::Direct,
+            ),
+            (
+                "age+ssc://h/db?SSLNEGOTIATION=direct",
+                SslNegotiation::Direct,
+            ),
+        ] {
+            assert_eq!(resolve(uri).unwrap(), expected, "{uri}");
+        }
+        for uri in [
+            "postgresql://h/db?sslnegotiation=direct",
+            "postgresql://h/db?sslmode=disable&sslnegotiation=direct",
+            "postgresql://h/db?sslmode=allow&sslnegotiation=direct",
+            "postgresql://h/db?sslmode=prefer&sslnegotiation=direct",
+            "postgresql://h/db?sslmode=require&sslnegotiation=Direct",
+            "postgresql://h/db?sslmode=require&sslnegotiation=tls",
+        ] {
+            assert!(
+                matches!(resolve(uri), Err(NetError::InvalidUri(_))),
+                "{uri} should be rejected"
+            );
+        }
+        let message = resolve("postgresql://h/db?sslmode=prefer&sslnegotiation=direct")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("weak sslmode \"prefer\""), "{message}");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn key_usage_reader() {
+        use der_fixtures as der;
+        assert_eq!(
+            leaf_key_usage_allows_signing(&der::with_key_usage(0x80)),
+            Some(true)
+        );
+        assert_eq!(
+            leaf_key_usage_allows_signing(&der::with_key_usage(0xA0)),
+            Some(true)
+        );
+        assert_eq!(
+            leaf_key_usage_allows_signing(&der::with_key_usage(0x20)),
+            Some(false)
+        );
+        assert_eq!(
+            leaf_key_usage_allows_signing(&der::without_key_usage()),
+            None
+        );
+        assert_eq!(leaf_key_usage_allows_signing(&[0x30, 0x05, 0x01]), None);
+        assert_eq!(leaf_key_usage_allows_signing(&[]), None);
+    }
+
+    /// Hand-built DER skeletons (only the structure the keyUsage reader walks).
+    #[cfg(feature = "tls")]
+    mod der_fixtures {
+        fn tlv(tag: u8, contents: &[u8]) -> Vec<u8> {
+            assert!(contents.len() < 0x80);
+            let mut out = vec![tag, contents.len() as u8];
+            out.extend_from_slice(contents);
+            out
+        }
+
+        fn certificate(extensions: Vec<u8>) -> Vec<u8> {
+            let mut tbs = tlv(0xA0, &tlv(0x02, &[2])); // version
+            tbs.extend(tlv(0x02, &[1])); // serial
+            tbs.extend(tlv(0xA3, &tlv(0x30, &extensions)));
+            let mut cert = tlv(0x30, &tbs);
+            cert.extend(tlv(0x30, &[])); // signature algorithm
+            tlv(0x30, &cert)
+        }
+
+        fn basic_constraints() -> Vec<u8> {
+            let mut ext = tlv(0x06, &[0x55, 0x1D, 0x13]);
+            ext.extend(tlv(0x04, &tlv(0x30, &[])));
+            tlv(0x30, &ext)
+        }
+
+        pub fn with_key_usage(bits: u8) -> Vec<u8> {
+            let mut ext = tlv(0x06, &[0x55, 0x1D, 0x0F]);
+            ext.extend(tlv(0x01, &[0xFF])); // critical
+            ext.extend(tlv(0x04, &tlv(0x03, &[0x05, bits])));
+            let mut extensions = basic_constraints();
+            extensions.extend(tlv(0x30, &ext));
+            certificate(extensions)
+        }
+
+        pub fn without_key_usage() -> Vec<u8> {
+            certificate(basic_constraints())
         }
     }
 

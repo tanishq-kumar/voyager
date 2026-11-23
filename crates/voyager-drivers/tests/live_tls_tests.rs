@@ -153,6 +153,15 @@ async fn live_neo4j_bolt_tls() {
     assert!(conn.is_tls());
     bolt_return_one(&mut conn).await;
 
+    // A URI parameter cannot turn bolt+s into plaintext, even though this port allows it.
+    for query in ["tls=false", "ssl=0", "SSLMODE=disable"] {
+        match bolt(&format!("bolt+s://{auth}@{h}:7687?{query}")).await {
+            Err(NetError::InvalidUri(_)) => {}
+            Err(other) => panic!("{query}: expected InvalidUri, got {other:?}"),
+            Ok(_) => panic!("{query}: connected"),
+        }
+    }
+
     // The same port still accepts plaintext (TLS level OPTIONAL).
     let mut plain = bolt(&format!("bolt://{auth}@{h}:7687")).await.unwrap();
     assert!(!plain.is_tls());
@@ -257,6 +266,18 @@ async fn live_falkordb_tls() {
         conn.ping().await.unwrap();
     }
 
+    // Plaintext RESP against the TLS-only port is not reported as a connection.
+    assert!(
+        redis(&format!("redis://{h}:6380?connect_timeout=5"))
+            .await
+            .is_err()
+    );
+    // A parameter cannot turn `rediss` into plaintext.
+    assert!(matches!(
+        redis(&format!("rediss://{h}:6380?tls=false")).await,
+        Err(NetError::InvalidUri(_))
+    ));
+
     // `?tls=insecure` encrypts without verifying.
     assert!(
         redis(&format!("redis://{h}:6380?tls=insecure"))
@@ -338,6 +359,16 @@ async fn pg_sslmodes(port: u16, scheme: &str, what: &str) {
             true,
         ),
         ("sslmode=require".to_string(), true),
+        // Direct TLS negotiation (PostgreSQL 17+): no SSLRequest, ALPN `postgresql`.
+        (
+            format!("sslmode=verify-full&sslrootcert={ca}&sslnegotiation=direct"),
+            true,
+        ),
+        (
+            format!("sslmode=verify-ca&tls_ca_file={ca}&sslnegotiation=direct"),
+            true,
+        ),
+        ("sslmode=require&sslnegotiation=direct".to_string(), true),
         ("sslmode=prefer".to_string(), true),
         ("sslmode=allow".to_string(), false),
         ("sslmode=disable".to_string(), false),
@@ -363,11 +394,31 @@ async fn pg_sslmodes(port: u16, scheme: &str, what: &str) {
         format!("sslmode=require&sslrootcert={unrelated}"),
         format!("sslmode=prefer&sslrootcert={unrelated}"),
         "sslmode=verify-full".to_string(),
+        // `tls_ca_file=system` implies verify-full against the system roots (no test CA there).
+        "tls_ca_file=system".to_string(),
+        format!("sslmode=verify-full&sslrootcert={unrelated}&sslnegotiation=direct"),
     ] {
         expect_tls_error(
             pg(&format!("{base}?{query}")).await,
             &format!("{what} {query}"),
         );
+    }
+
+    // Weakening or contradictory TLS parameters are rejected before connecting.
+    let tls_base = format!("{scheme}+s://postgres:voyagerpass123@{h}:{port}/voyager_graph");
+    for uri in [
+        format!("{tls_base}?sslmode=disable"),
+        format!("{tls_base}?ssl=false"),
+        format!("{tls_base}?sslmode=require"),
+        format!("{base}?sslmode=require&tls_ca_file=system"),
+        format!("{base}?sslmode=verify-full&sslmode=disable"),
+        format!("{base}?sslmode=prefer&sslnegotiation=direct"),
+    ] {
+        match pg(&uri).await {
+            Err(NetError::InvalidUri(_)) => {}
+            Err(other) => panic!("{what} {uri}: expected InvalidUri, got {other:?}"),
+            Ok(_) => panic!("{what} {uri}: connected"),
+        }
     }
 
     // connect_any goes through the same client.

@@ -104,6 +104,105 @@ async fn tls_requests_never_send_plaintext_protocol_bytes() {
     }
 }
 
+/// Accepts on a bare TCP listener and reports whether the client ever connected.
+async fn connects_at_all(uri_for_port: impl FnOnce(u16) -> String) -> (bool, NetError) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let uri = uri_for_port(port);
+    let error = match tokio::time::timeout(Duration::from_secs(5), connect_any(&uri)).await {
+        Ok(Ok(_)) => panic!("{uri}: connected"),
+        Ok(Err(error)) => error,
+        Err(_) => panic!("{uri}: connect hung"),
+    };
+    let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept())
+        .await
+        .is_ok();
+    (accepted, error)
+}
+
+/// A URI parameter can never turn a TLS scheme, a TLS-requiring `sslmode` or
+/// `sslrootcert=system` into plaintext (or into unverified TLS): the URI is rejected
+/// before any connection is made, with or without the `tls` feature.
+#[tokio::test]
+async fn weakening_tls_parameters_never_reach_the_network() {
+    let cases = [
+        "bolt+s://localhost:{port}?tls=false",
+        "neo4j+s://localhost:{port}?ssl=false",
+        "memgraph+s://localhost:{port}?tls=0",
+        "bolt+ssc://localhost:{port}?ssl=disable",
+        "neo4j+s://localhost:{port}?sslmode=disable",
+        "bolt+s://localhost:{port}?tls=insecure",
+        "rediss://localhost:{port}?tls=false",
+        "falkordbs://localhost:{port}?ssl=false",
+        "valkeys://localhost:{port}?SSL=disable",
+        "postgresql+s://postgres@127.0.0.1:{port}/db?sslmode=disable",
+        "postgres+s://postgres@127.0.0.1:{port}/db?ssl=disable",
+        "postgresql+s://postgres@127.0.0.1:{port}/db?tls=false",
+        "postgresql+s://postgres@127.0.0.1:{port}/db?sslmode=allow",
+        "postgresql+s://postgres@127.0.0.1:{port}/db?sslmode=require",
+        "age+s://postgres@127.0.0.1:{port}/db?SSLMODE=disable",
+        "postgresql://postgres@127.0.0.1:{port}/db?sslmode=verify-full&sslmode=disable",
+        "postgresql://postgres@127.0.0.1:{port}/db?sslmode=require&Sslmode=disable",
+        "postgresql://postgres@127.0.0.1:{port}/db?sslmode=require&ssl=false",
+        "postgresql://postgres@127.0.0.1:{port}/db?sslmode=require&tls_ca_file=system",
+        "postgresql://postgres@127.0.0.1:{port}/db?sslrootcert=/ca.pem&tls_ca_file=system",
+        "postgresql://postgres@127.0.0.1:{port}/db?sslmode=prefer&sslnegotiation=direct",
+    ];
+    for template in cases {
+        let (connected, error) =
+            connects_at_all(|port| template.replace("{port}", &port.to_string())).await;
+        assert!(
+            matches!(error, NetError::InvalidUri(_)),
+            "{template}: expected InvalidUri, got {error:?}"
+        );
+        assert!(!connected, "{template}: a connection was opened");
+    }
+}
+
+/// Upper-case TLS parameter names are honoured, not ignored.
+#[tokio::test]
+async fn tls_parameter_names_are_case_insensitive_on_the_wire() {
+    for query in ["SSLMODE=require", "Sslmode=verify-full", "SSL=true"] {
+        let (bytes, error) = first_bytes_sent(|port| {
+            format!("postgresql://postgres@127.0.0.1:{port}/db?{query}&connect_timeout=3")
+        })
+        .await;
+        if TLS_AVAILABLE {
+            assert_eq!(
+                bytes,
+                [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F],
+                "{query}: SSLRequest first"
+            );
+        } else {
+            assert!(matches!(error, NetError::TlsError(_)), "{query}: {error}");
+        }
+    }
+}
+
+#[test]
+fn uri_errors_and_display_do_not_show_credentials() {
+    let error =
+        voyager_drivers::ParsedUri::parse("postgresql://user:SECRET123@127.0.0.1:notaport/db")
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("Malformed URI"), "{error}");
+    assert!(
+        !error.contains("SECRET123") && !error.contains("user:"),
+        "{error}"
+    );
+
+    let parsed =
+        voyager_drivers::ParsedUri::parse("bolt+s://neo4j:SECRET123@db.example:7687").unwrap();
+    let shown = parsed.to_string();
+    assert!(!shown.contains("SECRET123"), "{shown}");
+    assert!(shown.contains("db.example:7687"), "{shown}");
+
+    let error = voyager_drivers::ParsedUri::parse("bolt+s://neo4j:SECRET123@h?tls=false")
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("SECRET123"), "{error}");
+}
+
 #[cfg(feature = "tls")]
 mod tls_enabled {
     use std::path::PathBuf;
@@ -161,6 +260,11 @@ mod tls_enabled {
     /// The server certificate is valid only for `localhost`, so connecting to `127.0.0.1`
     /// is a hostname mismatch.
     fn pki() -> Pki {
+        pki_with_server_key_usage(Vec::new())
+    }
+
+    /// Like [`pki`], with the given keyUsage bits on the server certificate (none: no extension).
+    fn pki_with_server_key_usage(key_usages: Vec<KeyUsagePurpose>) -> Pki {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "voyager-tls-tests-{}-{}",
@@ -175,6 +279,7 @@ mod tls_enabled {
         let server_key = KeyPair::generate().unwrap();
         let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        server_params.key_usages = key_usages;
         let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
         let client_key = KeyPair::generate().unwrap();
@@ -203,6 +308,20 @@ mod tls_enabled {
     }
 
     fn acceptor(pki: &Pki, require_client_cert: bool) -> tokio_rustls::TlsAcceptor {
+        tokio_rustls::TlsAcceptor::from(Arc::new(server_config(pki, require_client_cert)))
+    }
+
+    /// A server that accepts direct TLS only with the ALPN protocol `postgresql`, as
+    /// PostgreSQL 17+ does (`alpn = false`: a server that ignores ALPN).
+    fn acceptor_with_alpn(pki: &Pki, alpn: bool) -> tokio_rustls::TlsAcceptor {
+        let mut config = server_config(pki, false);
+        if alpn {
+            config.alpn_protocols = vec![b"postgresql".to_vec()];
+        }
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    fn server_config(pki: &Pki, require_client_cert: bool) -> rustls::ServerConfig {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
@@ -221,10 +340,9 @@ mod tls_enabled {
             builder.with_no_client_auth()
         };
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pki.server_key.clone()));
-        let config = builder
+        builder
             .with_single_cert(pki.server_chain.clone(), key)
-            .unwrap();
-        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+            .unwrap()
     }
 
     fn url_path(path: &std::path::Path) -> String {
@@ -350,6 +468,18 @@ mod tls_enabled {
         PlainStartup,
         TlsStartup,
         TlsHandshakeFailed,
+        /// A TLS ClientHello arrived without an SSLRequest (`sslnegotiation=direct`).
+        DirectTls,
+    }
+
+    /// How the PostgreSQL stub treats a startup that arrives without TLS.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Plaintext {
+        Accept,
+        /// A FATAL ErrorResponse, as for a hostssl-only pg_hba.conf.
+        Reject,
+        /// Close the connection without a reply.
+        Close,
     }
 
     /// A PostgreSQL stub. `ssl_reply` answers an SSLRequest (`S` or `N`); `reject_plaintext`
@@ -358,6 +488,23 @@ mod tls_enabled {
         acceptor: tokio_rustls::TlsAcceptor,
         ssl_reply: u8,
         reject_plaintext: bool,
+    ) -> (u16, Arc<Mutex<Vec<PgEvent>>>) {
+        let plaintext = if reject_plaintext {
+            Plaintext::Reject
+        } else {
+            Plaintext::Accept
+        };
+        pg_server_with(acceptor, ssl_reply, &[], plaintext).await
+    }
+
+    /// The general stub: `after_reply` is sent right after the SSLRequest reply (data a
+    /// man-in-the-middle could inject before the TLS handshake). A TLS ClientHello that
+    /// arrives without an SSLRequest is accepted as direct TLS.
+    async fn pg_server_with(
+        acceptor: tokio_rustls::TlsAcceptor,
+        ssl_reply: u8,
+        after_reply: &'static [u8],
+        plaintext: Plaintext,
     ) -> (u16, Arc<Mutex<Vec<PgEvent>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -372,10 +519,23 @@ mod tls_enabled {
                     if tcp.peek(&mut head).await.unwrap_or(0) < 8 {
                         return;
                     }
+                    if head[0] == 0x16 {
+                        seen.lock().push(PgEvent::DirectTls);
+                        match acceptor.accept(tcp).await {
+                            Ok(tls) => {
+                                seen.lock().push(PgEvent::TlsStartup);
+                                let _ = serve_pg_startup(tls, true).await;
+                            }
+                            Err(_) => seen.lock().push(PgEvent::TlsHandshakeFailed),
+                        }
+                        return;
+                    }
                     if head == [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F] {
                         tcp.read_exact(&mut head).await.unwrap();
                         seen.lock().push(PgEvent::SslRequest);
-                        tcp.write_all(&[ssl_reply]).await.unwrap();
+                        let mut reply = vec![ssl_reply];
+                        reply.extend_from_slice(after_reply);
+                        tcp.write_all(&reply).await.unwrap();
                         if ssl_reply == b'S' {
                             match acceptor.accept(tcp).await {
                                 Ok(tls) => {
@@ -392,7 +552,10 @@ mod tls_enabled {
                         return;
                     }
                     seen.lock().push(PgEvent::PlainStartup);
-                    let _ = serve_pg_startup(tcp, !reject_plaintext).await;
+                    if plaintext == Plaintext::Close {
+                        return;
+                    }
+                    let _ = serve_pg_startup(tcp, plaintext == Plaintext::Accept).await;
                 });
             }
         });
@@ -717,5 +880,300 @@ mod tls_enabled {
             "the server requires a client certificate"
         );
         assert!(!events.lock().contains(&PgEvent::PlainStartup));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Audit regressions
+    // ---------------------------------------------------------------------------
+
+    /// `tls_ca_file=system` behaves like `sslrootcert=system`: it implies verify-full (an
+    /// SSLRequest, then a certificate check against the system roots, which do not hold the
+    /// test CA), and a weaker sslmode is rejected before connecting.
+    #[tokio::test]
+    async fn tls_ca_file_system_implies_verify_full() {
+        let pki = pki();
+        let (port, events) = pg_server(acceptor(&pki, false), b'S', false).await;
+        for query in ["tls_ca_file=system", "sslrootcert=system"] {
+            events.lock().clear();
+            let message = assert_tls_error(pg(port, query).await.map(|_| ()), query);
+            assert!(message.contains("UnknownIssuer"), "{query}: {message}");
+            let seen = events.lock().clone();
+            assert!(seen.contains(&PgEvent::SslRequest), "{query}: {seen:?}");
+            assert!(!seen.contains(&PgEvent::PlainStartup), "{query}: {seen:?}");
+        }
+        for query in [
+            "tls_ca_file=system&sslmode=require",
+            "tls_ca_file=system&sslmode=verify-ca",
+            "TLS_CA_FILE=system&sslmode=prefer",
+        ] {
+            events.lock().clear();
+            assert!(
+                matches!(pg(port, query).await, Err(NetError::InvalidUri(_))),
+                "{query}"
+            );
+            assert!(events.lock().is_empty(), "{query}: connected");
+        }
+    }
+
+    /// Bytes the server (or a man-in-the-middle) sends right after the `S` / `N` reply are
+    /// rejected instead of being read as part of the TLS handshake or the session.
+    #[tokio::test]
+    async fn pg_data_after_the_ssl_reply_is_rejected() {
+        let pki = pki();
+        let injected: &'static [u8] = &[0x16, 0x03, 0x03, 0x00, 0x05, 1, 2, 3, 4, 5];
+        for (reply, query) in [(b'S', "sslmode=require"), (b'N', "sslmode=prefer")] {
+            let (port, events) =
+                pg_server_with(acceptor(&pki, false), reply, injected, Plaintext::Accept).await;
+            match pg(port, query).await {
+                Err(NetError::ProtocolError(message)) => {
+                    assert!(message.contains("unexpected data"), "{query}: {message}")
+                }
+                Err(other) => panic!("{query}: expected a protocol error, got {other:?}"),
+                Ok(_) => panic!("{query}: connected"),
+            }
+            assert_eq!(*events.lock(), [PgEvent::SslRequest], "{query}");
+        }
+        // A clean `S` still works.
+        let (port, _) = pg_server_with(acceptor(&pki, false), b'S', &[], Plaintext::Accept).await;
+        assert!(pg(port, "sslmode=require").await.unwrap().is_tls());
+    }
+
+    /// `sslmode=allow` retries with TLS after any failure of the plaintext attempt, including
+    /// a server that closes plaintext connections without a reply (libpq behaviour).
+    #[tokio::test]
+    async fn pg_allow_retries_tls_after_any_plaintext_failure() {
+        let pki = pki();
+        let (port, events) =
+            pg_server_with(acceptor(&pki, false), b'S', &[], Plaintext::Close).await;
+        let conn = pg(port, "sslmode=allow")
+            .await
+            .expect("allow retries with TLS");
+        assert!(conn.is_tls());
+        assert_eq!(
+            *events.lock(),
+            [
+                PgEvent::PlainStartup,
+                PgEvent::SslRequest,
+                PgEvent::TlsStartup
+            ]
+        );
+
+        // When the TLS retry fails too, the error names both attempts.
+        let (port, _) = pg_server_with(acceptor(&pki, false), b'N', &[], Plaintext::Close).await;
+        let message = assert_tls_error(pg(port, "sslmode=allow").await.map(|_| ()), "allow");
+        assert!(message.contains("plaintext attempt failed"), "{message}");
+    }
+
+    /// A server certificate whose keyUsage omits digitalSignature is rejected by the
+    /// verifying modes (rustls-webpki does not check the leaf keyUsage bits itself).
+    #[tokio::test]
+    async fn server_certificate_key_usage_needs_digital_signature() {
+        let bad = pki_with_server_key_usage(vec![KeyUsagePurpose::KeyEncipherment]);
+        let port = tls_server(acceptor(&bad, false), Proto::Bolt).await;
+        let ca = url_path(&bad.ca_file);
+        for uri in [
+            format!("bolt+s://localhost:{port}?tls_ca_file={ca}"),
+            format!("neo4j+s://localhost:{port}?sslmode=verify-full&tls_ca_file={ca}"),
+        ] {
+            let message = assert_tls_error(bolt(uri.clone()).await.map(|_| ()), &uri);
+            assert!(message.contains("digitalSignature"), "{uri}: {message}");
+        }
+        let (pg_port, _) = pg_server(acceptor(&bad, false), b'S', false).await;
+        let message = assert_tls_error(
+            pg_host(
+                "127.0.0.1",
+                pg_port,
+                &format!("sslmode=verify-ca&sslrootcert={ca}"),
+            )
+            .await
+            .map(|_| ()),
+            "pg verify-ca",
+        );
+        assert!(message.contains("digitalSignature"), "{message}");
+        // `+ssc` does not check the certificate at all.
+        assert!(
+            bolt(format!("bolt+ssc://127.0.0.1:{port}"))
+                .await
+                .unwrap()
+                .is_tls()
+        );
+
+        let good = pki_with_server_key_usage(vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ]);
+        let port = tls_server(acceptor(&good, false), Proto::Bolt).await;
+        let ca = url_path(&good.ca_file);
+        bolt(format!("bolt+s://localhost:{port}?tls_ca_file={ca}"))
+            .await
+            .expect("digitalSignature allowed");
+    }
+
+    /// A Redis server that closes the connection (or does not speak RESP) is not reported as
+    /// a working connection; a server without RESP3 (HELLO answered with an error) still is.
+    #[tokio::test]
+    async fn redis_handshake_needs_a_server_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let mut buf = [0u8; 256];
+                let _ = tcp.read(&mut buf).await;
+                // drop: close without a reply
+            }
+        });
+        let error = redis(format!("redis://127.0.0.1:{port}?connect_timeout=3"))
+            .await
+            .err()
+            .expect("a silent server is not a connection");
+        assert!(
+            matches!(error, NetError::ConnectionFailed(ref m) if m.contains("did not answer HELLO")),
+            "{error:?}"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 256];
+                    let mut first = true;
+                    while tcp.read(&mut buf).await.unwrap_or(0) > 0 {
+                        let reply: &[u8] = if first {
+                            b"-ERR unknown command 'HELLO'\r\n"
+                        } else {
+                            b"+PONG\r\n"
+                        };
+                        first = false;
+                        if tcp.write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut conn = redis(format!("redis://127.0.0.1:{port}"))
+            .await
+            .expect("RESP2 server");
+        assert!(!conn.is_resp3());
+        conn.ping().await.unwrap();
+    }
+
+    /// `ConnectionConfig::with_tls(SelfSigned)` cannot weaken a verified `+s` URI.
+    #[tokio::test]
+    async fn config_cannot_weaken_a_verified_bolt_uri() {
+        let config = ConnectionConfig::from_uri("bolt+s://localhost:1")
+            .with_tls(voyager_drivers::TlsMode::SelfSigned);
+        let message = assert_tls_error(
+            BoltConnection::connect(&config).await.map(|_| ()),
+            "with_tls(SelfSigned)",
+        );
+        assert!(message.contains("weaken"), "{message}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // PostgreSQL sslnegotiation=direct
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pg_direct_tls_skips_the_ssl_request() {
+        let pki = pki();
+        let ca = url_path(&pki.ca_file);
+        let (port, events) =
+            pg_server_with(acceptor_with_alpn(&pki, true), b'S', &[], Plaintext::Reject).await;
+        for query in [
+            "sslmode=require&sslnegotiation=direct".to_string(),
+            format!("sslmode=verify-full&sslrootcert={ca}&sslnegotiation=direct"),
+            format!("sslmode=verify-ca&sslrootcert={ca}&SSLNEGOTIATION=direct"),
+        ] {
+            events.lock().clear();
+            let mut conn = pg(port, &query)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(conn.is_tls(), "{query}");
+            conn.close().await.unwrap();
+            assert_eq!(
+                *events.lock(),
+                [PgEvent::DirectTls, PgEvent::TlsStartup],
+                "{query}: no SSLRequest"
+            );
+        }
+        // The default negotiation still sends an SSLRequest.
+        events.lock().clear();
+        pg(port, "sslmode=require&sslnegotiation=postgres")
+            .await
+            .unwrap();
+        assert_eq!(events.lock().first(), Some(&PgEvent::SslRequest));
+
+        // Certificate checks apply as usual.
+        let other = url_path(&pki.other_ca_file);
+        assert_tls_error(
+            pg(
+                port,
+                &format!("sslmode=verify-full&sslrootcert={other}&sslnegotiation=direct"),
+            )
+            .await
+            .map(|_| ()),
+            "direct, wrong CA",
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_direct_tls_first_bytes_are_a_client_hello() {
+        let (bytes, _) = super::first_bytes_sent(|port| {
+            format!(
+                "postgresql://postgres@127.0.0.1:{port}/db?sslmode=require&sslnegotiation=direct&connect_timeout=3"
+            )
+        })
+        .await;
+        assert_eq!(bytes.first(), Some(&0x16), "sent {bytes:02x?}");
+    }
+
+    #[tokio::test]
+    async fn pg_direct_tls_requires_alpn() {
+        let pki = pki();
+        let (port, _) = pg_server_with(
+            acceptor_with_alpn(&pki, false),
+            b'S',
+            &[],
+            Plaintext::Reject,
+        )
+        .await;
+        let message = assert_tls_error(
+            pg(port, "sslmode=require&sslnegotiation=direct")
+                .await
+                .map(|_| ()),
+            "no ALPN",
+        );
+        assert!(message.contains("ALPN"), "{message}");
+    }
+
+    /// A server without direct TLS support (PostgreSQL 16 and older) reads the ClientHello
+    /// as a startup packet and answers with an ErrorResponse; the client fails cleanly.
+    #[tokio::test]
+    async fn pg_direct_tls_against_an_old_server_fails_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tcp.read(&mut buf).await;
+                let _ = tcp
+                    .write_all(&pg_frame(
+                        b'E',
+                        b"SFATAL\0C08P01\0Minvalid length of startup packet\0\0",
+                    ))
+                    .await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let message = assert_tls_error(
+            pg(port, "sslmode=require&sslnegotiation=direct")
+                .await
+                .map(|_| ()),
+            "old server",
+        );
+        assert!(message.contains("PostgreSQL 17"), "{message}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 }

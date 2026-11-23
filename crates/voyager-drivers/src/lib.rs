@@ -61,5 +61,5 @@ pub use redis::{
     FalkorNode, FalkorQueryResult, FalkorRelationship, FalkorStatistics, RedisConnection,
     RedisTransaction, RespCodec, RespValue,
 };
-pub use tls::{NetStream, SslMode, TLS_AVAILABLE, TlsOptions, TlsVerification};
+pub use tls::{NetStream, SslMode, SslNegotiation, TLS_AVAILABLE, TlsOptions, TlsVerification};
 pub use uri::{DatabaseProtocol, ParsedUri};
