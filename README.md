@@ -424,6 +424,8 @@ Models are registered under a module-qualified identity (`package.module.Model`)
 
 `Field(description="...")` and a model-level `__description__` record documentation on schema entities. They are metadata only: generated DDL and compiled queries are unchanged, and `NativeSchemaRegistry.to_json()` snapshots include a `description` key only where one was set (fields and models without one have no `description` key). A subclass does not inherit its parent's `__description__` (field descriptions travel with the inherited `Field` objects). `examples/python/13_schema_ddl_and_indexes.py` prints a snapshot showing both cases.
 
+`export_schema([Person, Movie, ActedIn])` returns the declared models as a JSON-serialisable dict (labels, relationship types and endpoints, property types, flags, defaults, descriptions and `Field` value constraints), and `Person.to_json_schema()` emits a JSON Schema draft 2020-12 document for one model.
+
 ---
 
 ## Database Compatibility

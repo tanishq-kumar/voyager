@@ -118,6 +118,7 @@ from voyager_ogm.schema import (
     fulltext_index,
     resolve_fulltext_search,
 )
+from voyager_ogm.schema_export import export_schema
 from voyager_ogm.session import (
     AsyncSession,
     ExecutionResult,
@@ -307,6 +308,7 @@ __all__ = [
     "ingest_parquet_relationships",
     "explain",
     "explore",
+    "export_schema",
     "expressions",
     "extract_topology_from_query",
     "fn",

@@ -573,18 +573,24 @@ class Field(Generic[_T]):
             - gt -> exclusiveMinimum
             - le -> maximum
             - lt -> exclusiveMaximum
-            - min_length -> minLength
-            - max_length -> maxLength
+            - min_length -> minLength (minItems for a list annotation)
+            - max_length -> maxLength (maxItems for a list annotation)
             - choices -> enum
+
+        ``validate_value`` matches ``pattern`` against the whole string, while
+        JSON Schema ``pattern`` is unanchored, so a pattern that is not already
+        wrapped in ``^...$`` is emitted as ``^(?:pattern)$``. When the annotation
+        allows both ``str`` and ``list``, both length keywords are emitted (each
+        applies only to its own JSON type).
 
         Returns:
             Dictionary of JSON Schema keyword constraints.
         """
         mapping: dict[str, Any] = {}
         if self.pattern is not None:
-            mapping["pattern"] = (
-                self.pattern if isinstance(self.pattern, str) else self.pattern.pattern
-            )
+            pat = self.pattern if isinstance(self.pattern, str) else self.pattern.pattern
+            anchored = pat.startswith("^") and pat.endswith("$") and not pat.endswith("\\$")
+            mapping["pattern"] = pat if anchored else f"^(?:{pat})$"
         if self.ge is not None:
             mapping["minimum"] = self.ge
         if self.gt is not None:
@@ -593,10 +599,17 @@ class Field(Generic[_T]):
             mapping["maximum"] = self.le
         if self.lt is not None:
             mapping["exclusiveMaximum"] = self.lt
-        if self.min_length is not None:
-            mapping["minLength"] = self.min_length
-        if self.max_length is not None:
-            mapping["maxLength"] = self.max_length
+        base_types = _extract_base_types(self.type_annotation)
+        length_keys: list[tuple[str, str]] = []
+        if list in base_types:
+            length_keys.append(("minItems", "maxItems"))
+        if str in base_types or not length_keys:
+            length_keys.append(("minLength", "maxLength"))
+        for min_key, max_key in length_keys:
+            if self.min_length is not None:
+                mapping[min_key] = self.min_length
+            if self.max_length is not None:
+                mapping[max_key] = self.max_length
         if self.choices is not None:
             mapping["enum"] = list(self.choices)
         return mapping
@@ -1663,6 +1676,40 @@ class Node:
             raise
 
     @classmethod
+    def to_json_schema(cls) -> dict[str, Any]:
+        """Returns a JSON Schema (draft 2020-12) document for this model's properties.
+
+        Properties are keyed by Python attribute name (the keyword arguments
+        the model constructor takes). Mapping rules:
+
+        - ``str`` -> ``string``, ``int`` -> ``integer``, ``float`` -> ``number``,
+          ``bool`` -> ``boolean``; ``datetime``/``date``/``time``/``timedelta`` ->
+          ``string`` with format ``date-time``/``date``/``time``/``duration``;
+          ``list[T]`` -> ``array`` of ``T``; ``dict[str, T]`` -> ``object``;
+          ``Point`` -> ``object`` with numeric ``x``/``y``; ``Literal`` and
+          ``Enum`` -> ``enum``; unions -> ``anyOf``; unknown types -> ``{}``.
+        - A ``nullable`` field (the ``Field`` default) also accepts ``null``.
+        - ``required`` lists fields that are not nullable and have no default
+          or ``default_factory``; graph properties may otherwise be absent.
+        - ``default`` is emitted only for a plain JSON-representable default; a
+          ``default_factory`` is never called.
+        - ``Field`` value constraints come from ``Field.to_json_schema_constraints``
+          and a ``VectorProperty`` fixes ``minItems``/``maxItems`` to its dimensions.
+        - ``additionalProperties`` is ``False``: the document describes the
+          declared properties only.
+
+        Returns:
+            A JSON-serialisable JSON Schema document.
+
+        Example:
+            >>> Person.to_json_schema()["properties"]["age"]
+            {'type': ['integer', 'null'], 'minimum': 0}
+        """
+        from voyager_ogm.schema_export import model_json_schema
+
+        return model_json_schema(cls)
+
+    @classmethod
     def fulltext_search(
         cls,
         query_string: str,
@@ -2119,6 +2166,20 @@ class Relationship:
                 e,
             )
             raise
+
+    @classmethod
+    def to_json_schema(cls) -> dict[str, Any]:
+        """Returns a JSON Schema (draft 2020-12) document for this relationship's properties.
+
+        The mapping rules are those of ``Node.to_json_schema``; endpoints are
+        not part of the document (``export_schema`` reports them).
+
+        Returns:
+            A JSON-serialisable JSON Schema document.
+        """
+        from voyager_ogm.schema_export import model_json_schema
+
+        return model_json_schema(cls)
 
     @classmethod
     def fulltext_search(
