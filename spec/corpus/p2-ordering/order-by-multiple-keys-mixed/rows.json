@@ -1,0 +1,28 @@
+{
+  "columns": [
+    "n.active",
+    "n.name"
+  ],
+  "rows": [
+    [
+      true,
+      "Alice"
+    ],
+    [
+      true,
+      "Carol"
+    ],
+    [
+      true,
+      "Dave"
+    ],
+    [
+      false,
+      "Bob"
+    ],
+    [
+      false,
+      "Eve"
+    ]
+  ]
+}

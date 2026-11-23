@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/distinct-multiple-columns",
+  "pack": "p2-ordering",
+  "description": "DISTINCT deduplication across multiple columns.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p2-ordering",
+    "scenario": "DISTINCT on multiple columns"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

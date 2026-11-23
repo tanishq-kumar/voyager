@@ -1,0 +1,52 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "n",
+            [
+              "Person"
+            ]
+          ]
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "field",
+      "n",
+      "name",
+      null
+    ],
+    [
+      "expr",
+      [
+        "bin",
+        "add",
+        [
+          "prop",
+          "n",
+          "age"
+        ],
+        [
+          "lit",
+          1
+        ]
+      ],
+      "age_plus_one"
+    ]
+  ],
+  "order_by": [
+    [
+      [
+        "ident",
+        "age_plus_one"
+      ],
+      "ASC"
+    ]
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/order-by-multiple-keys",
+  "pack": "p2-ordering",
+  "description": "ORDER BY on multiple properties with identical ascending direction.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-orderby/ReturnOrderBy3.feature",
+    "scenario": "[1] Sort on aggregate function and normal property"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

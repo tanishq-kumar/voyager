@@ -56,7 +56,7 @@ Each target in `targets` has the shape:
 
 - **`supported`**: The compiler emits this construct for this dialect and the live engine evidence matches `rows.json` on every engine the dialect covers. The compilation runner also asserts that `compile_query_from_spec` succeeds, statement text matches the `expected.*` file exactly, and all statement parameter placeholders are satisfied by `params` and compiler-extracted parameters.
 - **`unsupported`**: The construct cannot be expressed in this dialect or is not yet implemented. The compilation runner asserts that `compile_query_from_spec` raises `VoyagerError` with the error code recorded in `reason`.
-- **`known-diff`**: The dialect compiles the query, but current compiler output differs from the ideal standard query or is rejected by live engine behaviour (for example Apache AGE's duplicate `entity` column name, #285, or AGE / SQL/PGQ unsupported constructs, #286). The `expected.*` file captures today's compiler output to guard against unintentional regressions, and `reason` documents why it differs from the ideal or live engine behaviour.
+- **`known-diff`**: The dialect compiles the query, but current compiler output differs from the ideal standard query or is rejected by live engine behaviour. The `expected.*` file captures today's compiler output to guard against unintentional regressions, and `reason` documents why it differs from the ideal or live engine behaviour.
 
 Live engine coverage per target:
 
@@ -102,8 +102,8 @@ and leaves the engine clean:
 | Neo4j | `neo4j` Python driver, literal `CREATE` statements with properties as parameters | Neo4j Community has one database. Loaded nodes carry a unique `__corpus_254` marker; cleanup deletes exactly that marker. The loader refuses to run when the database already contains unmarked nodes, so it never deletes or reads another suite's data. | One node per fixture node; all labels are kept; relationships use the fixture type. The marker is stripped from results. |
 | Memgraph | `neo4j` Python driver, same statements as Neo4j | Same marker namespace and cleanup as Neo4j. | Same as Neo4j. |
 | FalkorDB | `falkordb` Python client (`GRAPH.QUERY`) | A dedicated graph key `voyager_corpus_<token>`; the graph is deleted after the scenario. | One node per fixture node; labels are kept; unlabeled nodes report an empty label set. |
-| Apache AGE | SQL `cypher('<graph>', $$ ... $$)` in a dedicated AGE graph | A dedicated graph `voyager_corpus_<token>` created with `create_graph` and dropped with `drop_graph(..., true)`. | AGE stores at most one label per vertex, so the loader rejects multi-label fixture nodes (those targets are `known-diff`). Property maps are inlined into the `CREATE` statement because AGE does not accept a parameter as a `CREATE` property map; the marker is stripped from results. |
-| PostgreSQL 19 | Plain tables in a dedicated schema plus `CREATE PROPERTY GRAPH` | A dedicated schema `voyager_corpus_<token>` (and property graph in it) created for each scenario and dropped with `DROP SCHEMA ... CASCADE`. | One vertex table per label, plus one unlabeled vertex table; one edge table per (type, start table, end table). `PROPERTIES` exposes the fixture property names. Node properties become typed columns (booleans, integers, floats, text, arrays). Multi-label nodes and duplicate labels across tables cannot be represented, so the loader rejects them (those targets are `known-diff`). SQL/PGQ identifiers are emitted unquoted, matching PostgreSQL's lower-case folding. |
+| Apache AGE | SQL `cypher('<graph>', $$ ... $$)` in a dedicated AGE graph | A dedicated graph `voyager_corpus_<token>` created with `create_graph` and dropped with `drop_graph(..., true)`. | AGE stores at most one label per vertex, so the loader rejects multi-label fixture nodes (those targets are `unsupported`). Property maps are inlined into the `CREATE` statement because AGE does not accept a parameter as a `CREATE` property map; the marker is stripped from results. |
+| PostgreSQL 19 | Plain tables in a dedicated schema plus `CREATE PROPERTY GRAPH` | A dedicated schema `voyager_corpus_<token>` (and property graph in it) created for each scenario and dropped with `DROP SCHEMA ... CASCADE`. | One vertex table per label, plus one unlabeled vertex table; one edge table per (type, start table, end table). `PROPERTIES` exposes the fixture property names. Node properties become typed columns (booleans, integers, floats, text, arrays). Multi-label nodes and duplicate labels across tables cannot be represented, so the loader rejects them (those targets are `unsupported`). SQL/PGQ labels and relationship types are double-quoted so their declared case is preserved; property names stay unquoted and PostgreSQL folds them to lower case. |
 
 Batches of live tests are short and each scenario cleans up in a `finally`
 block. If a process dies mid-run, only namespace names carrying the
@@ -195,8 +195,9 @@ The recorder compiles and executes the `cypher` target only, sorts rows for
 `unordered` scenarios, strips loader markers, and writes `rows.json`. A target
 may only be marked `supported` after its live check passes on every engine the
 dialect covers; otherwise use `known-diff` (compiles but differs or is rejected
-live) or `unsupported` (does not compile) with a reason, including the open
-issue number where one applies (#285, #286).
+live) or `unsupported` (does not compile) with a reason that names the cause and
+starts with the error code for `unsupported` targets. Cite an issue number only
+while that issue is still open.
 
 ## Adding a Scenario
 

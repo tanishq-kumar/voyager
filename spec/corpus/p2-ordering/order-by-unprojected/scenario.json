@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/order-by-unprojected",
+  "pack": "p2-ordering",
+  "description": "ORDER BY on a property not projected in the RETURN clause.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p2-ordering",
+    "scenario": "ORDER BY unprojected node property"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

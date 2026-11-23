@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/order-by-alias-asc",
+  "pack": "p2-ordering",
+  "description": "ORDER BY ascending on a projected column alias.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-orderby/ReturnOrderBy5.feature",
+    "scenario": "[1] Renaming columns before ORDER BY should return results in ascending order"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

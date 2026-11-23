@@ -1,0 +1,22 @@
+{
+  "columns": [
+    "n.name"
+  ],
+  "rows": [
+    [
+      "Eve"
+    ],
+    [
+      "Dave"
+    ],
+    [
+      "Carol"
+    ],
+    [
+      "Bob"
+    ],
+    [
+      "Alice"
+    ]
+  ]
+}

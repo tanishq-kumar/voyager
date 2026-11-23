@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/pagination-third-page",
+  "pack": "p2-ordering",
+  "description": "Third and final partial page in deterministic pagination over a stable unique key order.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p2-ordering",
+    "scenario": "Deterministic pagination page 3"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

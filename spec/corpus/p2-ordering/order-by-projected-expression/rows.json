@@ -1,0 +1,28 @@
+{
+  "columns": [
+    "n.name",
+    "age_plus_one"
+  ],
+  "rows": [
+    [
+      "Eve",
+      21
+    ],
+    [
+      "Bob",
+      26
+    ],
+    [
+      "Alice",
+      31
+    ],
+    [
+      "Dave",
+      36
+    ],
+    [
+      "Carol",
+      41
+    ]
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/skip-zero",
+  "pack": "p2-ordering",
+  "description": "Pagination using literal SKIP 0 alone.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p2-ordering",
+    "scenario": "SKIP 0 pagination offset"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}
