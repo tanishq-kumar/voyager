@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+- **Unquoted SQL/PGQ labels**: from 0.5.0, SQL/PGQ quotes labels in the generated `CREATE PROPERTY GRAPH` DDL and in queries (`IS "Person"`), so labels are case-exact as in Cypher and reserved words such as `User` and `Order` work as labels. A property graph created with unquoted mixed-case labels will need to be re-created with `DROP PROPERTY GRAPH` and the DDL from `SchemaManager.generate_pgq_ddl(...)`; tables and data are not affected. 0.4.x keeps unquoted labels.
+
 ### Fixed
 - **SQL/PGQ and DuckPGQ `IN` with a list or list parameter (#303)**: the emitter now writes `x IN (a, b)` for a literal list and `x = ANY($p)` for a list parameter (`NOT IN (a, b)` / `x <> ALL($p)` when negated); an empty literal list compiles to `FALSE` (`TRUE` for `NOT IN`). The DuckDB bridge rewrites the parameter forms to a scalar `IN (...)` tuple because DuckPGQ's `GRAPH_TABLE` grammar has no `ANY`/`ALL`.
 - **SQL/PGQ and DuckPGQ `XOR` lowering (#304)**: `XOR` now compiles to `((a) OR (b)) AND NOT ((a) AND (b))` instead of the unsupported keyword, preserving the three-valued result when either side is NULL.

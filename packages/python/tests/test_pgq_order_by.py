@@ -18,7 +18,6 @@ from voyager_ogm import (
     Field,
     Node,
     Query,
-    VoyagerError,
     compile_query_from_spec,
     node,
     reset_alias_counters,
@@ -194,17 +193,17 @@ def test_order_by_aggregation_with_non_returned_key_rejected(dialect: str) -> No
         "spec_version": 1,
         "matches": [
             {
-                "paths": [[["node", "p", [LABEL]]]],
+                "paths": [[("node", "p", [LABEL], None)]],
             }
         ],
         "projections": [
-            ["agg", "p", "*", "count", "c"],
+            ("agg", "p", "*", "count", "c"),
         ],
-        "order_by": [["p", "age", True]],
+        "order_by": [("p", "age", True)],
     }
-    with pytest.raises(VoyagerError) as exc_info:
+    # release/0.4 has no Query Spec scope check, so the SQL/PGQ emitter rejects it.
+    with pytest.raises(ValueError, match="ORDER BY on unprojected expressions with aggregation"):
         compile_query_from_spec(spec, dialect, graph_name=GRAPH)
-    assert "only exposes the names it projects" in str(exc_info.value)
 
 
 # ===========================================================================

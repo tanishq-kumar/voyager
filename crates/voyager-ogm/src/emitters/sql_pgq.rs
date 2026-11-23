@@ -1580,20 +1580,25 @@ mod tests {
     }
 
     #[test]
-    fn sql_pgq_in_parameter_uses_any_and_not_in_uses_all() {
+    fn sql_pgq_in_bound_list_uses_any_and_not_in_uses_all() {
+        // On release/0.4 a list reaches the SQL/PGQ emitter as one bound list value
+        // (for example the fluent `.in_([...])`); it is bound as a single parameter.
         for (op, expected) in [
-            (BinaryOp::In, "p.name = ANY($names)"),
-            (BinaryOp::NotIn, "p.name <> ALL($names)"),
+            (BinaryOp::In, "p.name = ANY($p0)"),
+            (BinaryOp::NotIn, "p.name <> ALL($p0)"),
         ] {
             let mut builder = QueryBuilder::new();
-            let param = builder.param("names");
-            let compiled = compile_in_predicate(param, op, builder);
+            let names = builder.literal(LiteralValue::List(vec![
+                LiteralValue::String("Alice".into()),
+                LiteralValue::String("Bob".into()),
+            ]));
+            let compiled = compile_in_predicate(names, op, builder);
             assert!(
                 compiled.statement.contains(expected),
                 "statement was {}",
                 compiled.statement
             );
-            assert!(compiled.parameters.is_empty());
+            assert_eq!(compiled.parameters.len(), 1);
         }
     }
 
@@ -1625,7 +1630,7 @@ mod tests {
     fn sql_pgq_xor_lowers_without_the_keyword_and_reuses_parameters() {
         let mut builder = QueryBuilder::new();
         let age = builder.prop("p", "age");
-        let min = builder.param("min_age");
+        let min = builder.literal(LiteralValue::Int64(30));
         let lower = builder.binary_expr(age, BinaryOp::Gt, min);
         let city = builder.prop("p", "city");
         let paris = builder.literal(LiteralValue::String("Paris".into()));
@@ -1640,15 +1645,19 @@ mod tests {
 
         assert!(
             compiled.statement.contains(
-                "WHERE ((p.age > $min_age) OR (p.city = $p0)) AND NOT ((p.age > $min_age) AND (p.city = $p0))"
+                "WHERE ((p.age > $p0) OR (p.city = $p1)) AND NOT ((p.age > $p0) AND (p.city = $p1))"
             ),
             "statement was {}",
             compiled.statement
         );
         assert!(!compiled.statement.contains(" XOR "));
-        assert_eq!(compiled.parameters.len(), 1);
+        assert_eq!(compiled.parameters.len(), 2);
         assert_eq!(
             compiled.parameters.get("p0"),
+            Some(&LiteralValue::Int64(30))
+        );
+        assert_eq!(
+            compiled.parameters.get("p1"),
             Some(&LiteralValue::String("Paris".into()))
         );
     }

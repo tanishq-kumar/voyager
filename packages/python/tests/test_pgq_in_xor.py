@@ -63,7 +63,7 @@ def _membership_spec(op: str, right: Any) -> dict[str, Any]:
         "matches": [
             {
                 "paths": [[["node", "p", ["Person"]]]],
-                "where": ["bin", op, ["prop", "p", "name"], right],
+                "where": [["bin", op, ["prop", "p", "name"], right]],
             }
         ],
         "projections": [["field", "p", "name", None]],
