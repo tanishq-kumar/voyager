@@ -1356,6 +1356,25 @@ def _encode_duckdb_literal(v: Any) -> str:
     )
 
 
+def _literal_substitution(sql: str) -> Callable[[re.Match[str]], str]:
+    """Returns a ``re.sub`` replacement that emits ``sql`` literally."""
+
+    def replace(_match: re.Match[str]) -> str:
+        return sql
+
+    return replace
+
+
+def _encode_duckdb_in_tuple(values: Sequence[Any]) -> str:
+    """Encodes a non-empty Python sequence as a SQL scalar tuple for ``IN``.
+
+    ``x IN [a, b]`` (a DuckDB list) does not propagate a NULL list element
+    through ``NOT IN`` like SQL ``IN`` does, so DuckPGQ membership rewrites use
+    a scalar tuple (``x IN (a, b)``) instead.
+    """
+    return "(" + ", ".join(_encode_duckdb_literal(v) for v in values) + ")"
+
+
 class DuckDbBridge:
     """Synchronous DuckDB driver bridge with zero-copy Polars / Arrow output."""
 
@@ -1373,6 +1392,34 @@ class DuckDbBridge:
         """Interpolates parameters for DuckPGQ GRAPH_TABLE queries where native parameter binding is unsupported."""
         validate_pagination_parameters(statement, parameters)
         if "GRAPH_TABLE" in statement and parameters:
+            # DuckPGQ's GRAPH_TABLE grammar has no ANY/ALL keyword, so the
+            # SQL/PGQ `x = ANY($n)` / `x <> ALL($n)` forms for a list parameter
+            # are rewritten to a scalar `IN (...)` tuple. The list is known
+            # here, so an empty list becomes FALSE/TRUE like the emitter emits
+            # for an empty literal list.
+            stmt = statement
+            for key, value in parameters.items():
+                if not isinstance(value, (list, tuple)):
+                    continue
+                if value:
+                    positive = f" IN {_encode_duckdb_in_tuple(value)}"
+                    negative = f" NOT IN {_encode_duckdb_in_tuple(value)}"
+                else:
+                    # `IN ()` is invalid; FALSE/TRUE is the emitter's empty-list
+                    # rendering, kept as a valid comparison of the left operand.
+                    positive = " IN (NULL) AND FALSE"
+                    negative = " IN (NULL) OR TRUE"
+                stmt = re.sub(
+                    rf"(?<![<>=!])\s*=\s+ANY\(\s*\${re.escape(key)}\s*\)",
+                    _literal_substitution(positive),
+                    stmt,
+                )
+                stmt = re.sub(
+                    rf"(?<![<>=!])\s*<>\s+ALL\(\s*\${re.escape(key)}\s*\)",
+                    _literal_substitution(negative),
+                    stmt,
+                )
+
             regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
 
             def repl(m: re.Match[str]) -> str:
@@ -1381,7 +1428,7 @@ class DuckDbBridge:
                     return _encode_duckdb_literal(parameters[key])
                 return m.group(0)
 
-            stmt = regex.sub(repl, statement)
+            stmt = regex.sub(repl, stmt)
             return stmt, {}
         return statement, parameters
 
@@ -1917,7 +1964,10 @@ class PostgresBridge:
                 return "%s"
             return m.group(0)
 
-        stmt = regex.sub(repl, statement)
+        escaped_stmt = statement.replace("%", "%%")
+        stmt = regex.sub(repl, escaped_stmt)
+        if not ordered_params:
+            return statement, ()
         return stmt, ordered_params
 
     def execute(
@@ -1934,7 +1984,7 @@ class PostgresBridge:
         """
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         with self.conn.cursor() as cur:
-            cur.execute(stmt, params)
+            cur.execute(stmt, params or None)
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
@@ -1955,7 +2005,7 @@ class PostgresBridge:
         """
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         with self.conn.cursor() as cur:
-            cur.execute(stmt, params)
+            cur.execute(stmt, params or None)
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
@@ -1989,7 +2039,7 @@ class PostgresBridge:
                     batch_data = b.get("batch", [])
                     total_records += len(batch_data)
                     stmt, params = self._format_pgq_statement(statement, b)
-                    cur.execute(stmt, params)
+                    cur.execute(stmt, params or None)
             else:
                 statement = plan_or_statement.statement
                 for batch_item in plan_or_statement:
@@ -1999,7 +2049,7 @@ class PostgresBridge:
                     stmt, params = self._format_pgq_statement(
                         batch_item.statement, batch_item.parameters
                     )
-                    cur.execute(stmt, params)
+                    cur.execute(stmt, params or None)
         return BulkExecutionResult(
             total_batches=total_batches,
             total_records=total_records,
@@ -2101,7 +2151,7 @@ class PostgresBridgeTransaction:
     def _execute_sql(self, statement: str, parameters: Sequence[Any] = ()) -> str | None:
         """Executes a control statement and returns its command tag."""
         with self._bridge.conn.cursor() as cur:
-            cur.execute(statement, parameters)
+            cur.execute(statement, parameters or None)
             return getattr(cur, "statusmessage", None)
 
     def execute(
@@ -2112,7 +2162,7 @@ class PostgresBridgeTransaction:
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
-                cur.execute(stmt, params)
+                cur.execute(stmt, params or None)
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
@@ -2130,7 +2180,7 @@ class PostgresBridgeTransaction:
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
-                cur.execute(stmt, params)
+                cur.execute(stmt, params or None)
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
@@ -2161,7 +2211,7 @@ class PostgresBridgeTransaction:
                     for b in batch_list:
                         total_records += len(b.get("batch", []))
                         stmt, params = self._bridge._format_pgq_statement(statement, b)
-                        cur.execute(stmt, params)
+                        cur.execute(stmt, params or None)
                 else:
                     statement = plan_or_statement.statement
                     for batch_item in plan_or_statement:
@@ -2170,7 +2220,7 @@ class PostgresBridgeTransaction:
                         stmt, params = self._bridge._format_pgq_statement(
                             batch_item.statement, batch_item.parameters
                         )
-                        cur.execute(stmt, params)
+                        cur.execute(stmt, params or None)
         except BaseException:
             self._mark_failed()
             raise

@@ -254,6 +254,20 @@ def test_password_masked_in_create_bridge_error() -> None:
     assert "admin:***@db.internal:9999" in err_msg
 
 
+def test_native_client_repr_and_errors_hide_uri_password() -> None:
+    """Test that NativeClient repr/str and URI errors never print the password."""
+    native_client = pytest.importorskip("voyager_ogm._voyager_rs").NativeClient
+    secret = "s3cr3t-326"
+
+    client = native_client(f"bolt://neo4j:{secret}@127.0.0.1:7687")
+    assert secret not in repr(client)
+    assert secret not in str(client)
+
+    with pytest.raises(ValueError) as exc_info:
+        native_client(f"bolt://neo4j:{secret}@127.0.0.1:not-a-port")
+    assert secret not in str(exc_info.value)
+
+
 # ---------------------------------------------------------------------------
 # 5. AGE Setup Statements: Issued vs Not Issued
 # ---------------------------------------------------------------------------

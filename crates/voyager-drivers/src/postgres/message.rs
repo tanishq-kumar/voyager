@@ -2,8 +2,10 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::error::{NetError, Result};
+use crate::redact::{RedactedParams, SecretBytes};
 
 /// Protocol v3.0 version integer (`0x0003_0000` = 196608).
 pub const PG_PROTOCOL_V3: i32 = 196608;
@@ -72,7 +74,10 @@ impl TransactionStatus {
 }
 
 /// PostgreSQL Frontend message types sent from client to server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` redacts password and SASL response payloads, so a logged message
+/// never prints the password.
+#[derive(Clone, PartialEq, Eq)]
 pub enum FrontendMessage {
     /// Startup message sent immediately after TCP connection establishment.
     Startup(StartupMessage),
@@ -140,13 +145,88 @@ pub enum FrontendMessage {
     Terminate,
 }
 
+impl fmt::Debug for FrontendMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Startup(message) => f.debug_tuple("Startup").field(message).finish(),
+            Self::Password(password) => f
+                .debug_tuple("Password")
+                .field(&SecretBytes(password))
+                .finish(),
+            Self::SASLInitialResponse { mechanism, data } => f
+                .debug_struct("SASLInitialResponse")
+                .field("mechanism", mechanism)
+                .field("data", &data.as_ref().map(|_| "***"))
+                .finish(),
+            Self::SASLResponse(response) => f
+                .debug_tuple("SASLResponse")
+                .field(&SecretBytes(response))
+                .finish(),
+            Self::Query(query) => f.debug_tuple("Query").field(query).finish(),
+            Self::Parse {
+                name,
+                query,
+                param_types,
+            } => f
+                .debug_struct("Parse")
+                .field("name", name)
+                .field("query", query)
+                .field("param_types", param_types)
+                .finish(),
+            Self::Bind {
+                portal,
+                statement,
+                param_formats,
+                params,
+                result_formats,
+            } => f
+                .debug_struct("Bind")
+                .field("portal", portal)
+                .field("statement", statement)
+                .field("param_formats", param_formats)
+                .field("params", params)
+                .field("result_formats", result_formats)
+                .finish(),
+            Self::Execute { portal, max_rows } => f
+                .debug_struct("Execute")
+                .field("portal", portal)
+                .field("max_rows", max_rows)
+                .finish(),
+            Self::Describe { target_type, name } => f
+                .debug_struct("Describe")
+                .field("target_type", target_type)
+                .field("name", name)
+                .finish(),
+            Self::Close { target_type, name } => f
+                .debug_struct("Close")
+                .field("target_type", target_type)
+                .field("name", name)
+                .finish(),
+            Self::Sync => f.write_str("Sync"),
+            Self::Flush => f.write_str("Flush"),
+            Self::Terminate => f.write_str("Terminate"),
+        }
+    }
+}
+
 /// Initial startup parameters sent to PostgreSQL server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` redacts credential-named parameters.
+#[derive(Clone, PartialEq, Eq)]
 pub struct StartupMessage {
     /// Protocol version (default `PG_PROTOCOL_V3`).
     pub protocol_version: i32,
     /// Parameter key-value map (e.g. `user`, `database`, `client_encoding`, `application_name`).
     pub parameters: HashMap<String, String>,
+}
+
+impl fmt::Debug for StartupMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StartupMessage")
+            .field("protocol_version", &self.protocol_version)
+            .field("parameters", &RedactedParams(&self.parameters))
+            .finish()
+    }
 }
 
 impl StartupMessage {
@@ -731,4 +811,38 @@ fn decode_diagnostic(buf: &mut Bytes) -> Result<PgDiagnostic> {
         }
     }
     Ok(diag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_messages_debug_redact_credentials() {
+        let messages = [
+            FrontendMessage::Password(b"s3cr3t-326".to_vec()),
+            FrontendMessage::SASLResponse(b"s3cr3t-326".to_vec()),
+            FrontendMessage::SASLInitialResponse {
+                mechanism: "SCRAM-SHA-256".to_string(),
+                data: Some(b"s3cr3t-326".to_vec()),
+            },
+        ];
+        for message in messages {
+            let rendered = format!("{message:?}");
+            assert!(!rendered.contains("s3cr3t-326"), "{rendered}");
+            assert!(rendered.contains("***"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn startup_message_debug_redacts_credential_parameters() {
+        let mut message = StartupMessage::new("postgres", Some("graph"));
+        message
+            .parameters
+            .insert("password".to_string(), "s3cr3t-326".to_string());
+        let rendered = format!("{message:?}");
+        assert!(!rendered.contains("s3cr3t-326"), "{rendered}");
+        assert!(rendered.contains("\"password\": \"***\""), "{rendered}");
+        assert!(rendered.contains("graph"), "{rendered}");
+    }
 }
