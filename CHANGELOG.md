@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **SQL/PGQ and DuckPGQ `IN` with a list or list parameter (#303)**: the emitter now writes `x IN (a, b)` for a literal list and `x = ANY($p)` for a list parameter (`NOT IN (a, b)` / `x <> ALL($p)` when negated); an empty literal list compiles to `FALSE` (`TRUE` for `NOT IN`). The DuckDB bridge rewrites the parameter forms to a scalar `IN (...)` tuple because DuckPGQ's `GRAPH_TABLE` grammar has no `ANY`/`ALL`.
 - **SQL/PGQ and DuckPGQ `XOR` lowering (#304)**: `XOR` now compiles to `((a) OR (b)) AND NOT ((a) AND (b))` instead of the unsupported keyword, preserving the three-valued result when either side is NULL.
+- **SQL/PGQ string predicate placeholder escaping in PostgresBridge (#305)**: `PostgresBridge._format_pgq_statement` now escapes literal `%` characters as `%%` when query parameters are bound positionally as `%s`, preventing `psycopg` from misinterpreting `LIKE` wildcard patterns (such as in `STARTS WITH`, `ENDS WITH`, and `CONTAINS`) as invalid formatting placeholders.
 
 ## [0.4.2] - 2026-11-22
 

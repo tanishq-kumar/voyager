@@ -226,6 +226,94 @@ def test_postgres_bridge_format_pgq_statement_empty_params():
     assert ordered == ()
 
 
+def test_postgres_bridge_format_pgq_statement_starts_with_contains_ends_with():
+    """Verifies literal '%' in LIKE string predicates is escaped as '%%' when parameters are bound (#305)."""
+    bridge = PostgresBridge(MagicMock())
+
+    # 1. STARTS WITH: LIKE $p0 || '%'
+    stmt_starts = "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name LIKE $p0 || '%' COLUMNS (p.id))"
+    fmt_starts, ord_starts = bridge._format_pgq_statement(stmt_starts, {"p0": "Al"})
+    assert fmt_starts == (
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name LIKE %s || '%%' COLUMNS (p.id))"
+    )
+    assert ord_starts == ["Al"]
+
+    # 2. ENDS WITH: LIKE '%' || $p0
+    stmt_ends = "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name LIKE '%' || $p0 COLUMNS (p.id))"
+    fmt_ends, ord_ends = bridge._format_pgq_statement(stmt_ends, {"p0": "ce"})
+    assert fmt_ends == (
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name LIKE '%%' || %s COLUMNS (p.id))"
+    )
+    assert ord_ends == ["ce"]
+
+    # 3. CONTAINS: LIKE '%' || $p0 || '%'
+    stmt_contains = (
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) "
+        "WHERE p.city LIKE '%' || $p0 || '%' COLUMNS (p.id))"
+    )
+    fmt_contains, ord_contains = bridge._format_pgq_statement(stmt_contains, {"p0": "York"})
+    assert fmt_contains == (
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) "
+        "WHERE p.city LIKE '%%' || %s || '%%' COLUMNS (p.id))"
+    )
+    assert ord_contains == ["York"]
+
+
+def test_postgres_bridge_format_pgq_statement_percent_in_literals_and_identifiers():
+    """Verifies literal '%' in string literals, identifiers, and format strings are properly escaped (#305)."""
+    bridge = PostgresBridge(MagicMock())
+
+    # % inside string literal with parameters
+    stmt_lit = (
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p) "
+        "WHERE p.name = '100%' AND p.age > $min_age COLUMNS (p.id))"
+    )
+    fmt_lit, ord_lit = bridge._format_pgq_statement(stmt_lit, {"min_age": 18})
+    assert fmt_lit == (
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p) "
+        "WHERE p.name = '100%%' AND p.age > %s COLUMNS (p.id))"
+    )
+    assert ord_lit == [18]
+
+    # % inside identifier with parameters
+    stmt_ident = (
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p) WHERE p."pct%col" = $target COLUMNS (p.id))'
+    )
+    fmt_ident, ord_ident = bridge._format_pgq_statement(stmt_ident, {"target": "foo"})
+    assert fmt_ident == (
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p) WHERE p."pct%%col" = %s COLUMNS (p.id))'
+    )
+    assert ord_ident == ["foo"]
+
+    # '%s' string literal with parameters does not collide with placeholder conversion
+    stmt_s = (
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p) "
+        "WHERE p.format = '%s' AND p.val = $val COLUMNS (p.id))"
+    )
+    fmt_s, ord_s = bridge._format_pgq_statement(stmt_s, {"val": 42})
+    assert fmt_s == (
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p) "
+        "WHERE p.format = '%%s' AND p.val = %s COLUMNS (p.id))"
+    )
+    assert ord_s == [42]
+
+
+def test_postgres_bridge_format_pgq_statement_percent_without_parameters():
+    """Verifies statements containing '%' without bound parameters leave '%' untouched (#305)."""
+    bridge = PostgresBridge(MagicMock())
+
+    # Raw statement with % and empty parameters dict
+    stmt = "SELECT * FROM GRAPH_TABLE (g MATCH (p) WHERE p.name LIKE 'Al%' COLUMNS (p.id))"
+    fmt, ordered = bridge._format_pgq_statement(stmt, {})
+    assert fmt == stmt
+    assert ordered == ()
+
+    # Statement with parameters dict that has no matching keys in the statement
+    fmt_unmatched, ord_unmatched = bridge._format_pgq_statement(stmt, {"unrelated": 123})
+    assert fmt_unmatched == stmt
+    assert ord_unmatched == ()
+
+
 # ===========================================================================
 # 3. Live DuckDB / DuckPGQ Tests
 # ===========================================================================
@@ -612,3 +700,67 @@ class TestPostgres19PgqParameterBindingLive:
             rows = tx.execute(query, {"name": "Alice"})
             assert len(rows) == 1
             assert rows[0]["name"] == "Alice"
+
+    def test_pg19_bridge_starts_with_ends_with_contains_live(self, pg19_conn):
+        """Verifies STARTS WITH, ENDS WITH, and CONTAINS work on PostgreSQL 19 with PostgresBridge (#305)."""
+        bridge = PostgresBridge(pg19_conn)
+        session = Session(bridge=bridge, dialect="sql_pgq")
+
+        # 1. STARTS WITH ($p0 || '%')
+        q_starts = (
+            "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+            "MATCH (p IS Person) WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name)) ORDER BY id"
+        )
+        res_starts = session.execute(q_starts, {"p0": "Al"})
+        assert res_starts == [{"id": 1, "name": "Alice"}]
+
+        # 2. ENDS WITH ('%' || $p0)
+        q_ends = (
+            "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+            "MATCH (p IS Person) WHERE p.name LIKE '%' || $p0 COLUMNS (p.id, p.name)) ORDER BY id"
+        )
+        res_ends = session.execute(q_ends, {"p0": "lie"})
+        assert res_ends == [{"id": 3, "name": "Charlie"}]
+
+        # 3. CONTAINS ('%' || $p0 || '%')
+        q_contains = (
+            "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+            "MATCH (p IS Person) WHERE p.name LIKE '%' || $p0 || '%' COLUMNS (p.id, p.name)) ORDER BY id"
+        )
+        res_contains = session.execute(q_contains, {"p0": "arl"})
+        assert res_contains == [{"id": 3, "name": "Charlie"}]
+
+        # 4. Without parameters (raw LIKE with literal %)
+        q_raw = (
+            "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+            "MATCH (p IS Person) WHERE p.name LIKE 'Bo%' COLUMNS (p.id, p.name)) ORDER BY id"
+        )
+        res_raw = session.execute(q_raw)
+        assert res_raw == [{"id": 2, "name": "Bob"}]
+
+    def test_pg19_bridge_string_predicates_async_and_transaction(self, pg19_conn):
+        """Verifies string predicates work inside transactions on PostgreSQL 19 (#305)."""
+        bridge = PostgresBridge(pg19_conn)
+        session = Session(bridge=bridge, dialect="sql_pgq")
+
+        q = (
+            "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+            "MATCH (p IS Person) WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name))"
+        )
+
+        with session.transaction() as tx:
+            rows = tx.execute(q, {"p0": "Al"})
+            assert rows == [{"id": 1, "name": "Alice"}]
+
+    @pytest.mark.asyncio
+    async def test_pg19_async_bridge_string_predicates(self, pg19_conn):
+        """Verifies AsyncPostgresBridge correctly binds string predicate parameters (#305)."""
+        bridge = AsyncPostgresBridge(pg19_conn)
+        session = AsyncSession(bridge=bridge, dialect="sql_pgq")
+
+        q = (
+            "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
+            "MATCH (p IS Person) WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name))"
+        )
+        rows = await session.execute(q, {"p0": "Al"})
+        assert rows == [{"id": 1, "name": "Alice"}]
