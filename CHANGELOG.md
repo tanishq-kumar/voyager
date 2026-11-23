@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQL/PGQ and DuckPGQ `XOR` lowering (#304)**: `XOR` now compiles to `((a) OR (b)) AND NOT ((a) AND (b))` instead of the unsupported keyword, preserving the three-valued result when either side is NULL.
 - **SQL/PGQ string predicate placeholder escaping in PostgresBridge (#305)**: `PostgresBridge._format_pgq_statement` now escapes literal `%` characters as `%%` when query parameters are bound positionally as `%s`, preventing `psycopg` from misinterpreting `LIKE` wildcard patterns (such as in `STARTS WITH`, `ENDS WITH`, and `CONTAINS`) as invalid formatting placeholders.
 - **SQL/PGQ string predicates match the search value literally (#318)**: `STARTS WITH`, `ENDS WITH` and `CONTAINS` compile to `starts_with`, `right`/`length` and `strpos` instead of `LIKE`, so `%`, `_` and `\` in the search value are no longer wildcards on PostgreSQL 19 and DuckPGQ.
+- **SQL/PGQ ORDER BY on expressions outside GRAPH_TABLE (#319)**: ordering expressions that are not returned columns are now evaluated inside `GRAPH_TABLE` `COLUMNS` under an internal alias and selected only as returned columns in the outer query, so pattern variables are in scope on PostgreSQL 19 and DuckPGQ.
+- **SQL/PGQ ORDER BY on non-returned properties (#320)**: ordering by a property that is not projected now exposes it in `GRAPH_TABLE` `COLUMNS` under an internal alias, avoiding missing-column errors in the outer query on PostgreSQL 19 and DuckPGQ.
 
 ## [0.4.2] - 2026-11-22
 
