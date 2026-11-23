@@ -488,6 +488,7 @@ fn is_known_expr_tag(tag: &str) -> bool {
             | "count"
             | "list"
             | "alias"
+            | "label"
     )
 }
 
@@ -666,6 +667,50 @@ fn handle_prop_tuple(
     }
     let prop = extract_string(&array[2], &path.index(2), "a string property")?;
     Ok(builder.prop(var, prop))
+}
+
+#[inline(never)]
+fn handle_label_tuple(
+    builder: &mut QueryBuilder,
+    array: &[Value],
+    path: &SpecPath,
+) -> Result<NodeHandle, SpecError> {
+    check_spec_arity_bounded(
+        array,
+        path,
+        "expression 'label'",
+        3,
+        3,
+        "[label, variable, labels]",
+    )?;
+    let variable = extract_string(&array[1], &path.index(1), "a string variable")?;
+    if variable.is_empty() {
+        return Err(make_spec_err(
+            &path.index(1),
+            "Invalid 'label': the variable must be a non-empty string.",
+        ));
+    }
+    let labels_path = path.index(2);
+    let labels = expect_spec_array(&array[2], &labels_path, "label names")?;
+    if labels.is_empty() {
+        return Err(make_spec_err(
+            &labels_path,
+            "Invalid 'label': the labels list must contain at least one label name.",
+        ));
+    }
+    let mut names = Vec::with_capacity(labels.len());
+    for (index, label) in labels.iter().enumerate() {
+        let label_path = labels_path.index(index);
+        let name = extract_string(label, &label_path, "a string label name")?;
+        if name.is_empty() {
+            return Err(make_spec_err(
+                &label_path,
+                "Invalid 'label': label names must be non-empty strings.",
+            ));
+        }
+        names.push(name);
+    }
+    Ok(builder.label_predicate(variable, names))
 }
 
 #[inline(never)]
@@ -1017,6 +1062,7 @@ fn handle_expr_sequence(
         "ident" => handle_ident_tuple(builder, array, path),
         "param" => handle_param_tuple(builder, array, path),
         "lit" => handle_lit_tuple(builder, array, path),
+        "label" => handle_label_tuple(builder, array, path),
         "bin" => handle_bin_tuple(builder, array, depth, path),
         "unary" => handle_unary_tuple(builder, array, depth, path),
         "fn" => handle_fn_tuple(builder, array, depth, path),
@@ -1669,6 +1715,10 @@ fn render_expression_spec(expression: &Value) -> String {
             .get(1)
             .and_then(render_json_scalar)
             .unwrap_or_else(|| "expression".to_string()),
+        "label" => match array_string(sequence, 1) {
+            Some(variable) => format!("{variable}:<label>"),
+            None => "expression".to_string(),
+        },
         _ => "expression".to_string(),
     }
 }
@@ -1866,6 +1916,10 @@ fn expression_specs_equivalent(left: &Value, right: &Value, depth: usize) -> boo
                         expression_specs_equivalent(left_item, right_item, depth + 1)
                     })
         }
+        "label" => {
+            left_sequence.get(1) == right_sequence.get(1)
+                && left_sequence.get(2) == right_sequence.get(2)
+        }
         _ => false,
     }
 }
@@ -1952,6 +2006,7 @@ fn expression_is_derivable(
     match tag {
         "ident" => array_string(sequence, 1).is_some_and(|name| scope.contains(&name)),
         "prop" => array_string(sequence, 1).is_some_and(|variable| scope.contains(&variable)),
+        "label" => array_string(sequence, 1).is_some_and(|variable| scope.contains(&variable)),
         "param" | "lit" => true,
         "bin" => sequence
             .get(2)
@@ -2362,6 +2417,12 @@ fn validate_expr_scope(
     };
     match tag {
         "ident" | "prop" => {
+            if let Some(name) = array_string(sequence, 1) {
+                ensure_in_scope(&name, &path.index(1), scope, clause, last_with, hints)?;
+            }
+            Ok(())
+        }
+        "label" => {
             if let Some(name) = array_string(sequence, 1) {
                 ensure_in_scope(&name, &path.index(1), scope, clause, last_with, hints)?;
             }
@@ -4471,6 +4532,175 @@ mod tests {
             "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
             "projections": [["field", "p", "name", "n"]]
         })
+    }
+
+    #[test]
+    fn label_predicate_compiles_in_where() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "i", ["Node"]]]],
+                "where": ["label", "i", ["TextNode"]]
+            }],
+            "projections": [["field", "i", "name", null]]
+        });
+
+        let cypher = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            cypher.compiled.statement,
+            "MATCH (i:Node) WHERE i:TextNode RETURN i.name"
+        );
+
+        let age = compile(
+            &spec,
+            "age",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            age.compiled
+                .statement
+                .contains("WHERE label(i) = 'TextNode' RETURN i.name")
+        );
+
+        let gql = compile(
+            &spec,
+            "iso_gql",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gql.compiled.statement,
+            "MATCH (i:Node) WHERE i IS TextNode RETURN i.name"
+        );
+
+        let pgq_error = compile(
+            &spec,
+            "sql_pgq",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(pgq_error.code(), ErrorCode::UnsupportedFeature);
+    }
+
+    #[test]
+    fn label_predicate_multiple_labels_mean_all_of_them() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "i", ["Node"]]]],
+                "where": ["label", "i", ["A", "B"]]
+            }],
+            "projections": [["field", "i", "name", null]]
+        });
+        let cypher = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            cypher.compiled.statement,
+            "MATCH (i:Node) WHERE i:A:B RETURN i.name"
+        );
+
+        let age = compile(
+            &spec,
+            "age",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            age.compiled
+                .statement
+                .contains("WHERE label(i) = 'A' AND label(i) = 'B'")
+        );
+
+        let gql = compile(
+            &spec,
+            "iso_gql",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gql.compiled.statement,
+            "MATCH (i:Node) WHERE i IS A&B RETURN i.name"
+        );
+    }
+
+    #[test]
+    fn label_predicate_rejects_malformed_labels() {
+        let cases = [
+            (json!(["label", "i", []]), "/matches/0/where/2"),
+            (json!(["label", "i", [""]]), "/matches/0/where/2/0"),
+            (json!(["label", "i", ["A", 1]]), "/matches/0/where/2/1"),
+            (json!(["label", "i", "TextNode"]), "/matches/0/where/2"),
+            (json!(["label", "i"]), "/matches/0/where"),
+            (json!(["label", "", ["TextNode"]]), "/matches/0/where/1"),
+        ];
+        for (where_expression, expected_path) in cases {
+            let spec = json!({
+                "spec_version": 1,
+                "matches": [{
+                    "paths": [[["node", "i", ["Node"]]]],
+                    "where": where_expression
+                }],
+                "projections": [["field", "i", "name", null]]
+            });
+            let error = compile_cypher(&spec).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidSpec);
+            assert_eq!(error.path(), Some(expected_path));
+        }
+    }
+
+    #[test]
+    fn label_predicate_requires_a_bound_variable() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "i", ["Node"]]]],
+                "where": ["label", "unknown", ["TextNode"]]
+            }],
+            "projections": [["field", "i", "name", null]]
+        });
+        let error = compile_cypher(&spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidSpec);
+        assert_eq!(error.path(), Some("/matches/0/where/1"));
+        assert!(
+            error
+                .message()
+                .contains("variable 'unknown' is not in scope")
+        );
+    }
+
+    #[test]
+    fn label_predicate_round_trips_through_spec_export() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "i", ["Node"]]]],
+                "where": ["label", "i", ["A", "B"]]
+            }],
+            "projections": [["field", "i", "name", null]]
+        });
+        let builder = build_query(&spec).unwrap();
+        let (arena, root) = builder.try_build().unwrap();
+        let exported = crate::spec_export::spec_from_ast(&arena, root).unwrap();
+        let exported_json = exported.to_json_value();
+        assert_eq!(
+            exported_json["matches"][0]["where"],
+            json!(["label", "i", ["A", "B"]])
+        );
     }
 
     #[test]

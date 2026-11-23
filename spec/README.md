@@ -157,7 +157,8 @@ The following are rejected:
   separate documented trailing-`null` tolerance.
 - A non-string `alias` name in `["alias", expression, name]`.
 - An empty variable in `["prop", "", property]`, and an empty name in
-  `["ident", ""]` or `["param", ""]`.
+  `["ident", ""]` or `["param", ""]`. A label predicate with an empty variable,
+  an empty `labels` array, or an empty label name is rejected the same way.
 - A JSON object in an expression position that has no `expr` key. Only the
   `exists`, `count` and `pattern_comp` payloads accept a nested query spec or
   path spec; every other object must be written as `{"expr": ...}` (the nested
@@ -287,6 +288,7 @@ Expression trees used in `where`, `set`, and projections support fine-grained op
 | :--- | :--- | :--- |
 | **Property Access** | `["prop", var, property]` | Access entity property: `u.age` |
 | **Identifier** | `["ident", name]` | Variable or alias identifier: `friend_count` |
+| **Label Predicate** | `["label", var, labels]` | Node or relationship label test: `i:TextNode`. `labels` is a non-empty array of strings; every label must be present, so several labels mean all of them, like Cypher `i:A:B`. `var` is a variable reference and must be in scope. |
 | **Parameter** | `["param", name]` | Query parameter reference: `$param` |
 | **Literal** | `["lit", value]` | Any JSON value: a scalar (`42`, `"Alice"`, `true`, `null`), a list or an object |
 | **Binary Op** | `["bin", op, left, right]` | Binary operators (canonical lowercase spellings; the consumer also accepts the uppercase word spellings): `eq` (`=`), `neq` (`!=`, `ne`, `<>`), `gt` (`>`), `gte` (`>=`, `ge`), `lt` (`<`), `lte` (`<=`, `le`), `and` (`&`), `or` (`\|`), `xor` (`^`), `add` (`+`), `sub` (`-`), `mul` (`*`), `div` (`/`), `mod` (`%`), `concat` (`\|\|`), `contains`, `starts_with` (`startswith`), `ends_with` (`endswith`), `regex` (`=~`), `in`, `not_in` (`not in`). Any other operator is `INVALID_SPEC` at the operator element. |
@@ -312,6 +314,26 @@ The recursive payload positions are fully typed:
   `[variable, property, value_expression]`.
 - A `bin` operator is one of the operators in the table above; anything else is
   rejected at the operator element.
+
+### Label predicates
+
+`["label", variable, labels]` tests whether the node or relationship bound to
+`variable` has the listed labels. `labels` is a non-empty array of strings and
+**every** label must be present, matching the Cypher conjunction spelling
+`i:A:B` (not a disjunction). The variable is an ordinary variable reference and
+follows the scope rules in [Clause order and scope](#5-clause-order-and-scope);
+an unbound variable is `INVALID_SPEC` at the variable element's pointer.
+
+```json
+["label", "i", ["TextNode"]]
+```
+
+OpenCypher and ISO GQL can test node and relationship labels directly. Apache
+AGE rejects `i:TextNode` in `WHERE`, so it renders the equivalent
+`label(i) = 'TextNode'` (joined with `AND` for several labels), which AGE
+accepts for both nodes and relationships. SQL:PGQ has no label test in a
+`WHERE` clause, so it raises `UNSUPPORTED_FEATURE` for this expression; write
+the label on the element pattern instead.
 
 ### Expression arrays are always tagged
 
@@ -573,8 +595,9 @@ SQL:PGQ):
 - `load_csv` renders only in openCypher and Apache AGE; SQL:PGQ and ISO GQL
   raise `UNSUPPORTED_FEATURE` for it.
 - SQL:PGQ raises `UNSUPPORTED_FEATURE` for `optional: true` on a match,
-  `exists`/`count` subqueries, `list_comp`, `pattern_comp` and the `=~` regex
-  operator. Root `distinct: true` emits `SELECT DISTINCT`.
+  `exists`/`count` subqueries, `list_comp`, `pattern_comp`, the label predicate
+  expression (`label`), and the `=~` regex operator. Root `distinct: true`
+  emits `SELECT DISTINCT`.
 - ISO GQL raises `UNSUPPORTED_FEATURE` for `MERGE` whose `ON CREATE SET` and
   `ON MATCH SET` assignments differ, for `["delete", true, [...]]`
   (`DETACH DELETE`), and for the `=~` regex operator.

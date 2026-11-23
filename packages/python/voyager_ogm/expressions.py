@@ -61,6 +61,21 @@ class Expression:
         """Assigns a projection alias name to this expression in RETURN clauses."""
         return AliasedExpr(self, alias)
 
+    def has_label(self, *labels: str) -> LabelPredicateExpr:
+        """Constructs a label predicate on this identifier: `var:Label1:Label2`.
+
+        Every listed label must be present on the bound node or relationship,
+        matching the Cypher conjunction spelling `var:Label1:Label2`.
+        """
+        name = getattr(self, "name", None)
+        if not isinstance(name, str) or not name:
+            raise VoyagerError(
+                "has_label() needs an identifier expression such as ident('i'); "
+                "use has_label(variable, label) for a bare variable name",
+                code="INVALID_CLAUSE",
+            )
+        return LabelPredicateExpr(name, labels)
+
     def __bool__(self) -> bool:
         """Explicitly disallows evaluating AST expressions in a boolean context."""
         raise TypeError(
@@ -252,6 +267,47 @@ class IdentExpr(Expression):
 
     def __repr__(self) -> str:
         return self.name
+
+
+class LabelPredicateExpr(Expression):
+    """Label predicate on a bound node or relationship: `var:Label1:Label2`.
+
+    Every listed label must be present, matching the Cypher conjunction meaning
+    of `var:Label1:Label2`.
+    """
+
+    def __init__(self, variable: str, labels: Sequence[str]) -> None:
+        if not isinstance(variable, str) or not variable:
+            raise VoyagerError(
+                "label predicate requires a non-empty variable name",
+                code="INVALID_CLAUSE",
+            )
+        names = list(labels)
+        if not names:
+            raise VoyagerError(
+                "label predicate requires at least one label name",
+                code="INVALID_CLAUSE",
+            )
+        for name in names:
+            if not isinstance(name, str) or not name:
+                raise VoyagerError(
+                    "label predicate label names must be non-empty strings",
+                    code="INVALID_CLAUSE",
+                )
+        self.variable = variable
+        self.labels = names
+        if HAS_VOYAGER_RS and AstExpr is not None:
+            try:
+                self._native_expr = AstExpr.label(variable, names)
+            except Exception:
+                self._native_expr = None
+
+    def to_spec(self) -> tuple[str, str, list[str]]:
+        """Converts this label predicate into an AST spec descriptor tuple."""
+        return ("label", self.variable, list(self.labels))
+
+    def __repr__(self) -> str:
+        return f"{self.variable}:{':'.join(self.labels)}"
 
 
 class ParamExpr(Expression):
@@ -579,6 +635,16 @@ def to_expression(val: Any) -> Expression:
 def ident(name: str) -> IdentExpr:
     """Creates an identifier expression."""
     return IdentExpr(name)
+
+
+def has_label(variable: str | IdentExpr, *labels: str) -> LabelPredicateExpr:
+    """Creates a label predicate `variable:Label1:Label2` for a bound variable.
+
+    Every listed label must be present, matching the Cypher conjunction meaning
+    of `variable:Label1:Label2`.
+    """
+    name = variable.name if isinstance(variable, IdentExpr) else variable
+    return LabelPredicateExpr(name, labels)
 
 
 def col(name: str) -> IdentExpr:

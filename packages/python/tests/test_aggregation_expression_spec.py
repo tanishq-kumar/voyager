@@ -24,6 +24,7 @@ from voyager_ogm.expressions import (
     Expression,
     FunctionExpr,
     IdentExpr,
+    LabelPredicateExpr,
     ListCompExpr,
     ListLiteralExpr,
     LiteralExpr,
@@ -58,6 +59,10 @@ def _make_prop() -> Expression:
 
 def _make_ident() -> Expression:
     return IdentExpr("p")
+
+
+def _make_label_predicate() -> Expression:
+    return LabelPredicateExpr("p", ["SpecExprPerson"])
 
 
 def _make_param() -> Expression:
@@ -136,6 +141,7 @@ EXPRESSION_FACTORIES: dict[type[Expression], Callable[[], Expression]] = {
     CaseExpr: _make_case,
     FunctionExpr: _make_function,
     IdentExpr: _make_ident,
+    LabelPredicateExpr: _make_label_predicate,
     ListCompExpr: _make_list_comp,
     ListLiteralExpr: _make_list_literal,
     LiteralExpr: _make_literal,

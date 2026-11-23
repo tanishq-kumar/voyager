@@ -1,0 +1,39 @@
+{
+  "description": "A label predicate needs at least one label name.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "i",
+              [
+                "Node"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "label",
+          "i",
+          []
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "i",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/where/2"
+  }
+}

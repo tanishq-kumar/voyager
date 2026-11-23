@@ -900,6 +900,16 @@ pub enum AstNode {
         /// Property name string
         property: String,
     },
+    /// Label predicate on a bound node or relationship: `i:TextNode` or `i:A:B`.
+    ///
+    /// Every listed label must be present, matching the conjunction meaning of
+    /// the Cypher form `i:A:B`.
+    LabelPredicate {
+        /// Bound variable name (for example `i`).
+        variable: String,
+        /// Labels that must all be present; always non-empty.
+        labels: Vec<String>,
+    },
     /// Literal constant value or query parameter.
     Literal(LiteralValue),
     /// Named identifier reference (e.g. `p`, `director_name`).

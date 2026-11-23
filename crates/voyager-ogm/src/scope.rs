@@ -376,6 +376,16 @@ impl ScopeValidator<'_> {
                         .zip(right_items.iter())
                         .all(|(&l, &r)| self.expressions_equivalent(l, r, depth + 1))
             }
+            (
+                AstNode::LabelPredicate {
+                    variable: left_variable,
+                    labels: left_labels,
+                },
+                AstNode::LabelPredicate {
+                    variable: right_variable,
+                    labels: right_labels,
+                },
+            ) => left_variable == right_variable && left_labels == right_labels,
             _ => false,
         }
     }
@@ -415,6 +425,7 @@ impl ScopeValidator<'_> {
                     || self.expression_is_derivable(*target, projections, scope, depth + 1)
             }
             AstNode::Literal(_) | AstNode::Parameter(_) => true,
+            AstNode::LabelPredicate { variable, .. } => scope.contains(variable),
             AstNode::BinaryExpression { left, right, op: _ } => {
                 self.expression_is_derivable(*left, projections, scope, depth + 1)
                     && self.expression_is_derivable(*right, projections, scope, depth + 1)
@@ -809,6 +820,9 @@ impl ScopeValidator<'_> {
         }
         match self.arena.get(handle)? {
             AstNode::Identifier(name) => self.ensure_in_scope(name, scope, clause, last_with),
+            AstNode::LabelPredicate { variable, .. } => {
+                self.ensure_in_scope(variable, scope, clause, last_with)
+            }
             AstNode::PropertyAccess { target, property } => {
                 // `field(var, "")` renders as the bare variable and is also the
                 // shape a raw projection string such as `return_("name")`

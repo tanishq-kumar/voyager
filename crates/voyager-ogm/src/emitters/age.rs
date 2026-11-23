@@ -417,7 +417,9 @@ impl AstVisitor for AgeEmitter {
         }
         validate_age_ast(arena, root)?;
 
-        let mut cypher_emitter = CypherEmitter::new().without_execution_mode();
+        let mut cypher_emitter = CypherEmitter::new()
+            .without_execution_mode()
+            .with_age_label_predicates();
         let cypher_compiled = cypher_emitter.visit_query(arena, root)?;
 
         let root_node = arena.get(root)?;

@@ -310,6 +310,24 @@ impl IsoGqlEmitter {
                 }
                 Ok(())
             }
+            AstNode::LabelPredicate { variable, labels } => {
+                let wrap = nested && labels.len() > 1;
+                if wrap {
+                    self.buffer.push('(');
+                }
+                self.buffer.push_str(variable);
+                self.buffer.push_str(" IS ");
+                for (index, label) in labels.iter().enumerate() {
+                    if index > 0 {
+                        self.buffer.push('&');
+                    }
+                    self.buffer.push_str(label);
+                }
+                if wrap {
+                    self.buffer.push(')');
+                }
+                Ok(())
+            }
             AstNode::Literal(lit) => {
                 if let Some(param_name) = self.node_params.get(&handle) {
                     self.buffer.push('$');
