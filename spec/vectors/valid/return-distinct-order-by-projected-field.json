@@ -1,0 +1,59 @@
+{
+  "description": "A DISTINCT RETURN may order by a field it projects.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "city",
+        "city"
+      ]
+    ],
+    "distinct": true,
+    "order_by": [
+      [
+        "p",
+        "city",
+        true
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY p.city ASC",
+      "parameters": {}
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY p.city ASC $$) AS (city agtype)",
+      "parameters": {}
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) RETURN DISTINCT p.city AS city ORDER BY p.city ASC",
+      "parameters": {}
+    },
+    "sql_pgq": {
+      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.city AS city)) ORDER BY city ASC",
+      "parameters": {}
+    },
+    "duck_pgq": {
+      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.city AS city)) ORDER BY city ASC",
+      "parameters": {}
+    }
+  }
+}

@@ -1690,6 +1690,320 @@ fn projections_contain_aggregation(projections: &Value) -> bool {
         .any(|item| seq_tag(item).is_some_and(|(_, tag)| tag == "agg"))
 }
 
+/// Unwraps `{"expr": ...}` objects and `["alias", expression, name]` arrays so
+/// two expression specs can be compared by their emitted expression.
+fn unwrap_expression_spec(value: &Value) -> &Value {
+    let mut current = value;
+    loop {
+        if let Some(dict) = current.as_object() {
+            if let Some(inner) = dict.get("expr") {
+                current = inner;
+                continue;
+            }
+            break;
+        }
+        let Some((sequence, tag)) = seq_tag(current) else {
+            break;
+        };
+        if tag != "alias" {
+            break;
+        }
+        let Some(inner) = sequence.get(1) else {
+            break;
+        };
+        current = inner;
+    }
+    current
+}
+
+fn expression_is_ident_named(expression: &Value, name: &str) -> bool {
+    let expression = unwrap_expression_spec(expression);
+    let Some((sequence, "ident")) = seq_tag(expression) else {
+        return false;
+    };
+    array_string(sequence, 1).as_deref() == Some(name)
+}
+
+fn expression_is_property_named(expression: &Value, variable: &str, property: &str) -> bool {
+    let expression = unwrap_expression_spec(expression);
+    let Some((sequence, "prop")) = seq_tag(expression) else {
+        return false;
+    };
+    array_string(sequence, 1).as_deref() == Some(variable)
+        && array_string(sequence, 2).as_deref() == Some(property)
+}
+
+fn aggregate_target_matches(
+    variable: &str,
+    property: &str,
+    argument: &Value,
+    depth: usize,
+) -> bool {
+    if depth > MAX_AST_DEPTH {
+        return false;
+    }
+    if property == "*" || property.is_empty() {
+        expression_is_ident_named(argument, variable)
+    } else {
+        expression_is_property_named(argument, variable, property)
+    }
+}
+
+/// Structural equality for expression specs, ignoring alias wrappers and
+/// comparing function names without regard to case.
+fn expression_specs_equivalent(left: &Value, right: &Value, depth: usize) -> bool {
+    if depth > MAX_AST_DEPTH {
+        return false;
+    }
+    let left = unwrap_expression_spec(left);
+    let right = unwrap_expression_spec(right);
+    if left == right {
+        return true;
+    }
+    let (Some((left_sequence, left_tag)), Some((right_sequence, right_tag))) =
+        (seq_tag(left), seq_tag(right))
+    else {
+        return false;
+    };
+    if left_tag != right_tag {
+        return false;
+    }
+    match left_tag {
+        "bin" => {
+            array_string(left_sequence, 1) == array_string(right_sequence, 1)
+                && [2, 3].into_iter().all(|index| {
+                    match (left_sequence.get(index), right_sequence.get(index)) {
+                        (Some(left_child), Some(right_child)) => {
+                            expression_specs_equivalent(left_child, right_child, depth + 1)
+                        }
+                        _ => false,
+                    }
+                })
+        }
+        "unary" => {
+            array_string(left_sequence, 1) == array_string(right_sequence, 1)
+                && left_sequence.get(2).zip(right_sequence.get(2)).is_some_and(
+                    |(left_operand, right_operand)| {
+                        expression_specs_equivalent(left_operand, right_operand, depth + 1)
+                    },
+                )
+        }
+        "fn" => {
+            let (Some(left_name), Some(right_name)) = (
+                array_string(left_sequence, 1),
+                array_string(right_sequence, 1),
+            ) else {
+                return false;
+            };
+            if !left_name.eq_ignore_ascii_case(&right_name) {
+                return false;
+            }
+            let (Some(left_arguments), Some(right_arguments)) = (
+                left_sequence.get(2).and_then(Value::as_array),
+                right_sequence.get(2).and_then(Value::as_array),
+            ) else {
+                return false;
+            };
+            left_arguments.len() == right_arguments.len()
+                && left_arguments.iter().zip(right_arguments.iter()).all(
+                    |(left_argument, right_argument)| {
+                        expression_specs_equivalent(left_argument, right_argument, depth + 1)
+                    },
+                )
+        }
+        "list" => {
+            let (Some(left_items), Some(right_items)) = (
+                left_sequence.get(1).and_then(Value::as_array),
+                right_sequence.get(1).and_then(Value::as_array),
+            ) else {
+                return false;
+            };
+            left_items.len() == right_items.len()
+                && left_items
+                    .iter()
+                    .zip(right_items.iter())
+                    .all(|(left_item, right_item)| {
+                        expression_specs_equivalent(left_item, right_item, depth + 1)
+                    })
+        }
+        _ => false,
+    }
+}
+
+/// True when an ORDER BY/WHERE expression repeats a projection of a `DISTINCT`
+/// or aggregating clause, either exactly or as a sub-expression.
+fn projection_matches_expression(expression: &Value, item: &Value, depth: usize) -> bool {
+    if depth > MAX_AST_DEPTH {
+        return false;
+    }
+    let expression = unwrap_expression_spec(expression);
+    let Some((sequence, tag)) = seq_tag(item) else {
+        return false;
+    };
+    match tag {
+        "field" => {
+            let (Some(variable), Some(property)) =
+                (array_string(sequence, 1), array_string(sequence, 2))
+            else {
+                return false;
+            };
+            if property.is_empty() {
+                expression_is_ident_named(expression, &variable)
+            } else {
+                expression_is_property_named(expression, &variable, &property)
+            }
+        }
+        "agg" => {
+            let (Some(variable), Some(property), Some(function)) = (
+                array_string(sequence, 1),
+                array_string(sequence, 2),
+                array_string(sequence, 3),
+            ) else {
+                return false;
+            };
+            // `COUNT(DISTINCT x)` has no function-call expression spelling, so
+            // an ORDER BY cannot repeat it as an expression.
+            if function == "count_distinct" {
+                return false;
+            }
+            let Some((expression_sequence, "fn")) = seq_tag(expression) else {
+                return false;
+            };
+            let Some(name) = array_string(expression_sequence, 1) else {
+                return false;
+            };
+            if !name.eq_ignore_ascii_case(&function) {
+                return false;
+            }
+            let Some(arguments) = expression_sequence.get(2).and_then(Value::as_array) else {
+                return false;
+            };
+            arguments.len() == 1
+                && aggregate_target_matches(&variable, &property, &arguments[0], depth + 1)
+        }
+        "expr" => sequence
+            .get(1)
+            .is_some_and(|inner| expression_specs_equivalent(expression, inner, depth + 1)),
+        _ => false,
+    }
+}
+
+/// True when an expression spec can be evaluated from the projected columns
+/// alone. Mirrors `scope::ScopeValidator::expression_is_derivable`.
+fn expression_is_derivable(
+    expression: &Value,
+    projections: &[Value],
+    scope: &SpecScope,
+    depth: usize,
+) -> bool {
+    if depth > MAX_AST_DEPTH {
+        return true;
+    }
+    let expression = unwrap_expression_spec(expression);
+    if projections
+        .iter()
+        .any(|item| projection_matches_expression(expression, item, depth))
+    {
+        return true;
+    }
+    let Some((sequence, tag)) = seq_tag(expression) else {
+        return false;
+    };
+    match tag {
+        "ident" => array_string(sequence, 1).is_some_and(|name| scope.contains(&name)),
+        "prop" => array_string(sequence, 1).is_some_and(|variable| scope.contains(&variable)),
+        "param" | "lit" => true,
+        "bin" => sequence
+            .get(2)
+            .zip(sequence.get(3))
+            .is_some_and(|(left, right)| {
+                expression_is_derivable(left, projections, scope, depth + 1)
+                    && expression_is_derivable(right, projections, scope, depth + 1)
+            }),
+        "unary" => sequence
+            .get(2)
+            .is_some_and(|operand| expression_is_derivable(operand, projections, scope, depth + 1)),
+        "fn" => sequence
+            .get(2)
+            .and_then(Value::as_array)
+            .is_none_or(|arguments| {
+                arguments.iter().all(|argument| {
+                    expression_is_derivable(argument, projections, scope, depth + 1)
+                })
+            }),
+        "list" => sequence
+            .get(1)
+            .and_then(Value::as_array)
+            .is_none_or(|items| {
+                items
+                    .iter()
+                    .all(|item| expression_is_derivable(item, projections, scope, depth + 1))
+            }),
+        "case" => {
+            let operand_ok = sequence.get(1).is_none_or(|operand| {
+                operand.is_null() || expression_is_derivable(operand, projections, scope, depth + 1)
+            });
+            let branches_ok = sequence
+                .get(2)
+                .and_then(Value::as_array)
+                .is_none_or(|branches| {
+                    branches.iter().all(|branch| {
+                        branch.as_array().is_none_or(|pair| {
+                            pair.iter().all(|child| {
+                                expression_is_derivable(child, projections, scope, depth + 1)
+                            })
+                        })
+                    })
+                });
+            let else_ok = sequence.get(3).is_none_or(|else_branch| {
+                else_branch.is_null()
+                    || expression_is_derivable(else_branch, projections, scope, depth + 1)
+            });
+            operand_ok && branches_ok && else_ok
+        }
+        _ => false,
+    }
+}
+
+/// True when an ORDER BY entry is derivable from the projected columns.
+fn order_entry_is_derivable(
+    entry: &Value,
+    projections: &[Value],
+    scope: &SpecScope,
+    depth: usize,
+) -> bool {
+    let Some(sequence) = entry.as_array() else {
+        return false;
+    };
+    let Some(first) = sequence.first() else {
+        return false;
+    };
+    let Some(variable) = first.as_str() else {
+        return expression_is_derivable(first, projections, scope, depth);
+    };
+    if scope.contains(variable) {
+        return true;
+    }
+    let Some(property) = array_string(sequence, 1) else {
+        return false;
+    };
+    projections.iter().any(|item| {
+        let Some((item_sequence, tag)) = seq_tag(item) else {
+            return false;
+        };
+        match tag {
+            "field" => {
+                array_string(item_sequence, 1).as_deref() == Some(variable)
+                    && array_string(item_sequence, 2).as_deref() == Some(property.as_str())
+            }
+            "expr" => item_sequence
+                .get(1)
+                .is_some_and(|inner| expression_is_property_named(inner, variable, &property)),
+            _ => false,
+        }
+    })
+}
+
 #[inline(never)]
 fn collect_scope_hints(spec: &Map<String, Value>) -> ScopeHints {
     let mut hints = ScopeHints::default();
@@ -1748,32 +2062,58 @@ fn ensure_in_scope(
     Err(missing_scope_var(path, name, clause, last_with, hints))
 }
 
+/// A scope gate for a WITH or RETURN that exposes only its projected names.
+#[derive(Clone, Copy)]
+struct ScopeGate<'a> {
+    last_with: Option<usize>,
+    projections: Option<&'a [Value]>,
+}
+
 #[inline(never)]
 fn validate_where_scope(
     where_item: &Value,
     path: &SpecPath,
     scope: &SpecScope,
     clause: ScopeClause,
-    last_with: Option<usize>,
     hints: &ScopeHints,
+    gate: ScopeGate<'_>,
     depth: usize,
 ) -> Result<(), SpecError> {
+    let covered = |predicate: &Value| {
+        gate.projections.is_some_and(|projections| {
+            expression_is_derivable(predicate, projections, scope, depth)
+        })
+    };
     if let Some(sequence) = where_item.as_array() {
         if sequence.is_empty() {
             return Ok(());
         }
         let first = &sequence[0];
         if first.as_str().is_some() {
-            return validate_expr_scope(where_item, path, scope, clause, last_with, hints, depth);
+            if covered(where_item) {
+                return Ok(());
+            }
+            return validate_expr_scope(
+                where_item,
+                path,
+                scope,
+                clause,
+                gate.last_with,
+                hints,
+                depth,
+            );
         }
         if first.is_object() || first.is_array() {
             for (index, predicate) in sequence.iter().enumerate() {
+                if covered(predicate) {
+                    continue;
+                }
                 validate_expr_scope(
                     predicate,
                     &path.index(index),
                     scope,
                     clause,
-                    last_with,
+                    gate.last_with,
                     hints,
                     depth,
                 )?;
@@ -1781,7 +2121,18 @@ fn validate_where_scope(
         }
         return Ok(());
     }
-    validate_expr_scope(where_item, path, scope, clause, last_with, hints, depth)
+    if covered(where_item) {
+        return Ok(());
+    }
+    validate_expr_scope(
+        where_item,
+        path,
+        scope,
+        clause,
+        gate.last_with,
+        hints,
+        depth,
+    )
 }
 
 #[inline(never)]
@@ -1790,8 +2141,8 @@ fn validate_order_by_scope(
     path: &SpecPath,
     scope: &SpecScope,
     clause: ScopeClause,
-    last_with: Option<usize>,
     hints: &ScopeHints,
+    gate: ScopeGate<'_>,
     depth: usize,
 ) -> Result<(), SpecError> {
     let Some(sequence) = entry.as_array() else {
@@ -1800,15 +2151,28 @@ fn validate_order_by_scope(
     let Some(first) = sequence.first() else {
         return Ok(());
     };
+    if gate
+        .projections
+        .is_some_and(|projections| order_entry_is_derivable(entry, projections, scope, depth))
+    {
+        return Ok(());
+    }
     if let Some(variable) = first.as_str() {
-        return ensure_in_scope(variable, &path.index(0), scope, clause, last_with, hints);
+        return ensure_in_scope(
+            variable,
+            &path.index(0),
+            scope,
+            clause,
+            gate.last_with,
+            hints,
+        );
     }
     validate_expr_scope(
         first,
         &path.index(0),
         scope,
         clause,
-        last_with,
+        gate.last_with,
         hints,
         depth,
     )
@@ -2364,8 +2728,11 @@ fn validate_spec_scope_inner(
                     &match_path.key("where"),
                     scope,
                     ScopeClause::Match,
-                    last_with,
                     &hints,
+                    ScopeGate {
+                        last_with,
+                        projections: None,
+                    },
                     depth,
                 )?;
             }
@@ -2461,6 +2828,7 @@ fn validate_spec_scope_inner(
                 if !only_projected {
                     where_scope.include(&before);
                 }
+                let projections_slice = projections_item.and_then(Value::as_array);
                 validate_where_scope(
                     where_item,
                     &entry_path.key("where"),
@@ -2469,8 +2837,15 @@ fn validate_spec_scope_inner(
                         index,
                         only_projected,
                     },
-                    last_with,
                     &hints,
+                    ScopeGate {
+                        last_with,
+                        projections: if only_projected {
+                            projections_slice.map(Vec::as_slice)
+                        } else {
+                            None
+                        },
+                    },
                     depth,
                 )?;
             }
@@ -2492,8 +2867,17 @@ fn validate_spec_scope_inner(
                             index,
                             only_projected,
                         },
-                        last_with,
                         &hints,
+                        ScopeGate {
+                            last_with,
+                            projections: if only_projected {
+                                projections_item
+                                    .and_then(Value::as_array)
+                                    .map(Vec::as_slice)
+                            } else {
+                                None
+                            },
+                        },
                         depth,
                     )?;
                 }
@@ -2687,14 +3071,22 @@ fn validate_spec_scope_inner(
         for name in return_names {
             order_scope.bind(&name);
         }
+        let root_projections = spec.get("projections").and_then(Value::as_array);
         for (index, order_entry) in order_entries.iter().enumerate() {
             validate_order_by_scope(
                 order_entry,
                 &order_path.index(index),
                 &order_scope,
                 ScopeClause::RootOrderBy { only_projected },
-                last_with,
                 &hints,
+                ScopeGate {
+                    last_with,
+                    projections: if only_projected {
+                        root_projections.map(Vec::as_slice)
+                    } else {
+                        None
+                    },
+                },
                 depth,
             )?;
         }
@@ -4115,6 +4507,151 @@ mod tests {
                 .message()
                 .contains("Maximum AST expression recursion depth exceeded")
         );
+    }
+
+    #[test]
+    fn distinct_return_order_by_repeats_a_projected_field() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "projections": [["field", "p", "city", null]],
+            "distinct": true,
+            "order_by": [["p", "city", true]]
+        });
+        let result = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            result.compiled.statement,
+            "MATCH (p:Person) RETURN DISTINCT p.city ORDER BY p.city ASC"
+        );
+    }
+
+    #[test]
+    fn distinct_return_order_by_accepts_a_projected_subexpression() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "projections": [["field", "p", "city", null]],
+            "distinct": true,
+            "order_by": [[["bin", "+", ["prop", "p", "city"], ["lit", 1]], true]]
+        });
+        let result = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            result.compiled.statement,
+            "MATCH (p:Person) RETURN DISTINCT p.city ORDER BY p.city + $p0 ASC"
+        );
+    }
+
+    #[test]
+    fn distinct_return_order_by_rejects_an_unprojected_field() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "projections": [["field", "p", "city", null]],
+            "distinct": true,
+            "order_by": [["p", "age", true]]
+        });
+        let error = compile_cypher(&spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidSpec);
+        assert_eq!(error.path(), Some("/order_by/0/0"));
+    }
+
+    #[test]
+    fn aggregating_return_order_by_repeats_a_projected_field() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "projections": [
+                ["field", "p", "city", null],
+                ["agg", "p", "*", "count", "c"]
+            ],
+            "order_by": [["p", "city", true]]
+        });
+        let result = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            result.compiled.statement,
+            "MATCH (p:Person) RETURN p.city, COUNT(p) AS c ORDER BY p.city ASC"
+        );
+    }
+
+    #[test]
+    fn aggregating_return_order_by_repeats_a_projected_aggregation() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "projections": [["agg", "p", "*", "count", "c"]],
+            "order_by": [[["fn", "count", [["ident", "p"]]], true]]
+        });
+        let result = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            result.compiled.statement,
+            "MATCH (p:Person) RETURN COUNT(p) AS c ORDER BY count(p) ASC"
+        );
+    }
+
+    #[test]
+    fn distinct_with_order_by_and_where_repeat_a_projected_field() {
+        let order_spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "with_clauses": [{
+                "distinct": true,
+                "projections": [["field", "p", "city", "city"]],
+                "order_by": [["p", "city", true]]
+            }],
+            "projections": [["expr", ["ident", "city"], null]]
+        });
+        let result = compile_cypher(&order_spec).unwrap();
+        assert_eq!(
+            result.compiled.statement,
+            "MATCH (p:Person) WITH DISTINCT p.city AS city ORDER BY p.city ASC RETURN city"
+        );
+
+        let where_spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "with_clauses": [{
+                "distinct": true,
+                "projections": [["field", "p", "city", "city"]],
+                "where": [["unary", "is_not_null", ["prop", "p", "city"]]]
+            }],
+            "projections": [["expr", ["ident", "city"], null]]
+        });
+        let result = compile_cypher(&where_spec).unwrap();
+        assert_eq!(
+            result.compiled.statement,
+            "MATCH (p:Person) WITH DISTINCT p.city AS city WHERE p.city IS NOT NULL RETURN city"
+        );
+    }
+
+    #[test]
+    fn distinct_with_order_by_and_where_reject_an_unprojected_field() {
+        let order_spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "with_clauses": [{
+                "distinct": true,
+                "projections": [["field", "p", "city", "city"]],
+                "order_by": [["p", "age", true]]
+            }],
+            "projections": [["expr", ["ident", "city"], null]]
+        });
+        let error = compile_cypher(&order_spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidSpec);
+        assert_eq!(error.path(), Some("/with_clauses/0/order_by/0/0"));
+
+        let where_spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "with_clauses": [{
+                "distinct": true,
+                "projections": [["field", "p", "city", "city"]],
+                "where": [["unary", "is_not_null", ["prop", "p", "age"]]]
+            }],
+            "projections": [["expr", ["ident", "city"], null]]
+        });
+        let error = compile_cypher(&where_spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidSpec);
+        assert_eq!(error.path(), Some("/with_clauses/0/where/0/2/1"));
     }
 
     #[test]
