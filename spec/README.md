@@ -104,10 +104,10 @@ The following are rejected:
   integral JSON number such as `0.0` or `3.0` is accepted (the schema's
   `integer` type accepts it). `skip` and `offset` are aliases of the same
   position, so providing both is rejected at the second key in document order.
-- Negative `min_hops` / `max_hops` values. `min_hops` and `max_hops` both have
-  minimum 0; when `max_hops` is `null`, the traversal is exactly `min_hops`
-  hops. When `min_hops` is omitted or `null` and `max_hops` is set, the minimum
-  is 1.
+- Negative `min_hops` / `max_hops` values. `min_hops` has minimum 0; `max_hops`
+  has minimum 0 or may be `"unbounded"` for open upper bounds. When
+  `max_hops` is `null`, the traversal is exactly `min_hops` hops. When
+  `min_hops` is omitted or `null` and `max_hops` is set, the lower bound is 1.
 - A bare or untagged array in an expression position: an empty array, a non-string
   first element (for example `[1, 2, 3]`) or an unknown first string (for
   example `["propp", ...]` or `["red", "green"]`). Every expression array must
@@ -266,7 +266,7 @@ Paths within `matches[i].paths` or `create`/`merge` mutations are sequences of s
 | Step Type | Shape | Description |
 | :--- | :--- | :--- |
 | **Node** | `["node", variable, labels, properties]` | Node pattern, e.g. `["node", "u", ["User", "Admin"]]`. `variable` can be `null` for anonymous nodes. `properties` is optional: an object mapping property names to [expressions](#4-expression-ast-descriptors), for example `{"name": ["lit", "Alice"]}`. Omitted, `null`, and `{}` all mean no properties; any other non-object is rejected. |
-| **Edge** | `["edge", dir, types, variable, min_hops, max_hops, properties]` | Directed or undirected relationship traversal. `dir` accepts exactly `"outgoing"` (`"out"`, `"->"`), `"incoming"` (`"in"`, `"<-"`), and `"undirected"` (`"both"`, `"-"`, `"--"`); the spelling is case-sensitive. `min_hops` and `max_hops` specify variable-length paths and both have minimum 0. `max_hops: null` means exactly `min_hops` hops; when `min_hops` is omitted or `null` and `max_hops` is set, the minimum is 1. `variable`, `min_hops`, `max_hops` and `properties` may be omitted (`["edge", dir, types]`) and default to `null`. `properties` follows the same rules as the node step. A non-null item after `properties` is rejected. |
+| **Edge** | `["edge", dir, types, variable, min_hops, max_hops, properties]` | Directed or undirected relationship traversal. `dir` accepts exactly `"outgoing"` (`"out"`, `"->"`), `"incoming"` (`"in"`, `"<-"`), and `"undirected"` (`"both"`, `"-"`, `"--"`); the spelling is case-sensitive. `min_hops` has minimum 0. `max_hops` has minimum 0, or accepts `"unbounded"` to represent an unbounded upper bound (e.g. `*2..` in Cypher, `{2,}` in ISO GQL/PGQ). `max_hops: null` means exactly `min_hops` hops; when `min_hops` is omitted or `null` and `max_hops` is set, the lower bound is 1 (e.g. `*1..3` in Cypher, `{1,3}` in ISO GQL/PGQ). `variable`, `min_hops`, `max_hops` and `properties` may be omitted (`["edge", dir, types]`) and default to `null`. `properties` follows the same rules as the node step. A non-null item after `properties` is rejected. |
 
 Property values follow the same strict rule as every other expression
 position: each value must be a tagged expression such as `["lit", "Alice"]` or
@@ -542,7 +542,7 @@ Mutation tuples within `mutations`:
 
 - **CREATE**: `["create", paths_list]`
 - **MERGE**: `["merge", path_steps, on_create_sets, on_match_sets]`
-- **SET**: `["set", variable, property, value_expression]`
+- **SET**: `["set", variable, property, value_expression]` (property assignment) or `["set", variable, map_expression]` (map merge: `SET variable += map`)
 - **DELETE**: `["delete", detach_bool, [target_vars...]]`
 - **REMOVE**: `["remove", variable, property]`
 

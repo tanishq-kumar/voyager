@@ -552,11 +552,6 @@ fn export_edge_step(arena: &QueryAstArena, handle: NodeHandle) -> SpecExportResu
             .ok_or_else(|| unsupported("an edge type expression using AND or NOT"))?,
         None => Vec::new(),
     };
-    if min_hops.is_some() != max_hops.is_some() {
-        return Err(unsupported(
-            "an edge with only one of min_hops/max_hops (Query Spec cannot express an open bound)",
-        ));
-    }
     let properties = export_pattern_properties(arena, variable.as_deref(), predicates, "edge")?;
 
     let mut items = vec![
@@ -564,12 +559,19 @@ fn export_edge_step(arena: &QueryAstArena, handle: NodeHandle) -> SpecExportResu
         text(direction_name(*direction)),
         SpecValue::Array(types.into_iter().map(text).collect()),
     ];
-    if variable.is_some() || min_hops.is_some() || !properties.is_empty() {
+    let has_hops = min_hops.is_some() || max_hops.is_some();
+    if variable.is_some() || has_hops || !properties.is_empty() {
         items.push(optional_text(variable));
     }
-    if min_hops.is_some() || !properties.is_empty() {
-        items.push(optional_u32(*min_hops));
-        items.push(optional_u32(*max_hops));
+    if has_hops || !properties.is_empty() {
+        let spec_min = optional_u32(*min_hops);
+        let spec_max = match (*min_hops, *max_hops) {
+            (Some(_), None) => text("unbounded"),
+            (_, Some(max)) => SpecValue::Int(i64::from(max)),
+            (None, None) => SpecValue::Null,
+        };
+        items.push(spec_min);
+        items.push(spec_max);
     }
     if !properties.is_empty() {
         items.push(SpecValue::Object(properties));
@@ -825,6 +827,52 @@ fn export_linear(arena: &QueryAstArena, handle: NodeHandle) -> SpecExportResult<
     }
 }
 
+enum ExportSetMutation {
+    Property(String, String, SpecValue),
+    Merge(String, SpecValue),
+}
+
+fn export_set_clause_items(
+    arena: &QueryAstArena,
+    items: &[NodeHandle],
+) -> SpecExportResult<Vec<ExportSetMutation>> {
+    let mut entries = Vec::with_capacity(items.len());
+    for &item in items {
+        let AstNode::SetItem {
+            target,
+            value,
+            is_merge,
+        } = node(arena, item)?
+        else {
+            return Err(unsupported("a SET entry that is not a set item"));
+        };
+        if *is_merge {
+            let AstNode::Identifier(variable) = node(arena, *target)? else {
+                return Err(unsupported(
+                    "a SET merge target that is not a bound variable",
+                ));
+            };
+            entries.push(ExportSetMutation::Merge(
+                variable.clone(),
+                export_expression(arena, *value)?,
+            ));
+        } else {
+            let AstNode::PropertyAccess { target, property } = node(arena, *target)? else {
+                return Err(unsupported("a SET target that is not a property"));
+            };
+            let AstNode::Identifier(variable) = node(arena, *target)? else {
+                return Err(unsupported("a SET target that is not a bound variable"));
+            };
+            entries.push(ExportSetMutation::Property(
+                variable.clone(),
+                property.clone(),
+                export_expression(arena, *value)?,
+            ));
+        }
+    }
+    Ok(entries)
+}
+
 fn export_set_entries(
     arena: &QueryAstArena,
     items: &[NodeHandle],
@@ -894,10 +942,15 @@ fn export_mutation(arena: &QueryAstArena, handle: NodeHandle) -> SpecExportResul
                 entries(on_match),
             ])])
         }
-        AstNode::SetClause { items } => Ok(export_set_entries(arena, items)?
+        AstNode::SetClause { items } => Ok(export_set_clause_items(arena, items)?
             .into_iter()
-            .map(|(variable, property, value)| {
-                SpecValue::Array(vec![text("set"), text(variable), text(property), value])
+            .map(|mutation| match mutation {
+                ExportSetMutation::Property(variable, property, value) => {
+                    SpecValue::Array(vec![text("set"), text(variable), text(property), value])
+                }
+                ExportSetMutation::Merge(variable, value) => {
+                    SpecValue::Array(vec![text("set"), text(variable), value])
+                }
             })
             .collect()),
         AstNode::DeleteClause { detach, targets } => {

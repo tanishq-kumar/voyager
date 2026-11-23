@@ -224,7 +224,7 @@
       "items": { "type": "null" }
     },
     "EdgeStep": {
-      "description": "Edge pattern: ['edge', direction, types: string[], variable | null, min_hops | null, max_hops | null, properties | null]. max_hops null means exactly min_hops.",
+      "description": "Edge pattern: ['edge', direction, types: string[], variable | null, min_hops | null, max_hops | null, properties | null]. max_hops null means exactly min_hops, string 'unbounded' means unbounded.",
       "type": "array",
       "prefixItems": [
         { "type": "string", "const": "edge" },
@@ -232,7 +232,12 @@
         { "type": "array", "items": { "type": "string" } },
         { "type": ["string", "null"] },
         { "type": ["integer", "null"], "minimum": 0 },
-        { "type": ["integer", "null"], "minimum": 0 },
+        {
+          "oneOf": [
+            { "type": ["integer", "null"], "minimum": 0 },
+            { "type": "string", "enum": ["unbounded"] }
+          ]
+        },
         { "$ref": "#/$defs/PropertyMap" }
       ],
       "minItems": 3,
@@ -355,6 +360,17 @@
             { "$ref": "#/$defs/Expression" }
           ],
           "minItems": 4,
+          "items": false
+        },
+        {
+          "description": "SET map merge: ['set', variable, map_expression]",
+          "type": "array",
+          "prefixItems": [
+            { "type": "string", "const": "set" },
+            { "type": "string" },
+            { "$ref": "#/$defs/Expression" }
+          ],
+          "minItems": 3,
           "items": false
         },
         {

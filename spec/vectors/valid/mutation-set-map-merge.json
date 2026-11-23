@@ -1,0 +1,73 @@
+{
+  "description": "SET map merge mutation after a MATCH.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "mutations": [
+      [
+        "set",
+        "p",
+        [
+          "lit",
+          {
+            "age": 30
+          }
+        ]
+      ]
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (p:Person) SET p += $p0 RETURN p.name",
+      "parameters": {
+        "p0": {
+          "age": 30
+        }
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) SET p += $p0 RETURN p.name $$, %s) AS (name agtype)",
+      "parameters": {
+        "p0": {
+          "age": 30
+        }
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (p:Person) SET p += $p0 RETURN p.name",
+      "parameters": {
+        "p0": {
+          "age": 30
+        }
+      }
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

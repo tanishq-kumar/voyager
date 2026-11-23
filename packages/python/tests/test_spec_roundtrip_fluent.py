@@ -222,11 +222,28 @@ def _query_load_csv() -> Query:
     return Query.load_csv("file:///tmp/roundtrip.csv").match(row).return_(row.name)
 
 
+def _query_open_hops_min() -> Query:
+    p, f = _person("p"), _person("f")
+    return Query.match(p).to(RoundtripKnows(alias="r")).node(f).hops(min_hops=2).return_(f.name)
+
+
+def _query_open_hops_max() -> Query:
+    p, f = _person("p"), _person("f")
+    return Query.match(p).to(RoundtripKnows(alias="r")).node(f).hops(max_hops=3).return_(f.name)
+
+
+def _query_set_map_merge() -> Query:
+    p = _person()
+    return Query.match(p).where(p.name == "Alice").set_merge(p, {"city": "Berlin"}).return_(p.name)
+
+
 QUERY_FACTORIES: dict[str, Callable[[], Query]] = {
     "match_properties": _query_match_properties,
     "where_predicates": _query_where_predicates,
     "multi_hop_edges": _query_multi_hop_edges,
     "variable_length_edges": _query_variable_length_edges,
+    "open_hops_min": _query_open_hops_min,
+    "open_hops_max": _query_open_hops_max,
     "optional_match": _query_optional_match,
     "path_mode": _query_path_mode,
     "with_clause": _query_with_clause,
@@ -243,6 +260,7 @@ QUERY_FACTORIES: dict[str, Callable[[], Query]] = {
     "create": _query_create,
     "merge_with_sets": _query_merge_with_sets,
     "set_and_remove": _query_set_and_remove,
+    "set_map_merge": _query_set_map_merge,
     "delete": _query_delete,
     "detach_delete": _query_detach_delete,
     "linear_clauses": _query_linear_clauses,

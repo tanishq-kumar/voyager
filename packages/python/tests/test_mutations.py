@@ -1,7 +1,7 @@
 """Tests for DML Mutations (CREATE, MERGE, SET, DELETE, REMOVE) and Model Dirty Tracking."""
 
 import pytest
-from voyager_ogm import Query, node, relationship
+from voyager_ogm import Query, VoyagerError, node, relationship
 from voyager_ogm.models import reset_alias_counters
 
 
@@ -127,3 +127,46 @@ def test_python_model_dirty_tracking():
     assert "SET _person_0.age = $p1, _person_0.status = $p2" in compiled.statement
     assert compiled.parameters["p1"] == 26
     assert compiled.parameters["p2"] == "VERIFIED"
+
+
+def test_set_kwargs_bare_map_is_rejected_not_merged():
+    p = Person()
+    # A key without a dot is not a map merge (use set_merge); since #295 it raises
+    with pytest.raises(VoyagerError) as exc_info:
+        Query.match(p).set(p={"city": "Berlin"})
+    assert exc_info.value.code == "INVALID_CLAUSE"
+
+    # Key with dot assigns property
+    q_dot = Query.match(p).set(**{"_person_0.city": "Berlin"}).return_(p)
+    compiled_dot = q_dot.compile("cypher")
+    assert "SET _person_0.city = $p0" in compiled_dot.statement
+
+
+def test_set_merge_explicit_method():
+    p = Person()
+    query = Query.match(p).set_merge(p, {"city": "Berlin"}).return_(p)
+    compiled = query.compile("cypher")
+    assert "SET _person_0 += $p0" in compiled.statement
+    assert compiled.parameters["p0"] == {"city": "Berlin"}
+
+
+def test_open_hops_fluent_compilation():
+    p = Person()
+    f = Person()
+    rel = Follows()
+
+    # max_hops=3 emits *1..3 (main-compatible)
+    q_max = Query.match(p).to(rel).node(f).hops(max_hops=3).return_(f)
+    assert "*1..3" in q_max.compile("cypher").statement
+    assert "*1..3" in q_max.compile("age").statement
+    assert "{1,3}" in q_max.compile("iso_gql").statement
+
+    # min_hops=2 emits *2..
+    q_min = Query.match(p).to(rel).node(f).hops(min_hops=2).return_(f)
+    assert "*2.." in q_min.compile("cypher").statement
+    assert "*2.." in q_min.compile("age").statement
+    assert "{2,}" in q_min.compile("iso_gql").statement
+
+    # inf is rejected with TypeError
+    with pytest.raises(TypeError, match="expected an int, 'unbounded', or None for max_hops"):
+        Query.match(p).to(rel).node(f).hops(max_hops="inf")

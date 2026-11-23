@@ -1,0 +1,51 @@
+{
+  "description": "max_hops string must be 'unbounded'; 'inf' is rejected.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ],
+            [
+              "edge",
+              "outgoing",
+              [
+                "KNOWS"
+              ],
+              "r",
+              1,
+              "inf"
+            ],
+            [
+              "node",
+              "f",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/paths/0/1/5"
+  }
+}
