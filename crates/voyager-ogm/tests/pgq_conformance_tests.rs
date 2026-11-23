@@ -94,7 +94,7 @@ fn test_pgq_string_like_translations() {
     let (a1, r1) = b1.build();
     let mut pgq = SqlPgqEmitter::new("g");
     let res1 = pgq.visit_query(&a1, r1).unwrap();
-    assert!(res1.statement.contains("p.city LIKE '%' || $p0 || '%'"));
+    assert!(res1.statement.contains("strpos(p.city, $p0) > 0"));
 
     // STARTS WITH
     let mut b2 = QueryBuilder::new();
@@ -103,7 +103,7 @@ fn test_pgq_string_like_translations() {
         .field("p", "name", None::<String>);
     let (a2, r2) = b2.build();
     let res2 = pgq.visit_query(&a2, r2).unwrap();
-    assert!(res2.statement.contains("p.name LIKE $p0 || '%'"));
+    assert!(res2.statement.contains("starts_with(p.name, $p0)"));
 
     // ENDS WITH
     let mut b3 = QueryBuilder::new();
@@ -112,7 +112,7 @@ fn test_pgq_string_like_translations() {
         .field("p", "name", None::<String>);
     let (a3, r3) = b3.build();
     let res3 = pgq.visit_query(&a3, r3).unwrap();
-    assert!(res3.statement.contains("p.name LIKE '%' || $p0"));
+    assert!(res3.statement.contains("right(p.name, length($p0)) = $p0"));
 }
 
 #[test]

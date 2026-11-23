@@ -850,7 +850,7 @@
         "p1": "York",
         "p2": "ce"
       },
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE ((p.name LIKE $p0 || '%') AND (p.city LIKE '%' || $p1 || '%')) AND (p.name LIKE '%' || $p2) COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE ((starts_with(p.name, $p0)) AND (strpos(p.city, $p1) > 0)) AND (right(p.name, length($p2)) = $p2) COLUMNS (p.name))",
       "status": "ok"
     }
   },

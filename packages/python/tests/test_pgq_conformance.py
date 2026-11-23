@@ -94,9 +94,9 @@ def _reset():
             "p.city <> ALL($p0)",
             {"p0": ["Rome", "Tokyo"]},
         ),
-        (lambda p: p.city.contains("don"), "p.city LIKE '%' || $p0 || '%'", {"p0": "don"}),
-        (lambda p: p.name.startswith("Al"), "p.name LIKE $p0 || '%'", {"p0": "Al"}),
-        (lambda p: p.name.endswith("ce"), "p.name LIKE '%' || $p0", {"p0": "ce"}),
+        (lambda p: p.city.contains("don"), "strpos(p.city, $p0) > 0", {"p0": "don"}),
+        (lambda p: p.name.startswith("Al"), "starts_with(p.name, $p0)", {"p0": "Al"}),
+        (lambda p: p.name.endswith("ce"), "right(p.name, length($p0)) = $p0", {"p0": "ce"}),
     ],
     ids=[
         "pgq_eq",
