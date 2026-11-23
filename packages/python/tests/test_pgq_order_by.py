@@ -172,7 +172,13 @@ def test_order_by_duplicate_key_reuses_alias(dialect: str) -> None:
 @pytest.mark.parametrize("dialect", ["sql_pgq", "duckpgq"])
 def test_order_by_distinct_with_non_returned_key_rejected(dialect: str) -> None:
     p = Person(alias="p")
-    with pytest.raises(ValueError, match="ORDER BY on non-projected expressions with DISTINCT"):
+    # The fluent scope check (#287) rejects this before the emitter where it is
+    # present; without it the SQL/PGQ emitter raises UnsupportedFeature.
+    with pytest.raises(
+        ValueError,
+        match="ORDER BY on non-projected expressions with DISTINCT"
+        "|a RETURN with DISTINCT or an aggregation only exposes the names it projects",
+    ):
         (
             Query.match(p)
             .distinct()
