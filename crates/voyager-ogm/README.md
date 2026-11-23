@@ -135,7 +135,7 @@ let returned = arena.alloc(AstNode::ReturnClause {
     }],
     order_by: vec![],
     skip: None,
-    limit: Some(10),
+    limit: Some(PaginationValue::Count(10)),
 });
 let root = arena.alloc(AstNode::QueryStatement {
     execution_mode: ExecutionMode::Normal,
