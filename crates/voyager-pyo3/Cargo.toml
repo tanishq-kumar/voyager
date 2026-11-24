@@ -22,7 +22,7 @@ workspace = true
 
 [dependencies]
 voyager-ogm = { workspace = true, features = ["serde", "arrow"] }
-voyager-drivers = { workspace = true, features = ["bolt", "postgres", "redis", "arrow"] }
+voyager-drivers = { workspace = true, features = ["bolt", "postgres", "redis", "arrow", "tls"] }
 tokio = { workspace = true }
 arrow-array = { workspace = true, features = ["ffi"] }
 arrow-schema = { workspace = true }

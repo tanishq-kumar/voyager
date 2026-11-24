@@ -18,16 +18,13 @@ use crate::redis::RedisConnection;
 use crate::uri::{DatabaseProtocol, ParsedUri};
 
 /// Asynchronously connects to any supported database protocol based on the URI scheme.
+///
+/// TLS URIs (`bolt+s`, `rediss`, `?sslmode=...`, ...) connect over TLS when the `tls`
+/// feature is enabled and fail with [`NetError::TlsError`] naming the feature otherwise.
 pub async fn connect_any(uri: &str) -> Result<Box<dyn AsyncConnection>> {
     // Parsing already rejects protocols whose Cargo feature is disabled, with an
     // error that names the missing feature.
     let parsed = ParsedUri::parse(uri)?;
-    if parsed.tls != crate::config::TlsMode::Disabled {
-        return Err(NetError::TlsError(format!(
-            "TLS encryption requested for '{}' ({:?}), but native TLS socket negotiation is not yet configured on this endpoint. Plaintext downgrade rejected for security.",
-            parsed.host, parsed.tls
-        )));
-    }
     match parsed.protocol {
         DatabaseProtocol::Bolt => {
             #[cfg(feature = "bolt")]
