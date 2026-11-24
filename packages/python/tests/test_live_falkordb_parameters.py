@@ -12,11 +12,20 @@ import socket
 import uuid
 
 import pytest
-from redis.exceptions import RedisError
 from voyager_ogm import Field, Node, Relationship, RelationshipTo, Session
 from voyager_ogm.ingestion import BulkIngestionPlan
 
 pytestmark = pytest.mark.live
+
+# The falkordb/redis driver packages are not installed on Python 3.14 (see the
+# pyproject.toml markers), and a FalkorDB Session needs them on both backends.
+BATCH_ERRORS: tuple[type[BaseException], ...] = (ValueError, RuntimeError)
+try:
+    from redis.exceptions import RedisError
+except ImportError:
+    pass
+else:
+    BATCH_ERRORS = (*BATCH_ERRORS, RedisError)
 
 HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
 BACKENDS = ["native", "bridge"]
@@ -51,6 +60,7 @@ def _check_falkordb_reachable() -> None:
 
 
 def _open_session(backend: str) -> tuple[Session, str]:
+    pytest.importorskip("falkordb")
     graph_name = f"zz_falkor_339_{uuid.uuid4().hex[:8]}"
     uri = f"redis://{HOST}:6379/{graph_name}"
     session = Session(
@@ -288,7 +298,7 @@ def test_live_falkordb_failing_batched_write_raises(backend: str) -> None:
             dialect="cypher",
             batches_data=[[{"x": 1}], [{"x": 2}]],
         )
-        with pytest.raises((ValueError, RuntimeError, RedisError)):
+        with pytest.raises(BATCH_ERRORS):
             session.run_bulk(plan)
     finally:
         _cleanup_session(session, graph)
