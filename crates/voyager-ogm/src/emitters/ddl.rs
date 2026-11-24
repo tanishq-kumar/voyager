@@ -155,8 +155,10 @@ pub fn emit_cypher_node_ddl(node: &NodeSchema, include_type_constraints: bool) -
             ));
         }
 
-        // Property existence (NOT NULL) constraint
-        if !field.nullable {
+        // Property existence (NOT NULL) constraint. Only primary keys and
+        // explicitly non-nullable fields emit it; inference is declarative-only
+        // because Neo4j Community rejects this Enterprise-only constraint.
+        if field.emits_existence_constraint() {
             let c_name = cypher_constraint_name(primary_label, db_name, "not_null");
             statements.push(format!(
                 "CREATE CONSTRAINT {c_name} IF NOT EXISTS FOR (n:{primary_label}) REQUIRE n.{db_name} IS NOT NULL"
@@ -265,8 +267,10 @@ pub fn emit_cypher_rel_ddl(
             ));
         }
 
-        // Property existence (NOT NULL) constraint
-        if !field.nullable {
+        // Property existence (NOT NULL) constraint. Only primary keys and
+        // explicitly non-nullable fields emit it; inference is declarative-only
+        // because Neo4j Community rejects this Enterprise-only constraint.
+        if field.emits_existence_constraint() {
             let c_name = cypher_rel_constraint_name(type_name, db_name, "not_null");
             statements.push(format!(
                 "CREATE CONSTRAINT {c_name} IF NOT EXISTS FOR ()-[r:{type_name}]-() REQUIRE r.{db_name} IS NOT NULL"
@@ -329,7 +333,7 @@ pub fn emit_cypher_drop_node_ddl(node: &NodeSchema, include_type_constraints: bo
             let c_name = cypher_constraint_name(primary_label, db_name, "unique");
             statements.push(format!("DROP CONSTRAINT {c_name} IF EXISTS"));
         }
-        if !field.nullable {
+        if field.emits_existence_constraint() {
             let c_name = cypher_constraint_name(primary_label, db_name, "not_null");
             statements.push(format!("DROP CONSTRAINT {c_name} IF EXISTS"));
         }
@@ -381,7 +385,7 @@ pub fn emit_cypher_drop_rel_ddl(
             let c_name = cypher_rel_constraint_name(type_name, db_name, "unique");
             statements.push(format!("DROP CONSTRAINT {c_name} IF EXISTS"));
         }
-        if !field.nullable {
+        if field.emits_existence_constraint() {
             let c_name = cypher_rel_constraint_name(type_name, db_name, "not_null");
             statements.push(format!("DROP CONSTRAINT {c_name} IF EXISTS"));
         }
@@ -1881,7 +1885,7 @@ pub fn emit_node_constraint_ddl_with_graph(
                         "CREATE CONSTRAINT ON (n:{primary_label}) ASSERT n.{db_name} IS UNIQUE;"
                     ));
                 }
-                if !field.nullable {
+                if field.emits_existence_constraint() {
                     statements.push(format!(
                         "CREATE CONSTRAINT ON (n:{primary_label}) ASSERT EXISTS (n.{db_name});"
                     ));
@@ -1925,7 +1929,7 @@ pub fn emit_node_constraint_ddl_with_graph(
                         "CREATE CONSTRAINT {c_name} IF NOT EXISTS FOR (n:{primary_label}) REQUIRE n.{db_name} IS UNIQUE"
                     ));
                 }
-                if !field.nullable {
+                if field.emits_existence_constraint() {
                     let c_name = cypher_constraint_name(primary_label, db_name, "not_null");
                     statements.push(format!(
                         "CREATE CONSTRAINT {c_name} IF NOT EXISTS FOR (n:{primary_label}) REQUIRE n.{db_name} IS NOT NULL"
@@ -2025,7 +2029,7 @@ pub fn emit_rel_constraint_ddl_with_graph(
                         "CREATE CONSTRAINT {c_name} IF NOT EXISTS FOR ()-[r:{type_name}]-() REQUIRE r.{db_name} IS UNIQUE"
                     ));
                 }
-                if !field.nullable {
+                if field.emits_existence_constraint() {
                     let c_name = cypher_rel_constraint_name(type_name, db_name, "not_null");
                     statements.push(format!(
                         "CREATE CONSTRAINT {c_name} IF NOT EXISTS FOR ()-[r:{type_name}]-() REQUIRE r.{db_name} IS NOT NULL"
@@ -2401,7 +2405,7 @@ pub fn emit_node_drop_constraint_ddl_with_graph(
                         "DROP CONSTRAINT ON (n:{primary_label}) ASSERT n.{db_name} IS UNIQUE;"
                     ));
                 }
-                if !field.nullable {
+                if field.emits_existence_constraint() {
                     statements.push(format!(
                         "DROP CONSTRAINT ON (n:{primary_label}) ASSERT EXISTS (n.{db_name});"
                     ));
@@ -2436,7 +2440,7 @@ pub fn emit_node_drop_constraint_ddl_with_graph(
                     let c_name = cypher_constraint_name(primary_label, db_name, "unique");
                     statements.push(format!("DROP CONSTRAINT {c_name} IF EXISTS"));
                 }
-                if !field.nullable {
+                if field.emits_existence_constraint() {
                     let c_name = cypher_constraint_name(primary_label, db_name, "not_null");
                     statements.push(format!("DROP CONSTRAINT {c_name} IF EXISTS"));
                 }
@@ -2522,7 +2526,7 @@ pub fn emit_rel_drop_constraint_ddl_with_graph(
                     let c_name = cypher_rel_constraint_name(type_name, db_name, "unique");
                     statements.push(format!("DROP CONSTRAINT {c_name} IF EXISTS"));
                 }
-                if !field.nullable {
+                if field.emits_existence_constraint() {
                     let c_name = cypher_rel_constraint_name(type_name, db_name, "not_null");
                     statements.push(format!("DROP CONSTRAINT {c_name} IF EXISTS"));
                 }

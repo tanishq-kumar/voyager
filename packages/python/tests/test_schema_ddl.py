@@ -78,7 +78,8 @@ def test_schema_ddl_generation():
         in statements
     )
 
-    # Negative assertions: plain Field() and indexed Field() default to nullable (no NOT NULL constraint)
+    # Negative assertions: inferring non-nullability does not emit an executable
+    # existence constraint; only explicit nullable=False (and primary keys) do.
     assert not any("constraint_user_age_not_null" in s for s in statements)
     assert not any("constraint_user_bio_not_null" in s for s in statements)
 
@@ -157,7 +158,7 @@ def test_cypher25_graph_type_ddl():
     assert cypher25_ddl.startswith("ALTER CURRENT GRAPH TYPE SET {")
     assert "(:User =>" in cypher25_ddl
     assert "user_id :: STRING IS KEY" in cypher25_ddl
-    assert "email :: STRING IS UNIQUE" in cypher25_ddl
+    assert "email :: STRING NOT NULL IS UNIQUE" in cypher25_ddl
     assert "(:User)-[:FOLLOWS =>" in cypher25_ddl
     assert "since :: INTEGER" in cypher25_ddl
 
@@ -333,7 +334,7 @@ def test_alter_current_graph_type_ddl():
     node_alter = SchemaManager.generate_alter_graph_type_ddl(User)
     assert (
         node_alter
-        == "ALTER CURRENT GRAPH TYPE ADD NODE TYPE (:User {age :: INTEGER?, bio :: STRING?, email :: STRING, user_id :: STRING})"
+        == "ALTER CURRENT GRAPH TYPE ADD NODE TYPE (:User {age :: INTEGER, bio :: STRING, email :: STRING, user_id :: STRING})"
     )
 
     rel_alter = SchemaManager.generate_alter_graph_type_ddl(
@@ -350,10 +351,10 @@ def test_gql_create_graph_type_ddl():
     gql_ddl = SchemaManager.generate_gql_graph_type_ddl("SocialGraphType", User, Follows)
     assert "CREATE GRAPH TYPE SocialGraphType AS {" in gql_ddl
     assert (
-        "NODE User (age INTEGER, bio STRING, email STRING, user_id STRING NOT NULL) KEY (user_id)"
+        "NODE User (age INTEGER NOT NULL, bio STRING NOT NULL, email STRING NOT NULL, user_id STRING NOT NULL) KEY (user_id)"
         in gql_ddl
     )
-    assert "EDGE FOLLOWS CONNECTING (User TO User) (since INTEGER)" in gql_ddl
+    assert "EDGE FOLLOWS CONNECTING (User TO User) (since INTEGER NOT NULL)" in gql_ddl
 
     drop_ddl = SchemaManager.generate_gql_drop_graph_type_ddl("SocialGraphType")
     assert drop_ddl == "DROP GRAPH TYPE SocialGraphType IF EXISTS"

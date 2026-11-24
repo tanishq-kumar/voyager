@@ -66,7 +66,15 @@ fn test_field_descriptor_builder() {
         .nullable(false);
     assert!(email_field.unique);
     assert!(!email_field.nullable);
+    assert_eq!(email_field.nullable_explicit, Some(false));
+    assert!(email_field.emits_existence_constraint());
     assert!(!email_field.primary_key);
+
+    // The default is fail-open nullable and carries no explicit request.
+    let default_field = FieldDescriptor::new("nickname", FieldType::String);
+    assert!(default_field.nullable);
+    assert_eq!(default_field.nullable_explicit, None);
+    assert!(!default_field.emits_existence_constraint());
 
     let age_field = FieldDescriptor::new("age", FieldType::Int64)
         .indexed()
@@ -1443,6 +1451,53 @@ fn test_old_snapshot_json_without_description_deserializes() {
     assert_eq!(rel.name, "Follows");
     assert_eq!(rel.description, None);
     assert_eq!(rel.fields.get("since").unwrap().description, None);
+}
+
+#[test]
+fn test_pre_inference_snapshot_keeps_existence_constraint_ddl() {
+    let old_snapshot_json = r#"{
+        "nodes": {
+            "Legacy": {
+                "name": "Legacy",
+                "labels": ["Legacy"],
+                "fields": {
+                    "id": {
+                        "name": "id",
+                        "field_type": "String",
+                        "nullable": false,
+                        "primary_key": true,
+                        "unique": true,
+                        "indexed": false,
+                        "index_type": null,
+                        "default_value": null,
+                        "vector_config": null
+                    },
+                    "code": {
+                        "name": "code",
+                        "field_type": "String",
+                        "nullable": false,
+                        "primary_key": false,
+                        "unique": false,
+                        "indexed": false,
+                        "index_type": null,
+                        "default_value": null,
+                        "vector_config": null
+                    }
+                },
+                "primary_key": "id",
+                "fulltext_indexes": []
+            }
+        },
+        "relationships": {}
+    }"#;
+
+    let registry = SchemaRegistry::new();
+    registry.from_json(old_snapshot_json).unwrap();
+    let ddl = registry.generate_cypher_ddl(false);
+    assert!(
+        ddl.iter().any(|s| s.contains("legacy_code_not_null")),
+        "old snapshots treated non-nullable fields as explicit: {ddl:?}"
+    );
 }
 
 #[test]

@@ -6,6 +6,7 @@ automatic descriptor binding, base class injection, and type reflection.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import difflib
 import inspect
@@ -362,7 +363,11 @@ class Field(Generic[_T]):
         unique: Flag indicating a UNIQUE property database constraint.
         index: Flag indicating a database index should be created on this property.
         primary_key: Convenience flag setting both unique=True and index=True (and nullable=False).
-        nullable: Whether the field can store null values. Defaults to True (False for primary_key).
+        nullable: Whether the field can store null values. ``None`` (the default) infers it
+            from the type annotation when the model class is built; an explicit
+            ``True``/``False`` wins over the annotation. Primary keys are always non-nullable.
+        nullable_explicit: The explicit ``nullable`` value passed by the caller, or ``None``
+            when nullability was inferred from the annotation.
         type_annotation: The resolved Python type class (e.g. `str`, `int`).
         pattern: Regex pattern string or compiled Pattern for string validation.
             Maps to JSON Schema keyword `pattern`.
@@ -398,7 +403,7 @@ class Field(Generic[_T]):
         unique: bool = False,
         index: bool = False,
         primary_key: bool = False,
-        nullable: bool = True,
+        nullable: bool | None = None,
         type_annotation: Any = None,
         index_type: str | None = None,
         description: str | None = None,
@@ -420,7 +425,9 @@ class Field(Generic[_T]):
             unique: Whether to enforce a unique constraint.
             index: Whether to create a search index on this property.
             primary_key: Convenience flag setting both unique=True and index=True.
-            nullable: Whether the field can store null values. Defaults to True (False for primary_key).
+            nullable: Whether the field can store null values. ``None`` infers it from the
+                annotation at class build; an explicit value wins. Primary keys are always
+                non-nullable.
             type_annotation: Python type annotation class.
             index_type: Optional index type string ('BTREE', 'TEXT', 'POINT', 'VECTOR').
             description: Optional human-readable description of this property.
@@ -441,7 +448,8 @@ class Field(Generic[_T]):
         self.primary_key = primary_key
         self.unique = unique or primary_key
         self.index = index or primary_key
-        self.nullable = False if primary_key else nullable
+        self.nullable_explicit = nullable
+        self.nullable = False if primary_key else (True if nullable is None else nullable)
         self.index_type = index_type or ("BTREE" if self.index else None)
         self.description = description
         if isinstance(type_annotation, str) and type_annotation in _BUILTIN_TYPES:
@@ -1027,7 +1035,9 @@ class VectorProperty(Field):
             default: Default fallback value for this property.
             default_factory: Zero-argument callable producing a default value.
             name: Custom database property name (defaults to attribute name).
-            nullable: Whether the property can store null values. Defaults to True.
+            nullable: Whether the property can store null values. Defaults to an explicit
+                ``True`` (not inferred from the annotation), because embeddings are often
+                absent until computed.
             type_annotation: Python type annotation class (defaults to list[float]).
 
         Raises:
@@ -1421,6 +1431,106 @@ def _native_merge_key_fields(
     return list(key_fields)
 
 
+def _evaluate_annotation(cls: Any, annotation: Any) -> Any:
+    """Resolves one string annotation in the class's module without failing its siblings.
+
+    ``inspect.get_annotations(..., eval_str=True)`` evaluates a whole class at once, so a
+    single unimported name leaves every annotation as a raw string. Each annotation is
+    evaluated here independently and an unresolvable one is returned unchanged.
+
+    Args:
+        cls: Class whose module and class namespace are used for name resolution.
+        annotation: Raw annotation, usually a string under ``from __future__ import annotations``.
+
+    Returns:
+        The evaluated annotation, or the original string when it cannot be resolved.
+    """
+    if not isinstance(annotation, str):
+        return annotation
+    holder = type("_AnnotationHolder", (), {"__module__": getattr(cls, "__module__", "")})
+    for key, value in vars(cls).items():
+        if not (key.startswith("__") and key.endswith("__")):
+            setattr(holder, key, value)
+    holder.__annotations__ = {"value": annotation}
+    try:
+        return inspect.get_annotations(holder, eval_str=True)["value"]
+    except Exception:
+        return annotation
+
+
+def _string_annotation_is_nullable(annotation: str) -> bool:
+    """Infers nullability from an annotation string that could not be resolved.
+
+    A union containing ``None`` is nullable; a string that evaluates against builtins to a
+    concrete annotation (such as ``"str"`` or ``"list[str]"``) is not. Anything else is
+    treated as unknown and therefore nullable (fail-open).
+
+    Args:
+        annotation: Raw annotation text.
+
+    Returns:
+        True when the annotation is or may be nullable, False for a known concrete type.
+    """
+    text = annotation.strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        text = text[1:-1].strip()
+    if not text:
+        return True
+    if re.search(r"\bNone\b", text):
+        return True
+    holder = type("_AnnotationHolder", (), {"__module__": "builtins"})
+    holder.__annotations__ = {"value": text}
+    try:
+        evaluated = inspect.get_annotations(holder, eval_str=True)["value"]
+    except Exception:
+        return True
+    if isinstance(evaluated, str):
+        return True
+    return _annotation_is_nullable(evaluated)
+
+
+def _annotation_is_nullable(annotation: Any) -> bool:
+    """Infers nullability from a Python type annotation.
+
+    Args:
+        annotation: Resolved annotation (or an unresolvable string).
+
+    Returns:
+        True for no annotation, ``Any``, unresolvable annotations, and unions containing
+        ``None`` (including inside ``Annotated``); False for every other concrete annotation.
+    """
+    if annotation is None or annotation is inspect.Parameter.empty or annotation is typing.Any:
+        return True
+    if isinstance(annotation, str):
+        return _string_annotation_is_nullable(annotation)
+    origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
+        args = typing.get_args(annotation)
+        return _annotation_is_nullable(args[0]) if args else True
+    if annotation is type(None):
+        return True
+    if origin is typing.Union or (hasattr(types, "UnionType") and origin is types.UnionType):
+        return any(arg is type(None) for arg in typing.get_args(annotation))
+    return False
+
+
+def _resolve_field_nullability(field: Field[Any]) -> None:
+    """Resolves ``Field.nullable`` from the primary-key flag, explicit value, or annotation.
+
+    Primary keys are always non-nullable. An explicit ``nullable=True``/``False`` wins over
+    the annotation. Otherwise the stored ``type_annotation`` decides, failing open to True.
+
+    Args:
+        field: Field descriptor already bound to its declaration annotation.
+    """
+    if field.primary_key:
+        field.nullable = False
+    elif field.nullable_explicit is not None:
+        field.nullable = field.nullable_explicit
+    else:
+        field.nullable = _annotation_is_nullable(field.type_annotation)
+
+
 def _process_type_annotations(cls: Any) -> dict[str, Field]:
     """Extracts type annotations and injects Field descriptors automatically.
 
@@ -1437,10 +1547,10 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
         if hasattr(base, "_schema_fields") and isinstance(base._schema_fields, dict):
             fields_map.update(base._schema_fields)
 
-    try:
-        annotations = inspect.get_annotations(cls, eval_str=True)
-    except Exception:
-        annotations = getattr(cls, "__annotations__", {})
+    annotations = {
+        attr_name: _evaluate_annotation(cls, type_hint)
+        for attr_name, type_hint in inspect.get_annotations(cls, eval_str=False).items()
+    }
 
     for attr_name, type_hint in annotations.items():
         if attr_name.startswith("_"):
@@ -1453,6 +1563,11 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
             existing_val._set_owner(cls, attr_name)
             continue
         if isinstance(existing_val, Field):
+            if attr_name not in cls.__dict__:
+                # The annotation overrides an inherited descriptor for this
+                # subclass; clone it so re-inference cannot change the base.
+                existing_val = copy.copy(existing_val)
+                setattr(cls, attr_name, existing_val)
             existing_val.type_annotation = type_hint
             if existing_val.name is None:
                 existing_val.name = attr_name
@@ -1477,6 +1592,7 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
             fields_map[attr_name] = val
 
     for f in fields_map.values():
+        _resolve_field_nullability(f)
         f._owner = cls
 
     for attr_name, field_desc in fields_map.items():
@@ -1722,7 +1838,9 @@ class Node:
           ``list[T]`` -> ``array`` of ``T``; ``dict[str, T]`` -> ``object``;
           ``Point`` -> ``object`` with numeric ``x``/``y``; ``Literal`` and
           ``Enum`` -> ``enum``; unions -> ``anyOf``; unknown types -> ``{}``.
-        - A ``nullable`` field (the ``Field`` default) also accepts ``null``.
+        - A nullable field also accepts ``null``. Nullability is inferred from the
+          annotation (``str | None`` / ``Optional[str]`` are nullable, ``str`` is not)
+          unless ``Field(nullable=...)`` says otherwise.
         - ``required`` lists fields that are not nullable and have no default
           or ``default_factory``; graph properties may otherwise be absent.
         - ``default`` is emitted only for a plain JSON-representable default; a
