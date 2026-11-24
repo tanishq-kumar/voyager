@@ -5895,21 +5895,61 @@ impl PyNativeSchemaRegistry {
     }
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` DDL statement.
-    #[pyo3(signature = (graph_name, model_names=None))]
+    #[pyo3(signature = (graph_name, model_names=None, dialect="postgres"))]
     fn generate_pgq_ddl(
         &self,
         graph_name: &str,
         model_names: Option<Vec<String>>,
+        dialect: &str,
     ) -> PyResult<String> {
         if let Some(names) = model_names {
             let str_names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
             self.registry()
-                .generate_pgq_ddl_for(graph_name, &str_names)
-                .map_err(|e| PyValueError::new_err(e.to_string()))
+                .generate_pgq_ddl_for_with_dialect(graph_name, &str_names, dialect)
+                .map_err(to_py_schema_err)
         } else {
             self.registry()
-                .generate_pgq_ddl(graph_name)
-                .map_err(|e| PyValueError::new_err(e.to_string()))
+                .generate_pgq_ddl_with_dialect(graph_name, dialect)
+                .map_err(to_py_schema_err)
+        }
+    }
+
+    /// Emits relational table DDL (`CREATE TABLE IF NOT EXISTS`) for registered models.
+    #[pyo3(signature = (model_names=None, dialect="postgres"))]
+    fn generate_table_ddl(
+        &self,
+        model_names: Option<Vec<String>>,
+        dialect: &str,
+    ) -> PyResult<Vec<String>> {
+        if let Some(names) = model_names {
+            let str_names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            self.registry()
+                .generate_table_ddl_for(&str_names, dialect)
+                .map_err(to_py_schema_err)
+        } else {
+            self.registry()
+                .generate_table_ddl(dialect)
+                .map_err(to_py_schema_err)
+        }
+    }
+
+    /// Emits full SQL/PGQ schema DDL in run order (tables, constraints, indexes, property graph).
+    #[pyo3(signature = (graph_name, model_names=None, dialect="postgres"))]
+    fn generate_pgq_schema_ddl(
+        &self,
+        graph_name: &str,
+        model_names: Option<Vec<String>>,
+        dialect: &str,
+    ) -> PyResult<Vec<String>> {
+        if let Some(names) = model_names {
+            let str_names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            self.registry()
+                .generate_pgq_schema_ddl_for(graph_name, &str_names, dialect)
+                .map_err(to_py_schema_err)
+        } else {
+            self.registry()
+                .generate_pgq_schema_ddl(graph_name, dialect)
+                .map_err(to_py_schema_err)
         }
     }
 
@@ -6139,11 +6179,12 @@ fn emit_gql_drop_graph_type_ddl(graph_type_name: &str) -> PyResult<String> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (graph_name, nodes=None, rels=None))]
+#[pyo3(signature = (graph_name, nodes=None, rels=None, dialect="postgres"))]
 fn emit_pgq_property_graph_ddl(
     graph_name: &str,
     nodes: Option<Vec<Bound<'_, PyAny>>>,
     rels: Option<Vec<Bound<'_, PyAny>>>,
+    dialect: &str,
 ) -> PyResult<String> {
     let mut node_schemas = Vec::new();
     if let Some(n_list) = nodes {
@@ -6159,8 +6200,60 @@ fn emit_pgq_property_graph_ddl(
     }
     let node_refs: Vec<&NodeSchema> = node_schemas.iter().collect();
     let rel_refs: Vec<&RelationshipSchema> = rel_schemas.iter().collect();
-    voyager_ogm::emit_pgq_property_graph_ddl(graph_name, &node_refs, &rel_refs)
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+    voyager_ogm::emit_pgq_property_graph_ddl_with_dialect(
+        graph_name, &node_refs, &rel_refs, dialect,
+    )
+    .map_err(to_py_schema_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (nodes=None, rels=None, dialect="postgres"))]
+fn emit_table_ddl(
+    nodes: Option<Vec<Bound<'_, PyAny>>>,
+    rels: Option<Vec<Bound<'_, PyAny>>>,
+    dialect: &str,
+) -> PyResult<Vec<String>> {
+    let mut node_schemas = Vec::new();
+    if let Some(n_list) = nodes {
+        for n in &n_list {
+            node_schemas.push(extract_node_schema(n)?);
+        }
+    }
+    let mut rel_schemas = Vec::new();
+    if let Some(r_list) = rels {
+        for r in &r_list {
+            rel_schemas.push(extract_rel_schema(r)?);
+        }
+    }
+    let node_refs: Vec<&NodeSchema> = node_schemas.iter().collect();
+    let rel_refs: Vec<&RelationshipSchema> = rel_schemas.iter().collect();
+    voyager_ogm::emit_table_ddl(&node_refs, &rel_refs, dialect).map_err(to_py_schema_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (graph_name, nodes=None, rels=None, dialect="postgres"))]
+fn emit_pgq_schema_ddl(
+    graph_name: &str,
+    nodes: Option<Vec<Bound<'_, PyAny>>>,
+    rels: Option<Vec<Bound<'_, PyAny>>>,
+    dialect: &str,
+) -> PyResult<Vec<String>> {
+    let mut node_schemas = Vec::new();
+    if let Some(n_list) = nodes {
+        for n in &n_list {
+            node_schemas.push(extract_node_schema(n)?);
+        }
+    }
+    let mut rel_schemas = Vec::new();
+    if let Some(r_list) = rels {
+        for r in &r_list {
+            rel_schemas.push(extract_rel_schema(r)?);
+        }
+    }
+    let node_refs: Vec<&NodeSchema> = node_schemas.iter().collect();
+    let rel_refs: Vec<&RelationshipSchema> = rel_schemas.iter().collect();
+    voyager_ogm::emit_pgq_schema_ddl(graph_name, &node_refs, &rel_refs, dialect)
+        .map_err(to_py_schema_err)
 }
 
 #[pyfunction]
@@ -6446,6 +6539,8 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(emit_gql_drop_graph_type_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_pgq_property_graph_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_pgq_drop_property_graph_ddl, m)?)?;
+    m.add_function(wrap_pyfunction!(emit_table_ddl, m)?)?;
+    m.add_function(wrap_pyfunction!(emit_pgq_schema_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_cypher25_graph_type_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_cypher25_drop_graph_type_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_node_index_ddl, m)?)?;

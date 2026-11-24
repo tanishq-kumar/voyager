@@ -429,6 +429,212 @@ def test_pgq_ddl_for_a_relationship_uses_the_endpoint_key():
     assert 'SOURCE KEY ("src_id")' not in ddl
 
 
+def test_schema_manager_generate_table_ddl():
+    """Verifies table DDL generation for postgres and duckdb dialects (#327)."""
+
+    @node(label="T327User")
+    class T327User(Node):
+        uid: str = Field(primary_key=True)
+        email: str = Field(unique=True)
+        age: int = Field(default=0, nullable=False)
+
+    @relationship(type_name="T327_FOLLOWS", source_node=T327User, target_node=T327User)
+    class T327Follows(Relationship):
+        since: int = Field(nullable=False)
+
+    # PostgreSQL table DDL
+    pg_tables = SchemaManager.generate_table_ddl(T327User, T327Follows, dialect="postgres")
+    assert len(pg_tables) == 2
+    assert pg_tables[0].startswith('CREATE TABLE IF NOT EXISTS "t327user" (')
+    assert '"uid" TEXT NOT NULL' in pg_tables[0]
+    assert '"email" TEXT' in pg_tables[0]
+    assert '"age" BIGINT NOT NULL' in pg_tables[0]
+    assert 'PRIMARY KEY ("uid")' in pg_tables[0]
+
+    assert pg_tables[1].startswith('CREATE TABLE IF NOT EXISTS "t327_follows" (')
+    assert '"id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY' in pg_tables[1]
+    assert '"src_uid" TEXT NOT NULL REFERENCES "t327user" ("uid")' in pg_tables[1]
+    assert '"dst_uid" TEXT NOT NULL REFERENCES "t327user" ("uid")' in pg_tables[1]
+    assert '"since" BIGINT NOT NULL' in pg_tables[1]
+    assert 'PRIMARY KEY ("src_uid", "dst_uid")' not in pg_tables[1]
+
+    # DuckDB table DDL: 1 vertex table + 1 sequence + 1 edge table = 3 statements
+    duck_tables = SchemaManager.generate_table_ddl(T327User, T327Follows, dialect="duckdb")
+    assert len(duck_tables) == 3
+    assert duck_tables[0].startswith('CREATE TABLE IF NOT EXISTS "t327user" (')
+    assert '"uid" VARCHAR NOT NULL' in duck_tables[0]
+    assert '"email" VARCHAR' in duck_tables[0]
+    assert '"age" BIGINT NOT NULL' in duck_tables[0]
+    assert 'PRIMARY KEY ("uid")' in duck_tables[0]
+    assert duck_tables[1] == "CREATE SEQUENCE IF NOT EXISTS seq_t327_follows_id;"
+    assert duck_tables[2].startswith('CREATE TABLE IF NOT EXISTS "t327_follows" (')
+    assert "\"id\" BIGINT DEFAULT nextval('seq_t327_follows_id') PRIMARY KEY" in duck_tables[2]
+    assert '"src_uid" VARCHAR NOT NULL REFERENCES "t327user" ("uid")' in duck_tables[2]
+    assert '"dst_uid" VARCHAR NOT NULL REFERENCES "t327user" ("uid")' in duck_tables[2]
+
+
+def test_schema_manager_generate_table_ddl_relationship_alone():
+    """Verifies edge table DDL automatically resolves endpoint node schemas when rel is alone."""
+
+    @node(label="T327SoloNode")
+    class T327SoloNode(Node):
+        nid: str = Field(primary_key=True)
+
+    @relationship(
+        type_name="T327_SOLO_REL",
+        source_node=T327SoloNode,
+        target_node=T327SoloNode,
+    )
+    class T327SoloRel(Relationship):
+        weight: float = Field()
+
+    tables = SchemaManager.generate_table_ddl(T327SoloRel, dialect="postgres")
+    assert len(tables) == 2
+    assert any('"t327solonode"' in t for t in tables)
+    assert any('"src_nid" TEXT NOT NULL REFERENCES "t327solonode" ("nid")' in t for t in tables)
+
+
+def test_schema_manager_generate_pgq_schema_ddl_run_order():
+    """Verifies complete schema DDL returned in run order: tables, constraints, indexes, graph."""
+
+    @node(label="T327OrderNode")
+    class T327OrderNode(Node):
+        oid: str = Field(primary_key=True)
+        code: str = Field(unique=True)
+        score: int = Field(index=True)
+
+    @relationship(
+        type_name="T327_ORDER_EDGE",
+        source_node=T327OrderNode,
+        target_node=T327OrderNode,
+    )
+    class T327OrderEdge(Relationship):
+        priority: int = Field(index=True)
+
+    ddl = SchemaManager.generate_pgq_schema_ddl(
+        "t327_graph", T327OrderNode, T327OrderEdge, dialect="postgres"
+    )
+
+    # Order: Vertex Table, Edge Table, Constraint, Node Index, Rel Index, Property Graph
+    assert len(ddl) == 6
+    assert ddl[0].startswith('CREATE TABLE IF NOT EXISTS "t327ordernode"')
+    assert ddl[1].startswith('CREATE TABLE IF NOT EXISTS "t327_order_edge"')
+    assert ddl[2].startswith(
+        'ALTER TABLE "t327ordernode" ADD CONSTRAINT uq_t327ordernode_code UNIQUE'
+    )
+    assert ddl[3].startswith(
+        'CREATE INDEX IF NOT EXISTS idx_t327ordernode_score ON "t327ordernode"'
+    )
+    assert ddl[4].startswith(
+        'CREATE INDEX IF NOT EXISTS idx_t327_order_edge_priority ON "t327_order_edge"'
+    )
+    assert ddl[5].startswith("CREATE PROPERTY GRAPH t327_graph")
+
+    # DuckDB run order: unique index instead of ALTER TABLE, and duckpgq CREATE PROPERTY GRAPH
+    duck_ddl = SchemaManager.generate_pgq_schema_ddl(
+        "t327_graph", T327OrderNode, T327OrderEdge, dialect="duckdb"
+    )
+    # Order: Vertex Table, Sequence, Edge Table, Constraint, Node Index, Rel Index, Property Graph
+    assert len(duck_ddl) == 7
+    assert duck_ddl[0].startswith('CREATE TABLE IF NOT EXISTS "t327ordernode"')
+    assert duck_ddl[1] == "CREATE SEQUENCE IF NOT EXISTS seq_t327_order_edge_id;"
+    assert duck_ddl[2].startswith('CREATE TABLE IF NOT EXISTS "t327_order_edge"')
+    assert "\"id\" BIGINT DEFAULT nextval('seq_t327_order_edge_id') PRIMARY KEY" in duck_ddl[2]
+    assert duck_ddl[3].startswith(
+        'CREATE UNIQUE INDEX IF NOT EXISTS uq_t327ordernode_code ON "t327ordernode"'
+    )
+    assert duck_ddl[4].startswith(
+        'CREATE INDEX IF NOT EXISTS idx_t327ordernode_score ON "t327ordernode"'
+    )
+    assert duck_ddl[5].startswith(
+        'CREATE INDEX IF NOT EXISTS idx_t327_order_edge_priority ON "t327_order_edge"'
+    )
+    assert duck_ddl[6].startswith("CREATE PROPERTY GRAPH t327_graph")
+    assert "PROPERTIES" not in duck_ddl[6]
+
+
+def test_schema_manager_generate_table_ddl_explicit_relationship_pk():
+    """Verifies that relationship models with explicit primary keys omit surrogate keys."""
+
+    @node(label="T327PersonNode")
+    class T327PersonNode(Node):
+        pid: str = Field(primary_key=True)
+
+    @relationship(
+        type_name="T327_CALLS",
+        source_node=T327PersonNode,
+        target_node=T327PersonNode,
+    )
+    class T327Calls(Relationship):
+        call_id: str = Field(primary_key=True)
+        duration: int = Field(default=0)
+
+    # Postgres: uses declared primary key, no surrogate
+    pg_ddl = SchemaManager.generate_table_ddl(T327PersonNode, T327Calls, dialect="postgres")
+    assert len(pg_ddl) == 2
+    assert 'PRIMARY KEY ("call_id")' in pg_ddl[1]
+    assert "GENERATED ALWAYS AS IDENTITY" not in pg_ddl[1]
+
+    # DuckDB: uses declared primary key, no sequence generated
+    duck_ddl = SchemaManager.generate_table_ddl(T327PersonNode, T327Calls, dialect="duckdb")
+    assert len(duck_ddl) == 2
+    assert 'PRIMARY KEY ("call_id")' in duck_ddl[1]
+    assert "nextval(" not in duck_ddl[1]
+
+
+def test_schema_manager_generate_table_ddl_surrogate_key_name_collision():
+    """Verifies non-clashing surrogate key column name when relationship has non-PK 'id' field."""
+
+    @node(label="T327ItemNode")
+    class T327ItemNode(Node):
+        iid: str = Field(primary_key=True)
+
+    @relationship(
+        type_name="T327_CONNECTS",
+        source_node=T327ItemNode,
+        target_node=T327ItemNode,
+    )
+    class T327Connects(Relationship):
+        id: str = Field(nullable=False)
+        weight: float = Field(default=1.0)
+
+    pg_ddl = SchemaManager.generate_table_ddl(T327ItemNode, T327Connects, dialect="postgres")
+    assert len(pg_ddl) == 2
+    # Surrogate column resolves to t327_connects_id
+    assert '"t327_connects_id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY' in pg_ddl[1]
+    assert '"id" TEXT NOT NULL' in pg_ddl[1]
+    assert '"weight" DOUBLE PRECISION' in pg_ddl[1]
+
+    duck_ddl = SchemaManager.generate_table_ddl(T327ItemNode, T327Connects, dialect="duckdb")
+    assert len(duck_ddl) == 3
+    assert duck_ddl[1] == "CREATE SEQUENCE IF NOT EXISTS seq_t327_connects_t327_connects_id;"
+    assert (
+        "\"t327_connects_id\" BIGINT DEFAULT nextval('seq_t327_connects_t327_connects_id') PRIMARY KEY"
+        in duck_ddl[2]
+    )
+    assert '"id" VARCHAR NOT NULL' in duck_ddl[2]
+
+
+def test_table_ddl_unsupported_types_error():
+    """Verifies UnsupportedFeature is raised for dialect-unsupported types."""
+    from voyager_ogm._voyager_rs import emit_table_ddl
+
+    # Point type on DuckDB
+    node_point = {
+        "name": "GeoNode",
+        "labels": ["GeoNode"],
+        "primary_key": "id",
+        "fields": {
+            "id": {"name": "id", "type": "STRING", "primary_key": True},
+            "loc": {"name": "loc", "type": "POINT"},
+        },
+    }
+    with pytest.raises(Exception) as exc_info:
+        emit_table_ddl(nodes=[node_point], dialect="duckdb")
+    assert "POINT" in str(exc_info.value)
+    assert "loc" in str(exc_info.value)
+
+
 def test_native_schema_registry_ddl():
     """Verifies DDL generation directly through NativeSchemaRegistry instance."""
     from voyager_ogm import NativeSchemaRegistry

@@ -15,10 +15,13 @@ pub use ddl::{
     emit_node_constraint_ddl, emit_node_constraint_ddl_with_graph, emit_node_drop_constraint_ddl,
     emit_node_drop_constraint_ddl_with_graph, emit_node_drop_index_ddl,
     emit_node_drop_index_ddl_with_graph, emit_node_index_ddl, emit_node_index_ddl_with_graph,
-    emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl, emit_rel_constraint_ddl,
+    emit_node_table_ddl, emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl,
+    emit_pgq_property_graph_ddl_with_dialect, emit_pgq_schema_ddl, emit_rel_constraint_ddl,
     emit_rel_constraint_ddl_with_graph, emit_rel_drop_constraint_ddl,
     emit_rel_drop_constraint_ddl_with_graph, emit_rel_drop_index_ddl,
     emit_rel_drop_index_ddl_with_graph, emit_rel_index_ddl, emit_rel_index_ddl_with_graph,
+    emit_rel_table_ddl, emit_table_ddl, field_type_to_sql, pgq_edge_sequence_name,
+    resolve_edge_surrogate_key_name,
 };
 pub use iso_gql::IsoGqlEmitter;
 pub use sql_pgq::SqlPgqEmitter;
