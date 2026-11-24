@@ -4879,11 +4879,11 @@ mod tests {
             ),
             (
                 "sql_pgq",
-                "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) LIMIT $l OFFSET $s",
+                "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) LIMIT $l OFFSET $s",
             ),
             (
                 "duckpgq",
-                "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) LIMIT $l OFFSET $s",
+                "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) LIMIT $l OFFSET $s",
             ),
         ];
         for (dialect, statement) in cases {

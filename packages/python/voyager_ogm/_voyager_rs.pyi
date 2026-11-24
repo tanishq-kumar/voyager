@@ -581,6 +581,10 @@ def resolve_fulltext_search(
     """Resolves cross-dialect full-text procedure name, target arguments, and query adaptation."""
     ...
 
+def introspect_schema_json(uri: str, sample_size: int = ...) -> str:
+    """Connects to a database and returns its live graph schema as a JSON string."""
+    ...
+
 class AstExpr:
     """Native AST Expression node handle wrapping a lightweight AST arena."""
 

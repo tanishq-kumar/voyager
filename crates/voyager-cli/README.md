@@ -7,9 +7,10 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://github.com/tanishq-kumar/voyager/blob/main/Cargo.toml)
 
 The command-line interface for Voyager OGM. It installs two identical binaries,
-`voyager` and the short alias `voy`, and provides three subcommands:
+`voyager` and the short alias `voy`, and provides four subcommands:
 
 - `doctor` reports build facts, or checks a database connection with `--uri`.
+- `introspect` prints a live database's graph schema.
 - `compile` compiles a Query Spec v1 JSON document to a dialect.
 - `validate` checks a Query Spec v1 document without emitting a statement.
 
@@ -38,8 +39,9 @@ Every subcommand documents the same exit codes in `--help`:
 | `0` | Success |
 | `1` | Invalid Query Spec document, malformed JSON, or a compilation the dialect rejects (`compile`, `validate`) |
 | `2` | Usage error, including unknown flags, a missing input, or an unknown dialect or format |
-| `3` | `doctor` connection or check failure (invalid URI, unsupported protocol, connect/auth/ping failure) |
+| `3` | Connection, check or catalog query failure in `doctor` or `introspect` (invalid URI, unsupported protocol, connect/auth/ping failure, missing property graph) |
 | `4` | Input/output error, such as an unreadable spec file |
+| `5` | `introspect` does not support the engine (Apache AGE, DuckDB) |
 
 `validate` succeeds silently and exits `0`, so it can run in CI pipelines
 without extra output. A validation failure prints one line to stderr in the
@@ -175,6 +177,53 @@ reports that it cannot be checked. SQL/PGQ itself is checked only through
 compilation; `doctor` connects to PostgreSQL and reports `age` for `age://`
 URIs or PostgreSQL URIs carrying an AGE graph parameter, and `sql_pgq`
 otherwise.
+
+## `voyager introspect`
+
+`introspect` reads a live database's labels, relationship types with their
+endpoints, properties, constraints and indexes, and prints them:
+
+```bash
+voyager introspect --uri bolt://localhost:7687 --username neo4j --password-env NEO4J_PASSWORD
+voyager introspect --uri bolt://localhost:7688 --format json
+voyager introspect --uri "falkordb://localhost:6379?graph=social"
+voyager introspect --uri "postgresql://postgres@localhost:5456/voyager_graph?graph=social" --password-env PGPASSWORD
+```
+
+Credentials work as for `doctor`. `--format text` (the default) prints a
+summary; `--format json` prints the same JSON as the library call
+(`voyager_drivers::introspect` in Rust, `voyager_ogm.introspect_schema` in
+Python). `nodes` and `relationships` have the shape of the Python
+`export_schema(models)` result, so a model export and a live database can be
+compared key by key. `constraints`, `indexes` and `source` (engine, version,
+edition, database, sample size) are added. Keys a database cannot know are
+`null`: `model`, `description`, `attribute`, `has_default`, `constraints`
+(the `Field` value constraints) and a node's `relationship_attributes`.
+
+How properties are filled in:
+
+- `unique`: a single-property uniqueness or key constraint.
+- `nullable`: `false` only with an existence (`NOT NULL`) or key constraint.
+- `primary_key`: `true` only for a key constraint (Neo4j Enterprise node key,
+  PostgreSQL primary key), otherwise `null`.
+- `indexed` / `index_type`: a single-property index that does not back a
+  constraint.
+- `type`: a type constraint or declared column type if there is one, else the
+  value types of at most `--sample-size` (default 1000) entities per label or
+  relationship type: one type gives that type, mixed values give `ANY`, no
+  values give `null`. Relationship endpoints are sampled the same way, except
+  on PostgreSQL where the property graph declares them.
+
+| Engine | Catalogs read |
+| :--- | :--- |
+| Neo4j 5.13+ | `db.labels()`, `db.relationshipTypes()`, `SHOW CONSTRAINTS`, `SHOW INDEXES`, `valueType()` |
+| Memgraph | `SHOW CONSTRAINT INFO`, `SHOW INDEX INFO`, `valueType()`; labels from `SHOW NODE_LABELS INFO` when schema metadata is enabled, else a label scan |
+| FalkorDB | `db.labels()`, `db.relationshipTypes()`, `db.indexes()`, `db.constraints()`, `typeOf()` for the URI's graph |
+| PostgreSQL 19 | `pg_propgraph_*` catalogs plus the element tables' keys, `NOT NULL`, unique constraints and indexes; needs `?graph=<name>` |
+| Apache AGE, DuckDB | not supported (exit `5`) |
+
+Neo4j Community Edition has no existence or key constraints, so every property
+there is reported nullable.
 
 ## MSRV
 

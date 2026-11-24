@@ -71,7 +71,7 @@
       }
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.name <> ALL($p0) COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") WHERE p.name <> ALL($p0) COLUMNS (p.name))",
       "parameters": {
         "p0": [
           "Mallory",
@@ -80,7 +80,7 @@
       }
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.name <> ALL($p0) COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") WHERE p.name <> ALL($p0) COLUMNS (p.name))",
       "parameters": {
         "p0": [
           "Mallory",

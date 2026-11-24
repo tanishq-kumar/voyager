@@ -172,14 +172,14 @@ def test_postgres_bridge_format_pgq_statement_binding():
 
     # GRAPH_TABLE query with multiple parameters
     stmt = (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) "
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p IS "Person") '
         "WHERE p.name = $name AND p.age >= $min_age AND p.score >= $min_score COLUMNS (p.id))"
     )
     params = {"name": "Alice", "min_age": 21, "min_score": 90.5}
     formatted, ordered = bridge._format_pgq_statement(stmt, params)
 
     assert formatted == (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) "
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p IS "Person") '
         "WHERE p.name = %s AND p.age >= %s AND p.score >= %s COLUMNS (p.id))"
     )
     assert ordered == ["Alice", 21, 90.5]
@@ -190,14 +190,14 @@ def test_postgres_bridge_format_pgq_statement_duplicate_parameter():
     bridge = PostgresBridge(MagicMock())
 
     stmt = (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) "
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p IS "Person") '
         "WHERE p.name = $target OR p.nickname = $target COLUMNS (p.id))"
     )
     params = {"target": "Alice"}
     formatted, ordered = bridge._format_pgq_statement(stmt, params)
 
     assert formatted == (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) "
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p IS "Person") '
         "WHERE p.name = %s OR p.nickname = %s COLUMNS (p.id))"
     )
     assert ordered == ["Alice", "Alice"]
@@ -231,29 +231,29 @@ def test_postgres_bridge_format_pgq_statement_starts_with_contains_ends_with():
     bridge = PostgresBridge(MagicMock())
 
     # 1. STARTS WITH: LIKE $p0 || '%'
-    stmt_starts = "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name LIKE $p0 || '%' COLUMNS (p.id))"
+    stmt_starts = "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") WHERE p.name LIKE $p0 || '%' COLUMNS (p.id))"
     fmt_starts, ord_starts = bridge._format_pgq_statement(stmt_starts, {"p0": "Al"})
     assert fmt_starts == (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name LIKE %s || '%%' COLUMNS (p.id))"
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") WHERE p.name LIKE %s || '%%' COLUMNS (p.id))"
     )
     assert ord_starts == ["Al"]
 
     # 2. ENDS WITH: LIKE '%' || $p0
-    stmt_ends = "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name LIKE '%' || $p0 COLUMNS (p.id))"
+    stmt_ends = "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") WHERE p.name LIKE '%' || $p0 COLUMNS (p.id))"
     fmt_ends, ord_ends = bridge._format_pgq_statement(stmt_ends, {"p0": "ce"})
     assert fmt_ends == (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.name LIKE '%%' || %s COLUMNS (p.id))"
+        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") WHERE p.name LIKE '%%' || %s COLUMNS (p.id))"
     )
     assert ord_ends == ["ce"]
 
     # 3. CONTAINS: LIKE '%' || $p0 || '%'
     stmt_contains = (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) "
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p IS "Person") '
         "WHERE p.city LIKE '%' || $p0 || '%' COLUMNS (p.id))"
     )
     fmt_contains, ord_contains = bridge._format_pgq_statement(stmt_contains, {"p0": "York"})
     assert fmt_contains == (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) "
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p IS "Person") '
         "WHERE p.city LIKE '%%' || %s || '%%' COLUMNS (p.id))"
     )
     assert ord_contains == ["York"]
@@ -363,7 +363,7 @@ def test_duckdb_duckpgq_graph_table_literal_encoding_live():
             (1, 'Alice', 30, 95.5, true, DATE '2026-01-15'),
             (2, 'Bob', 25, 80.0, false, DATE '2026-02-20'),
             (3, 'x'') OR 1=1 --', 40, 50.0, true, DATE '2026-03-25');
-        CREATE PROPERTY GRAPH duck_test_pg VERTEX TABLES (duck_person LABEL Person);
+        CREATE PROPERTY GRAPH duck_test_pg VERTEX TABLES (duck_person LABEL "Person");
         """
     )
 
@@ -372,7 +372,7 @@ def test_duckdb_duckpgq_graph_table_literal_encoding_live():
     # 1. Query with string, int, float, boolean, and date parameters
     query = """
     SELECT * FROM GRAPH_TABLE (duck_test_pg
-        MATCH (p IS Person)
+        MATCH (p IS \"Person\")
         WHERE p.name = $name AND p.age >= $age AND p.score >= $score AND p.active = $active AND p.created = $created
         COLUMNS (p.id, p.name)
     )
@@ -393,7 +393,7 @@ def test_duckdb_duckpgq_graph_table_literal_encoding_live():
     hostile = "x') OR 1=1 --"
     hostile_query = """
     SELECT * FROM GRAPH_TABLE (duck_test_pg
-        MATCH (p IS Person)
+        MATCH (p IS \"Person\")
         WHERE p.name = $name
         COLUMNS (p.id, p.name)
     )
@@ -452,7 +452,7 @@ class TestPostgres19PgqParameterBindingLive:
                     (3, 'Charlie', 35, 70.0, TRUE, NULL),
                     (4, 'x'') OR 1=1 --', 40, 50.0, FALSE, ARRAY['test']);
                 CREATE PROPERTY GRAPH pg19_param_graph
-                    VERTEX TABLES (pg19_param_person LABEL Person);
+                    VERTEX TABLES (pg19_param_person LABEL "Person");
                 """
             )
 
@@ -475,7 +475,7 @@ class TestPostgres19PgqParameterBindingLive:
         # 1. String, int, float, boolean, list binding
         query = """
         SELECT * FROM GRAPH_TABLE (pg19_param_graph
-            MATCH (p IS Person)
+            MATCH (p IS \"Person\")
             WHERE p.name = $name AND p.age >= $min_age AND p.score >= $min_score
                   AND p.active = $active AND p.tags = $tags
             COLUMNS (p.id, p.name)
@@ -495,7 +495,7 @@ class TestPostgres19PgqParameterBindingLive:
         # 2. Null parameter binding (IS NOT DISTINCT FROM)
         null_query = """
         SELECT * FROM GRAPH_TABLE (pg19_param_graph
-            MATCH (p IS Person)
+            MATCH (p IS \"Person\")
             WHERE p.tags IS NOT DISTINCT FROM $tags
             COLUMNS (p.id, p.name)
         )
@@ -507,7 +507,7 @@ class TestPostgres19PgqParameterBindingLive:
         # 3. Duplicate parameter name ($target used multiple times)
         dup_query = """
         SELECT * FROM GRAPH_TABLE (pg19_param_graph
-            MATCH (p IS Person)
+            MATCH (p IS \"Person\")
             WHERE p.name = $target OR p.name = $target
             COLUMNS (p.id, p.name)
         )
@@ -524,7 +524,7 @@ class TestPostgres19PgqParameterBindingLive:
         hostile = "x') OR 1=1 --"
         query = """
         SELECT * FROM GRAPH_TABLE (pg19_param_graph
-            MATCH (p IS Person)
+            MATCH (p IS \"Person\")
             WHERE p.name = $name
             COLUMNS (p.id, p.name)
         )
@@ -548,27 +548,27 @@ class TestPostgres19PgqParameterBindingLive:
         test_cases: list[tuple[str, str, dict[str, Any]]] = [
             (
                 "string",
-                "SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS Person) WHERE p.name = $name COLUMNS (p.id, p.name))",
+                'SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS "Person") WHERE p.name = $name COLUMNS (p.id, p.name))',
                 {"name": "Alice"},
             ),
             (
                 "int/float",
-                "SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS Person) WHERE p.age = $age AND p.score >= $score COLUMNS (p.id, p.name))",
+                'SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS "Person") WHERE p.age = $age AND p.score >= $score COLUMNS (p.id, p.name))',
                 {"age": 30, "score": 90.0},
             ),
             (
                 "bool",
-                "SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS Person) WHERE p.active = $active COLUMNS (p.id, p.name))",
+                'SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS "Person") WHERE p.active = $active COLUMNS (p.id, p.name))',
                 {"active": True},
             ),
             (
                 "null",
-                "SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS Person) WHERE p.tags IS NOT DISTINCT FROM $tags COLUMNS (p.id, p.name))",
+                'SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS "Person") WHERE p.tags IS NOT DISTINCT FROM $tags COLUMNS (p.id, p.name))',
                 {"tags": None},
             ),
             (
                 "hostile",
-                "SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS Person) WHERE p.name = $name COLUMNS (p.id, p.name))",
+                'SELECT * FROM GRAPH_TABLE (pg19_param_graph MATCH (p IS "Person") WHERE p.name = $name COLUMNS (p.id, p.name))',
                 {"name": "x') OR 1=1 --"},
             ),
         ]
@@ -618,7 +618,7 @@ class TestPostgres19PgqParameterBindingLive:
                 "GRAPH_TABLE = ANY(...) strings",
                 (
                     "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-                    "MATCH (p IS Person) WHERE p.name = ANY($names) "
+                    'MATCH (p IS "Person") WHERE p.name = ANY($names) '
                     "COLUMNS (p.id, p.name)) ORDER BY id"
                 ),
                 {"names": ["Alice", "Charlie"]},
@@ -628,7 +628,7 @@ class TestPostgres19PgqParameterBindingLive:
                 "GRAPH_TABLE = ANY(...) ints",
                 (
                     "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-                    "MATCH (p IS Person) WHERE p.id = ANY($ids) "
+                    'MATCH (p IS "Person") WHERE p.id = ANY($ids) '
                     "COLUMNS (p.id, p.name)) ORDER BY id"
                 ),
                 {"ids": [2, 4]},
@@ -638,7 +638,7 @@ class TestPostgres19PgqParameterBindingLive:
                 "GRAPH_TABLE = ANY(...) empty list",
                 (
                     "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-                    "MATCH (p IS Person) WHERE p.id = ANY($ids) "
+                    'MATCH (p IS "Person") WHERE p.id = ANY($ids) '
                     "COLUMNS (p.id, p.name)) ORDER BY id"
                 ),
                 {"ids": []},
@@ -649,7 +649,7 @@ class TestPostgres19PgqParameterBindingLive:
                 "GRAPH_TABLE array column equality strings",
                 (
                     "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-                    "MATCH (p IS Person) WHERE p.tags = $tags "
+                    'MATCH (p IS "Person") WHERE p.tags = $tags '
                     "COLUMNS (p.id, p.name)) ORDER BY id"
                 ),
                 {"tags": ["admin", "staff"]},
@@ -675,7 +675,7 @@ class TestPostgres19PgqParameterBindingLive:
 
         query = """
         SELECT * FROM GRAPH_TABLE (pg19_param_graph
-            MATCH (p IS Person)
+            MATCH (p IS \"Person\")
             WHERE p.name = $name AND p.age >= $age
             COLUMNS (p.id, p.name)
         )
@@ -691,7 +691,7 @@ class TestPostgres19PgqParameterBindingLive:
 
         query = """
         SELECT * FROM GRAPH_TABLE (pg19_param_graph
-            MATCH (p IS Person)
+            MATCH (p IS \"Person\")
             WHERE p.name = $name
             COLUMNS (p.id, p.name)
         )
@@ -709,7 +709,7 @@ class TestPostgres19PgqParameterBindingLive:
         # 1. STARTS WITH ($p0 || '%')
         q_starts = (
             "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-            "MATCH (p IS Person) WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name)) ORDER BY id"
+            "MATCH (p IS \"Person\") WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name)) ORDER BY id"
         )
         res_starts = session.execute(q_starts, {"p0": "Al"})
         assert res_starts == [{"id": 1, "name": "Alice"}]
@@ -717,7 +717,7 @@ class TestPostgres19PgqParameterBindingLive:
         # 2. ENDS WITH ('%' || $p0)
         q_ends = (
             "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-            "MATCH (p IS Person) WHERE p.name LIKE '%' || $p0 COLUMNS (p.id, p.name)) ORDER BY id"
+            "MATCH (p IS \"Person\") WHERE p.name LIKE '%' || $p0 COLUMNS (p.id, p.name)) ORDER BY id"
         )
         res_ends = session.execute(q_ends, {"p0": "lie"})
         assert res_ends == [{"id": 3, "name": "Charlie"}]
@@ -725,7 +725,7 @@ class TestPostgres19PgqParameterBindingLive:
         # 3. CONTAINS ('%' || $p0 || '%')
         q_contains = (
             "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-            "MATCH (p IS Person) WHERE p.name LIKE '%' || $p0 || '%' COLUMNS (p.id, p.name)) ORDER BY id"
+            "MATCH (p IS \"Person\") WHERE p.name LIKE '%' || $p0 || '%' COLUMNS (p.id, p.name)) ORDER BY id"
         )
         res_contains = session.execute(q_contains, {"p0": "arl"})
         assert res_contains == [{"id": 3, "name": "Charlie"}]
@@ -733,7 +733,7 @@ class TestPostgres19PgqParameterBindingLive:
         # 4. Without parameters (raw LIKE with literal %)
         q_raw = (
             "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-            "MATCH (p IS Person) WHERE p.name LIKE 'Bo%' COLUMNS (p.id, p.name)) ORDER BY id"
+            "MATCH (p IS \"Person\") WHERE p.name LIKE 'Bo%' COLUMNS (p.id, p.name)) ORDER BY id"
         )
         res_raw = session.execute(q_raw)
         assert res_raw == [{"id": 2, "name": "Bob"}]
@@ -745,7 +745,7 @@ class TestPostgres19PgqParameterBindingLive:
 
         q = (
             "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-            "MATCH (p IS Person) WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name))"
+            "MATCH (p IS \"Person\") WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name))"
         )
 
         with session.transaction() as tx:
@@ -760,7 +760,7 @@ class TestPostgres19PgqParameterBindingLive:
 
         q = (
             "SELECT * FROM GRAPH_TABLE (pg19_param_graph "
-            "MATCH (p IS Person) WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name))"
+            "MATCH (p IS \"Person\") WHERE p.name LIKE $p0 || '%' COLUMNS (p.id, p.name))"
         )
         rows = await session.execute(q, {"p0": "Al"})
         assert rows == [{"id": 1, "name": "Alice"}]

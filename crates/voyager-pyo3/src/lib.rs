@@ -6393,6 +6393,34 @@ fn resolve_fulltext_search<'py>(
     Ok(dict)
 }
 
+/// Connects to `uri` and returns its live graph schema as a JSON string.
+///
+/// The JSON is the `voyager_drivers::introspect` result, identical to
+/// `voyager introspect --format json`. The GIL is released while the catalog
+/// queries run. Connection and query failures raise `VoyagerError` with the
+/// driver error code; Apache AGE and DuckDB raise `VoyagerError` with code
+/// `UNSUPPORTED_FEATURE`.
+#[pyfunction]
+#[pyo3(signature = (uri, sample_size=voyager_drivers::introspect::DEFAULT_SAMPLE_SIZE))]
+fn introspect_schema_json(py: Python<'_>, uri: &str, sample_size: usize) -> PyResult<String> {
+    let parsed = voyager_drivers::ParsedUri::parse(uri)
+        .map_err(|error| make_voyager_err(error.code(), error.to_string()))?;
+    let options = voyager_drivers::IntrospectOptions { sample_size };
+    let schema = py
+        .detach(|| {
+            get_tokio_runtime()
+                .block_on(async move { voyager_drivers::introspect(&parsed, &options).await })
+        })
+        .map_err(|error| {
+            make_voyager_err(
+                error.code(),
+                voyager_drivers::introspect::describe_error(&error),
+            )
+        })?;
+    serde_json::to_string(&schema.to_json_value())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
 /// Native Python module definition for `_voyager_rs`.
 #[pymodule]
 fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -6432,6 +6460,7 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(canonical_fulltext_index_name, m)?)?;
     m.add_function(wrap_pyfunction!(adapt_tantivy_query, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_fulltext_search, m)?)?;
+    m.add_function(wrap_pyfunction!(introspect_schema_json, m)?)?;
     m.add_class::<PyQueryBuilder>()?;
     m.add_class::<PyAstExpr>()?;
     m.add_class::<PyArrowStream>()?;

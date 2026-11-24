@@ -293,18 +293,65 @@ fn test_pgq_property_graph_ddl() {
     let expected = "\
 CREATE PROPERTY GRAPH social_graph
   VERTEX TABLES (
-    user KEY (user_id) LABEL User PROPERTIES (age, bio, email, user_id)
+    \"user\" KEY (\"user_id\") LABEL \"User\" PROPERTIES (\"age\", \"bio\", \"email\", \"user_id\")
   )
   EDGE TABLES (
-    follows
-      SOURCE KEY (user_id) REFERENCES user (user_id)
-      DESTINATION KEY (user_id) REFERENCES user (user_id)
-      LABEL FOLLOWS PROPERTIES (role, since)
+    \"follows\"
+      SOURCE KEY (\"src_user_id\") REFERENCES \"user\" (\"user_id\")
+      DESTINATION KEY (\"dst_user_id\") REFERENCES \"user\" (\"user_id\")
+      LABEL \"FOLLOWS\" PROPERTIES (\"role\", \"since\")
   );";
     assert_eq!(ddl, expected);
 
     let drop_ddl = emit_pgq_drop_property_graph_ddl("social_graph");
     assert_eq!(drop_ddl, "DROP PROPERTY GRAPH IF EXISTS social_graph;");
+}
+
+#[test]
+fn test_pgq_vertex_and_edge_table_names_follow_labels_and_types() {
+    // A model whose class name differs from its label, a second model, a
+    // self-relationship and a relationship between the two models.
+    let person = NodeSchema::new("P", vec!["ZzPerson".to_string()])
+        .with_field(FieldDescriptor::new("pid", FieldType::String).primary_key());
+    let company = NodeSchema::new("C", vec!["ZzCompany".to_string()])
+        .with_field(FieldDescriptor::new("cid", FieldType::String).primary_key());
+    let knows = RelationshipSchema::new("K", "KNOWS")
+        .with_endpoints(vec!["ZzPerson".to_string()], vec!["ZzPerson".to_string()])
+        .with_field(FieldDescriptor::new("since", FieldType::Int64));
+    let works_at = RelationshipSchema::new("W", "WORKS_AT")
+        .with_endpoints(vec!["ZzPerson".to_string()], vec!["ZzCompany".to_string()])
+        .with_field(FieldDescriptor::new("since", FieldType::Int64));
+
+    let ddl = emit_pgq_property_graph_ddl("g", &[&person, &company], &[&knows, &works_at]).unwrap();
+    let expected = "\
+CREATE PROPERTY GRAPH g
+  VERTEX TABLES (
+    \"zzperson\" KEY (\"pid\") LABEL \"ZzPerson\" PROPERTIES (\"pid\"),
+    \"zzcompany\" KEY (\"cid\") LABEL \"ZzCompany\" PROPERTIES (\"cid\")
+  )
+  EDGE TABLES (
+    \"knows\"
+      SOURCE KEY (\"src_pid\") REFERENCES \"zzperson\" (\"pid\")
+      DESTINATION KEY (\"dst_pid\") REFERENCES \"zzperson\" (\"pid\")
+      LABEL \"KNOWS\" PROPERTIES (\"since\"),
+    \"works_at\"
+      SOURCE KEY (\"src_pid\") REFERENCES \"zzperson\" (\"pid\")
+      DESTINATION KEY (\"dst_cid\") REFERENCES \"zzcompany\" (\"cid\")
+      LABEL \"WORKS_AT\" PROPERTIES (\"since\")
+  );";
+    assert_eq!(ddl, expected);
+}
+
+#[test]
+fn test_pgq_edge_only_ddl_uses_endpoint_node_key() {
+    let person = NodeSchema::new("P", vec!["ZzPerson".to_string()])
+        .with_field(FieldDescriptor::new("pid", FieldType::String).primary_key());
+    let knows = RelationshipSchema::new("K", "KNOWS")
+        .with_endpoints(vec!["ZzPerson".to_string()], vec!["ZzPerson".to_string()]);
+
+    let ddl = emit_pgq_property_graph_ddl("g", &[&person], &[&knows]).unwrap();
+    assert!(ddl.contains("SOURCE KEY (\"src_pid\") REFERENCES \"zzperson\" (\"pid\")"));
+    assert!(ddl.contains("DESTINATION KEY (\"dst_pid\") REFERENCES \"zzperson\" (\"pid\")"));
 }
 
 #[test]
@@ -374,6 +421,15 @@ fn test_schema_registry_ddl_methods() {
 
     let pgq_ddl = registry.generate_pgq_ddl("network_pgq").unwrap();
     assert!(pgq_ddl.starts_with("CREATE PROPERTY GRAPH network_pgq"));
+
+    // Requesting only the relationship still pulls in its endpoint node so the
+    // edge references the node's real key column.
+    let edge_only = registry
+        .generate_pgq_ddl_for("network_pgq", &["Follows"])
+        .unwrap();
+    assert!(edge_only.contains("VERTEX TABLES"));
+    assert!(edge_only.contains("SOURCE KEY (\"src_user_id\") REFERENCES \"user\" (\"user_id\")"));
+    assert!(!edge_only.contains("SOURCE KEY (\"src_id\")"));
 }
 
 #[test]

@@ -294,7 +294,7 @@ def duckpgq_bridge():
         f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
     )
     connection.executemany(f"INSERT INTO {PERSON} VALUES (?, ?, ?, ?);", ROWS)
-    connection.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL Person);")
+    connection.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "Person");')
     yield DuckDbBridge(connection)
     connection.close()
 
@@ -324,7 +324,7 @@ def _setup_postgres19(conn: Any) -> None:
         cur.execute(f"DROP TABLE IF EXISTS {PERSON} CASCADE;")
         cur.execute(f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);")
         cur.executemany(f"INSERT INTO {PERSON} VALUES (%s, %s, %s, %s);", ROWS)
-        cur.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL Person);")
+        cur.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "Person");')
 
 
 def _teardown_postgres19(conn: Any) -> None:
@@ -377,17 +377,17 @@ class TestPostgres19InXor:
         bridge = PostgresBridge(pg19)
         old_statements = [
             (
-                f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS Person) "
+                f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "Person") '
                 "WHERE p.name IN ['Alice', 'Bob'] COLUMNS (p.name))",
                 {},
             ),
             (
-                f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS Person) "
+                f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "Person") '
                 "WHERE p.name IN $names COLUMNS (p.name))",
                 {"names": ["Alice", "Bob"]},
             ),
             (
-                f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS Person) "
+                f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "Person") '
                 "WHERE (p.age > 30) XOR (p.city = 'Paris') COLUMNS (p.name))",
                 {},
             ),

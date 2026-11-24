@@ -250,12 +250,12 @@ async fn test_live_postgres19_sql_pgq_graph_table_and_arrow() {
 
     conn.execute_simple(
         "CREATE PROPERTY GRAPH net_pgq_graph
-            VERTEX TABLES (net_pgq_person LABEL Person PROPERTIES (name, age, city))
+            VERTEX TABLES (net_pgq_person LABEL \"Person\" PROPERTIES (name, age, city))
             EDGE TABLES (
                 net_pgq_knows
                 SOURCE KEY (src) REFERENCES net_pgq_person (id)
                 DESTINATION KEY (dst) REFERENCES net_pgq_person (id)
-                LABEL KNOWS
+                LABEL \"KNOWS\"
                 PROPERTIES (since)
             );",
     )

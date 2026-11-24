@@ -99,7 +99,7 @@ def test_order_by_expression_compiles_inside_columns(dialect: str) -> None:
         Query.match(p).return_(p.name, p.age).order_by(p.age + 1).compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f"SELECT name, age FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT name, age FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
     )
     assert compiled.statement == expected
@@ -111,7 +111,7 @@ def test_order_by_non_returned_property_compiles_inside_columns(dialect: str) ->
     p = Person(alias="p")
     compiled = Query.match(p).return_(p.name).order_by(p.age).compile(dialect, graph_name=GRAPH)
     expected = (
-        f"SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
     )
     assert compiled.statement == expected
@@ -125,7 +125,7 @@ def test_order_by_returned_property_stays_select_star(dialect: str) -> None:
         Query.match(p).return_(p.name, p.age).order_by(p.age).compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.age)) ORDER BY age ASC NULLS LAST"
     )
     assert compiled.statement == expected
@@ -144,7 +144,7 @@ def test_order_by_multiple_mixed_keys_compiles(dialect: str) -> None:
         .compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f"SELECT name, city FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT name, city FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) "
         "ORDER BY _ord_0 ASC NULLS LAST, city DESC NULLS FIRST, _ord_1 ASC NULLS LAST"
     )
@@ -163,7 +163,7 @@ def test_order_by_duplicate_key_reuses_alias(dialect: str) -> None:
         .compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f"SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
+        f'SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
         "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST, _ord_0 DESC NULLS FIRST"
     )
     assert compiled.statement == expected
@@ -222,7 +222,7 @@ def duckpgq_bridge():
         f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
     )
     connection.executemany(f"INSERT INTO {PERSON} VALUES (?, ?, ?, ?);", ROWS)
-    connection.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL {LABEL});")
+    connection.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "{LABEL}");')
     yield DuckDbBridge(connection)
     connection.close()
 
@@ -350,7 +350,7 @@ class TestLivePostgres19AndNeo4jParity:
                 f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
             )
             cur.executemany(f"INSERT INTO {PERSON} VALUES (%s, %s, %s, %s);", ROWS)
-            cur.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL {LABEL});")
+            cur.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "{LABEL}");')
 
         # Setup Neo4j
         with neo_driver.session() as s:
@@ -499,7 +499,9 @@ class TestLivePostgres19AndNeo4jParity:
             f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
         )
         duck_conn.executemany(f"INSERT INTO {PERSON} VALUES (?, ?, ?, ?);", ROWS)
-        duck_conn.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL {LABEL});")
+        duck_conn.execute(
+            f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "{LABEL}");'
+        )
         duck_bridge = DuckDbBridge(duck_conn)
 
         try:

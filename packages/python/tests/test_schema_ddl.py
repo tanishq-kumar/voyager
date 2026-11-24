@@ -307,12 +307,14 @@ def test_live_postgres19_pgq_ddl_execution():
     cur = conn.cursor()
     try:
         cur.execute("DROP PROPERTY GRAPH IF EXISTS live_pgq_test CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS friendswith CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS friends_with CASCADE;")
         cur.execute("DROP TABLE IF EXISTS member CASCADE;")
 
         cur.execute("CREATE TABLE member (member_id TEXT PRIMARY KEY, name TEXT, age INT);")
         cur.execute(
-            "CREATE TABLE friendswith (member_id TEXT REFERENCES member(member_id), since INT, PRIMARY KEY (member_id, since));"
+            "CREATE TABLE friends_with (src_member_id TEXT REFERENCES member(member_id), "
+            "dst_member_id TEXT REFERENCES member(member_id), since INT, "
+            "PRIMARY KEY (src_member_id, dst_member_id));"
         )
 
         pgq_ddl = SchemaManager.generate_pgq_ddl("live_pgq_test", Member, FriendsWith)
@@ -362,14 +364,69 @@ def test_pgq_property_graph_ddl():
     pgq_ddl = SchemaManager.generate_pgq_ddl("social_pgq", User, Follows)
     assert "CREATE PROPERTY GRAPH social_pgq" in pgq_ddl
     assert "VERTEX TABLES (" in pgq_ddl
-    assert "user KEY (user_id) LABEL User PROPERTIES (age, bio, email, user_id)" in pgq_ddl
+    assert (
+        '"user" KEY ("user_id") LABEL "User" PROPERTIES ("age", "bio", "email", "user_id")'
+        in pgq_ddl
+    )
     assert "EDGE TABLES (" in pgq_ddl
-    assert "SOURCE KEY (user_id) REFERENCES user (user_id)" in pgq_ddl
-    assert "DESTINATION KEY (user_id) REFERENCES user (user_id)" in pgq_ddl
-    assert "LABEL FOLLOWS PROPERTIES (since)" in pgq_ddl
+    assert 'SOURCE KEY ("src_user_id") REFERENCES "user" ("user_id")' in pgq_ddl
+    assert 'DESTINATION KEY ("dst_user_id") REFERENCES "user" ("user_id")' in pgq_ddl
+    assert 'LABEL "FOLLOWS" PROPERTIES ("since")' in pgq_ddl
 
     drop_pgq = SchemaManager.generate_pgq_drop_ddl("social_pgq")
     assert drop_pgq == "DROP PROPERTY GRAPH IF EXISTS social_pgq;"
+
+
+def test_pgq_ddl_uses_label_table_names_and_distinct_edge_keys():
+    """Verifies vertex/edge table names come from labels/types and edge keys are distinct."""
+
+    @node(label="Fix325Person")
+    class Fix325Person(Node):
+        pid: str = Field(primary_key=True)
+
+    @node(label="Fix325Company")
+    class Fix325Company(Node):
+        cid: str = Field(primary_key=True)
+
+    @relationship(type_name="FIX325_KNOWS", source_node=Fix325Person, target_node=Fix325Person)
+    class Fix325Knows(Relationship):
+        since: int = Field()
+
+    @relationship(type_name="FIX325_WORKS_AT", source_node=Fix325Person, target_node=Fix325Company)
+    class Fix325WorksAt(Relationship):
+        since: int = Field()
+
+    ddl = SchemaManager.generate_pgq_ddl(
+        "fix325", Fix325Person, Fix325Company, Fix325Knows, Fix325WorksAt
+    )
+    assert '"fix325person" KEY ("pid") LABEL "Fix325Person"' in ddl
+    assert '"fix325company" KEY ("cid") LABEL "Fix325Company"' in ddl
+    assert '"fix325_knows"' in ddl
+    assert '"fix325_works_at"' in ddl
+    assert 'SOURCE KEY ("src_pid") REFERENCES "fix325person" ("pid")' in ddl
+    assert 'DESTINATION KEY ("dst_pid") REFERENCES "fix325person" ("pid")' in ddl
+    assert 'DESTINATION KEY ("dst_cid") REFERENCES "fix325company" ("cid")' in ddl
+
+
+def test_pgq_ddl_for_a_relationship_uses_the_endpoint_key():
+    """Verifies a relationship generated on its own references the endpoint node's real key."""
+
+    @node(label="Fix325EdgePerson")
+    class Fix325EdgePerson(Node):
+        pid: str = Field(primary_key=True)
+
+    @relationship(
+        type_name="FIX325_EDGE_KNOWS",
+        source_node=Fix325EdgePerson,
+        target_node=Fix325EdgePerson,
+    )
+    class Fix325EdgeKnows(Relationship):
+        since: int = Field()
+
+    ddl = SchemaManager.generate_ddl(Fix325EdgeKnows, dialect="pgq")[0]
+    assert 'SOURCE KEY ("src_pid") REFERENCES "fix325edgeperson" ("pid")' in ddl
+    assert 'DESTINATION KEY ("dst_pid") REFERENCES "fix325edgeperson" ("pid")' in ddl
+    assert 'SOURCE KEY ("src_id")' not in ddl
 
 
 def test_native_schema_registry_ddl():
@@ -416,10 +473,15 @@ def test_native_schema_registry_ddl():
     # 4. SQL:2023 PGQ DDL
     pgq = reg.generate_pgq_ddl("article_pgq")
     assert "CREATE PROPERTY GRAPH article_pgq" in pgq
-    assert "article KEY (id) LABEL Article PROPERTIES (id, title)" in pgq
-    assert "SOURCE KEY (article_id) REFERENCES article (id)" in pgq
-    assert "DESTINATION KEY (article_id) REFERENCES article (id)" in pgq
-    assert "LABEL CITED_BY PROPERTIES (year)" in pgq
+    assert '"article" KEY ("id") LABEL "Article" PROPERTIES ("id", "title")' in pgq
+    assert 'SOURCE KEY ("src_id") REFERENCES "article" ("id")' in pgq
+    assert 'DESTINATION KEY ("dst_id") REFERENCES "article" ("id")' in pgq
+    assert 'LABEL "CITED_BY" PROPERTIES ("year")' in pgq
+
+    # An edge requested on its own pulls in its endpoint node schema.
+    edge_only = reg.generate_pgq_ddl("article_pgq", ["CitedBy"])
+    assert 'SOURCE KEY ("src_id") REFERENCES "article" ("id")' in edge_only
+    assert 'DESTINATION KEY ("dst_id") REFERENCES "article" ("id")' in edge_only
 
 
 def test_dialect_ddl_error_handling():

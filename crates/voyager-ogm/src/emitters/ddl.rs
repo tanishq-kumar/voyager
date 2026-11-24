@@ -659,13 +659,57 @@ pub fn emit_gql_drop_graph_type_ddl(graph_type_name: &str) -> String {
 // SQL:2023 PGQ DDL Emitter (PostgreSQL / DuckPGQ)
 // ---------------------------------------------------------------------------
 
+/// Returns the SQL:2023 PGQ vertex table name for a node label.
+///
+/// The table name is the primary label folded to ASCII lower case. That is the
+/// same rule the SQL constraint and index emitters use, so the property graph
+/// statement, `ALTER TABLE` constraints and `CREATE INDEX` statements target the
+/// same table.
+pub fn pgq_vertex_table_name(label: &str) -> String {
+    label.to_ascii_lowercase()
+}
+
+/// Returns the SQL:2023 PGQ edge table name for a relationship type.
+///
+/// Like [`pgq_vertex_table_name`], the name is the type folded to ASCII lower
+/// case, matching the SQL constraint and index emitters.
+pub fn pgq_edge_table_name(type_name: &str) -> String {
+    type_name.to_ascii_lowercase()
+}
+
+/// Returns the source endpoint foreign-key column name for an edge table.
+///
+/// The role (`src`) plus the endpoint node's primary-key column (`pid`) keeps
+/// the source and destination columns distinct even for a self-relationship.
+pub fn pgq_edge_source_key(primary_key: &str) -> String {
+    format!("src_{primary_key}")
+}
+
+/// Returns the destination endpoint foreign-key column name for an edge table.
+///
+/// See [`pgq_edge_source_key`] for the naming rule.
+pub fn pgq_edge_destination_key(primary_key: &str) -> String {
+    format!("dst_{primary_key}")
+}
+
 /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` DDL statement.
 ///
 /// # Endpoints and Key Convention Note
 /// SQL:2023 PGQ edge tables require explicit vertex endpoints (`source_labels` and `target_labels`).
 /// If any relationship has empty endpoints, this function returns an `Err`.
-/// By convention, edge tables reference source and target vertex tables using foreign key column
-/// names `{src_table}_id` and `{tgt_table}_id` (e.g. `member_id`), referencing the target node's primary key.
+///
+/// Vertex tables are named after the node's primary label in lower case and
+/// edge tables after the relationship type in lower case (see
+/// [`pgq_vertex_table_name`] and [`pgq_edge_table_name`]). Edge source and
+/// destination columns are `src_<node key>` and `dst_<node key>` (see
+/// [`pgq_edge_source_key`] and [`pgq_edge_destination_key`]), so a
+/// self-relationship gets two distinct columns. All table, label, key and
+/// property identifiers are double-quoted to preserve their case on PostgreSQL.
+///
+/// When an endpoint node is not present in `nodes`, the emitter cannot know its
+/// key column and falls back to the `id` key so the statement remains
+/// well-formed. Callers that only have a relationship should resolve its
+/// endpoint nodes from their registry first.
 pub fn emit_pgq_property_graph_ddl(
     graph_name: &str,
     nodes: &[&NodeSchema],
@@ -674,29 +718,32 @@ pub fn emit_pgq_property_graph_ddl(
     let mut v_clauses = Vec::new();
     for node in nodes {
         let primary_label = node.primary_label();
-        let table_name = node.name.to_ascii_lowercase();
+        let table_name = pgq_vertex_table_name(primary_label);
+        let q_table = escape_sql_ident(&table_name);
+        let q_label = escape_sql_ident(primary_label);
         let props_clause = if node.fields.is_empty() {
             String::new()
         } else {
-            let field_names: Vec<&str> = node.fields.keys().map(|k| k.as_str()).collect();
+            let field_names: Vec<String> =
+                node.fields.keys().map(|k| escape_sql_ident(k)).collect();
             format!(" PROPERTIES ({})", field_names.join(", "))
         };
 
         if let Some(ref pk) = node.primary_key {
             v_clauses.push(format!(
-                "    {table_name} KEY ({pk}) LABEL {primary_label}{props_clause}"
+                "    {q_table} KEY ({}) LABEL {q_label}{props_clause}",
+                escape_sql_ident(pk)
             ));
         } else {
-            v_clauses.push(format!(
-                "    {table_name} LABEL {primary_label}{props_clause}"
-            ));
+            v_clauses.push(format!("    {q_table} LABEL {q_label}{props_clause}"));
         }
     }
 
     let mut e_clauses = Vec::new();
     for rel in relationships {
-        let table_name = rel.name.to_ascii_lowercase();
-        let label = &rel.type_name;
+        let table_name = pgq_edge_table_name(&rel.type_name);
+        let q_table = escape_sql_ident(&table_name);
+        let q_label = escape_sql_ident(&rel.type_name);
 
         let src_label = rel
             .source_labels
@@ -721,33 +768,38 @@ pub fn emit_pgq_property_graph_ddl(
                 ))
             })?;
 
-        let src_table = src_label.to_ascii_lowercase();
-        let tgt_table = tgt_label.to_ascii_lowercase();
-
-        let src_key = format!("{src_table}_id");
-        let tgt_key = format!("{tgt_table}_id");
+        let src_table = pgq_vertex_table_name(src_label);
+        let tgt_table = pgq_vertex_table_name(tgt_label);
 
         let src_node_pk = nodes
             .iter()
-            .find(|n| n.labels.contains(&src_label.to_string()) || n.name == src_label)
+            .find(|n| n.labels.iter().any(|l| l == src_label) || n.name == src_label)
             .and_then(|n| n.primary_key.as_deref());
         let tgt_node_pk = nodes
             .iter()
-            .find(|n| n.labels.contains(&tgt_label.to_string()) || n.name == tgt_label)
+            .find(|n| n.labels.iter().any(|l| l == tgt_label) || n.name == tgt_label)
             .and_then(|n| n.primary_key.as_deref());
 
-        let src_ref_col = src_node_pk.unwrap_or(&src_key);
-        let tgt_ref_col = tgt_node_pk.unwrap_or(&tgt_key);
+        let src_ref_col = src_node_pk.unwrap_or("id");
+        let tgt_ref_col = tgt_node_pk.unwrap_or("id");
+        let src_key = pgq_edge_source_key(src_ref_col);
+        let tgt_key = pgq_edge_destination_key(tgt_ref_col);
 
         let props_clause = if rel.fields.is_empty() {
             String::new()
         } else {
-            let field_names: Vec<&str> = rel.fields.keys().map(|k| k.as_str()).collect();
+            let field_names: Vec<String> = rel.fields.keys().map(|k| escape_sql_ident(k)).collect();
             format!(" PROPERTIES ({})", field_names.join(", "))
         };
 
         e_clauses.push(format!(
-            "    {table_name}\n      SOURCE KEY ({src_key}) REFERENCES {src_table} ({src_ref_col})\n      DESTINATION KEY ({tgt_key}) REFERENCES {tgt_table} ({tgt_ref_col})\n      LABEL {label}{props_clause}"
+            "    {q_table}\n      SOURCE KEY ({}) REFERENCES {} ({})\n      DESTINATION KEY ({}) REFERENCES {} ({})\n      LABEL {q_label}{props_clause}",
+            escape_sql_ident(&src_key),
+            escape_sql_ident(&src_table),
+            escape_sql_ident(src_ref_col),
+            escape_sql_ident(&tgt_key),
+            escape_sql_ident(&tgt_table),
+            escape_sql_ident(tgt_ref_col)
         ));
     }
 
@@ -913,7 +965,7 @@ pub fn emit_node_index_ddl_with_graph(
             }
         }
         DdlDialect::DuckDb => {
-            let table = primary_label.to_ascii_lowercase();
+            let table = pgq_vertex_table_name(primary_label);
             let q_table = escape_sql_ident(&table);
             for field in node.fields.values() {
                 if is_pure_index_field(field) {
@@ -1045,7 +1097,7 @@ pub fn emit_node_index_ddl_with_graph(
             }
         }
         DdlDialect::Sql => {
-            let table = primary_label.to_ascii_lowercase();
+            let table = pgq_vertex_table_name(primary_label);
             let q_table = escape_sql_ident(&table);
             for field in node.fields.values() {
                 if is_pure_index_field(field) {
@@ -1206,7 +1258,7 @@ pub fn emit_rel_index_ddl_with_graph(
             }
         }
         DdlDialect::DuckDb => {
-            let table = type_name.to_ascii_lowercase();
+            let table = pgq_edge_table_name(type_name);
             let q_table = escape_sql_ident(&table);
             for field in rel.fields.values() {
                 if is_pure_index_field(field) {
@@ -1265,7 +1317,7 @@ pub fn emit_rel_index_ddl_with_graph(
             });
         }
         DdlDialect::Sql => {
-            let table = type_name.to_ascii_lowercase();
+            let table = pgq_edge_table_name(type_name);
             let q_table = escape_sql_ident(&table);
             for field in rel.fields.values() {
                 if is_pure_index_field(field) {
@@ -1392,7 +1444,7 @@ pub fn emit_node_constraint_ddl_with_graph(
             }
         }
         DdlDialect::Sql | DdlDialect::DuckDb => {
-            let table = primary_label.to_ascii_lowercase();
+            let table = pgq_vertex_table_name(primary_label);
             let q_table = escape_sql_ident(&table);
             for field in node.fields.values() {
                 if field.unique && !field.primary_key {
@@ -1479,7 +1531,7 @@ pub fn emit_rel_constraint_ddl_with_graph(
             // Memgraph does not support edge constraints; no-op.
         }
         DdlDialect::Sql | DdlDialect::DuckDb => {
-            let table = type_name.to_ascii_lowercase();
+            let table = pgq_edge_table_name(type_name);
             let q_table = escape_sql_ident(&table);
             for field in rel.fields.values() {
                 if field.unique && !field.primary_key {
@@ -1564,7 +1616,7 @@ pub fn emit_node_drop_index_ddl_with_graph(
             }
         }
         DdlDialect::DuckDb => {
-            let table = primary_label.to_ascii_lowercase();
+            let table = pgq_vertex_table_name(primary_label);
             for field in node.fields.values() {
                 if is_pure_index_field(field) {
                     let idx_name = field
@@ -1659,7 +1711,7 @@ pub fn emit_node_drop_index_ddl_with_graph(
             }
         }
         DdlDialect::Sql => {
-            let table = primary_label.to_ascii_lowercase();
+            let table = pgq_vertex_table_name(primary_label);
             for field in node.fields.values() {
                 if is_pure_index_field(field) {
                     let idx_name = field
@@ -1747,7 +1799,7 @@ pub fn emit_rel_drop_index_ddl_with_graph(
             }
         }
         DdlDialect::DuckDb => {
-            let table = type_name.to_ascii_lowercase();
+            let table = pgq_edge_table_name(type_name);
             for field in rel.fields.values() {
                 if is_pure_index_field(field) {
                     statements.push(format!("DROP INDEX IF EXISTS idx_{table}_{};", field.name));
@@ -1793,7 +1845,7 @@ pub fn emit_rel_drop_index_ddl_with_graph(
             });
         }
         DdlDialect::Sql => {
-            let table = type_name.to_ascii_lowercase();
+            let table = pgq_edge_table_name(type_name);
             for field in rel.fields.values() {
                 if is_pure_index_field(field) {
                     statements.push(format!("DROP INDEX IF EXISTS idx_{table}_{};", field.name));
@@ -1886,7 +1938,7 @@ pub fn emit_node_drop_constraint_ddl_with_graph(
             }
         }
         DdlDialect::Sql | DdlDialect::DuckDb => {
-            let table = primary_label.to_ascii_lowercase();
+            let table = pgq_vertex_table_name(primary_label);
             let q_table = escape_sql_ident(&table);
             for field in node.fields.values() {
                 if field.unique && !field.primary_key {
@@ -1964,7 +2016,7 @@ pub fn emit_rel_drop_constraint_ddl_with_graph(
             // Memgraph does not support edge constraints; no-op.
         }
         DdlDialect::Sql | DdlDialect::DuckDb => {
-            let table = type_name.to_ascii_lowercase();
+            let table = pgq_edge_table_name(type_name);
             let q_table = escape_sql_ident(&table);
             for field in rel.fields.values() {
                 if field.unique && !field.primary_key {

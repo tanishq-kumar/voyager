@@ -29,7 +29,7 @@ fn test_pgq_single_node_and_where_conformance() {
 
     assert!(
         res.statement
-            .contains("SELECT * FROM GRAPH_TABLE (social_graph MATCH (p IS Person)")
+            .contains("SELECT * FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\")")
     );
     assert!(res.statement.contains("WHERE p.age > $p0"));
     assert!(
@@ -54,7 +54,7 @@ fn test_pgq_named_parameter_in_node_property_predicate() {
 
     assert!(
         res.statement
-            .contains("(p IS Person WHERE p.email = $email)"),
+            .contains("(p IS \"Person\" WHERE p.email = $email)"),
         "statement was {}",
         res.statement
     );
@@ -154,7 +154,7 @@ fn test_pgq_multi_hop_and_quantified_hops() {
     let res = pgq.visit_query(&arena, root).unwrap();
 
     assert!(res.statement.contains(
-        "(a IS Person) -[r1 IS KNOWS]-> (b IS Person) -[r2 IS WORKS_AT]-> (c IS Company)"
+        "(a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") -[r2 IS \"WORKS_AT\"]-> (c IS \"Company\")"
     ));
 
     // Variable hops
@@ -168,7 +168,7 @@ fn test_pgq_multi_hop_and_quantified_hops() {
 
     let (a_h, r_h) = b_hops.build();
     let res_h = pgq.visit_query(&a_h, r_h).unwrap();
-    assert!(res_h.statement.contains("-[r IS KNOWS]->{1,3}"));
+    assert!(res_h.statement.contains("-[r IS \"KNOWS\"]->{1,3}"));
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn test_pgq_directions_undirected_and_incoming() {
     assert!(
         res_u
             .statement
-            .contains("(a IS Person) -[r IS KNOWS]- (b IS Person)")
+            .contains("(a IS \"Person\") -[r IS \"KNOWS\"]- (b IS \"Person\")")
     );
 
     let mut b_inc = QueryBuilder::new();
@@ -201,7 +201,7 @@ fn test_pgq_directions_undirected_and_incoming() {
     assert!(
         res_i
             .statement
-            .contains("(c IS Company) <-[r IS WORKS_AT]- (a IS Person)")
+            .contains("(c IS \"Company\") <-[r IS \"WORKS_AT\"]- (a IS \"Person\")")
     );
 }
 
@@ -329,7 +329,7 @@ fn test_pgq_distinct_projection_is_emitted() {
     let res = pgq.visit_query(&arena, root).unwrap();
     assert_eq!(
         res.statement,
-        "SELECT DISTINCT * FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.city))"
+        "SELECT DISTINCT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.city))"
     );
 }
 

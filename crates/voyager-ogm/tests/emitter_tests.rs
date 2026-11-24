@@ -88,7 +88,7 @@ fn test_sql_pgq_emitter_graph_table() {
 
     assert_eq!(
         compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (movies_graph MATCH (p IS Person) -[r IS ACTED_IN]-> (m IS Movie) WHERE p.age > $p0 COLUMNS (p.name AS actor, m.title AS movie)) ORDER BY actor ASC NULLS LAST LIMIT 10"
+        "SELECT * FROM GRAPH_TABLE (movies_graph MATCH (p IS \"Person\") -[r IS \"ACTED_IN\"]-> (m IS \"Movie\") WHERE p.age > $p0 COLUMNS (p.name AS actor, m.title AS movie)) ORDER BY actor ASC NULLS LAST LIMIT 10"
     );
     assert_eq!(
         compiled.parameters.get("p0"),
@@ -114,7 +114,7 @@ fn test_sql_pgq_emitter_like_translation() {
 
     assert_eq!(
         compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (social_network MATCH (p IS Person) WHERE strpos(p.name, $p0) > 0 COLUMNS (p.name AS name))"
+        "SELECT * FROM GRAPH_TABLE (social_network MATCH (p IS \"Person\") WHERE strpos(p.name, $p0) > 0 COLUMNS (p.name AS name))"
     );
     assert_eq!(
         compiled.parameters.get("p0"),
@@ -448,7 +448,7 @@ fn test_pagination_parameters_emit_as_parameters() {
     let mut pgq = SqlPgqEmitter::new("graph");
     assert_eq!(
         pgq.visit_query(&arena, root).unwrap().statement,
-        "SELECT * FROM GRAPH_TABLE (graph MATCH (p IS Person) COLUMNS (p.name)) LIMIT $l OFFSET $s"
+        "SELECT * FROM GRAPH_TABLE (graph MATCH (p IS \"Person\") COLUMNS (p.name)) LIMIT $l OFFSET $s"
     );
 }
 

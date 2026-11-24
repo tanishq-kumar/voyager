@@ -1,9 +1,10 @@
 //! Voyager OGM Command-Line Interface (`voyager`, also installed as `voy`).
 //!
 //! The CLI compiles and validates Query Spec v1 JSON documents with the Rust
-//! consumer in [`voyager_ogm::spec`] and diagnoses database connections through
-//! [`voyager_drivers`]. It does not parse query text and does not reimplement
-//! the spec consumer.
+//! consumer in [`voyager_ogm::spec`], diagnoses database connections through
+//! [`voyager_drivers`], and prints a live database schema with
+//! [`voyager_drivers::introspect`]. It does not parse query text and does not
+//! reimplement the spec consumer.
 
 use std::collections::HashMap;
 use std::env;
@@ -16,6 +17,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Map, Value};
 
 use voyager_drivers::Auth;
+use voyager_drivers::introspect::{DEFAULT_SAMPLE_SIZE, GraphSchema, IntrospectOptions};
 use voyager_drivers::uri::{DatabaseProtocol, ParsedUri};
 use voyager_ogm::ast::LiteralValue;
 use voyager_ogm::spec::{SpecCompileOptions, build_query, compile};
@@ -24,28 +26,32 @@ use voyager_ogm::spec::{SpecCompileOptions, build_query, compile};
 const EXIT_SUCCESS: u8 = 0;
 /// Exit code for an invalid Query Spec document or a rejected compilation.
 const EXIT_INVALID_SPEC: u8 = 1;
-/// Exit code for a failed doctor connection or check.
+/// Exit code for a failed connection, check or catalog query (doctor, introspect).
 const EXIT_CHECK: u8 = 3;
 /// Exit code for an input/output error.
 const EXIT_IO: u8 = 4;
+/// Exit code for an engine that `introspect` does not support.
+const EXIT_UNSUPPORTED: u8 = 5;
 
 const EXIT_HELP: &str = "\
 Exit codes:
   0  success
   1  invalid Query Spec document or rejected compilation (compile, validate)
   2  usage error
-  3  doctor connection or check failure
-  4  input/output error (cannot read the spec file or stdin)";
+  3  connection, check or catalog query failure (doctor, introspect)
+  4  input/output error (cannot read the spec file or stdin)
+  5  engine not supported by introspect (Apache AGE, DuckDB)";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "voyager",
     author = "Voyager OGM Team",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Compile and validate Voyager Query Spec documents and check database connections",
+    about = "Compile and validate Voyager Query Spec documents, check database connections and introspect live schemas",
     long_about = "The Voyager CLI compiles Query Spec v1 JSON documents with the same consumer as \
-                  `compile_query_from_spec`, validates them without emitting a statement, and checks \
-                  database connections through voyager-drivers. The same program is installed as both \
+                  `compile_query_from_spec`, validates them without emitting a statement, checks \
+                  database connections through voyager-drivers, and prints a live database's graph \
+                  schema in the shape of `export_schema`. The same program is installed as both \
                   `voyager` and `voy`.",
     after_help = EXIT_HELP
 )]
@@ -78,6 +84,46 @@ enum Commands {
         /// Environment variable holding the password (never pass a password on the command line)
         #[arg(long, value_name = "VAR")]
         password_env: Option<String>,
+    },
+
+    /// Print a live database's graph schema (labels, relationship types, properties, constraints, indexes)
+    #[command(
+        long_about = "Print a live database's graph schema: labels, relationship types with their \
+                      endpoints, properties, constraints and indexes.\n\n\
+                      The JSON format is the result of the library call (Python \
+                      `voyager_ogm.introspect_schema`, Rust `voyager_drivers::introspect`) and has the \
+                      shape of `export_schema(models)`, plus `constraints`, `indexes` and `source`. \
+                      Keys a database cannot know (model, attribute, description, has_default, \
+                      constraints) are null. Property value types and relationship endpoints come from \
+                      a sample of at most --sample-size entities per label or relationship type, \
+                      unless the engine declares them (PostgreSQL).\n\n\
+                      Supported: Neo4j 5.13+ and Memgraph (bolt://), FalkorDB (redis:// or \
+                      falkordb://, graph from the URI), PostgreSQL 19 SQL/PGQ property graphs \
+                      (postgresql://...?graph=<name>). Apache AGE and DuckDB exit with code 5.\n\n\
+                      Credentials work as for doctor: URI userinfo or --username, and \
+                      --password-env for the password.",
+        after_help = EXIT_HELP
+    )]
+    Introspect {
+        /// Connection URI (bolt://, neo4j://, redis://, falkordb://, postgresql://...?graph=<name>)
+        #[arg(long)]
+        uri: String,
+
+        /// Output format
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+
+        /// Username (overrides the URI userinfo); omit it for servers that do not authenticate
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Environment variable holding the password (never pass a password on the command line)
+        #[arg(long, value_name = "VAR")]
+        password_env: Option<String>,
+
+        /// Maximum entities sampled per label or relationship type for property types and endpoints (0 disables sampling)
+        #[arg(long, value_name = "N", default_value_t = DEFAULT_SAMPLE_SIZE)]
+        sample_size: usize,
     },
 
     /// Compile a Query Spec v1 document to a dialect
@@ -152,10 +198,10 @@ impl Dialect {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
-    /// Statement on stdout; parameters only with --show-params
+    /// Human-readable text (compile: the statement; introspect: a schema summary)
     #[value(name = "text")]
     Text,
-    /// JSON object with statement, parameters and columns
+    /// JSON (compile: statement, parameters and columns; introspect: the schema)
     #[value(name = "json")]
     Json,
 }
@@ -218,6 +264,13 @@ async fn run(cli: Cli) -> Result<(), Failure> {
             username,
             password_env,
         } => run_doctor(uri, username, password_env).await,
+        Commands::Introspect {
+            uri,
+            format,
+            username,
+            password_env,
+            sample_size,
+        } => run_introspect(&uri, format, username, password_env, sample_size).await,
         Commands::Compile {
             input,
             dialect,
@@ -341,22 +394,205 @@ async fn run_doctor(
             Ok(())
         }
         Some(uri) => {
-            let mut parsed = ParsedUri::parse(&uri)
-                .map_err(|error| Failure::check(format!("doctor: {error}")))?;
-            let password = match password_env {
-                Some(variable) => Some(env::var(&variable).map_err(|_| {
-                    Failure::check(format!(
-                        "doctor: environment variable '{variable}' is not set (--password-env)"
-                    ))
-                })?),
-                None => None,
-            };
-            apply_credentials(&mut parsed, username.as_deref(), password.as_deref())?;
+            let parsed = connection_uri("doctor", &uri, username, password_env)?;
             let report = probe_connection(&parsed).await?;
             print_connection_report(&parsed, &report);
             Ok(())
         }
     }
+}
+
+/// Parses `uri` and applies --username / --password-env.
+fn connection_uri(
+    command: &str,
+    uri: &str,
+    username: Option<String>,
+    password_env: Option<String>,
+) -> Result<ParsedUri, Failure> {
+    let mut parsed =
+        ParsedUri::parse(uri).map_err(|error| Failure::check(format!("{command}: {error}")))?;
+    let password = match password_env {
+        Some(variable) => Some(env::var(&variable).map_err(|_| {
+            Failure::check(format!(
+                "{command}: environment variable '{variable}' is not set (--password-env)"
+            ))
+        })?),
+        None => None,
+    };
+    apply_credentials(
+        command,
+        &mut parsed,
+        username.as_deref(),
+        password.as_deref(),
+    )?;
+    Ok(parsed)
+}
+
+async fn run_introspect(
+    uri: &str,
+    format: OutputFormat,
+    username: Option<String>,
+    password_env: Option<String>,
+    sample_size: usize,
+) -> Result<(), Failure> {
+    let parsed = connection_uri("introspect", uri, username, password_env)?;
+    let options = IntrospectOptions { sample_size };
+    let schema = voyager_drivers::introspect(&parsed, &options)
+        .await
+        .map_err(|error| {
+            let code = if error.code() == voyager_ogm::ErrorCode::UnsupportedFeature {
+                EXIT_UNSUPPORTED
+            } else {
+                EXIT_CHECK
+            };
+            Failure::new(
+                code,
+                format!(
+                    "introspect: {}",
+                    voyager_drivers::introspect::describe_error(&error)
+                ),
+            )
+        })?;
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&schema.to_json_value())
+                .unwrap_or_else(|_| "{}".to_string())
+        ),
+        OutputFormat::Text => print!("{}", render_schema_text(&schema)),
+    }
+    Ok(())
+}
+
+/// Renders a schema as an indented text summary.
+fn render_schema_text(schema: &GraphSchema) -> String {
+    use std::fmt::Write as _;
+    use voyager_drivers::introspect::{EntityKind, PropertyEntry};
+
+    fn property_line(out: &mut String, property: &PropertyEntry) {
+        let mut facts = vec![
+            property
+                .type_name
+                .clone()
+                .unwrap_or_else(|| "?".to_string()),
+        ];
+        if property.primary_key == Some(true) {
+            facts.push("primary key".to_string());
+        }
+        if property.unique {
+            facts.push("unique".to_string());
+        }
+        if !property.nullable {
+            facts.push("not null".to_string());
+        }
+        if property.indexed {
+            facts.push(format!(
+                "indexed {}",
+                property.index_type.as_deref().unwrap_or("")
+            ));
+        }
+        let _ = writeln!(
+            out,
+            "    {}: {}",
+            property.name,
+            facts.join(", ").trim_end()
+        );
+    }
+    fn entity(kind: EntityKind) -> &'static str {
+        match kind {
+            EntityKind::Node => "node",
+            EntityKind::Relationship => "relationship",
+        }
+    }
+
+    let mut out = String::new();
+    let source = &schema.source;
+    let mut engine = source.engine.clone();
+    if let Some(version) = &source.server_version {
+        engine.push(' ');
+        engine.push_str(version);
+    }
+    if let Some(edition) = &source.edition {
+        let _ = write!(engine, " ({edition})");
+    }
+    let _ = writeln!(out, "engine: {engine}");
+    if let Some(database) = &source.database {
+        let _ = writeln!(out, "database: {database}");
+    }
+    let _ = writeln!(out, "sample size: {}", source.sample_size);
+
+    let _ = writeln!(out, "\nnodes ({}):", schema.nodes.len());
+    for node in &schema.nodes {
+        let _ = writeln!(out, "  {}", node.name);
+        for property in node.properties.values() {
+            property_line(&mut out, property);
+        }
+    }
+    let _ = writeln!(out, "\nrelationships ({}):", schema.relationships.len());
+    for rel in &schema.relationships {
+        let side = |labels: &[String]| {
+            if labels.is_empty() {
+                "()".to_string()
+            } else {
+                format!("(:{})", labels.join("|"))
+            }
+        };
+        let _ = writeln!(
+            out,
+            "  {}  {}-[:{}]->{}",
+            rel.type_name,
+            side(&rel.source_labels),
+            rel.type_name,
+            side(&rel.target_labels)
+        );
+        for property in rel.properties.values() {
+            property_line(&mut out, property);
+        }
+    }
+    let _ = writeln!(out, "\nconstraints ({}):", schema.constraints.len());
+    for constraint in &schema.constraints {
+        let kind = match constraint.kind {
+            voyager_drivers::introspect::ConstraintKind::Unique => "unique",
+            voyager_drivers::introspect::ConstraintKind::Exists => "exists",
+            voyager_drivers::introspect::ConstraintKind::Key => "key",
+            voyager_drivers::introspect::ConstraintKind::Type => "type",
+        };
+        let mut line = format!(
+            "  {kind} {} {}({})",
+            entity(constraint.entity),
+            constraint.label_or_type,
+            constraint.properties.join(", ")
+        );
+        if let Some(property_type) = &constraint.property_type {
+            let _ = write!(line, " :: {property_type}");
+        }
+        if let Some(name) = &constraint.name {
+            let _ = write!(line, " [{name}]");
+        }
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = writeln!(out, "\nindexes ({}):", schema.indexes.len());
+    for index in &schema.indexes {
+        let mut line = format!(
+            "  {} {} {}({})",
+            index.index_type,
+            entity(index.entity),
+            if index.labels_or_types.is_empty() {
+                "*".to_string()
+            } else {
+                index.labels_or_types.join("|")
+            },
+            index.properties.join(", ")
+        );
+        if let Some(name) = &index.name {
+            let _ = write!(line, " [{name}]");
+        }
+        if let Some(owner) = &index.owning_constraint {
+            let _ = write!(line, " backs {owner}");
+        }
+        let _ = writeln!(out, "{line}");
+    }
+    out
 }
 
 fn print_build_facts() {
@@ -386,6 +622,7 @@ fn enabled_driver_features() -> String {
 }
 
 fn apply_credentials(
+    command: &str,
     parsed: &mut ParsedUri,
     username: Option<&str>,
     password: Option<&str>,
@@ -406,15 +643,15 @@ fn apply_credentials(
 
     if current_user.is_empty() {
         if !current_password.is_empty() {
-            return Err(Failure::check(
-                "doctor: a password needs a username; put the username in the URI or pass --username",
-            ));
+            return Err(Failure::check(format!(
+                "{command}: a password needs a username; put the username in the URI or pass --username"
+            )));
         }
         return match parsed.protocol {
             // PostgreSQL has no anonymous login: the startup message must name a role.
-            DatabaseProtocol::Postgres => Err(Failure::check(
-                "doctor: PostgreSQL requires a username; put it in the URI (for example postgresql://user@host:5432/database) or pass --username",
-            )),
+            DatabaseProtocol::Postgres => Err(Failure::check(format!(
+                "{command}: PostgreSQL requires a username; put it in the URI (for example postgresql://user@host:5432/database) or pass --username"
+            ))),
             // Bolt sends the `none` authentication scheme and Redis skips AUTH, which is
             // what servers without authentication expect.
             _ => {
@@ -717,6 +954,49 @@ mod tests {
     }
 
     #[test]
+    fn schema_text_lists_properties_constraints_and_indexes() {
+        use voyager_drivers::introspect::{
+            ConstraintEntry, ConstraintKind, EntityKind, SchemaBuilder, SourceInfo,
+        };
+        let mut builder = SchemaBuilder::new();
+        builder.add_property_type(EntityKind::Node, "Person", "email", Some("STRING NOT NULL"));
+        builder.add_endpoint("KNOWS", Some("Person"), Some("Person"));
+        builder.add_constraint(ConstraintEntry {
+            entity: EntityKind::Node,
+            label_or_type: "Person".to_string(),
+            properties: vec!["email".to_string()],
+            kind: ConstraintKind::Unique,
+            property_type: None,
+            name: Some("person_email".to_string()),
+            engine_type: "UNIQUENESS".to_string(),
+        });
+        let schema = builder.finish(SourceInfo {
+            engine: "neo4j".to_string(),
+            server_version: Some("5.26.0".to_string()),
+            edition: Some("community".to_string()),
+            database: None,
+            sample_size: 1000,
+        });
+        let text = render_schema_text(&schema);
+        assert!(
+            text.starts_with("engine: neo4j 5.26.0 (community)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  Person\n    email: STRING, unique\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  KNOWS  (:Person)-[:KNOWS]->(:Person)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  unique node Person(email) [person_email]"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn doctor_lists_only_compiled_protocol_features() {
         let features = enabled_driver_features();
         assert_eq!(features.contains("bolt"), cfg!(feature = "bolt"));
@@ -728,7 +1008,7 @@ mod tests {
     fn username_is_optional_for_bolt_and_redis() {
         for uri in ["bolt://localhost:7687", "redis://localhost:6379"] {
             let mut parsed = ParsedUri::parse(uri).expect("parse URI");
-            apply_credentials(&mut parsed, None, None).expect("no credentials needed");
+            apply_credentials("doctor", &mut parsed, None, None).expect("no credentials needed");
             assert_eq!(parsed.auth, Auth::None, "{uri}");
         }
     }
@@ -736,7 +1016,8 @@ mod tests {
     #[test]
     fn postgres_without_a_username_is_rejected() {
         let mut parsed = ParsedUri::parse("postgresql://localhost:5432/graph").expect("parse URI");
-        let failure = apply_credentials(&mut parsed, None, None).expect_err("username required");
+        let failure =
+            apply_credentials("doctor", &mut parsed, None, None).expect_err("username required");
         assert_eq!(failure.code, EXIT_CHECK);
         assert!(
             failure.message.contains("requires a username"),
@@ -753,8 +1034,8 @@ mod tests {
     #[test]
     fn password_without_a_username_is_rejected() {
         let mut parsed = ParsedUri::parse("bolt://localhost:7687").expect("parse URI");
-        let failure =
-            apply_credentials(&mut parsed, None, Some("secret")).expect_err("username required");
+        let failure = apply_credentials("doctor", &mut parsed, None, Some("secret"))
+            .expect_err("username required");
         assert_eq!(failure.code, EXIT_CHECK);
         assert!(
             failure.message.contains("needs a username"),
@@ -766,7 +1047,8 @@ mod tests {
     #[test]
     fn username_without_a_password_is_kept() {
         let mut parsed = ParsedUri::parse("bolt://localhost:7687").expect("parse URI");
-        apply_credentials(&mut parsed, Some("memgraph"), None).expect("username is enough");
+        apply_credentials("doctor", &mut parsed, Some("memgraph"), None)
+            .expect("username is enough");
         assert_eq!(
             parsed.auth,
             Auth::Basic {

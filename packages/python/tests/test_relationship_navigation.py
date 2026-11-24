@@ -849,11 +849,11 @@ def test_pgq_ddl_supports_relationship_descriptors() -> None:
         PGQ_GRAPH, Feat121PgqSource, Feat121PgqTarget, Feat121PgqKnows
     )
 
-    assert "LABEL Feat121PgqSource" in ddl
-    assert "LABEL Feat121PgqTarget" in ddl
-    assert "LABEL FEAT121_PGQ_KNOWS" in ddl
-    assert "SOURCE KEY (feat121pgqsource_id)" in ddl
-    assert "DESTINATION KEY (feat121pgqtarget_id)" in ddl
+    assert 'LABEL "Feat121PgqSource"' in ddl
+    assert 'LABEL "Feat121PgqTarget"' in ddl
+    assert 'LABEL "FEAT121_PGQ_KNOWS"' in ddl
+    assert 'SOURCE KEY ("src_id") REFERENCES "feat121pgqsource" ("id")' in ddl
+    assert 'DESTINATION KEY ("dst_id") REFERENCES "feat121pgqtarget" ("id")' in ddl
 
 
 @pytest.mark.live
@@ -872,21 +872,21 @@ def test_live_postgres19_pgq_relationship_navigation() -> None:
     try:
         cur.execute(f"DROP PROPERTY GRAPH IF EXISTS {PGQ_GRAPH} CASCADE;")
         cur.execute(
-            "DROP TABLE IF EXISTS feat121pgqknows CASCADE; "
+            "DROP TABLE IF EXISTS feat121_pgq_knows CASCADE; "
             "DROP TABLE IF EXISTS feat121pgqsource CASCADE; "
             "DROP TABLE IF EXISTS feat121pgqtarget CASCADE;"
         )
         cur.execute("CREATE TABLE feat121pgqsource (id TEXT PRIMARY KEY, name TEXT);")
         cur.execute("CREATE TABLE feat121pgqtarget (id TEXT PRIMARY KEY, name TEXT, age INT);")
         cur.execute(
-            "CREATE TABLE feat121pgqknows ("
-            "feat121pgqsource_id TEXT REFERENCES feat121pgqsource(id), "
-            "feat121pgqtarget_id TEXT REFERENCES feat121pgqtarget(id), "
-            "since INT, PRIMARY KEY (feat121pgqsource_id, feat121pgqtarget_id));"
+            "CREATE TABLE feat121_pgq_knows ("
+            "src_id TEXT REFERENCES feat121pgqsource(id), "
+            "dst_id TEXT REFERENCES feat121pgqtarget(id), "
+            "since INT, PRIMARY KEY (src_id, dst_id));"
         )
         cur.execute("INSERT INTO feat121pgqsource VALUES ('s1', 'Source');")
         cur.execute("INSERT INTO feat121pgqtarget VALUES ('t1', 'Bob', 18), ('t2', 'Carol', 16);")
-        cur.execute("INSERT INTO feat121pgqknows VALUES ('s1', 't1', 2026), ('s1', 't2', 2026);")
+        cur.execute("INSERT INTO feat121_pgq_knows VALUES ('s1', 't1', 2026), ('s1', 't2', 2026);")
         cur.execute(
             SchemaManager.generate_pgq_ddl(
                 PGQ_GRAPH, Feat121PgqSource, Feat121PgqTarget, Feat121PgqKnows
@@ -906,7 +906,7 @@ def test_live_postgres19_pgq_relationship_navigation() -> None:
         try:
             cur.execute(f"DROP PROPERTY GRAPH IF EXISTS {PGQ_GRAPH} CASCADE;")
             cur.execute(
-                "DROP TABLE IF EXISTS feat121pgqknows CASCADE; "
+                "DROP TABLE IF EXISTS feat121_pgq_knows CASCADE; "
                 "DROP TABLE IF EXISTS feat121pgqsource CASCADE; "
                 "DROP TABLE IF EXISTS feat121pgqtarget CASCADE;"
             )
@@ -942,14 +942,14 @@ def test_embedded_duckpgq_relationship_navigation() -> None:
             f"""
             CREATE PROPERTY GRAPH {PGQ_GRAPH}
               VERTEX TABLES (
-                feat121pgqsource LABEL Feat121PgqSource,
-                feat121pgqtarget LABEL Feat121PgqTarget
+                feat121pgqsource LABEL "Feat121PgqSource",
+                feat121pgqtarget LABEL "Feat121PgqTarget"
               )
               EDGE TABLES (
                 feat121pgqknows
                   SOURCE KEY (feat121pgqsource_id) REFERENCES feat121pgqsource (id)
                   DESTINATION KEY (feat121pgqtarget_id) REFERENCES feat121pgqtarget (id)
-                  LABEL FEAT121_PGQ_KNOWS
+                  LABEL "FEAT121_PGQ_KNOWS"
               );
             """
         )
