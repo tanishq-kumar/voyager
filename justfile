@@ -75,6 +75,10 @@ check-features:
     cargo clippy -p voyager-drivers --no-default-features --features postgres -- -D warnings
     cargo clippy -p voyager-drivers --no-default-features --features redis -- -D warnings
     cargo clippy -p voyager-drivers --no-default-features --features arrow -- -D warnings
+    cargo clippy -p voyager-drivers --no-default-features --features tls -- -D warnings
+    cargo clippy -p voyager-drivers --no-default-features --features bolt,tls -- -D warnings
+    cargo clippy -p voyager-drivers --no-default-features --features bolt,postgres,redis,arrow -- -D warnings
+    cargo clippy -p voyager-cli --no-default-features --features bolt,postgres,redis -- -D warnings
     cargo clippy -p voyager-drivers -- -D warnings
     cargo clippy -p voyager-drivers --all-features -- -D warnings
 

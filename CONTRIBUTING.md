@@ -117,6 +117,34 @@ NEO4J_EDITION=enterprise NEO4J_ACCEPT_LICENSE_AGREEMENT=eval just up neo4j
 
 Memgraph (BSL 1.1) and FalkorDB (SSPL v1) are pulled and run locally only; this project never redistributes them.
 
+#### TLS test stack
+
+`containers/compose.tls.yaml` is an overlay that turns on TLS with a throwaway test CA. Plaintext ports keep working, so the other live tests are unaffected:
+
+```bash
+# 1. Generate the test CA, the server certificate and a client certificate (git-ignored, in
+#    containers/tls/certs/). Add the address of a remote test machine as an extra SAN.
+containers/tls/gen-certs.sh                    # or: containers/tls/gen-certs.sh IP:192.168.1.12
+
+# 2. Start the stack with the overlay
+podman compose -f containers/compose.yaml -f containers/compose.tls.yaml up -d
+
+# 3. Run the live TLS tests (Rust, CLI doctor and Python native client)
+cargo nextest run -p voyager-drivers --test live_tls_tests
+cargo nextest run -p voyager-cli --test live_doctor
+uv run --no-sync pytest -m live packages/python/tests/test_native_tls.py
+```
+
+| Endpoint | TLS |
+| :--- | :--- |
+| Neo4j 7687 | optional: the same port accepts `bolt://` and `bolt+s://` |
+| Memgraph 7690 | TLS only (plain Memgraph stays on 7688) |
+| FalkorDB 6380 | TLS only (plain FalkorDB stays on 6379) |
+| FalkorDB 6381 | mutual TLS: clients present `client.crt` / `client.key` |
+| Apache AGE 5455, PostgreSQL 19 5456 | `ssl=on`: the client chooses with `sslmode` |
+
+The tests read the host from `VOYAGER_TEST_HOST` (default `127.0.0.1`) and the CA from `VOYAGER_TEST_TLS_CA` (default `containers/tls/certs/ca.crt`; the client certificate is read from the same directory), and skip an endpoint that is unreachable. TLS behaviour that needs no database (certificate and hostname checks, mutual TLS, every PostgreSQL `sslmode`, the server's `N` reply) is covered by `crates/voyager-drivers/tests/tls_tests.rs`, which generates its own certificates.
+
 ### Git Hooks
 
 The repository ships hooks in `.githooks/`. Enable them once per clone:
@@ -170,6 +198,7 @@ Voyager is structured as a monorepo:
 * `test_data/`: TCK/conformance corpora and seed data.
 * `fuzz/`: cargo-fuzz targets (excluded from the Cargo workspace).
 * `containers/compose.yaml`: Multi-engine Compose stack (Neo4j, Memgraph, Apache AGE, FalkorDB, PostgreSQL) for live tests.
+* `containers/compose.tls.yaml`, `containers/tls/gen-certs.sh`: TLS overlay and test-certificate generator for the live TLS tests.
 * `.github/workflows/` + `justfile`: CI (`ci.yml`), releases (`release.yml`), PR tooling, and every dev recipe.
 
 A TypeScript SDK (`packages/typescript`) is planned but is not part of this repository yet.

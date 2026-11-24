@@ -185,3 +185,61 @@ fn live_doctor_checks_postgresql_19() {
     );
     assert!(text.contains("status: ok"), "{text}");
 }
+
+/// The TLS test CA: `VOYAGER_TEST_TLS_CA`, or `containers/tls/certs/ca.crt`.
+fn tls_ca() -> Option<String> {
+    let path = std::env::var_os("VOYAGER_TEST_TLS_CA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../containers/tls/certs/ca.crt")
+        });
+    path.is_file().then(|| path.display().to_string())
+}
+
+#[test]
+fn live_doctor_checks_tls_endpoints() {
+    if !cfg!(feature = "tls") {
+        eprintln!("[SKIP] voyager-cli was built without the `tls` feature");
+        return;
+    }
+    let Some(ca) = tls_ca() else {
+        eprintln!("[SKIP] TLS test CA not found (containers/tls/gen-certs.sh)");
+        return;
+    };
+    let h = host();
+    let checks = [
+        (
+            7687,
+            format!("bolt+s://neo4j:voyagerpass123@{h}:7687?tls_ca_file={ca}"),
+            "protocol: Bolt v",
+        ),
+        (
+            6380,
+            format!("rediss://{h}:6380?tls_ca_file={ca}"),
+            "protocol: Redis/RESP",
+        ),
+        (
+            5456,
+            format!(
+                "postgresql://postgres:voyagerpass123@{h}:5456/voyager_graph?sslmode=verify-full&sslrootcert={ca}"
+            ),
+            "protocol: PostgreSQL wire",
+        ),
+    ];
+    for (port, uri, protocol) in checks {
+        if !is_reachable(port) {
+            eprintln!("[SKIP] {h}:{port} is not reachable");
+            continue;
+        }
+        let output = Command::new(bin())
+            .args(["doctor", "--uri", &uri])
+            .output()
+            .expect("run voyager doctor");
+        assert!(output.status.success(), "{uri}: {}", stderr(&output));
+        let text = stdout(&output);
+        assert!(text.contains(protocol), "{text}");
+        assert!(text.contains(" over TLS"), "{text}");
+        assert!(text.contains("status: ok"), "{text}");
+    }
+}

@@ -73,7 +73,8 @@ enum Commands {
         after_help = EXIT_HELP
     )]
     Doctor {
-        /// Connection URI to check (bolt://, neo4j://, postgresql://, age://, redis://, falkordb://)
+        /// Connection URI to check (bolt://, neo4j://, postgresql://, age://, redis://, falkordb://;
+        /// TLS: bolt+s://, bolt+ssc://, rediss://, ?sslmode=..., with ?tls_ca_file=<PEM> for a private CA)
         #[arg(long)]
         uri: Option<String>,
 
@@ -599,6 +600,14 @@ fn print_build_facts() {
     println!("voyager {}", env!("CARGO_PKG_VERSION"));
     println!("voyager-ogm {}", voyager_ogm::VERSION);
     println!("driver protocol features: {}", enabled_driver_features());
+    println!(
+        "TLS: {}",
+        if voyager_drivers::TLS_AVAILABLE {
+            "enabled (rustls; bolt+s, rediss, PostgreSQL sslmode)"
+        } else {
+            "not built (enable the `tls` Cargo feature)"
+        }
+    );
     println!("supported dialects: cypher, age, iso_gql, sql_pgq, duck_pgq");
     println!("connection checks: run `voyager doctor --uri <URI>`");
 }
@@ -739,13 +748,14 @@ async fn probe_bolt(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         .await
         .map_err(|error| Failure::check(format!("doctor: {error}")))?;
     let protocol_version = connection.version();
+    let tls = tls_label(connection.is_tls());
     let server_version = connection.server_agent().map(str::to_string);
     let latency = measure_ping(&mut connection).await?;
     let _ = connection.close().await;
 
     Ok(ProbeReport {
         protocol: format!(
-            "Bolt v{}.{}",
+            "Bolt v{}.{}{tls}",
             protocol_version.major, protocol_version.minor
         ),
         server_version,
@@ -765,6 +775,7 @@ async fn probe_postgres(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         .server_parameters()
         .get("server_version")
         .cloned();
+    let tls = tls_label(connection.is_tls());
     let latency = measure_ping(&mut connection).await?;
     let _ = connection.close().await;
 
@@ -775,7 +786,7 @@ async fn probe_postgres(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         || parsed.params.get("dialect").map(String::as_str) == Some("age");
 
     Ok(ProbeReport {
-        protocol: "PostgreSQL wire".to_string(),
+        protocol: format!("PostgreSQL wire{tls}"),
         server_version,
         latency,
         dialect: if uses_age { "age" } else { "sql_pgq" },
@@ -795,11 +806,12 @@ async fn probe_redis(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         "Redis/RESP2"
     };
     let server_version = redis_server_version(connection.server_info());
+    let tls = tls_label(connection.is_tls());
     let latency = measure_ping(&mut connection).await?;
     let _ = connection.close().await;
 
     Ok(ProbeReport {
-        protocol: resp_label.to_string(),
+        protocol: format!("{resp_label}{tls}"),
         server_version,
         latency,
         dialect: "cypher",
@@ -822,6 +834,11 @@ fn redis_server_version(info: &HashMap<String, voyager_drivers::RespValue>) -> O
         }
     }
     None
+}
+
+#[cfg(any(feature = "bolt", feature = "postgres", feature = "redis"))]
+fn tls_label(is_tls: bool) -> &'static str {
+    if is_tls { " over TLS" } else { "" }
 }
 
 #[cfg(any(feature = "bolt", feature = "postgres", feature = "redis"))]

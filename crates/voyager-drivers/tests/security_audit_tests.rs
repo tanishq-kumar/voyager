@@ -331,47 +331,26 @@ async fn test_plaintext_tls_downgrade_prevention() {
         "ConnectionConfig::from_uri must preserve TLS mode!"
     );
 
-    let res = connect_any(uri).await;
-    match res {
-        Err(NetError::TlsError(msg)) => {
-            println!("Safely rejected bolt+s plaintext downgrade: {}", msg);
-            assert!(msg.contains("Plaintext downgrade rejected"));
+    // With the `tls` feature the client starts TLS (tls_tests.rs checks that the first
+    // bytes on the wire are a ClientHello / SSLRequest); without it, every TLS URI is
+    // refused before connecting, naming the feature.
+    for uri in [
+        uri,
+        "rediss://default:password@127.0.0.1:6379",
+        "postgresql+s://postgres:secret@127.0.0.1:5432/mydb",
+    ] {
+        match connect_any(uri).await {
+            Ok(_) => panic!("{uri}: nothing listens there, expected an error"),
+            Err(NetError::TlsError(msg)) => {
+                assert!(msg.contains("Plaintext downgrade rejected"), "{msg}");
+                assert!(msg.contains("`tls` feature"), "{msg}");
+            }
+            // With TLS the connection attempt itself fails: nothing listens there.
+            Err(_) if voyager_drivers::TLS_AVAILABLE => {}
+            Err(other) => {
+                panic!("{uri}: without the tls feature expected a TlsError, got {other:?}")
+            }
         }
-        Ok(_) => panic!("Expected TlsError on bolt+s connection, got Ok"),
-        Err(e) => panic!(
-            "Expected TlsError on bolt+s connection, got other error: {:?}",
-            e
-        ),
-    }
-
-    // 2. rediss scheme
-    let redis_uri = "rediss://default:password@127.0.0.1:6379";
-    let redis_res = connect_any(redis_uri).await;
-    match redis_res {
-        Err(NetError::TlsError(msg)) => {
-            println!("Safely rejected rediss plaintext downgrade: {}", msg);
-            assert!(msg.contains("Plaintext downgrade rejected"));
-        }
-        Ok(_) => panic!("Expected TlsError on rediss connection, got Ok"),
-        Err(e) => panic!(
-            "Expected TlsError on rediss connection, got other error: {:?}",
-            e
-        ),
-    }
-
-    // 3. postgresql+s scheme
-    let pg_uri = "postgresql+s://postgres:secret@127.0.0.1:5432/mydb";
-    let pg_res = connect_any(pg_uri).await;
-    match pg_res {
-        Err(NetError::TlsError(msg)) => {
-            println!("Safely rejected postgresql+s plaintext downgrade: {}", msg);
-            assert!(msg.contains("Plaintext downgrade rejected"));
-        }
-        Ok(_) => panic!("Expected TlsError on postgresql+s connection, got Ok"),
-        Err(e) => panic!(
-            "Expected TlsError on postgresql+s connection, got other error: {:?}",
-            e
-        ),
     }
 }
 
