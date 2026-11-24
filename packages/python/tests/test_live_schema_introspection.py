@@ -46,9 +46,9 @@ WORKS_AT = "IX_PY_WORKS_AT"
 @node(PERSON)
 class IxPyPerson(Node):
     pid: str = Field(primary_key=True)
-    email: str = Field(unique=True)
+    email: str | None = Field(unique=True)
     name: str | None = Field(default=None, index=True)
-    age: int = 0
+    age: int | None = 0
 
 
 @node(COMPANY)
@@ -59,12 +59,12 @@ class IxPyCompany(Node):
 
 @relationship(KNOWS, source_labels=[PERSON], target_labels=[PERSON])
 class IxPyKnows(Relationship):
-    since: int = Field(index=True)
+    since: int | None = Field(index=True)
 
 
 @relationship(WORKS_AT, source_labels=[PERSON], target_labels=[COMPANY])
 class IxPyWorksAt(Relationship):
-    since: int = Field()
+    since: int | None = Field()
 
 
 MODELS: list[Any] = [IxPyPerson, IxPyCompany, IxPyKnows, IxPyWorksAt]
