@@ -510,12 +510,7 @@ def _live_cleanup(session: Session) -> None:
 
 
 def _seed_live_people(session: Session) -> None:
-    """Creates the live test nodes with raw statements.
-
-    Used for backends whose batched ``flush`` path cannot write (the native
-    FalkorDB client does not execute the generated parametrized ``UNWIND``
-    batch), so the navigation exercise still runs on real stored data.
-    """
+    """Creates the live test nodes with raw statements."""
     for person_id, name, age in (
         ("alice", "Alice", 30),
         ("bob", "Bob", 18),
@@ -758,7 +753,7 @@ def test_live_relationship_navigation(engine: str, backend: str) -> None:
             assert session.backend == "bridge"
         _exercise_live_relationship_navigation(
             session,
-            write_with_flush=not (engine == "falkordb" and backend == "native"),
+            write_with_flush=True,
         )
     finally:
         close()

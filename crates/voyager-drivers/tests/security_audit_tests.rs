@@ -21,7 +21,7 @@ fn test_falkordb_backslash_quote_injection_defense() {
         serde_json::Value::String(r#"malicious\" OR 1=1 --"#.to_string()),
     );
 
-    let formatted = format_cypher_with_params("MATCH (n) RETURN n", &params);
+    let formatted = format_cypher_with_params("MATCH (n) RETURN n", &params).unwrap();
     println!("FalkorDB secured query: {}", formatted);
 
     // Backslashes MUST be escaped before quotes, ensuring Cypher sees an escaped backslash

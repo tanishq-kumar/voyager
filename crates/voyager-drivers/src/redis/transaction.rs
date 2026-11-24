@@ -41,7 +41,7 @@ impl<'a> RedisTransaction<'a> {
             ));
         }
 
-        let formatted_query = format_cypher_with_params(query, params);
+        let formatted_query = format_cypher_with_params(query, params)?;
         let graph_name = self.conn.default_graph().to_string();
 
         let resp = self
@@ -164,13 +164,112 @@ impl<'a> AsyncTransaction for RedisTransaction<'a> {
     }
 }
 
+/// Helper function to determine if a string is a plain Cypher identifier
+/// (starts with an ASCII letter or underscore, followed by ASCII alphanumeric or underscore).
+fn is_plain_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Renders a map key or parameter name for FalkorDB Cypher syntax.
+///
+/// Plain identifiers are emitted unquoted. Non-plain identifiers are quoted in backticks.
+/// Keys containing backticks or null bytes are rejected with an error, as FalkorDB parameter
+/// parsing cannot escape backticks within backticked identifier tokens.
+fn render_identifier_or_key(key: &str, out: &mut String) -> Result<()> {
+    if key.contains('`') {
+        return Err(NetError::ExecutionError(format!(
+            "FalkorDB Cypher parameter key cannot contain backticks: {key:?}"
+        )));
+    }
+    if key.contains('\0') {
+        return Err(NetError::ExecutionError(
+            "FalkorDB Cypher parameter key cannot contain null bytes".to_string(),
+        ));
+    }
+    if is_plain_identifier(key) {
+        out.push_str(key);
+    } else {
+        out.push('`');
+        out.push_str(key);
+        out.push('`');
+    }
+    Ok(())
+}
+
+/// Recursively renders a JSON value as a Cypher literal for FalkorDB's `CYPHER name=value` prefix.
+fn render_cypher_literal(val: &serde_json::Value, out: &mut String) -> Result<()> {
+    match val {
+        serde_json::Value::Null => {
+            out.push_str("null");
+            Ok(())
+        }
+        serde_json::Value::Bool(b) => {
+            out.push_str(if *b { "true" } else { "false" });
+            Ok(())
+        }
+        serde_json::Value::Number(n) => {
+            out.push_str(&n.to_string());
+            Ok(())
+        }
+        serde_json::Value::String(s) => {
+            out.push('"');
+            for ch in s.chars() {
+                match ch {
+                    '"' => out.push_str(r#"\""#),
+                    '\\' => out.push_str(r"\\"),
+                    '\n' => out.push_str(r"\n"),
+                    '\r' => out.push_str(r"\r"),
+                    '\t' => out.push_str(r"\t"),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render_cypher_literal(item, out)?;
+            }
+            out.push(']');
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            out.push('{');
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (i, (key, value)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render_identifier_or_key(key, out)?;
+                out.push_str(": ");
+                render_cypher_literal(value, out)?;
+            }
+            out.push('}');
+            Ok(())
+        }
+    }
+}
+
 /// Helper function to prefix a Cypher query with parameters in FalkorDB's native syntax.
 pub fn format_cypher_with_params(
     query: &str,
     params: &HashMap<String, serde_json::Value>,
-) -> String {
+) -> Result<String> {
     if params.is_empty() {
-        return query.to_string();
+        return Ok(query.to_string());
     }
 
     let mut keys: Vec<&String> = params.keys().collect();
@@ -178,28 +277,13 @@ pub fn format_cypher_with_params(
 
     let mut parts = Vec::with_capacity(params.len());
     for k in keys {
-        let v = &params[k];
-        match v {
-            serde_json::Value::String(s) => {
-                let escaped = s.replace('\\', "\\\\").replace('\"', "\\\"");
-                parts.push(format!("{}=\"{}\"", k, escaped));
-            }
-            serde_json::Value::Number(n) => {
-                parts.push(format!("{}={}", k, n));
-            }
-            serde_json::Value::Bool(b) => {
-                parts.push(format!("{}={}", k, b));
-            }
-            serde_json::Value::Null => {
-                parts.push(format!("{}=null", k));
-            }
-            other => {
-                let raw = other.to_string();
-                let escaped = raw.replace('\\', "\\\\").replace('\"', "\\\"");
-                parts.push(format!("{}=\"{}\"", k, escaped));
-            }
-        }
+        let param_name = k.strip_prefix('$').unwrap_or(k);
+        let mut key_buf = String::new();
+        render_identifier_or_key(param_name, &mut key_buf)?;
+        let mut val_buf = String::new();
+        render_cypher_literal(&params[k], &mut val_buf)?;
+        parts.push(format!("{key_buf}={val_buf}"));
     }
 
-    format!("CYPHER {} {}", parts.join(" "), query)
+    Ok(format!("CYPHER {} {}", parts.join(" "), query))
 }
