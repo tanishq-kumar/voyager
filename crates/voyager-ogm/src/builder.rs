@@ -66,6 +66,102 @@ impl MergeRelationshipProperties {
     }
 }
 
+/// One node endpoint of a relationship builder statement.
+#[derive(Debug, Clone)]
+pub struct RelationshipEndpoint {
+    /// Query variable alias.
+    pub variable: String,
+    /// Node labels used in the match pattern.
+    pub labels: Vec<String>,
+    /// Property used to match the node.
+    pub key: String,
+    /// Value used for the match property.
+    pub key_value: LiteralValue,
+}
+
+impl RelationshipEndpoint {
+    /// Creates an endpoint from its alias, labels, key property and key value.
+    pub fn new(
+        variable: impl Into<String>,
+        labels: Vec<impl Into<String>>,
+        key: impl Into<String>,
+        key_value: impl Into<LiteralValue>,
+    ) -> Self {
+        Self {
+            variable: variable.into(),
+            labels: labels.into_iter().map(Into::into).collect(),
+            key: key.into(),
+            key_value: key_value.into(),
+        }
+    }
+}
+
+/// Navigation pattern specification: match a source by key, traverse one edge.
+#[derive(Debug, Clone)]
+pub struct RelationshipNavigationSpec {
+    /// Source endpoint matched by key.
+    pub source: RelationshipEndpoint,
+    /// Target endpoint variable and labels.
+    pub target: RelationshipEndpoint,
+    /// Graph relationship type.
+    pub rel_type: String,
+    /// Traversal direction from the source.
+    pub direction: Direction,
+    /// Optional relationship variable alias.
+    pub rel_variable: Option<String>,
+}
+
+/// Connect specification: match both endpoints by key and create the edge.
+#[derive(Debug, Clone)]
+pub struct RelationshipConnectSpec {
+    /// Source endpoint.
+    pub source: RelationshipEndpoint,
+    /// Target endpoint.
+    pub target: RelationshipEndpoint,
+    /// Graph relationship type.
+    pub rel_type: String,
+    /// Creation direction from the source.
+    pub direction: Direction,
+    /// Edge properties written inline on `CREATE`.
+    pub properties: Vec<(String, LiteralValue)>,
+}
+
+/// Disconnect specification: match both endpoints and the edge, then delete it.
+#[derive(Debug, Clone)]
+pub struct RelationshipDisconnectSpec {
+    /// Source endpoint.
+    pub source: RelationshipEndpoint,
+    /// Target endpoint.
+    pub target: RelationshipEndpoint,
+    /// Graph relationship type.
+    pub rel_type: String,
+    /// Direction of the edge as seen from the source.
+    pub direction: Direction,
+    /// Relationship variable deleted by the statement.
+    pub rel_variable: String,
+}
+
+/// Batched connect or disconnect specification driven by an `UNWIND` list.
+#[derive(Debug, Clone)]
+pub struct RelationshipBatchSpec {
+    /// Source endpoint matched once.
+    pub source: RelationshipEndpoint,
+    /// Target endpoint; only its variable, labels and key property are used.
+    pub target: RelationshipEndpoint,
+    /// Graph relationship type.
+    pub rel_type: String,
+    /// Direction of the edge as seen from the source.
+    pub direction: Direction,
+    /// Some for disconnect, `None` for connect.
+    pub rel_variable: Option<String>,
+    /// Edge properties for connect.
+    pub properties: Vec<(String, LiteralValue)>,
+    /// Parameter holding the list of target key values.
+    pub batch_param: String,
+    /// Row alias introduced by `UNWIND`.
+    pub row_alias: String,
+}
+
 /// Cypher `CREATE`/`MERGE` patterns require a direction, so an undirected
 /// relationship is materialized left-to-right as outgoing.
 fn direction_for_creation(direction: Direction) -> Direction {
@@ -699,6 +795,194 @@ impl QueryBuilder {
             }
         }
         self.node_var(target);
+    }
+
+    /// Builds a relationship navigation pattern that matches a source node by a
+    /// property key and traverses one relationship step in the declared
+    /// direction:
+    ///
+    /// `MATCH (source:Source {key: key_value})-[rel:TYPE]->(target:Target)`.
+    ///
+    /// No `RETURN` clause is emitted, so callers can add filters with
+    /// [`Self::where_property`] / [`Self::where_expr`] and project the targets
+    /// with [`Self::select_expr`] and [`Self::r#return`].
+    pub fn navigate_relationship(&mut self, spec: &RelationshipNavigationSpec) -> &mut Self {
+        self.r#match();
+        self.node_with_props(
+            Some(spec.source.variable.clone()),
+            spec.source.labels.clone(),
+            vec![(spec.source.key.clone(), spec.source.key_value.clone())],
+        );
+        self.apply_edge_direction(
+            spec.direction,
+            spec.rel_type.clone(),
+            spec.rel_variable.clone(),
+        );
+        self.node(
+            Some(spec.target.variable.clone()),
+            spec.target.labels.clone(),
+        );
+        self
+    }
+
+    /// Builds a complete navigation query: matches the source by key, traverses
+    /// in the declared direction, applies optional target property filters and
+    /// returns the target variable.
+    ///
+    /// Each filter is `(target_property, comparison, value)`. Pass an empty
+    /// slice to return every traversed target.
+    pub fn build_navigation_query(
+        &mut self,
+        spec: &RelationshipNavigationSpec,
+        filters: &[(String, BinaryOp, LiteralValue)],
+    ) -> &mut Self {
+        self.navigate_relationship(spec);
+        for (property, operator, value) in filters {
+            self.where_property(
+                spec.target.variable.clone(),
+                property.clone(),
+                *operator,
+                value.clone(),
+            );
+        }
+        self.r#return();
+        let target = self.ident(spec.target.variable.clone());
+        self.select_expr(target, None::<String>);
+        self
+    }
+
+    /// Builds a statement that connects two nodes matched by key:
+    ///
+    /// `MATCH (source:Source {key: value}) MATCH (target:Target {key: value}) CREATE (source)-[:TYPE]->(target)`.
+    ///
+    /// Incoming direction is materialized as `(source)<-[:TYPE]-(target)`, so the
+    /// edge still runs from `target` to `source`. Undirected is created outgoing
+    /// from `source` to `target`, matching [`Self::create_relationship`].
+    pub fn connect_relationship(&mut self, spec: &RelationshipConnectSpec) -> Result<&mut Self> {
+        self.r#match();
+        self.node_with_props(
+            Some(spec.source.variable.clone()),
+            spec.source.labels.clone(),
+            vec![(spec.source.key.clone(), spec.source.key_value.clone())],
+        );
+        self.r#match();
+        self.node_with_props(
+            Some(spec.target.variable.clone()),
+            spec.target.labels.clone(),
+            vec![(spec.target.key.clone(), spec.target.key_value.clone())],
+        );
+        self.create_relationship(
+            spec.source.variable.clone(),
+            spec.rel_type.clone(),
+            spec.direction,
+            None::<String>,
+            spec.target.variable.clone(),
+            spec.properties.clone(),
+        )
+    }
+
+    /// Builds a statement that disconnects two nodes matched by key:
+    ///
+    /// `MATCH (source:Source {key: value})-[rel:TYPE]->(target:Target {key: value}) DELETE rel`.
+    ///
+    /// The direction is applied to the matched pattern, so an incoming
+    /// declaration deletes the edge that runs from `target` to `source`.
+    pub fn disconnect_relationship(
+        &mut self,
+        spec: &RelationshipDisconnectSpec,
+    ) -> Result<&mut Self> {
+        self.r#match();
+        self.node_with_props(
+            Some(spec.source.variable.clone()),
+            spec.source.labels.clone(),
+            vec![(spec.source.key.clone(), spec.source.key_value.clone())],
+        );
+        self.apply_edge_direction(
+            spec.direction,
+            spec.rel_type.clone(),
+            Some(spec.rel_variable.clone()),
+        );
+        self.node_with_props(
+            Some(spec.target.variable.clone()),
+            spec.target.labels.clone(),
+            vec![(spec.target.key.clone(), spec.target.key_value.clone())],
+        );
+        self.delete(vec![spec.rel_variable.clone()]);
+        Ok(self)
+    }
+
+    /// Batched connect and disconnect builder.
+    ///
+    /// Connect emits
+    /// `UNWIND $batch AS row MATCH (source:Source {key: value}) MATCH (target:Target {key: row}) CREATE (source)-[:TYPE]->(target)`;
+    /// disconnect emits the same match with a relationship variable and
+    /// `DELETE rel`. The batch parameter is supplied at execution time as a list
+    /// of target key values.
+    pub fn relationship_batch(&mut self, spec: &RelationshipBatchSpec) -> Result<&mut Self> {
+        let batch_expr = self.param(spec.batch_param.clone());
+        self.unwind(batch_expr, spec.row_alias.clone());
+        if let Some(rel_variable) = &spec.rel_variable {
+            self.r#match();
+            self.node_with_props(
+                Some(spec.source.variable.clone()),
+                spec.source.labels.clone(),
+                vec![(spec.source.key.clone(), spec.source.key_value.clone())],
+            );
+            self.apply_edge_direction(
+                spec.direction,
+                spec.rel_type.clone(),
+                Some(rel_variable.clone()),
+            );
+            let key_expr = self.ident(spec.row_alias.clone());
+            self.node_with_prop_exprs(
+                Some(spec.target.variable.clone()),
+                spec.target.labels.clone(),
+                vec![(spec.target.key.clone(), key_expr)],
+            );
+            self.delete(vec![rel_variable.clone()]);
+            Ok(self)
+        } else {
+            self.r#match();
+            self.node_with_props(
+                Some(spec.source.variable.clone()),
+                spec.source.labels.clone(),
+                vec![(spec.source.key.clone(), spec.source.key_value.clone())],
+            );
+            self.r#match();
+            let key_expr = self.ident(spec.row_alias.clone());
+            self.node_with_prop_exprs(
+                Some(spec.target.variable.clone()),
+                spec.target.labels.clone(),
+                vec![(spec.target.key.clone(), key_expr)],
+            );
+            self.create_relationship(
+                spec.source.variable.clone(),
+                spec.rel_type.clone(),
+                spec.direction,
+                None::<String>,
+                spec.target.variable.clone(),
+                spec.properties.clone(),
+            )
+        }
+    }
+
+    fn apply_edge_direction(
+        &mut self,
+        direction: Direction,
+        rel_type: String,
+        rel_variable: Option<String>,
+    ) {
+        match direction {
+            Direction::Outgoing => {
+                self.to(vec![rel_type], rel_variable);
+            }
+            Direction::Incoming => {
+                self.from(vec![rel_type], rel_variable);
+            }
+            Direction::Undirected => {
+                self.edge(vec![rel_type], rel_variable);
+            }
+        }
     }
 
     /// Adds an `ON CREATE SET target.prop = value` assignment to the active MERGE block.

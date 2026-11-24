@@ -15,7 +15,8 @@
 //! Some keys of a model export describe the Python declaration and have no
 //! database counterpart. They are present and `null` in a live schema:
 //! `model`, `description` (node, relationship and property), `attribute`,
-//! `has_default` and `constraints` (the `Field` value constraints). `default`
+//! `has_default`, `constraints` (the `Field` value constraints) and the node's
+//! `relationship_attributes`. `default`
 //! is omitted. `primary_key` is `null` unless the engine has a key constraint
 //! (Neo4j Enterprise `NODE_KEY`, a PostgreSQL `PRIMARY KEY`): a uniqueness
 //! constraint does not tell a primary key apart from a unique property.
@@ -121,6 +122,8 @@ pub struct NodeEntry {
     pub primary_key: Option<String>,
     /// Properties keyed by property name, sorted by name.
     pub properties: BTreeMap<String, PropertyEntry>,
+    /// Always `null`: relationship attributes are declared on Node models.
+    pub relationship_attributes: Option<Vec<Value>>,
 }
 
 /// A relationship type.
@@ -446,6 +449,7 @@ impl SchemaBuilder {
                     description: None,
                     primary_key,
                     properties,
+                    relationship_attributes: None,
                 }
             })
             .collect();

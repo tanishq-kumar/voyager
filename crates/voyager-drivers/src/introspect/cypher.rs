@@ -562,7 +562,8 @@ mod tests {
                     "labels",
                     "description",
                     "primary_key",
-                    "properties"
+                    "properties",
+                    "relationship_attributes"
                 ]
                 .map(String::from)
                 .to_vec()
