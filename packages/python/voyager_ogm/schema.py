@@ -31,10 +31,12 @@ from voyager_ogm._voyager_rs import (
     emit_node_index_ddl,
     emit_pgq_drop_property_graph_ddl,
     emit_pgq_property_graph_ddl,
+    emit_pgq_schema_ddl,
     emit_rel_constraint_ddl,
     emit_rel_drop_constraint_ddl,
     emit_rel_drop_index_ddl,
     emit_rel_index_ddl,
+    emit_table_ddl,
 )
 from voyager_ogm._voyager_rs import (
     adapt_tantivy_query as _native_adapt_tantivy_query,
@@ -320,6 +322,44 @@ def _split_models(
         else:
             nodes.append(m)
     return nodes, rels
+
+
+def _node_labels(spec: Any) -> list[str]:
+    """Returns a node spec's labels, whether it is a model class or a schema dict."""
+    if isinstance(spec, dict):
+        return [str(label) for label in spec.get("labels") or []]
+    return [str(label) for label in getattr(spec, "__labels__", []) or []]
+
+
+def _relationship_endpoint_labels(spec: Any) -> list[str]:
+    """Returns a relationship spec's declared source and target labels."""
+    if isinstance(spec, dict):
+        sources = spec.get("source_labels") or spec.get("from_labels") or []
+        targets = spec.get("target_labels") or spec.get("to_labels") or []
+    else:
+        sources = getattr(spec, "__source_labels__", []) or []
+        targets = getattr(spec, "__target_labels__", []) or []
+    return [str(label) for label in (*sources, *targets)]
+
+
+def _add_pgq_endpoint_nodes(nodes: list[Any], rels: list[Any]) -> None:
+    """Adds the registered endpoint node of every relationship to ``nodes`` in place.
+
+    A relationship model alone does not carry its endpoint's primary key, so
+    the property-graph emitter needs the endpoint node schema to reference the
+    real key column. Schemas that cannot be resolved are left to the emitter's
+    ``id`` fallback.
+    """
+    registry = SchemaRegistry.global_registry()
+    known = {label for node in nodes for label in _node_labels(node)}
+    for rel in rels:
+        for label in _relationship_endpoint_labels(rel):
+            if not label or label in known:
+                continue
+            endpoint = registry.get_node_by_label(label) or registry.get_node(label)
+            if endpoint is not None:
+                nodes.append(endpoint)
+                known.add(label)
 
 
 def _resolve_model_specs(
@@ -1157,18 +1197,76 @@ class SchemaManager:
         cls,
         graph_name: str,
         *models: type[Node] | type[Relationship] | dict[str, Any],
+        dialect: str = "postgres",
     ) -> str:
         """Generates standard SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement.
 
         Args:
             graph_name: Identifier name for the Property Graph.
             *models: Node and Relationship model classes to include.
+            dialect: Target dialect ('postgres' or 'duckdb'). Defaults to 'postgres'.
 
         Returns:
             Executable `CREATE PROPERTY GRAPH` statement.
         """
+        if not models:
+            return SchemaRegistry.global_registry().generate_pgq_ddl(graph_name, dialect=dialect)
         nodes, rels = _split_models(models)
-        return emit_pgq_property_graph_ddl(graph_name, nodes, rels)
+        _add_pgq_endpoint_nodes(nodes, rels)
+        return emit_pgq_property_graph_ddl(graph_name, nodes, rels, dialect=dialect)
+
+    @classmethod
+    def generate_table_ddl(
+        cls,
+        *models: type[Node] | type[Relationship] | dict[str, Any],
+        dialect: str = "postgres",
+    ) -> list[str]:
+        """Generates standard relational table DDL (CREATE TABLE IF NOT EXISTS) for SQL/PGQ.
+
+        Emits vertex tables first, followed by edge tables with foreign-key references
+        to endpoint node tables and surrogate primary keys (or declared primary keys) to
+        support parallel edges. For DuckDB, required sequences are emitted before edge tables.
+
+        Args:
+            *models: Node and Relationship model classes or schema dicts.
+            dialect: Target SQL dialect ('postgres' or 'duckdb'). Defaults to 'postgres'.
+
+        Returns:
+            List of executable DDL statement strings.
+        """
+        if not models:
+            return SchemaRegistry.global_registry().generate_table_ddl(dialect=dialect)
+        nodes, rels = _split_models(models)
+        _add_pgq_endpoint_nodes(nodes, rels)
+        return emit_table_ddl(nodes, rels, dialect=dialect)
+
+    @classmethod
+    def generate_pgq_schema_ddl(
+        cls,
+        graph_name: str,
+        *models: type[Node] | type[Relationship] | dict[str, Any],
+        dialect: str = "postgres",
+    ) -> list[str]:
+        """Generates complete SQL/PGQ schema DDL in executable run order.
+
+        Returns tables, constraints, secondary indexes, and CREATE PROPERTY GRAPH
+        statements in the exact sequence required for single-pass migration execution.
+
+        Args:
+            graph_name: Identifier name for the Property Graph.
+            *models: Node and Relationship model classes or schema dicts.
+            dialect: Target SQL dialect ('postgres' or 'duckdb'). Defaults to 'postgres'.
+
+        Returns:
+            List of executable DDL statement strings in run order.
+        """
+        if not models:
+            return SchemaRegistry.global_registry().generate_pgq_schema_ddl(
+                graph_name, dialect=dialect
+            )
+        nodes, rels = _split_models(models)
+        _add_pgq_endpoint_nodes(nodes, rels)
+        return emit_pgq_schema_ddl(graph_name, nodes, rels, dialect=dialect)
 
     @staticmethod
     def generate_pgq_drop_ddl(graph_name: str) -> str:

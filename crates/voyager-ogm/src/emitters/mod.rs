@@ -15,10 +15,13 @@ pub use ddl::{
     emit_node_constraint_ddl, emit_node_constraint_ddl_with_graph, emit_node_drop_constraint_ddl,
     emit_node_drop_constraint_ddl_with_graph, emit_node_drop_index_ddl,
     emit_node_drop_index_ddl_with_graph, emit_node_index_ddl, emit_node_index_ddl_with_graph,
-    emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl, emit_rel_constraint_ddl,
+    emit_node_table_ddl, emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl,
+    emit_pgq_property_graph_ddl_with_dialect, emit_pgq_schema_ddl, emit_rel_constraint_ddl,
     emit_rel_constraint_ddl_with_graph, emit_rel_drop_constraint_ddl,
     emit_rel_drop_constraint_ddl_with_graph, emit_rel_drop_index_ddl,
     emit_rel_drop_index_ddl_with_graph, emit_rel_index_ddl, emit_rel_index_ddl_with_graph,
+    emit_rel_table_ddl, emit_table_ddl, field_type_to_sql, pgq_edge_sequence_name,
+    resolve_edge_surrogate_key_name,
 };
 pub use iso_gql::IsoGqlEmitter;
 pub use sql_pgq::SqlPgqEmitter;
@@ -249,6 +252,17 @@ fn validate_node_identifiers(
                 validate_identifier("property name", property)?;
             }
         }
+        AstNode::LabelPredicate { variable, labels } => {
+            validate_identifier("label predicate variable", variable)?;
+            if labels.is_empty() {
+                return Err(Error::InvalidClause(
+                    "Invalid label predicate: at least one label is required".to_string(),
+                ));
+            }
+            for label in labels {
+                validate_identifier("label name", label)?;
+            }
+        }
         AstNode::Literal(_) => {}
         // `col("n.uuid")` from the fluent API is emitted verbatim as a variable/property path,
         // so identifier expressions accept dotted names while still rejecting injection syntax.
@@ -463,16 +477,27 @@ pub(crate) fn emit_gql_edge_labels(buffer: &mut String, expr: Option<&LabelExpre
     }
 }
 
+/// Writes a SQL identifier double-quoted, escaping embedded quotes.
+///
+/// SQL:2023 PGQ labels and table names are identifiers. Quoting them keeps the
+/// declared case, which is what PostgreSQL 19 stores and what `IS "Label"`
+/// matches.
+pub(crate) fn push_pgq_quoted_ident(buffer: &mut String, ident: &str) {
+    buffer.push('"');
+    buffer.push_str(&ident.replace('"', "\"\""));
+    buffer.push('"');
+}
+
 /// Emits a node label expression for SQL:2023 PGQ.
 ///
-/// For simple conjunctions, emits ` IS Label1 IS Label2...`.
+/// For simple conjunctions, emits ` IS "Label1" IS "Label2"...`.
 /// For complex expressions, emits ` IS <formatted_expr>`.
 pub(crate) fn emit_pgq_node_labels(buffer: &mut String, expr: Option<&LabelExpression>) {
     let Some(expr) = expr else { return };
     if let Some(labels) = expr.to_conjunction_labels() {
         for label in labels {
             buffer.push_str(" IS ");
-            buffer.push_str(&label);
+            push_pgq_quoted_ident(buffer, label.as_str());
         }
     } else {
         buffer.push_str(" IS ");
@@ -480,7 +505,7 @@ pub(crate) fn emit_pgq_node_labels(buffer: &mut String, expr: Option<&LabelExpre
     }
 }
 
-/// Emits an edge label expression for SQL:2023 PGQ: `-[r IS TYPE1 | TYPE2]->`.
+/// Emits an edge label expression for SQL:2023 PGQ: `-[r IS "TYPE1" | "TYPE2"]->`.
 pub(crate) fn emit_pgq_edge_labels(buffer: &mut String, expr: Option<&LabelExpression>) {
     let Some(expr) = expr else { return };
     buffer.push_str(" IS ");
@@ -489,7 +514,7 @@ pub(crate) fn emit_pgq_edge_labels(buffer: &mut String, expr: Option<&LabelExpre
             if i > 0 {
                 buffer.push_str(" | ");
             }
-            buffer.push_str(t);
+            push_pgq_quoted_ident(buffer, t);
         }
     } else {
         format_pgq_label_expr(buffer, expr);
@@ -542,7 +567,7 @@ fn format_cypher_label_expr(buffer: &mut String, expr: &LabelExpression) {
 
 fn format_pgq_label_expr(buffer: &mut String, expr: &LabelExpression) {
     match expr {
-        LabelExpression::Label(s) => buffer.push_str(s),
+        LabelExpression::Label(s) => push_pgq_quoted_ident(buffer, s),
         LabelExpression::Wildcard => buffer.push('%'),
         LabelExpression::Not(inner) => {
             buffer.push('!');

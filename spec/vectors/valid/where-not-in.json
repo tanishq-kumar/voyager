@@ -1,5 +1,5 @@
 {
-  "description": "NOT IN lowers to a negated IN on graph dialects; SQL/PGQ keeps infix NOT IN.",
+  "description": "NOT IN lowers to a negated IN on graph dialects; SQL/PGQ and DuckPGQ use <> ALL for a list parameter.",
   "spec": {
     "spec_version": 1,
     "matches": [
@@ -71,7 +71,7 @@
       }
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.name NOT IN $p0 COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") WHERE p.name <> ALL($p0) COLUMNS (p.name))",
       "parameters": {
         "p0": [
           "Mallory",
@@ -80,7 +80,7 @@
       }
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) WHERE p.name NOT IN $p0 COLUMNS (p.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") WHERE p.name <> ALL($p0) COLUMNS (p.name))",
       "parameters": {
         "p0": [
           "Mallory",

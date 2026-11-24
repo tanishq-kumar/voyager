@@ -250,12 +250,12 @@ async fn test_live_postgres19_sql_pgq_graph_table_and_arrow() {
 
     conn.execute_simple(
         "CREATE PROPERTY GRAPH net_pgq_graph
-            VERTEX TABLES (net_pgq_person LABEL Person PROPERTIES (name, age, city))
+            VERTEX TABLES (net_pgq_person LABEL \"Person\" PROPERTIES (name, age, city))
             EDGE TABLES (
                 net_pgq_knows
                 SOURCE KEY (src) REFERENCES net_pgq_person (id)
                 DESTINATION KEY (dst) REFERENCES net_pgq_person (id)
-                LABEL KNOWS
+                LABEL \"KNOWS\"
                 PROPERTIES (since)
             );",
     )
@@ -281,7 +281,11 @@ async fn test_live_postgres19_sql_pgq_graph_table_and_arrow() {
             .statement
             .contains("GRAPH_TABLE (net_pgq_graph MATCH")
     );
-    assert!(compiled.statement.contains("ORDER BY source ASC"));
+    assert!(
+        compiled
+            .statement
+            .contains("ORDER BY source ASC NULLS LAST")
+    );
 
     let res = conn.execute_simple(&compiled.statement).await.unwrap();
     assert_eq!(res.columns, vec!["source", "target"]);
@@ -321,7 +325,11 @@ async fn test_live_postgres19_sql_pgq_graph_table_and_arrow() {
     let compiled_agg = pgq_agg.visit_query(&agg_arena, agg_root).unwrap();
 
     assert!(compiled_agg.statement.contains("GROUP BY city"));
-    assert!(compiled_agg.statement.contains("ORDER BY city ASC"));
+    assert!(
+        compiled_agg
+            .statement
+            .contains("ORDER BY city ASC NULLS LAST")
+    );
 
     let agg_res = conn.execute_simple(&compiled_agg.statement).await.unwrap();
     assert_eq!(agg_res.columns, vec!["city", "total_count"]);

@@ -79,7 +79,7 @@ def test_sql_pgq_distinct_is_emitted() -> None:
     compiled = Query.match(p).distinct().return_(p.city).compile("sql_pgq", graph_name="g")
 
     assert compiled.statement == (
-        "SELECT DISTINCT * FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.city))"
+        'SELECT DISTINCT * FROM GRAPH_TABLE (g MATCH (p IS "Person") COLUMNS (p.city))'
     )
 
 
@@ -167,7 +167,7 @@ def test_spec_distinct_is_emitted() -> None:
     result = compile_query_from_spec(spec, "sql_pgq", graph_name="g")
 
     assert result["statement"] == (
-        "SELECT DISTINCT * FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name))"
+        'SELECT DISTINCT * FROM GRAPH_TABLE (g MATCH (p IS "Person") COLUMNS (p.name))'
     )
 
 
@@ -360,12 +360,12 @@ def test_sql_pgq_accepts_single_label_and_property_columns() -> None:
     query = Query.match_node("p", "Person").return_("p.name")
     compiled = query.compile("sql_pgq", graph_name="g")
     assert (
-        compiled.statement == "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.name))"
+        compiled.statement == 'SELECT * FROM GRAPH_TABLE (g MATCH (p IS "Person") COLUMNS (p.name))'
     )
 
 
 def test_sql_pgq_accepts_alternative_relationship_types() -> None:
-    """Verifies alternative relationship types compile to -[r IS T1 | T2]->."""
+    """Verifies alternative relationship types compile to -[r IS "T1" | "T2"]->."""
     query = (
         Query.match_node("a", "Person")
         .to(["KNOWS", "HATES"], "r")
@@ -375,7 +375,7 @@ def test_sql_pgq_accepts_alternative_relationship_types() -> None:
     compiled = query.compile("sql_pgq", graph_name="g")
     assert (
         compiled.statement
-        == "SELECT * FROM GRAPH_TABLE (g MATCH (a IS Person) -[r IS KNOWS | HATES]-> (b IS Person) COLUMNS (a.name, b.name))"
+        == 'SELECT * FROM GRAPH_TABLE (g MATCH (a IS "Person") -[r IS "KNOWS" | "HATES"]-> (b IS "Person") COLUMNS (a.name, b.name))'
     )
 
 
@@ -391,12 +391,12 @@ def test_duckpgq_shares_sql_pgq_validation_behavior() -> None:
 
 
 def test_sql_pgq_accepts_node_label_disjunction_fluent() -> None:
-    """Verifies node label disjunction compiles to (n IS Person | Company)."""
+    """Verifies node label disjunction compiles to (n IS "Person" | "Company")."""
     query = Query.match_node("n", labels="Person | Company").return_("n.name")
     compiled = query.compile("sql_pgq", graph_name="g")
     assert (
         compiled.statement
-        == "SELECT * FROM GRAPH_TABLE (g MATCH (n IS Person | Company) COLUMNS (n.name))"
+        == 'SELECT * FROM GRAPH_TABLE (g MATCH (n IS "Person" | "Company") COLUMNS (n.name))'
     )
 
 
@@ -410,7 +410,7 @@ def test_sql_pgq_spec_accepts_node_label_disjunction() -> None:
     compiled = compile_query_from_spec(spec, "sql_pgq", graph_name="g")
     assert (
         compiled["statement"]
-        == "SELECT * FROM GRAPH_TABLE (g MATCH (n IS Person | Company) COLUMNS (n.name))"
+        == 'SELECT * FROM GRAPH_TABLE (g MATCH (n IS "Person" | "Company") COLUMNS (n.name))'
     )
 
 
@@ -495,23 +495,23 @@ def test_live_postgres19_supported_forms() -> None:
                     INSERT INTO live_pg19_fix_286_hates VALUES (1, 3);
                     CREATE PROPERTY GRAPH live_pg19_fix_286_graph
                         VERTEX TABLES (
-                            live_pg19_fix_286_person LABEL Person,
-                            live_pg19_fix_286_company LABEL Company
+                            live_pg19_fix_286_person LABEL "Person",
+                            live_pg19_fix_286_company LABEL "Company"
                         )
                         EDGE TABLES (
                             live_pg19_fix_286_knows
                                 SOURCE KEY (src_id) REFERENCES live_pg19_fix_286_person (id)
                                 DESTINATION KEY (dst_id) REFERENCES live_pg19_fix_286_person (id)
-                                LABEL KNOWS,
+                                LABEL "KNOWS",
                             live_pg19_fix_286_hates
                                 SOURCE KEY (src_id) REFERENCES live_pg19_fix_286_person (id)
                                 DESTINATION KEY (dst_id) REFERENCES live_pg19_fix_286_person (id)
-                                LABEL HATES
+                                LABEL "HATES"
                         );
                     """
                 )
 
-                # 1. Alternative relationship types test: -[r IS KNOWS | HATES]->
+                # 1. Alternative relationship types test: -[r IS "KNOWS" | "HATES"]->
                 query_edge = (
                     Query.match_node("a", "Person")
                     .to(["KNOWS", "HATES"], "r")
@@ -520,17 +520,17 @@ def test_live_postgres19_supported_forms() -> None:
                 )
                 compiled_edge = query_edge.compile("sql_pgq", graph_name="live_pg19_fix_286_graph")
 
-                assert "-[r IS KNOWS | HATES]->" in compiled_edge.statement
+                assert '-[r IS "KNOWS" | "HATES"]->' in compiled_edge.statement
                 assert "COLUMNS (a.name AS src, b.name AS dst)" in compiled_edge.statement
 
                 cur.execute(f"{compiled_edge.statement} ORDER BY src, dst")
                 rows = cur.fetchall()
                 assert rows == [("Alice", "Bob"), ("Alice", "Charlie")]
 
-                # 2. Node label disjunction test: (n IS Person | Company)
+                # 2. Node label disjunction test: (n IS "Person" | "Company")
                 query_disj = Query.match_node("n", labels="Person | Company").return_(val="n.name")
                 compiled_disj = query_disj.compile("sql_pgq", graph_name="live_pg19_fix_286_graph")
-                assert "(n IS Person | Company)" in compiled_disj.statement
+                assert '(n IS "Person" | "Company")' in compiled_disj.statement
                 assert "COLUMNS (n.name AS val)" in compiled_disj.statement
 
                 cur.execute(f"{compiled_disj.statement} ORDER BY val")

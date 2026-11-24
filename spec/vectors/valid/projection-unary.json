@@ -60,11 +60,11 @@
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (NOT (p.active) AS inactive, -p.age AS negative_age))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (NOT (p.active) AS inactive, -p.age AS negative_age))",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (NOT (p.active) AS inactive, -p.age AS negative_age))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (NOT (p.active) AS inactive, -p.age AS negative_age))",
       "parameters": {}
     }
   }

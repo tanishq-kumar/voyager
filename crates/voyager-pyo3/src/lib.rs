@@ -171,13 +171,17 @@ fn to_py_schema_err(err: voyager_ogm::Error) -> PyErr {
 use voyager_ogm::ast::{
     AggregationFunc, BinaryOp, Direction, LiteralValue, NodeHandle, QueryAstArena, UnaryOp,
 };
-use voyager_ogm::builder::{MergeRelationshipProperties, QueryBuilder};
+use voyager_ogm::builder::{
+    MergeRelationshipProperties, QueryBuilder, RelationshipBatchSpec, RelationshipConnectSpec,
+    RelationshipDisconnectSpec, RelationshipEndpoint, RelationshipNavigationSpec,
+};
 use voyager_ogm::emitters::{AgeEmitter, CypherEmitter, IsoGqlEmitter, SqlPgqEmitter};
 use voyager_ogm::optimizer::{AstOptimizer, OptimizationLevel};
 use voyager_ogm::schema::{
     ConformanceReport, DEFAULT_VECTOR_DIMENSIONS, DdlDialect, FieldDescriptor, FieldType,
-    FullTextIndexConfig, IndexType, NodeSchema, RelationshipSchema, SchemaRegistry,
-    VectorIndexConfig, VectorSimilarity, adapt_tantivy_query as core_adapt_tantivy_query,
+    FullTextIndexConfig, IndexType, NodeSchema, RelationshipDeclaration, RelationshipSchema,
+    SchemaRegistry, VectorIndexConfig, VectorSimilarity,
+    adapt_tantivy_query as core_adapt_tantivy_query,
     canonical_fulltext_index_name as core_canonical_fulltext_index_name,
     canonical_vector_index_name as core_canonical_vector_index_name, global_schema_registry,
     resolve_fulltext_search as core_resolve_fulltext_search,
@@ -378,6 +382,16 @@ impl PyAstExpr {
     fn ident(name: String) -> Self {
         let mut b = QueryBuilder::new();
         let h = b.ident(name);
+        Self {
+            arena: b.into_arena(),
+            handle: h,
+        }
+    }
+
+    #[staticmethod]
+    fn label(variable: String, labels: Vec<String>) -> Self {
+        let mut b = QueryBuilder::new();
+        let h = b.label_predicate(variable, labels);
         Self {
             arena: b.into_arena(),
             handle: h,
@@ -1490,6 +1504,72 @@ fn parse_direction(dir_str: &str) -> PyResult<Direction> {
     }
 }
 
+fn relationship_spec_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
+    dict.get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("Missing required key '{key}'")))?
+        .extract()
+}
+
+fn relationship_spec_strings(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<String>> {
+    dict.get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("Missing required key '{key}'")))?
+        .extract()
+}
+
+fn relationship_spec_optional_string(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+) -> PyResult<Option<String>> {
+    Ok(dict.get_item(key)?.and_then(|value| {
+        if value.is_none() {
+            None
+        } else {
+            value.extract().ok()
+        }
+    }))
+}
+
+fn relationship_spec_endpoint(
+    dict: &Bound<'_, PyDict>,
+    prefix: &str,
+    require_key_value: bool,
+) -> PyResult<RelationshipEndpoint> {
+    let variable = relationship_spec_string(dict, prefix)?;
+    let labels = relationship_spec_strings(dict, &format!("{prefix}_labels"))?;
+    let key = if require_key_value {
+        relationship_spec_string(dict, &format!("{prefix}_key"))?
+    } else {
+        relationship_spec_optional_string(dict, &format!("{prefix}_key"))?.unwrap_or_default()
+    };
+    let key_value = if require_key_value {
+        let raw = dict
+            .get_item(format!("{prefix}_key_value"))?
+            .ok_or_else(|| {
+                PyValueError::new_err(format!("Missing required key '{prefix}_key_value'"))
+            })?;
+        py_to_literal(&raw)?
+    } else {
+        LiteralValue::Null
+    };
+    Ok(RelationshipEndpoint {
+        variable,
+        labels,
+        key,
+        key_value,
+    })
+}
+
+fn relationship_spec_properties(dict: &Bound<'_, PyDict>) -> PyResult<Vec<(String, LiteralValue)>> {
+    let Some(properties) = dict.get_item("properties")? else {
+        return Ok(Vec::new());
+    };
+    if properties.is_none() {
+        return Ok(Vec::new());
+    }
+    let properties = properties.extract::<Vec<(String, Bound<'_, PyAny>)>>()?;
+    optional_property_list_to_literals(Some(properties))
+}
+
 fn build_path_steps_into_builder(
     builder: &mut QueryBuilder,
     steps: &Bound<'_, PyTuple>,
@@ -2375,6 +2455,74 @@ impl PyQueryBuilder {
         Ok(())
     }
 
+    fn navigate_relationship(&mut self, spec: &Bound<'_, PyDict>) -> PyResult<()> {
+        let source = relationship_spec_endpoint(spec, "source", true)?;
+        let target = relationship_spec_endpoint(spec, "target", false)?;
+        let direction = parse_direction(&relationship_spec_string(spec, "direction")?)?;
+        self.inner
+            .navigate_relationship(&RelationshipNavigationSpec {
+                source,
+                target,
+                rel_type: relationship_spec_string(spec, "rel_type")?,
+                direction,
+                rel_variable: relationship_spec_optional_string(spec, "rel_variable")?,
+            });
+        Ok(())
+    }
+
+    fn connect_relationship(&mut self, spec: &Bound<'_, PyDict>) -> PyResult<()> {
+        let source = relationship_spec_endpoint(spec, "source", true)?;
+        let target = relationship_spec_endpoint(spec, "target", true)?;
+        let direction = parse_direction(&relationship_spec_string(spec, "direction")?)?;
+        self.inner
+            .connect_relationship(&RelationshipConnectSpec {
+                source,
+                target,
+                rel_type: relationship_spec_string(spec, "rel_type")?,
+                direction,
+                properties: relationship_spec_properties(spec)?,
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    fn disconnect_relationship(&mut self, spec: &Bound<'_, PyDict>) -> PyResult<()> {
+        let source = relationship_spec_endpoint(spec, "source", true)?;
+        let target = relationship_spec_endpoint(spec, "target", true)?;
+        let direction = parse_direction(&relationship_spec_string(spec, "direction")?)?;
+        self.inner
+            .disconnect_relationship(&RelationshipDisconnectSpec {
+                source,
+                target,
+                rel_type: relationship_spec_string(spec, "rel_type")?,
+                direction,
+                rel_variable: relationship_spec_string(spec, "rel_variable")?,
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    fn relationship_batch(&mut self, spec: &Bound<'_, PyDict>) -> PyResult<()> {
+        let source = relationship_spec_endpoint(spec, "source", true)?;
+        let target = relationship_spec_endpoint(spec, "target", false)?;
+        let direction = parse_direction(&relationship_spec_string(spec, "direction")?)?;
+        self.inner
+            .relationship_batch(&RelationshipBatchSpec {
+                source,
+                target,
+                rel_type: relationship_spec_string(spec, "rel_type")?,
+                direction,
+                rel_variable: relationship_spec_optional_string(spec, "rel_variable")?,
+                properties: relationship_spec_properties(spec)?,
+                batch_param: relationship_spec_optional_string(spec, "batch_param")?
+                    .unwrap_or_else(|| "targets".to_string()),
+                row_alias: relationship_spec_optional_string(spec, "row_alias")?
+                    .unwrap_or_else(|| "target_key".to_string()),
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
     fn on_create_set(&mut self, var: String, prop: String, val: &Bound<'_, PyAny>) -> PyResult<()> {
         let lit = py_to_literal(val)?;
         self.inner.on_create_set(var, prop, lit);
@@ -2501,12 +2649,45 @@ impl PyQueryBuilder {
         self.inner.limit(limit);
     }
 
+    fn limit_param(&mut self, name: String) -> PyResult<()> {
+        let name = strip_leading_dollar(name);
+        if name.is_empty() {
+            return Err(PyValueError::new_err(
+                "Pagination parameter name must be a non-empty string",
+            ));
+        }
+        self.inner.limit_param(name);
+        Ok(())
+    }
+
     fn skip(&mut self, skip: u64) {
         self.inner.skip(skip);
     }
 
+    fn skip_param(&mut self, name: String) -> PyResult<()> {
+        let name = strip_leading_dollar(name);
+        if name.is_empty() {
+            return Err(PyValueError::new_err(
+                "Pagination parameter name must be a non-empty string",
+            ));
+        }
+        self.inner.skip_param(name);
+        Ok(())
+    }
+
     fn offset(&mut self, offset: u64) {
         self.inner.offset(offset);
+    }
+
+    fn offset_param(&mut self, name: String) -> PyResult<()> {
+        let name = strip_leading_dollar(name);
+        if name.is_empty() {
+            return Err(PyValueError::new_err(
+                "Pagination parameter name must be a non-empty string",
+            ));
+        }
+        self.inner.offset_param(name);
+        Ok(())
     }
 
     fn let_(&mut self, variable: String, expr: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -4658,7 +4839,118 @@ fn node_schema_to_py<'py>(py: Python<'py>, node: &NodeSchema) -> PyResult<Bound<
         ft_list.append(ft_dict)?;
     }
     dict.set_item("fulltext_indexes", ft_list)?;
+    let declaration_list = PyList::empty(py);
+    for declaration in &node.relationship_declarations {
+        let item = PyDict::new(py);
+        item.set_item("name", &declaration.name)?;
+        item.set_item("rel_type", &declaration.rel_type)?;
+        item.set_item(
+            "direction",
+            match declaration.direction {
+                Direction::Outgoing => "outgoing",
+                Direction::Incoming => "incoming",
+                Direction::Undirected => "undirected",
+            },
+        )?;
+        item.set_item("target_model", &declaration.target_model)?;
+        if let Some(ref model) = declaration.relationship_model {
+            item.set_item("relationship_model", model)?;
+        } else {
+            item.set_item("relationship_model", py.None())?;
+        }
+        declaration_list.append(item)?;
+    }
+    dict.set_item("relationship_declarations", declaration_list)?;
     Ok(dict)
+}
+
+fn parse_relationship_declaration(val: &Bound<'_, PyAny>) -> PyResult<RelationshipDeclaration> {
+    if let Ok(dict) = val.cast::<PyDict>() {
+        let name: String = dict
+            .get_item("name")?
+            .ok_or_else(|| {
+                PyValueError::new_err("Missing required key 'name' in relationship declaration")
+            })?
+            .extract()?;
+        let rel_type: String = dict
+            .get_item("rel_type")?
+            .or(dict.get_item("type_name")?)
+            .or(dict.get_item("type")?)
+            .ok_or_else(|| {
+                PyValueError::new_err("Missing required key 'rel_type' in relationship declaration")
+            })?
+            .extract()?;
+        let direction: String = dict
+            .get_item("direction")?
+            .and_then(|v| if v.is_none() { None } else { v.extract().ok() })
+            .unwrap_or_else(|| "outgoing".to_string());
+        let direction = parse_direction(&direction)?;
+        let target_model: String = dict
+            .get_item("target_model")?
+            .or(dict.get_item("target")?)
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "Missing required key 'target_model' in relationship declaration",
+                )
+            })?
+            .extract()?;
+        let relationship_model: Option<String> = dict
+            .get_item("relationship_model")?
+            .or(dict.get_item("model")?)
+            .and_then(|v| if v.is_none() { None } else { v.extract().ok() });
+        let mut declaration = RelationshipDeclaration::new(name, rel_type, direction, target_model);
+        if let Some(model) = relationship_model {
+            declaration = declaration.with_relationship_model(model);
+        }
+        Ok(declaration)
+    } else {
+        let name: String = val.getattr("name")?.extract()?;
+        let rel_type: String = if val.hasattr("rel_type")? {
+            val.getattr("rel_type")?.extract()?
+        } else {
+            val.getattr("type_name")?.extract()?
+        };
+        let direction: String = if val.hasattr("direction")? {
+            val.getattr("direction")?.extract()?
+        } else {
+            "outgoing".to_string()
+        };
+        let direction = parse_direction(&direction)?;
+        let target_model: String = if val.hasattr("target_model")? {
+            val.getattr("target_model")?.extract()?
+        } else {
+            val.getattr("target")?.extract()?
+        };
+        let relationship_model: Option<String> = if val.hasattr("relationship_model")? {
+            val.getattr("relationship_model")?
+                .extract::<Option<String>>()?
+        } else if val.hasattr("model")? {
+            val.getattr("model")?.extract::<Option<String>>()?
+        } else {
+            None
+        };
+        let mut declaration = RelationshipDeclaration::new(name, rel_type, direction, target_model);
+        if let Some(model) = relationship_model {
+            declaration = declaration.with_relationship_model(model);
+        }
+        Ok(declaration)
+    }
+}
+
+fn extract_relationship_declarations(
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Vec<RelationshipDeclaration>> {
+    let mut out = Vec::new();
+    if let Ok(list) = obj.cast::<PyList>() {
+        for item in list {
+            out.push(parse_relationship_declaration(&item)?);
+        }
+    } else if let Ok(tuple) = obj.cast::<PyTuple>() {
+        for item in tuple {
+            out.push(parse_relationship_declaration(&item)?);
+        }
+    }
+    Ok(out)
 }
 
 fn relationship_schema_to_py<'py>(
@@ -4815,6 +5107,11 @@ fn extract_node_schema(obj: &Bound<'_, PyAny>) -> PyResult<NodeSchema> {
                 node = node.with_fulltext_index(cfg);
             }
         }
+        if let Some(decl_obj) = dict.get_item("relationship_declarations")? {
+            for declaration in extract_relationship_declarations(&decl_obj)? {
+                node = node.with_relationship_declaration(declaration);
+            }
+        }
         Ok(node)
     } else {
         let name: String = if obj.hasattr("__name__")? {
@@ -4857,6 +5154,25 @@ fn extract_node_schema(obj: &Bound<'_, PyAny>) -> PyResult<NodeSchema> {
             let ft_obj = obj.getattr("__fulltext_indexes__")?;
             for cfg in extract_fulltext_configs(&ft_obj)? {
                 node = node.with_fulltext_index(cfg);
+            }
+        }
+        if obj.hasattr("_schema_relationships")? {
+            let decl_obj = obj.getattr("_schema_relationships")?;
+            if let Ok(values) = decl_obj.call_method0("values") {
+                if let Ok(iterator) = values.try_iter() {
+                    for item in iterator.flatten() {
+                        // Relationship descriptors expose ``to_declaration()``;
+                        // plain schema dicts are parsed directly.
+                        let declaration = if item.hasattr("to_declaration")? {
+                            item.call_method0("to_declaration")?
+                        } else {
+                            item
+                        };
+                        node = node.with_relationship_declaration(parse_relationship_declaration(
+                            &declaration,
+                        )?);
+                    }
+                }
             }
         }
         Ok(node)
@@ -5004,6 +5320,7 @@ impl PyNativeSchemaRegistry {
         fields: &Bound<'_, PyAny>,
         primary_key: Option<String>,
         fulltext_indexes: Option<&Bound<'_, PyAny>>,
+        relationship_declarations: Option<&Bound<'_, PyAny>>,
         description: Option<String>,
     ) -> PyResult<NodeSchema> {
         let mut node_schema = NodeSchema::new(name, labels);
@@ -5041,6 +5358,12 @@ impl PyNativeSchemaRegistry {
         if let Some(ft_any) = fulltext_indexes {
             for cfg in extract_fulltext_configs(ft_any)? {
                 node_schema = node_schema.with_fulltext_index(cfg);
+            }
+        }
+
+        if let Some(decl_any) = relationship_declarations {
+            for declaration in extract_relationship_declarations(decl_any)? {
+                node_schema = node_schema.with_relationship_declaration(declaration);
             }
         }
 
@@ -5132,6 +5455,7 @@ impl PyNativeSchemaRegistry {
             fields,
             primary_key,
             fulltext_indexes,
+            None,
             description,
         )?;
         self.registry()
@@ -5153,10 +5477,33 @@ impl PyNativeSchemaRegistry {
         fulltext_indexes: Option<&Bound<'_, PyAny>>,
         description: Option<String>,
     ) -> PyResult<()> {
-        let node_schema =
-            Self::build_node_schema(name, labels, fields, None, fulltext_indexes, description)?;
+        let node_schema = Self::build_node_schema(
+            name,
+            labels,
+            fields,
+            None,
+            fulltext_indexes,
+            None,
+            description,
+        )?;
         self.registry()
             .register_node_with_id(model_id, node_schema)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Adds declarative relationship navigation attributes to a registered node.
+    ///
+    /// Node models register first and then attach their relationship
+    /// declarations, so the node registration argument list stays unchanged.
+    fn register_relationship_declarations(
+        &self,
+        model_name_or_id: String,
+        declarations: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let declarations = extract_relationship_declarations(declarations)?;
+        self.registry()
+            .add_relationship_declarations(&model_name_or_id, declarations)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
@@ -5186,7 +5533,20 @@ impl PyNativeSchemaRegistry {
             let description: Option<String> = dict
                 .get_item("description")?
                 .and_then(|v| if v.is_none() { None } else { v.extract().ok() });
-            self.register_node(name, labels, &fields_obj, pk, ft_obj.as_ref(), description)
+            let decl_obj = dict.get_item("relationship_declarations")?;
+            let node_schema = Self::build_node_schema(
+                name,
+                labels,
+                &fields_obj,
+                pk,
+                ft_obj.as_ref(),
+                decl_obj.as_ref(),
+                description,
+            )?;
+            self.registry()
+                .register_node(node_schema)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok(())
         } else {
             Err(PyTypeError::new_err("schema must be a dict"))
         }
@@ -5539,21 +5899,61 @@ impl PyNativeSchemaRegistry {
     }
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` DDL statement.
-    #[pyo3(signature = (graph_name, model_names=None))]
+    #[pyo3(signature = (graph_name, model_names=None, dialect="postgres"))]
     fn generate_pgq_ddl(
         &self,
         graph_name: &str,
         model_names: Option<Vec<String>>,
+        dialect: &str,
     ) -> PyResult<String> {
         if let Some(names) = model_names {
             let str_names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
             self.registry()
-                .generate_pgq_ddl_for(graph_name, &str_names)
-                .map_err(|e| PyValueError::new_err(e.to_string()))
+                .generate_pgq_ddl_for_with_dialect(graph_name, &str_names, dialect)
+                .map_err(to_py_schema_err)
         } else {
             self.registry()
-                .generate_pgq_ddl(graph_name)
-                .map_err(|e| PyValueError::new_err(e.to_string()))
+                .generate_pgq_ddl_with_dialect(graph_name, dialect)
+                .map_err(to_py_schema_err)
+        }
+    }
+
+    /// Emits relational table DDL (`CREATE TABLE IF NOT EXISTS`) for registered models.
+    #[pyo3(signature = (model_names=None, dialect="postgres"))]
+    fn generate_table_ddl(
+        &self,
+        model_names: Option<Vec<String>>,
+        dialect: &str,
+    ) -> PyResult<Vec<String>> {
+        if let Some(names) = model_names {
+            let str_names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            self.registry()
+                .generate_table_ddl_for(&str_names, dialect)
+                .map_err(to_py_schema_err)
+        } else {
+            self.registry()
+                .generate_table_ddl(dialect)
+                .map_err(to_py_schema_err)
+        }
+    }
+
+    /// Emits full SQL/PGQ schema DDL in run order (tables, constraints, indexes, property graph).
+    #[pyo3(signature = (graph_name, model_names=None, dialect="postgres"))]
+    fn generate_pgq_schema_ddl(
+        &self,
+        graph_name: &str,
+        model_names: Option<Vec<String>>,
+        dialect: &str,
+    ) -> PyResult<Vec<String>> {
+        if let Some(names) = model_names {
+            let str_names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            self.registry()
+                .generate_pgq_schema_ddl_for(graph_name, &str_names, dialect)
+                .map_err(to_py_schema_err)
+        } else {
+            self.registry()
+                .generate_pgq_schema_ddl(graph_name, dialect)
+                .map_err(to_py_schema_err)
         }
     }
 
@@ -5783,11 +6183,12 @@ fn emit_gql_drop_graph_type_ddl(graph_type_name: &str) -> PyResult<String> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (graph_name, nodes=None, rels=None))]
+#[pyo3(signature = (graph_name, nodes=None, rels=None, dialect="postgres"))]
 fn emit_pgq_property_graph_ddl(
     graph_name: &str,
     nodes: Option<Vec<Bound<'_, PyAny>>>,
     rels: Option<Vec<Bound<'_, PyAny>>>,
+    dialect: &str,
 ) -> PyResult<String> {
     let mut node_schemas = Vec::new();
     if let Some(n_list) = nodes {
@@ -5803,8 +6204,60 @@ fn emit_pgq_property_graph_ddl(
     }
     let node_refs: Vec<&NodeSchema> = node_schemas.iter().collect();
     let rel_refs: Vec<&RelationshipSchema> = rel_schemas.iter().collect();
-    voyager_ogm::emit_pgq_property_graph_ddl(graph_name, &node_refs, &rel_refs)
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+    voyager_ogm::emit_pgq_property_graph_ddl_with_dialect(
+        graph_name, &node_refs, &rel_refs, dialect,
+    )
+    .map_err(to_py_schema_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (nodes=None, rels=None, dialect="postgres"))]
+fn emit_table_ddl(
+    nodes: Option<Vec<Bound<'_, PyAny>>>,
+    rels: Option<Vec<Bound<'_, PyAny>>>,
+    dialect: &str,
+) -> PyResult<Vec<String>> {
+    let mut node_schemas = Vec::new();
+    if let Some(n_list) = nodes {
+        for n in &n_list {
+            node_schemas.push(extract_node_schema(n)?);
+        }
+    }
+    let mut rel_schemas = Vec::new();
+    if let Some(r_list) = rels {
+        for r in &r_list {
+            rel_schemas.push(extract_rel_schema(r)?);
+        }
+    }
+    let node_refs: Vec<&NodeSchema> = node_schemas.iter().collect();
+    let rel_refs: Vec<&RelationshipSchema> = rel_schemas.iter().collect();
+    voyager_ogm::emit_table_ddl(&node_refs, &rel_refs, dialect).map_err(to_py_schema_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (graph_name, nodes=None, rels=None, dialect="postgres"))]
+fn emit_pgq_schema_ddl(
+    graph_name: &str,
+    nodes: Option<Vec<Bound<'_, PyAny>>>,
+    rels: Option<Vec<Bound<'_, PyAny>>>,
+    dialect: &str,
+) -> PyResult<Vec<String>> {
+    let mut node_schemas = Vec::new();
+    if let Some(n_list) = nodes {
+        for n in &n_list {
+            node_schemas.push(extract_node_schema(n)?);
+        }
+    }
+    let mut rel_schemas = Vec::new();
+    if let Some(r_list) = rels {
+        for r in &r_list {
+            rel_schemas.push(extract_rel_schema(r)?);
+        }
+    }
+    let node_refs: Vec<&NodeSchema> = node_schemas.iter().collect();
+    let rel_refs: Vec<&RelationshipSchema> = rel_schemas.iter().collect();
+    voyager_ogm::emit_pgq_schema_ddl(graph_name, &node_refs, &rel_refs, dialect)
+        .map_err(to_py_schema_err)
 }
 
 #[pyfunction]
@@ -6037,6 +6490,34 @@ fn resolve_fulltext_search<'py>(
     Ok(dict)
 }
 
+/// Connects to `uri` and returns its live graph schema as a JSON string.
+///
+/// The JSON is the `voyager_drivers::introspect` result, identical to
+/// `voyager introspect --format json`. The GIL is released while the catalog
+/// queries run. Connection and query failures raise `VoyagerError` with the
+/// driver error code; Apache AGE and DuckDB raise `VoyagerError` with code
+/// `UNSUPPORTED_FEATURE`.
+#[pyfunction]
+#[pyo3(signature = (uri, sample_size=voyager_drivers::introspect::DEFAULT_SAMPLE_SIZE))]
+fn introspect_schema_json(py: Python<'_>, uri: &str, sample_size: usize) -> PyResult<String> {
+    let parsed = voyager_drivers::ParsedUri::parse(uri)
+        .map_err(|error| make_voyager_err(error.code(), error.to_string()))?;
+    let options = voyager_drivers::IntrospectOptions { sample_size };
+    let schema = py
+        .detach(|| {
+            get_tokio_runtime()
+                .block_on(async move { voyager_drivers::introspect(&parsed, &options).await })
+        })
+        .map_err(|error| {
+            make_voyager_err(
+                error.code(),
+                voyager_drivers::introspect::describe_error(&error),
+            )
+        })?;
+    serde_json::to_string(&schema.to_json_value())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+}
+
 /// Native Python module definition for `_voyager_rs`.
 #[pymodule]
 fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -6062,6 +6543,8 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(emit_gql_drop_graph_type_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_pgq_property_graph_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_pgq_drop_property_graph_ddl, m)?)?;
+    m.add_function(wrap_pyfunction!(emit_table_ddl, m)?)?;
+    m.add_function(wrap_pyfunction!(emit_pgq_schema_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_cypher25_graph_type_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_cypher25_drop_graph_type_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_node_index_ddl, m)?)?;
@@ -6076,6 +6559,7 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(canonical_fulltext_index_name, m)?)?;
     m.add_function(wrap_pyfunction!(adapt_tantivy_query, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_fulltext_search, m)?)?;
+    m.add_function(wrap_pyfunction!(introspect_schema_json, m)?)?;
     m.add_class::<PyQueryBuilder>()?;
     m.add_class::<PyAstExpr>()?;
     m.add_class::<PyArrowStream>()?;

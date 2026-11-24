@@ -42,11 +42,11 @@
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) LIMIT 3 OFFSET 0",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) LIMIT 3 OFFSET 0",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name)) LIMIT 3 OFFSET 0",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) LIMIT 3 OFFSET 0",
       "parameters": {}
     }
   }

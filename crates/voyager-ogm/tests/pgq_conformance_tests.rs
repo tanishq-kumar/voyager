@@ -29,14 +29,14 @@ fn test_pgq_single_node_and_where_conformance() {
 
     assert!(
         res.statement
-            .contains("SELECT * FROM GRAPH_TABLE (social_graph MATCH (p IS Person)")
+            .contains("SELECT * FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\")")
     );
     assert!(res.statement.contains("WHERE p.age > $p0"));
     assert!(
         res.statement
             .contains("COLUMNS (p.name AS name, p.age AS age)")
     );
-    assert!(res.statement.contains("ORDER BY age ASC"));
+    assert!(res.statement.contains("ORDER BY age ASC NULLS LAST"));
     assert_eq!(res.parameters.get("p0"), Some(&LiteralValue::Int64(30)));
 }
 
@@ -54,7 +54,7 @@ fn test_pgq_named_parameter_in_node_property_predicate() {
 
     assert!(
         res.statement
-            .contains("(p IS Person WHERE p.email = $email)"),
+            .contains("(p IS \"Person\" WHERE p.email = $email)"),
         "statement was {}",
         res.statement
     );
@@ -72,7 +72,7 @@ fn test_pgq_all_operator_translations() {
         (BinaryOp::Lte, "p.age <= $p0", LiteralValue::Int64(65)),
         (
             BinaryOp::In,
-            "p.age IN $p0",
+            "p.age = ANY($p0)",
             LiteralValue::List(vec![
                 LiteralValue::String("London".into()),
                 LiteralValue::String("Paris".into()),
@@ -80,7 +80,7 @@ fn test_pgq_all_operator_translations() {
         ),
         (
             BinaryOp::NotIn,
-            "p.age NOT IN $p0",
+            "p.age <> ALL($p0)",
             LiteralValue::List(vec![LiteralValue::String("Rome".into())]),
         ),
     ];
@@ -115,7 +115,7 @@ fn test_pgq_string_like_translations() {
     let (a1, r1) = b1.build();
     let mut pgq = SqlPgqEmitter::new("g");
     let res1 = pgq.visit_query(&a1, r1).unwrap();
-    assert!(res1.statement.contains("p.city LIKE '%' || $p0 || '%'"));
+    assert!(res1.statement.contains("strpos(p.city, $p0) > 0"));
 
     // STARTS WITH
     let mut b2 = QueryBuilder::new();
@@ -124,7 +124,7 @@ fn test_pgq_string_like_translations() {
         .field("p", "name", None::<String>);
     let (a2, r2) = b2.build();
     let res2 = pgq.visit_query(&a2, r2).unwrap();
-    assert!(res2.statement.contains("p.name LIKE $p0 || '%'"));
+    assert!(res2.statement.contains("starts_with(p.name, $p0)"));
 
     // ENDS WITH
     let mut b3 = QueryBuilder::new();
@@ -133,7 +133,7 @@ fn test_pgq_string_like_translations() {
         .field("p", "name", None::<String>);
     let (a3, r3) = b3.build();
     let res3 = pgq.visit_query(&a3, r3).unwrap();
-    assert!(res3.statement.contains("p.name LIKE '%' || $p0"));
+    assert!(res3.statement.contains("right(p.name, length($p0)) = $p0"));
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn test_pgq_multi_hop_and_quantified_hops() {
     let res = pgq.visit_query(&arena, root).unwrap();
 
     assert!(res.statement.contains(
-        "(a IS Person) -[r1 IS KNOWS]-> (b IS Person) -[r2 IS WORKS_AT]-> (c IS Company)"
+        "(a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") -[r2 IS \"WORKS_AT\"]-> (c IS \"Company\")"
     ));
 
     // Variable hops
@@ -168,7 +168,7 @@ fn test_pgq_multi_hop_and_quantified_hops() {
 
     let (a_h, r_h) = b_hops.build();
     let res_h = pgq.visit_query(&a_h, r_h).unwrap();
-    assert!(res_h.statement.contains("-[r IS KNOWS]->{1,3}"));
+    assert!(res_h.statement.contains("-[r IS \"KNOWS\"]->{1,3}"));
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn test_pgq_directions_undirected_and_incoming() {
     assert!(
         res_u
             .statement
-            .contains("(a IS Person) -[r IS KNOWS]- (b IS Person)")
+            .contains("(a IS \"Person\") -[r IS \"KNOWS\"]- (b IS \"Person\")")
     );
 
     let mut b_inc = QueryBuilder::new();
@@ -201,7 +201,7 @@ fn test_pgq_directions_undirected_and_incoming() {
     assert!(
         res_i
             .statement
-            .contains("(c IS Company) <-[r IS WORKS_AT]- (a IS Person)")
+            .contains("(c IS \"Company\") <-[r IS \"WORKS_AT\"]- (a IS \"Person\")")
     );
 }
 
@@ -329,7 +329,7 @@ fn test_pgq_distinct_projection_is_emitted() {
     let res = pgq.visit_query(&arena, root).unwrap();
     assert_eq!(
         res.statement,
-        "SELECT DISTINCT * FROM GRAPH_TABLE (g MATCH (p IS Person) COLUMNS (p.city))"
+        "SELECT DISTINCT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.city))"
     );
 }
 

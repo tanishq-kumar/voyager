@@ -88,7 +88,7 @@ fn test_sql_pgq_emitter_graph_table() {
 
     assert_eq!(
         compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (movies_graph MATCH (p IS Person) -[r IS ACTED_IN]-> (m IS Movie) WHERE p.age > $p0 COLUMNS (p.name AS actor, m.title AS movie)) ORDER BY actor ASC LIMIT 10"
+        "SELECT * FROM GRAPH_TABLE (movies_graph MATCH (p IS \"Person\") -[r IS \"ACTED_IN\"]-> (m IS \"Movie\") WHERE p.age > $p0 COLUMNS (p.name AS actor, m.title AS movie)) ORDER BY actor ASC NULLS LAST LIMIT 10"
     );
     assert_eq!(
         compiled.parameters.get("p0"),
@@ -114,7 +114,7 @@ fn test_sql_pgq_emitter_like_translation() {
 
     assert_eq!(
         compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (social_network MATCH (p IS Person) WHERE p.name LIKE '%' || $p0 || '%' COLUMNS (p.name AS name))"
+        "SELECT * FROM GRAPH_TABLE (social_network MATCH (p IS \"Person\") WHERE strpos(p.name, $p0) > 0 COLUMNS (p.name AS name))"
     );
     assert_eq!(
         compiled.parameters.get("p0"),
@@ -418,6 +418,37 @@ fn test_iso_gql_emitter_with_where_order_by_offset_limit() {
     assert_eq!(
         compiled.statement,
         "MATCH (p:Person) WITH p.name AS name, p.age AS age WHERE age > $p0 ORDER BY age ASC OFFSET 5 LIMIT 10 RETURN name"
+    );
+}
+
+#[test]
+fn test_pagination_parameters_emit_as_parameters() {
+    let mut builder = QueryBuilder::new();
+    builder
+        .r#match()
+        .node(Some("p"), vec!["Person"])
+        .r#return()
+        .field("p", "name", None::<&str>)
+        .skip_param("s")
+        .limit_param("l");
+    let (arena, root) = builder.build();
+
+    let mut cypher = CypherEmitter::new();
+    assert_eq!(
+        cypher.visit_query(&arena, root).unwrap().statement,
+        "MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l"
+    );
+
+    let mut iso = IsoGqlEmitter::new();
+    assert_eq!(
+        iso.visit_query(&arena, root).unwrap().statement,
+        "MATCH (p:Person) RETURN p.name OFFSET $s LIMIT $l"
+    );
+
+    let mut pgq = SqlPgqEmitter::new("graph");
+    assert_eq!(
+        pgq.visit_query(&arena, root).unwrap().statement,
+        "SELECT * FROM GRAPH_TABLE (graph MATCH (p IS \"Person\") COLUMNS (p.name)) LIMIT $l OFFSET $s"
     );
 }
 

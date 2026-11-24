@@ -12,6 +12,7 @@ import datetime
 import inspect
 import json
 import math
+import operator
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -23,6 +24,45 @@ import polars as pl
 
 from voyager_ogm.ingestion import BulkIngestionPlan
 from voyager_ogm.types import unwrap_spatial_param
+
+_PAGINATION_PARAMETER_PATTERN = re.compile(
+    r"\b(?:SKIP|OFFSET|LIMIT)\s+\$([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE
+)
+
+
+def validate_pagination_parameters(statement: str, parameters: Mapping[str, Any] | None) -> None:
+    """Rejects negative or non-integer values bound to pagination parameters.
+
+    Engines disagree on a bad ``SKIP``/``OFFSET``/``LIMIT`` binding: Neo4j and
+    Memgraph raise, while Apache AGE, PostgreSQL and DuckDB silently truncate a
+    fractional value. Validating before dispatch gives every dialect the same
+    clear failure and keeps the error independent of the target database.
+
+    Args:
+        statement: Compiled statement, before dialect-specific parameter rewriting.
+        parameters: Bound parameter values.
+
+    Raises:
+        ValueError: If a parameter bound to ``SKIP``, ``OFFSET`` or ``LIMIT`` is
+            not a non-negative integer.
+    """
+    if not parameters:
+        return
+    for name in sorted(set(_PAGINATION_PARAMETER_PATTERN.findall(statement))):
+        if name not in parameters:
+            continue
+        value = parameters[name]
+        try:
+            # operator.index accepts every true integer type (int, NumPy and
+            # Polars integers) and rejects floats, strings and Decimal.
+            count = None if isinstance(value, bool) else operator.index(value)
+        except TypeError:
+            count = None
+        if count is None or count < 0:
+            raise ValueError(
+                f"Pagination parameter '${name}' must be a non-negative integer, "
+                f"got {type(value).__name__} {value!r}"
+            )
 
 
 @dataclass
@@ -346,6 +386,7 @@ class MockBridge:
         Returns:
             List of record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = unwrap_spatial_param(parameters or {})
         self.executed_queries.append((statement, params))
         if self._canned_results:
@@ -367,6 +408,7 @@ class MockBridge:
         Returns:
             Polars DataFrame.
         """
+        validate_pagination_parameters(statement, parameters)
         params = unwrap_spatial_param(parameters or {})
         self.executed_queries.append((statement, params))
         if self._canned_results:
@@ -696,6 +738,7 @@ class Neo4jBoltBridge:
         Returns:
             List of record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = _adapt_bolt_parameters(parameters or {})
         session_kwargs = {"database": self.database} if self.database else {}
         with self.driver.session(**session_kwargs) as session:
@@ -851,6 +894,7 @@ class Neo4jBoltTransaction:
             raise RuntimeError("transaction is aborted; roll back before executing more statements")
         if not self.is_active:
             raise ValueError("Cannot execute query on inactive transaction")
+        validate_pagination_parameters(statement, parameters)
         try:
             result = self._tx.run(statement, _adapt_bolt_parameters(parameters or {}))
             return [_normalize_bolt_record(record) for record in result]
@@ -982,6 +1026,7 @@ class AsyncNeo4jBoltBridge:
         Returns:
             List of record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = _adapt_bolt_parameters(parameters or {})
         session_kwargs = {"database": self.database} if self.database else {}
         async with self.driver.session(**session_kwargs) as session:
@@ -1311,6 +1356,25 @@ def _encode_duckdb_literal(v: Any) -> str:
     )
 
 
+def _literal_substitution(sql: str) -> Callable[[re.Match[str]], str]:
+    """Returns a ``re.sub`` replacement that emits ``sql`` literally."""
+
+    def replace(_match: re.Match[str]) -> str:
+        return sql
+
+    return replace
+
+
+def _encode_duckdb_in_tuple(values: Sequence[Any]) -> str:
+    """Encodes a non-empty Python sequence as a SQL scalar tuple for ``IN``.
+
+    ``x IN [a, b]`` (a DuckDB list) does not propagate a NULL list element
+    through ``NOT IN`` like SQL ``IN`` does, so DuckPGQ membership rewrites use
+    a scalar tuple (``x IN (a, b)``) instead.
+    """
+    return "(" + ", ".join(_encode_duckdb_literal(v) for v in values) + ")"
+
+
 class DuckDbBridge:
     """Synchronous DuckDB driver bridge with zero-copy Polars / Arrow output."""
 
@@ -1326,7 +1390,36 @@ class DuckDbBridge:
         self, statement: str, parameters: dict[str, Any]
     ) -> tuple[str, dict[str, Any]]:
         """Interpolates parameters for DuckPGQ GRAPH_TABLE queries where native parameter binding is unsupported."""
+        validate_pagination_parameters(statement, parameters)
         if "GRAPH_TABLE" in statement and parameters:
+            # DuckPGQ's GRAPH_TABLE grammar has no ANY/ALL keyword, so the
+            # SQL/PGQ `x = ANY($n)` / `x <> ALL($n)` forms for a list parameter
+            # are rewritten to a scalar `IN (...)` tuple. The list is known
+            # here, so an empty list becomes FALSE/TRUE like the emitter emits
+            # for an empty literal list.
+            stmt = statement
+            for key, value in parameters.items():
+                if not isinstance(value, (list, tuple)):
+                    continue
+                if value:
+                    positive = f" IN {_encode_duckdb_in_tuple(value)}"
+                    negative = f" NOT IN {_encode_duckdb_in_tuple(value)}"
+                else:
+                    # `IN ()` is invalid; FALSE/TRUE is the emitter's empty-list
+                    # rendering, kept as a valid comparison of the left operand.
+                    positive = " IN (NULL) AND FALSE"
+                    negative = " IN (NULL) OR TRUE"
+                stmt = re.sub(
+                    rf"(?<![<>=!])\s*=\s+ANY\(\s*\${re.escape(key)}\s*\)",
+                    _literal_substitution(positive),
+                    stmt,
+                )
+                stmt = re.sub(
+                    rf"(?<![<>=!])\s*<>\s+ALL\(\s*\${re.escape(key)}\s*\)",
+                    _literal_substitution(negative),
+                    stmt,
+                )
+
             regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
 
             def repl(m: re.Match[str]) -> str:
@@ -1335,7 +1428,7 @@ class DuckDbBridge:
                     return _encode_duckdb_literal(parameters[key])
                 return m.group(0)
 
-            stmt = regex.sub(repl, statement)
+            stmt = regex.sub(repl, stmt)
             return stmt, {}
         return statement, parameters
 
@@ -1850,6 +1943,7 @@ class PostgresBridge:
         self, statement: str, parameters: dict[str, Any]
     ) -> tuple[str, list[Any] | tuple[Any, ...]]:
         """Formats statement and parameters for PostgreSQL execution."""
+        validate_pagination_parameters(statement, parameters)
         if not parameters:
             return statement, ()
 
@@ -1870,7 +1964,10 @@ class PostgresBridge:
                 return "%s"
             return m.group(0)
 
-        stmt = regex.sub(repl, statement)
+        escaped_stmt = statement.replace("%", "%%")
+        stmt = regex.sub(repl, escaped_stmt)
+        if not ordered_params:
+            return statement, ()
         return stmt, ordered_params
 
     def execute(
@@ -1887,7 +1984,7 @@ class PostgresBridge:
         """
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         with self.conn.cursor() as cur:
-            cur.execute(stmt, params)
+            cur.execute(stmt, params or None)
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
@@ -1908,7 +2005,7 @@ class PostgresBridge:
         """
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         with self.conn.cursor() as cur:
-            cur.execute(stmt, params)
+            cur.execute(stmt, params or None)
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
@@ -1942,7 +2039,7 @@ class PostgresBridge:
                     batch_data = b.get("batch", [])
                     total_records += len(batch_data)
                     stmt, params = self._format_pgq_statement(statement, b)
-                    cur.execute(stmt, params)
+                    cur.execute(stmt, params or None)
             else:
                 statement = plan_or_statement.statement
                 for batch_item in plan_or_statement:
@@ -1952,7 +2049,7 @@ class PostgresBridge:
                     stmt, params = self._format_pgq_statement(
                         batch_item.statement, batch_item.parameters
                     )
-                    cur.execute(stmt, params)
+                    cur.execute(stmt, params or None)
         return BulkExecutionResult(
             total_batches=total_batches,
             total_records=total_records,
@@ -2054,7 +2151,7 @@ class PostgresBridgeTransaction:
     def _execute_sql(self, statement: str, parameters: Sequence[Any] = ()) -> str | None:
         """Executes a control statement and returns its command tag."""
         with self._bridge.conn.cursor() as cur:
-            cur.execute(statement, parameters)
+            cur.execute(statement, parameters or None)
             return getattr(cur, "statusmessage", None)
 
     def execute(
@@ -2065,7 +2162,7 @@ class PostgresBridgeTransaction:
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
-                cur.execute(stmt, params)
+                cur.execute(stmt, params or None)
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
@@ -2083,7 +2180,7 @@ class PostgresBridgeTransaction:
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
-                cur.execute(stmt, params)
+                cur.execute(stmt, params or None)
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
@@ -2114,7 +2211,7 @@ class PostgresBridgeTransaction:
                     for b in batch_list:
                         total_records += len(b.get("batch", []))
                         stmt, params = self._bridge._format_pgq_statement(statement, b)
-                        cur.execute(stmt, params)
+                        cur.execute(stmt, params or None)
                 else:
                     statement = plan_or_statement.statement
                     for batch_item in plan_or_statement:
@@ -2123,7 +2220,7 @@ class PostgresBridgeTransaction:
                         stmt, params = self._bridge._format_pgq_statement(
                             batch_item.statement, batch_item.parameters
                         )
-                        cur.execute(stmt, params)
+                        cur.execute(stmt, params or None)
         except BaseException:
             self._mark_failed()
             raise
@@ -2394,6 +2491,7 @@ class FalkorDBBridge:
         Returns:
             List of record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = _adapt_falkordb_parameters(parameters or {})
         try:
             res = self.graph.query(statement, params)
@@ -2700,6 +2798,7 @@ class RelateBridge:
         Returns:
             List of normalized record dictionaries.
         """
+        validate_pagination_parameters(statement, parameters)
         params = _adapt_relate_parameters(parameters or {})
         res = self.con.execute(statement, params)
         if hasattr(res, "fetchall"):

@@ -15,12 +15,14 @@ pub mod client;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod introspect;
 #[cfg(feature = "testkit")]
 pub mod mock;
 pub mod native_transaction;
 pub mod pool;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+mod redact;
 #[cfg(feature = "redis")]
 pub mod redis;
 pub mod tls;
@@ -45,6 +47,7 @@ pub use engine::{
     QueryResult, QuerySummary,
 };
 pub use error::{NetError, Result};
+pub use introspect::{GraphSchema, IntrospectOptions, introspect};
 #[cfg(feature = "testkit")]
 pub use mock::{MockConnection, MockConnectionFactory, MockEngine};
 pub use native_transaction::{NativeTransaction, NativeTransactionState};

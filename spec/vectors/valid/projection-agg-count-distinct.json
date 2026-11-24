@@ -41,11 +41,11 @@
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT COUNT(DISTINCT id) AS n FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.id AS id))",
+      "statement": "SELECT COUNT(DISTINCT id) AS n FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.id AS id))",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT COUNT(DISTINCT id) AS n FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.id AS id))",
+      "statement": "SELECT COUNT(DISTINCT id) AS n FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.id AS id))",
       "parameters": {}
     }
   }

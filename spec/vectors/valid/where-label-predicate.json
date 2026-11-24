@@ -1,0 +1,90 @@
+{
+  "description": "A label predicate in WHERE, matching the MatchWhere5 label test.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "root",
+              [
+                "Root"
+              ]
+            ],
+            [
+              "edge",
+              "undirected",
+              [],
+              null
+            ],
+            [
+              "node",
+              "i",
+              []
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "and",
+          [
+            "bin",
+            "gt",
+            [
+              "prop",
+              "i",
+              "var"
+            ],
+            [
+              "lit",
+              "te"
+            ]
+          ],
+          [
+            "label",
+            "i",
+            [
+              "TextNode"
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "i",
+        "var",
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "cypher": {
+      "statement": "MATCH (root:Root)-[]-(i) WHERE (i.var > $p0) AND i:TextNode RETURN i.var",
+      "parameters": {
+        "p0": "te"
+      }
+    },
+    "age": {
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (root:Root)-[]-(i) WHERE (i.var > $p0) AND label(i) = 'TextNode' RETURN i.var $$, %s) AS (var agtype)",
+      "parameters": {
+        "p0": "te"
+      }
+    },
+    "iso_gql": {
+      "statement": "MATCH (root:Root)-[]-(i) WHERE (i.var > $p0) AND i IS TextNode RETURN i.var",
+      "parameters": {
+        "p0": "te"
+      }
+    },
+    "sql_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    },
+    "duck_pgq": {
+      "error": "UNSUPPORTED_FEATURE"
+    }
+  }
+}

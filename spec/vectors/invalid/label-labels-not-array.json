@@ -1,0 +1,39 @@
+{
+  "description": "The labels item of a label predicate must be an array.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "i",
+              [
+                "Node"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "label",
+          "i",
+          "TextNode"
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "i",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/where/2"
+  }
+}

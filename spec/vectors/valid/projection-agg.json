@@ -41,11 +41,11 @@
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT AVG(age) AS avg_age FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.age AS age))",
+      "statement": "SELECT AVG(age) AS avg_age FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.age AS age))",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT AVG(age) AS avg_age FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.age AS age))",
+      "statement": "SELECT AVG(age) AS avg_age FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.age AS age))",
       "parameters": {}
     }
   }

@@ -84,15 +84,19 @@ def _reset():
         (lambda p: p.age >= 21, "p.age >= $p0", {"p0": 21}),
         (lambda p: p.age < 65, "p.age < $p0", {"p0": 65}),
         (lambda p: p.age <= 65, "p.age <= $p0", {"p0": 65}),
-        (lambda p: p.city.in_(["London", "Paris"]), "p.city IN $p0", {"p0": ["London", "Paris"]}),
+        (
+            lambda p: p.city.in_(["London", "Paris"]),
+            "p.city = ANY($p0)",
+            {"p0": ["London", "Paris"]},
+        ),
         (
             lambda p: p.city.not_in(["Rome", "Tokyo"]),
-            "p.city NOT IN $p0",
+            "p.city <> ALL($p0)",
             {"p0": ["Rome", "Tokyo"]},
         ),
-        (lambda p: p.city.contains("don"), "p.city LIKE '%' || $p0 || '%'", {"p0": "don"}),
-        (lambda p: p.name.startswith("Al"), "p.name LIKE $p0 || '%'", {"p0": "Al"}),
-        (lambda p: p.name.endswith("ce"), "p.name LIKE '%' || $p0", {"p0": "ce"}),
+        (lambda p: p.city.contains("don"), "strpos(p.city, $p0) > 0", {"p0": "don"}),
+        (lambda p: p.name.startswith("Al"), "starts_with(p.name, $p0)", {"p0": "Al"}),
+        (lambda p: p.name.endswith("ce"), "right(p.name, length($p0)) = $p0", {"p0": "ce"}),
     ],
     ids=[
         "pgq_eq",
@@ -143,7 +147,7 @@ def test_pgq_multi_hop_chain_traversal():
 
     assert "SELECT * FROM GRAPH_TABLE (corp_graph MATCH" in compiled.statement
     assert (
-        "(a IS Person) -[r1 IS KNOWS]-> (b IS Person) -[r2 IS WORKS_AT]-> (c IS Company)"
+        '(a IS "Person") -[r1 IS "KNOWS"]-> (b IS "Person") -[r2 IS "WORKS_AT"]-> (c IS "Company")'
         in compiled.statement
     )
     assert "WHERE a.name = $p0" in compiled.statement
@@ -155,9 +159,9 @@ def test_pgq_multi_hop_chain_traversal():
 @pytest.mark.parametrize(
     ("min_hops", "max_hops", "expected_quantifier"),
     [
-        (1, 2, "-[r IS KNOWS]->{1,2}"),
-        (1, 3, "-[r IS KNOWS]->{1,3}"),
-        (2, 5, "-[r IS KNOWS]->{2,5}"),
+        (1, 2, '-[r IS "KNOWS"]->{1,2}'),
+        (1, 3, '-[r IS "KNOWS"]->{1,3}'),
+        (2, 5, '-[r IS "KNOWS"]->{2,5}'),
     ],
     ids=["hops_1_2", "hops_1_3", "hops_2_5"],
 )
@@ -190,12 +194,12 @@ def test_pgq_undirected_and_incoming_traversal():
     b = Person(alias="b")
     q_undir = Query.match(a).edge(Knows, "r").node(b).return_(b.name)
     c_undir = q_undir.compile("sql_pgq", graph_name="g")
-    assert "(a IS Person) -[r IS KNOWS]- (b IS Person)" in c_undir.statement
+    assert '(a IS "Person") -[r IS "KNOWS"]- (b IS "Person")' in c_undir.statement
 
     c = Company(alias="c")
     q_inc = Query.match(c).from_(WorksAt, "r").node(a).return_(c.name, a.name)
     c_inc = q_inc.compile("sql_pgq", graph_name="g")
-    assert "(c IS Company) <-[r IS WORKS_AT]- (a IS Person)" in c_inc.statement
+    assert '(c IS "Company") <-[r IS "WORKS_AT"]- (a IS "Person")' in c_inc.statement
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +233,10 @@ def test_pgq_aggregations_and_projections():
     assert "MIN(age) AS min_age" in compiled.statement
     assert "MAX(age) AS max_age" in compiled.statement
     assert "ARRAY_AGG(name) AS all_names" in compiled.statement
-    assert "FROM GRAPH_TABLE (g MATCH (p IS Person)" in compiled.statement
+    assert 'FROM GRAPH_TABLE (g MATCH (p IS "Person")' in compiled.statement
     assert "COLUMNS (p.city AS city, p.name AS name, p.age AS age))" in compiled.statement
     assert "GROUP BY city" in compiled.statement
-    assert "ORDER BY city ASC LIMIT 10 OFFSET 5" in compiled.statement
+    assert "ORDER BY city ASC NULLS LAST LIMIT 10 OFFSET 5" in compiled.statement
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +413,7 @@ def test_live_duckdb_relational_graph_schema_and_polars():
     )
     compiled = q_agg.compile("sql_pgq", graph_name="corp_graph")
     assert (
-        "FROM GRAPH_TABLE (corp_graph MATCH (p IS Person) -[r IS WORKS_AT]-> (c IS Company)"
+        'FROM GRAPH_TABLE (corp_graph MATCH (p IS "Person") -[r IS "WORKS_AT"]-> (c IS "Company")'
         in compiled.statement
     )
 

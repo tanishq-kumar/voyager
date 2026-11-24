@@ -108,8 +108,8 @@ fn test_fluent_query_builder_simple_match() {
             assert!(!distinct);
             assert_eq!(projections.len(), 2);
             assert_eq!(order_by.len(), 1);
-            assert_eq!(*limit, Some(10));
-            assert_eq!(*skip, Some(5));
+            assert_eq!(*limit, Some(PaginationValue::Count(10)));
+            assert_eq!(*skip, Some(PaginationValue::Count(5)));
         } else {
             panic!("Expected ReturnClause");
         }
@@ -238,8 +238,8 @@ fn test_intuitive_builder_aliases() {
         } = ret
         {
             assert_eq!(projections.len(), 2);
-            assert_eq!(*limit, Some(25));
-            assert_eq!(*skip, Some(10));
+            assert_eq!(*limit, Some(PaginationValue::Count(25)));
+            assert_eq!(*skip, Some(PaginationValue::Count(10)));
             assert_eq!(order_by.len(), 1);
             assert!(!order_by[0].1); // descending = false
         }
@@ -382,7 +382,7 @@ fn test_memgraph_gqlalchemy_chaining_style() {
         } = ret
         {
             assert_eq!(projections.len(), 3);
-            assert_eq!(*limit, Some(10));
+            assert_eq!(*limit, Some(PaginationValue::Count(10)));
         }
     }
 }
@@ -621,7 +621,7 @@ fn test_label_expression_ast_dialects_emission() {
     use voyager_ogm::emitters::{CypherEmitter, IsoGqlEmitter, SqlPgqEmitter};
     use voyager_ogm::visitor::AstVisitor;
 
-    // Test 1: Complex nested node expression: (Person | Company) & !Inactive
+    // Test 1: Complex nested node expression: (Person | "Company") & !Inactive
     let complex_expr = LabelExpression::parse("(Person | Company) & !Inactive").unwrap();
     let mut b = QueryBuilder::new();
     let n_id = b.ident("n");
@@ -687,7 +687,7 @@ fn test_label_expression_ast_dialects_emission() {
     let pgq1_disj_compiled = pgq.visit_query(&arena1_disj, root1_disj).unwrap();
     assert_eq!(
         pgq1_disj_compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (n IS Person | Company) COLUMNS (n.name))"
+        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (n IS \"Person\" | \"Company\") COLUMNS (n.name))"
     );
 
     // Test 2: Edge traversal with disjunction: -[r:KNOWS|FOLLOWS]->
@@ -737,7 +737,7 @@ fn test_label_expression_ast_dialects_emission() {
     let mut pgq3 = SqlPgqEmitter::new("voyager_graph");
     assert_eq!(
         pgq3.visit_query(&arena3, root3).unwrap().statement,
-        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (a IS User) -[r IS KNOWS | FOLLOWS]-> (b IS User) COLUMNS (a.id))"
+        "SELECT * FROM GRAPH_TABLE (voyager_graph MATCH (a IS \"User\") -[r IS \"KNOWS\" | \"FOLLOWS\"]-> (b IS \"User\") COLUMNS (a.id))"
     );
 
     // Test 4: Edge traversal with negation rejected for SQL:PGQ:

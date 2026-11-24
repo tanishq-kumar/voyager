@@ -36,7 +36,8 @@ use std::fmt;
 use serde_json::{Map, Value};
 
 use crate::ast::{
-    AggregationFunc, BinaryOp, Direction, LiteralValue, NodeHandle, PathMode, UnaryOp,
+    AggregationFunc, BinaryOp, Direction, LiteralValue, NodeHandle, PaginationValue, PathMode,
+    UnaryOp,
 };
 use crate::builder::QueryBuilder;
 use crate::cache::global_query_cache;
@@ -488,6 +489,7 @@ fn is_known_expr_tag(tag: &str) -> bool {
             | "count"
             | "list"
             | "alias"
+            | "label"
     )
 }
 
@@ -666,6 +668,50 @@ fn handle_prop_tuple(
     }
     let prop = extract_string(&array[2], &path.index(2), "a string property")?;
     Ok(builder.prop(var, prop))
+}
+
+#[inline(never)]
+fn handle_label_tuple(
+    builder: &mut QueryBuilder,
+    array: &[Value],
+    path: &SpecPath,
+) -> Result<NodeHandle, SpecError> {
+    check_spec_arity_bounded(
+        array,
+        path,
+        "expression 'label'",
+        3,
+        3,
+        "[label, variable, labels]",
+    )?;
+    let variable = extract_string(&array[1], &path.index(1), "a string variable")?;
+    if variable.is_empty() {
+        return Err(make_spec_err(
+            &path.index(1),
+            "Invalid 'label': the variable must be a non-empty string.",
+        ));
+    }
+    let labels_path = path.index(2);
+    let labels = expect_spec_array(&array[2], &labels_path, "label names")?;
+    if labels.is_empty() {
+        return Err(make_spec_err(
+            &labels_path,
+            "Invalid 'label': the labels list must contain at least one label name.",
+        ));
+    }
+    let mut names = Vec::with_capacity(labels.len());
+    for (index, label) in labels.iter().enumerate() {
+        let label_path = labels_path.index(index);
+        let name = extract_string(label, &label_path, "a string label name")?;
+        if name.is_empty() {
+            return Err(make_spec_err(
+                &label_path,
+                "Invalid 'label': label names must be non-empty strings.",
+            ));
+        }
+        names.push(name);
+    }
+    Ok(builder.label_predicate(variable, names))
 }
 
 #[inline(never)]
@@ -1017,6 +1063,7 @@ fn handle_expr_sequence(
         "ident" => handle_ident_tuple(builder, array, path),
         "param" => handle_param_tuple(builder, array, path),
         "lit" => handle_lit_tuple(builder, array, path),
+        "label" => handle_label_tuple(builder, array, path),
         "bin" => handle_bin_tuple(builder, array, depth, path),
         "unary" => handle_unary_tuple(builder, array, depth, path),
         "fn" => handle_fn_tuple(builder, array, depth, path),
@@ -1669,6 +1716,10 @@ fn render_expression_spec(expression: &Value) -> String {
             .get(1)
             .and_then(render_json_scalar)
             .unwrap_or_else(|| "expression".to_string()),
+        "label" => match array_string(sequence, 1) {
+            Some(variable) => format!("{variable}:<label>"),
+            None => "expression".to_string(),
+        },
         _ => "expression".to_string(),
     }
 }
@@ -1866,6 +1917,10 @@ fn expression_specs_equivalent(left: &Value, right: &Value, depth: usize) -> boo
                         expression_specs_equivalent(left_item, right_item, depth + 1)
                     })
         }
+        "label" => {
+            left_sequence.get(1) == right_sequence.get(1)
+                && left_sequence.get(2) == right_sequence.get(2)
+        }
         _ => false,
     }
 }
@@ -1952,6 +2007,7 @@ fn expression_is_derivable(
     match tag {
         "ident" => array_string(sequence, 1).is_some_and(|name| scope.contains(&name)),
         "prop" => array_string(sequence, 1).is_some_and(|variable| scope.contains(&variable)),
+        "label" => array_string(sequence, 1).is_some_and(|variable| scope.contains(&variable)),
         "param" | "lit" => true,
         "bin" => sequence
             .get(2)
@@ -2362,6 +2418,12 @@ fn validate_expr_scope(
     };
     match tag {
         "ident" | "prop" => {
+            if let Some(name) = array_string(sequence, 1) {
+                ensure_in_scope(&name, &path.index(1), scope, clause, last_with, hints)?;
+            }
+            Ok(())
+        }
+        "label" => {
             if let Some(name) = array_string(sequence, 1) {
                 ensure_in_scope(&name, &path.index(1), scope, clause, last_with, hints)?;
             }
@@ -3269,6 +3331,46 @@ fn reject_unknown_keys(
     Ok(())
 }
 
+/// Parses a pagination position: a non-negative integer literal or a
+/// `["param", name]` reference.
+fn parse_pagination(
+    val: &Value,
+    path: &SpecPath,
+    field: &str,
+) -> Result<PaginationValue, SpecError> {
+    if let Value::Array(array) = val {
+        check_spec_arity_bounded(
+            array,
+            path,
+            &format!("'{field}' parameter"),
+            2,
+            2,
+            "[param, name]",
+        )?;
+        let tag = extract_string(&array[0], &path.index(0), "the string tag 'param'")?;
+        if tag != "param" {
+            return Err(make_spec_err(
+                &path.index(0),
+                format!(
+                    "Invalid '{field}': expected a non-negative integer or [\"param\", name], got the tag '{tag}'."
+                ),
+            ));
+        }
+        let name = extract_string(&array[1], &path.index(1), "a string name")?;
+        let name = strip_leading_dollar(name);
+        if name.is_empty() {
+            return Err(make_spec_err(
+                &path.index(1),
+                format!("Invalid '{field}': the parameter name must be a non-empty string."),
+            ));
+        }
+        return Ok(PaginationValue::Parameter(name));
+    }
+    Ok(PaginationValue::Count(parse_non_negative(
+        val, path, field,
+    )?))
+}
+
 /// Parses a non-negative `skip` / `offset` / `limit` value.
 fn parse_non_negative(val: &Value, path: &SpecPath, field: &str) -> Result<u64, SpecError> {
     if val.is_boolean() {
@@ -3883,14 +3985,26 @@ fn build_query_internal(
             if let Some(skip_item) = with_dict.get("skip")
                 && !skip_item.is_null()
             {
-                let skip = parse_non_negative(skip_item, &item_path.key("skip"), "skip")?;
-                builder.skip(skip);
+                match parse_pagination(skip_item, &item_path.key("skip"), "skip")? {
+                    PaginationValue::Count(skip) => {
+                        builder.skip(skip);
+                    }
+                    PaginationValue::Parameter(name) => {
+                        builder.skip_param(name);
+                    }
+                }
             }
             if let Some(limit_item) = with_dict.get("limit")
                 && !limit_item.is_null()
             {
-                let limit = parse_non_negative(limit_item, &item_path.key("limit"), "limit")?;
-                builder.limit(limit);
+                match parse_pagination(limit_item, &item_path.key("limit"), "limit")? {
+                    PaginationValue::Count(limit) => {
+                        builder.limit(limit);
+                    }
+                    PaginationValue::Parameter(name) => {
+                        builder.limit_param(name);
+                    }
+                }
             }
         }
     }
@@ -3988,22 +4102,40 @@ fn build_query_internal(
     if let Some(skip_item) = spec.get("skip")
         && !skip_item.is_null()
     {
-        let skip = parse_non_negative(skip_item, &path.key("skip"), "skip")?;
-        builder.skip(skip);
+        match parse_pagination(skip_item, &path.key("skip"), "skip")? {
+            PaginationValue::Count(skip) => {
+                builder.skip(skip);
+            }
+            PaginationValue::Parameter(name) => {
+                builder.skip_param(name);
+            }
+        }
     }
 
     if let Some(offset_item) = spec.get("offset")
         && !offset_item.is_null()
     {
-        let offset = parse_non_negative(offset_item, &path.key("offset"), "offset")?;
-        builder.offset(offset);
+        match parse_pagination(offset_item, &path.key("offset"), "offset")? {
+            PaginationValue::Count(offset) => {
+                builder.offset(offset);
+            }
+            PaginationValue::Parameter(name) => {
+                builder.offset_param(name);
+            }
+        }
     }
 
     if let Some(limit_item) = spec.get("limit")
         && !limit_item.is_null()
     {
-        let limit = parse_non_negative(limit_item, &path.key("limit"), "limit")?;
-        builder.limit(limit);
+        match parse_pagination(limit_item, &path.key("limit"), "limit")? {
+            PaginationValue::Count(limit) => {
+                builder.limit(limit);
+            }
+            PaginationValue::Parameter(name) => {
+                builder.limit_param(name);
+            }
+        }
     }
 
     if let Some(linear_item) = spec.get("linear_clauses") {
@@ -4474,6 +4606,175 @@ mod tests {
     }
 
     #[test]
+    fn label_predicate_compiles_in_where() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "i", ["Node"]]]],
+                "where": ["label", "i", ["TextNode"]]
+            }],
+            "projections": [["field", "i", "name", null]]
+        });
+
+        let cypher = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            cypher.compiled.statement,
+            "MATCH (i:Node) WHERE i:TextNode RETURN i.name"
+        );
+
+        let age = compile(
+            &spec,
+            "age",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            age.compiled
+                .statement
+                .contains("WHERE label(i) = 'TextNode' RETURN i.name")
+        );
+
+        let gql = compile(
+            &spec,
+            "iso_gql",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gql.compiled.statement,
+            "MATCH (i:Node) WHERE i IS TextNode RETURN i.name"
+        );
+
+        let pgq_error = compile(
+            &spec,
+            "sql_pgq",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(pgq_error.code(), ErrorCode::UnsupportedFeature);
+    }
+
+    #[test]
+    fn label_predicate_multiple_labels_mean_all_of_them() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "i", ["Node"]]]],
+                "where": ["label", "i", ["A", "B"]]
+            }],
+            "projections": [["field", "i", "name", null]]
+        });
+        let cypher = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            cypher.compiled.statement,
+            "MATCH (i:Node) WHERE i:A:B RETURN i.name"
+        );
+
+        let age = compile(
+            &spec,
+            "age",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            age.compiled
+                .statement
+                .contains("WHERE label(i) = 'A' AND label(i) = 'B'")
+        );
+
+        let gql = compile(
+            &spec,
+            "iso_gql",
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gql.compiled.statement,
+            "MATCH (i:Node) WHERE i IS A&B RETURN i.name"
+        );
+    }
+
+    #[test]
+    fn label_predicate_rejects_malformed_labels() {
+        let cases = [
+            (json!(["label", "i", []]), "/matches/0/where/2"),
+            (json!(["label", "i", [""]]), "/matches/0/where/2/0"),
+            (json!(["label", "i", ["A", 1]]), "/matches/0/where/2/1"),
+            (json!(["label", "i", "TextNode"]), "/matches/0/where/2"),
+            (json!(["label", "i"]), "/matches/0/where"),
+            (json!(["label", "", ["TextNode"]]), "/matches/0/where/1"),
+        ];
+        for (where_expression, expected_path) in cases {
+            let spec = json!({
+                "spec_version": 1,
+                "matches": [{
+                    "paths": [[["node", "i", ["Node"]]]],
+                    "where": where_expression
+                }],
+                "projections": [["field", "i", "name", null]]
+            });
+            let error = compile_cypher(&spec).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidSpec);
+            assert_eq!(error.path(), Some(expected_path));
+        }
+    }
+
+    #[test]
+    fn label_predicate_requires_a_bound_variable() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "i", ["Node"]]]],
+                "where": ["label", "unknown", ["TextNode"]]
+            }],
+            "projections": [["field", "i", "name", null]]
+        });
+        let error = compile_cypher(&spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidSpec);
+        assert_eq!(error.path(), Some("/matches/0/where/1"));
+        assert!(
+            error
+                .message()
+                .contains("variable 'unknown' is not in scope")
+        );
+    }
+
+    #[test]
+    fn label_predicate_round_trips_through_spec_export() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "i", ["Node"]]]],
+                "where": ["label", "i", ["A", "B"]]
+            }],
+            "projections": [["field", "i", "name", null]]
+        });
+        let builder = build_query(&spec).unwrap();
+        let (arena, root) = builder.try_build().unwrap();
+        let exported = crate::spec_export::spec_from_ast(&arena, root).unwrap();
+        let exported_json = exported.to_json_value();
+        assert_eq!(
+            exported_json["matches"][0]["where"],
+            json!(["label", "i", ["A", "B"]])
+        );
+    }
+
+    #[test]
     fn non_object_document_reports_the_root() {
         let error = build_query(&json!(["spec_version", 1])).unwrap_err();
         assert_eq!(error.code(), ErrorCode::InvalidSpec);
@@ -4544,6 +4845,104 @@ mod tests {
             "{:?}",
             result.warnings
         );
+    }
+
+    fn compile_dialect(spec: &Value, dialect: &str) -> Result<SpecCompileResult, SpecError> {
+        compile(
+            spec,
+            dialect,
+            &SpecCompileOptions {
+                use_cache: false,
+                ..SpecCompileOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn pagination_parameters_compile_in_every_dialect() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "projections": [["field", "p", "name", null]],
+            "skip": ["param", "s"],
+            "limit": ["param", "$l"]
+        });
+        let cases = [
+            ("cypher", "MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l"),
+            (
+                "age",
+                "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l $$, %s) AS (name agtype)",
+            ),
+            (
+                "iso_gql",
+                "MATCH (p:Person) RETURN p.name OFFSET $s LIMIT $l",
+            ),
+            (
+                "sql_pgq",
+                "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) LIMIT $l OFFSET $s",
+            ),
+            (
+                "duckpgq",
+                "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) LIMIT $l OFFSET $s",
+            ),
+        ];
+        for (dialect, statement) in cases {
+            let compiled = compile_dialect(&spec, dialect).unwrap();
+            assert_eq!(compiled.compiled.statement, statement, "{dialect}");
+            assert!(compiled.compiled.parameters.is_empty(), "{dialect}");
+        }
+    }
+
+    #[test]
+    fn pagination_parameters_compile_inside_with() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "with_clauses": [{
+                "projections": [["field", "p", "name", "n"]],
+                "skip": ["param", "ws"],
+                "limit": ["param", "wl"]
+            }],
+            "projections": [["expr", ["ident", "n"], null]],
+            "skip": ["param", "s"],
+            "limit": ["param", "l"]
+        });
+        let compiled = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            compiled.compiled.statement,
+            "MATCH (p:Person) WITH p.name AS n SKIP $ws LIMIT $wl RETURN n SKIP $s LIMIT $l"
+        );
+    }
+
+    #[test]
+    fn malformed_pagination_parameter_reports_its_pointer() {
+        let base = base_spec();
+        let cases = [
+            (json!(["param"]), "/limit"),
+            (json!(["param", 1]), "/limit/1"),
+            (json!(["param", ""]), "/limit/1"),
+            (json!(["param", "l", null]), "/limit/2"),
+            (json!(["lit", "l"]), "/limit/0"),
+        ];
+        for (value, pointer) in cases {
+            let mut spec = base.clone();
+            spec["limit"] = value.clone();
+            let error = compile_cypher(&spec).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidSpec, "{value}");
+            assert_eq!(error.path(), Some(pointer), "{value}");
+        }
+
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "with_clauses": [{
+                "projections": [["field", "p", "name", "n"]],
+                "skip": ["param"]
+            }],
+            "projections": [["expr", ["ident", "n"], null]]
+        });
+        let error = compile_cypher(&spec).unwrap_err();
+        assert_eq!(error.path(), Some("/with_clauses/0/skip"));
     }
 
     #[test]

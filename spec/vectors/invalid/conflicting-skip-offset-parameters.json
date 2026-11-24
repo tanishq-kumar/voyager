@@ -1,0 +1,42 @@
+{
+  "description": "skip and offset remain aliases even when both are parameters; the second key is rejected.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ],
+    "skip": [
+      "param",
+      "s"
+    ],
+    "offset": [
+      "param",
+      "o"
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/offset"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "description": "A label name in a label predicate cannot be empty.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "i",
+              [
+                "Node"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "label",
+          "i",
+          [
+            ""
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "i",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/where/2/0"
+  }
+}

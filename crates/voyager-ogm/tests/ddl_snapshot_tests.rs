@@ -10,7 +10,9 @@ use voyager_ogm::{
     emit_cypher_drop_node_ddl, emit_cypher_drop_rel_ddl, emit_cypher_node_ddl, emit_cypher_rel_ddl,
     emit_cypher25_drop_graph_type_ddl, emit_cypher25_graph_type_ddl, emit_gql_alter_node_ddl,
     emit_gql_alter_rel_ddl, emit_gql_drop_graph_type_ddl, emit_gql_graph_type_ddl,
-    emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl,
+    emit_node_table_ddl, emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl,
+    emit_pgq_property_graph_ddl_with_dialect, emit_pgq_schema_ddl, emit_rel_table_ddl,
+    emit_table_ddl, field_type_to_sql,
 };
 
 fn create_test_node_schema() -> NodeSchema {
@@ -293,18 +295,65 @@ fn test_pgq_property_graph_ddl() {
     let expected = "\
 CREATE PROPERTY GRAPH social_graph
   VERTEX TABLES (
-    user KEY (user_id) LABEL User PROPERTIES (age, bio, email, user_id)
+    \"user\" KEY (\"user_id\") LABEL \"User\" PROPERTIES (\"age\", \"bio\", \"email\", \"user_id\")
   )
   EDGE TABLES (
-    follows
-      SOURCE KEY (user_id) REFERENCES user (user_id)
-      DESTINATION KEY (user_id) REFERENCES user (user_id)
-      LABEL FOLLOWS PROPERTIES (role, since)
+    \"follows\"
+      SOURCE KEY (\"src_user_id\") REFERENCES \"user\" (\"user_id\")
+      DESTINATION KEY (\"dst_user_id\") REFERENCES \"user\" (\"user_id\")
+      LABEL \"FOLLOWS\" PROPERTIES (\"role\", \"since\")
   );";
     assert_eq!(ddl, expected);
 
     let drop_ddl = emit_pgq_drop_property_graph_ddl("social_graph");
     assert_eq!(drop_ddl, "DROP PROPERTY GRAPH IF EXISTS social_graph;");
+}
+
+#[test]
+fn test_pgq_vertex_and_edge_table_names_follow_labels_and_types() {
+    // A model whose class name differs from its label, a second model, a
+    // self-relationship and a relationship between the two models.
+    let person = NodeSchema::new("P", vec!["ZzPerson".to_string()])
+        .with_field(FieldDescriptor::new("pid", FieldType::String).primary_key());
+    let company = NodeSchema::new("C", vec!["ZzCompany".to_string()])
+        .with_field(FieldDescriptor::new("cid", FieldType::String).primary_key());
+    let knows = RelationshipSchema::new("K", "KNOWS")
+        .with_endpoints(vec!["ZzPerson".to_string()], vec!["ZzPerson".to_string()])
+        .with_field(FieldDescriptor::new("since", FieldType::Int64));
+    let works_at = RelationshipSchema::new("W", "WORKS_AT")
+        .with_endpoints(vec!["ZzPerson".to_string()], vec!["ZzCompany".to_string()])
+        .with_field(FieldDescriptor::new("since", FieldType::Int64));
+
+    let ddl = emit_pgq_property_graph_ddl("g", &[&person, &company], &[&knows, &works_at]).unwrap();
+    let expected = "\
+CREATE PROPERTY GRAPH g
+  VERTEX TABLES (
+    \"zzperson\" KEY (\"pid\") LABEL \"ZzPerson\" PROPERTIES (\"pid\"),
+    \"zzcompany\" KEY (\"cid\") LABEL \"ZzCompany\" PROPERTIES (\"cid\")
+  )
+  EDGE TABLES (
+    \"knows\"
+      SOURCE KEY (\"src_pid\") REFERENCES \"zzperson\" (\"pid\")
+      DESTINATION KEY (\"dst_pid\") REFERENCES \"zzperson\" (\"pid\")
+      LABEL \"KNOWS\" PROPERTIES (\"since\"),
+    \"works_at\"
+      SOURCE KEY (\"src_pid\") REFERENCES \"zzperson\" (\"pid\")
+      DESTINATION KEY (\"dst_cid\") REFERENCES \"zzcompany\" (\"cid\")
+      LABEL \"WORKS_AT\" PROPERTIES (\"since\")
+  );";
+    assert_eq!(ddl, expected);
+}
+
+#[test]
+fn test_pgq_edge_only_ddl_uses_endpoint_node_key() {
+    let person = NodeSchema::new("P", vec!["ZzPerson".to_string()])
+        .with_field(FieldDescriptor::new("pid", FieldType::String).primary_key());
+    let knows = RelationshipSchema::new("K", "KNOWS")
+        .with_endpoints(vec!["ZzPerson".to_string()], vec!["ZzPerson".to_string()]);
+
+    let ddl = emit_pgq_property_graph_ddl("g", &[&person], &[&knows]).unwrap();
+    assert!(ddl.contains("SOURCE KEY (\"src_pid\") REFERENCES \"zzperson\" (\"pid\")"));
+    assert!(ddl.contains("DESTINATION KEY (\"dst_pid\") REFERENCES \"zzperson\" (\"pid\")"));
 }
 
 #[test]
@@ -374,6 +423,15 @@ fn test_schema_registry_ddl_methods() {
 
     let pgq_ddl = registry.generate_pgq_ddl("network_pgq").unwrap();
     assert!(pgq_ddl.starts_with("CREATE PROPERTY GRAPH network_pgq"));
+
+    // Requesting only the relationship still pulls in its endpoint node so the
+    // edge references the node's real key column.
+    let edge_only = registry
+        .generate_pgq_ddl_for("network_pgq", &["Follows"])
+        .unwrap();
+    assert!(edge_only.contains("VERTEX TABLES"));
+    assert!(edge_only.contains("SOURCE KEY (\"src_user_id\") REFERENCES \"user\" (\"user_id\")"));
+    assert!(!edge_only.contains("SOURCE KEY (\"src_id\")"));
 }
 
 #[test]
@@ -389,4 +447,396 @@ fn test_unsupported_constraint_ddl_error() {
     assert!(voyager_ogm::emit_node_drop_constraint_ddl(&node, "falkordb", false).is_err());
     assert!(voyager_ogm::emit_rel_drop_constraint_ddl(&rel, "age", false).is_err());
     assert!(voyager_ogm::emit_rel_drop_constraint_ddl(&rel, "falkordb", false).is_err());
+}
+
+#[test]
+fn test_table_ddl_sharing_naming_rules_and_reserved_words() {
+    let user = NodeSchema::new("UserModel", vec!["User".to_string()])
+        .with_field(FieldDescriptor::new("uid", FieldType::String).primary_key())
+        .with_field(FieldDescriptor::new("name", FieldType::String).nullable(false));
+    let order = NodeSchema::new("OrderModel", vec!["Order".to_string()])
+        .with_field(FieldDescriptor::new("oid", FieldType::String).primary_key())
+        .with_field(FieldDescriptor::new("amount", FieldType::Float64));
+    let places = RelationshipSchema::new("PlacesModel", "PLACES")
+        .with_endpoints(vec!["User".to_string()], vec!["Order".to_string()])
+        .with_field(FieldDescriptor::new("placed_at", FieldType::DateTime).nullable(false));
+
+    let tables = emit_table_ddl(&[&user, &order], &[&places], "postgres").unwrap();
+    assert_eq!(tables.len(), 3);
+
+    let user_table = emit_node_table_ddl(&user, "postgres").unwrap();
+    assert_eq!(user_table, tables[0]);
+    let places_table = emit_rel_table_ddl(&places, &[&user, &order], "postgres").unwrap();
+    assert_eq!(places_table, tables[2]);
+    assert!(tables[0].contains("\"uid\" TEXT NOT NULL"));
+    assert!(tables[0].contains("\"name\" TEXT NOT NULL"));
+    assert!(tables[0].contains("PRIMARY KEY (\"uid\")"));
+
+    assert!(tables[1].starts_with("CREATE TABLE IF NOT EXISTS \"order\" ("));
+    assert!(tables[1].contains("\"oid\" TEXT NOT NULL"));
+    assert!(tables[1].contains("\"amount\" DOUBLE PRECISION"));
+    assert!(tables[1].contains("PRIMARY KEY (\"oid\")"));
+
+    // Edge table uses lowercased type, quoted, with surrogate id key and src_<key> and dst_<key> endpoint columns
+    assert!(tables[2].starts_with("CREATE TABLE IF NOT EXISTS \"places\" ("));
+    assert!(tables[2].contains("\"id\" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY"));
+    assert!(tables[2].contains("\"src_uid\" TEXT NOT NULL REFERENCES \"user\" (\"uid\")"));
+    assert!(tables[2].contains("\"dst_oid\" TEXT NOT NULL REFERENCES \"order\" (\"oid\")"));
+    assert!(tables[2].contains("\"placed_at\" TIMESTAMP WITH TIME ZONE NOT NULL"));
+    assert!(!tables[2].contains("PRIMARY KEY (\"src_uid\", \"dst_oid\")"));
+}
+
+#[test]
+fn test_table_ddl_self_relationship_and_label_differs_from_class() {
+    let person = NodeSchema::new("PClass", vec!["ZzPerson".to_string()])
+        .with_field(FieldDescriptor::new("pid", FieldType::Int64).primary_key())
+        .with_field(FieldDescriptor::new("bio", FieldType::String));
+    let knows = RelationshipSchema::new("KClass", "KNOWS")
+        .with_endpoints(vec!["ZzPerson".to_string()], vec!["ZzPerson".to_string()])
+        .with_field(FieldDescriptor::new("since", FieldType::Int64).nullable(false));
+
+    let tables = emit_table_ddl(&[&person], &[&knows], "postgres").unwrap();
+    assert_eq!(tables.len(), 2);
+
+    assert!(tables[0].starts_with("CREATE TABLE IF NOT EXISTS \"zzperson\" ("));
+    assert!(tables[0].contains("\"pid\" BIGINT NOT NULL"));
+    assert!(tables[0].contains("PRIMARY KEY (\"pid\")"));
+
+    // Self-relationship keeps source and destination endpoint columns distinct with surrogate id key
+    assert!(tables[1].starts_with("CREATE TABLE IF NOT EXISTS \"knows\" ("));
+    assert!(tables[1].contains("\"id\" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY"));
+    assert!(tables[1].contains("\"src_pid\" BIGINT NOT NULL REFERENCES \"zzperson\" (\"pid\")"));
+    assert!(tables[1].contains("\"dst_pid\" BIGINT NOT NULL REFERENCES \"zzperson\" (\"pid\")"));
+    assert!(tables[1].contains("\"since\" BIGINT NOT NULL"));
+    assert!(!tables[1].contains("PRIMARY KEY (\"src_pid\", \"dst_pid\")"));
+}
+
+#[test]
+fn test_table_ddl_generation_duckdb_surrogate_sequence() {
+    let user = NodeSchema::new("UserModel", vec!["User".to_string()])
+        .with_field(FieldDescriptor::new("uid", FieldType::String).primary_key());
+    let order = NodeSchema::new("OrderModel", vec!["Order".to_string()])
+        .with_field(FieldDescriptor::new("oid", FieldType::String).primary_key());
+    let places = RelationshipSchema::new("PlacesModel", "PLACES")
+        .with_endpoints(vec!["User".to_string()], vec!["Order".to_string()])
+        .with_field(FieldDescriptor::new("placed_at", FieldType::DateTime).nullable(false));
+
+    let tables = emit_table_ddl(&[&user, &order], &[&places], "duckdb").unwrap();
+    // 2 vertex tables + 1 sequence + 1 edge table = 4 statements
+    assert_eq!(tables.len(), 4);
+    assert!(tables[0].starts_with("CREATE TABLE IF NOT EXISTS \"user\""));
+    assert!(tables[1].starts_with("CREATE TABLE IF NOT EXISTS \"order\""));
+    assert_eq!(tables[2], "CREATE SEQUENCE IF NOT EXISTS seq_places_id;");
+    assert!(tables[3].starts_with("CREATE TABLE IF NOT EXISTS \"places\" ("));
+    assert!(tables[3].contains("\"id\" BIGINT DEFAULT nextval('seq_places_id') PRIMARY KEY"));
+    assert!(tables[3].contains("\"src_uid\" VARCHAR NOT NULL REFERENCES \"user\" (\"uid\")"));
+    assert!(tables[3].contains("\"dst_oid\" VARCHAR NOT NULL REFERENCES \"order\" (\"oid\")"));
+}
+
+#[test]
+fn test_table_ddl_explicit_relationship_primary_key() {
+    let person = NodeSchema::new("Person", vec!["Person".to_string()])
+        .with_field(FieldDescriptor::new("pid", FieldType::String).primary_key());
+    let calls = RelationshipSchema::new("Calls", "CALLS")
+        .with_endpoints(vec!["Person".to_string()], vec!["Person".to_string()])
+        .with_field(FieldDescriptor::new("call_id", FieldType::String).primary_key())
+        .with_field(FieldDescriptor::new("duration", FieldType::Int64).nullable(false));
+
+    // Postgres: uses explicit PK and no surrogate key
+    let pg_tables = emit_table_ddl(&[&person], &[&calls], "postgres").unwrap();
+    assert_eq!(pg_tables.len(), 2);
+    assert!(pg_tables[1].starts_with("CREATE TABLE IF NOT EXISTS \"calls\" ("));
+    assert!(!pg_tables[1].contains("GENERATED ALWAYS AS IDENTITY"));
+    assert!(pg_tables[1].contains("\"call_id\" TEXT NOT NULL"));
+    assert!(pg_tables[1].contains("PRIMARY KEY (\"call_id\")"));
+
+    // DuckDB: uses explicit PK, no sequence created, no surrogate key
+    let duck_tables = emit_table_ddl(&[&person], &[&calls], "duckdb").unwrap();
+    assert_eq!(duck_tables.len(), 2); // No sequence!
+    assert!(duck_tables[1].starts_with("CREATE TABLE IF NOT EXISTS \"calls\" ("));
+    assert!(!duck_tables[1].contains("nextval("));
+    assert!(duck_tables[1].contains("\"call_id\" VARCHAR NOT NULL"));
+    assert!(duck_tables[1].contains("PRIMARY KEY (\"call_id\")"));
+}
+
+#[test]
+fn test_table_ddl_surrogate_name_avoid_collision_with_id_field() {
+    let node = NodeSchema::new("Item", vec!["Item".to_string()])
+        .with_field(FieldDescriptor::new("iid", FieldType::String).primary_key());
+    // Relationship has non-PK field named "id"
+    let rel = RelationshipSchema::new("Connects", "CONNECTS")
+        .with_endpoints(vec!["Item".to_string()], vec!["Item".to_string()])
+        .with_field(FieldDescriptor::new("id", FieldType::String).nullable(false))
+        .with_field(FieldDescriptor::new("weight", FieldType::Float64));
+
+    let pg_tables = emit_table_ddl(&[&node], &[&rel], "postgres").unwrap();
+    assert_eq!(pg_tables.len(), 2);
+    // Surrogate column is "connects_id", not "id"
+    assert!(
+        pg_tables[1].contains("\"connects_id\" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY")
+    );
+    assert!(pg_tables[1].contains("\"id\" TEXT NOT NULL"));
+    assert!(pg_tables[1].contains("\"weight\" DOUBLE PRECISION"));
+
+    let duck_tables = emit_table_ddl(&[&node], &[&rel], "duckdb").unwrap();
+    assert_eq!(duck_tables.len(), 3);
+    assert_eq!(
+        duck_tables[1],
+        "CREATE SEQUENCE IF NOT EXISTS seq_connects_connects_id;"
+    );
+    assert!(duck_tables[2].contains(
+        "\"connects_id\" BIGINT DEFAULT nextval('seq_connects_connects_id') PRIMARY KEY"
+    ));
+    assert!(duck_tables[2].contains("\"id\" VARCHAR NOT NULL"));
+}
+
+#[test]
+fn test_table_ddl_type_mapping_postgres_and_duckdb() {
+    use voyager_ogm::schema::DdlDialect;
+
+    // Direct mappings
+    assert_eq!(
+        field_type_to_sql(&FieldType::String, DdlDialect::Sql, "col").unwrap(),
+        "TEXT"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::String, DdlDialect::DuckDb, "col").unwrap(),
+        "VARCHAR"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Int64, DdlDialect::Sql, "col").unwrap(),
+        "BIGINT"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Int64, DdlDialect::DuckDb, "col").unwrap(),
+        "BIGINT"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Float64, DdlDialect::Sql, "col").unwrap(),
+        "DOUBLE PRECISION"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Float64, DdlDialect::DuckDb, "col").unwrap(),
+        "DOUBLE PRECISION"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Boolean, DdlDialect::Sql, "col").unwrap(),
+        "BOOLEAN"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Boolean, DdlDialect::DuckDb, "col").unwrap(),
+        "BOOLEAN"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Date, DdlDialect::Sql, "col").unwrap(),
+        "DATE"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Date, DdlDialect::DuckDb, "col").unwrap(),
+        "DATE"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::DateTime, DdlDialect::Sql, "col").unwrap(),
+        "TIMESTAMP WITH TIME ZONE"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::DateTime, DdlDialect::DuckDb, "col").unwrap(),
+        "TIMESTAMPTZ"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Duration, DdlDialect::Sql, "col").unwrap(),
+        "INTERVAL"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Duration, DdlDialect::DuckDb, "col").unwrap(),
+        "INTERVAL"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Map, DdlDialect::Sql, "col").unwrap(),
+        "JSONB"
+    );
+    assert_eq!(
+        field_type_to_sql(&FieldType::Map, DdlDialect::DuckDb, "col").unwrap(),
+        "JSON"
+    );
+    assert_eq!(
+        field_type_to_sql(
+            &FieldType::List(Box::new(FieldType::String)),
+            DdlDialect::Sql,
+            "col"
+        )
+        .unwrap(),
+        "TEXT[]"
+    );
+    assert_eq!(
+        field_type_to_sql(
+            &FieldType::List(Box::new(FieldType::String)),
+            DdlDialect::DuckDb,
+            "col"
+        )
+        .unwrap(),
+        "VARCHAR[]"
+    );
+    assert_eq!(
+        field_type_to_sql(
+            &FieldType::Custom("DECIMAL".to_string()),
+            DdlDialect::Sql,
+            "col"
+        )
+        .unwrap(),
+        "NUMERIC"
+    );
+    assert_eq!(
+        field_type_to_sql(
+            &FieldType::Custom("BYTES".to_string()),
+            DdlDialect::Sql,
+            "col"
+        )
+        .unwrap(),
+        "BYTEA"
+    );
+    assert_eq!(
+        field_type_to_sql(
+            &FieldType::Custom("BYTES".to_string()),
+            DdlDialect::DuckDb,
+            "col"
+        )
+        .unwrap(),
+        "BLOB"
+    );
+    assert_eq!(
+        field_type_to_sql(
+            &FieldType::Custom("POINT".to_string()),
+            DdlDialect::Sql,
+            "col"
+        )
+        .unwrap(),
+        "POINT"
+    );
+    assert_eq!(
+        field_type_to_sql(
+            &FieldType::Custom("VECTOR".to_string()),
+            DdlDialect::DuckDb,
+            "col"
+        )
+        .unwrap(),
+        "FLOAT[]"
+    );
+}
+
+#[test]
+fn test_table_ddl_unsupported_types() {
+    use voyager_ogm::schema::DdlDialect;
+
+    // DuckDB does not natively support POINT without spatial extensions
+    let err_point = field_type_to_sql(
+        &FieldType::Custom("POINT".to_string()),
+        DdlDialect::DuckDb,
+        "geo_point",
+    );
+    assert!(err_point.is_err());
+    let err_str = err_point.unwrap_err().to_string();
+    assert!(err_str.contains("geo_point"));
+    assert!(err_str.contains("POINT"));
+
+    // PostgreSQL does not have VECTOR without pgvector
+    let err_vec = field_type_to_sql(
+        &FieldType::Custom("VECTOR".to_string()),
+        DdlDialect::Sql,
+        "embedding",
+    );
+    assert!(err_vec.is_err());
+    let err_str = err_vec.unwrap_err().to_string();
+    assert!(err_str.contains("embedding"));
+    assert!(err_str.contains("VECTOR"));
+
+    // Unrecognized custom type
+    let err_unknown = field_type_to_sql(
+        &FieldType::Custom("SPATIAL_GEOMETRY".to_string()),
+        DdlDialect::Sql,
+        "shape",
+    );
+    assert!(err_unknown.is_err());
+    let err_str = err_unknown.unwrap_err().to_string();
+    assert!(err_str.contains("shape"));
+    assert!(err_str.contains("SPATIAL_GEOMETRY"));
+}
+
+#[test]
+fn test_pgq_schema_ddl_execution_order() {
+    let user = NodeSchema::new("User", vec!["User".to_string()])
+        .with_field(FieldDescriptor::new("uid", FieldType::String).primary_key())
+        .with_field(FieldDescriptor::new("email", FieldType::String).unique())
+        .with_field(FieldDescriptor::new("score", FieldType::Int64).indexed());
+    let follows = RelationshipSchema::new("Follows", "FOLLOWS")
+        .with_endpoints(vec!["User".to_string()], vec!["User".to_string()])
+        .with_field(FieldDescriptor::new("since", FieldType::Int64).indexed());
+
+    let ddl = emit_pgq_schema_ddl("social_g", &[&user], &[&follows], "postgres").unwrap();
+
+    // Must emit:
+    // 1. Vertex table
+    // 2. Edge table
+    // 3. Constraints
+    // 4. Indexes
+    // 5. CREATE PROPERTY GRAPH
+    assert_eq!(ddl.len(), 6);
+    assert!(ddl[0].starts_with("CREATE TABLE IF NOT EXISTS \"user\""));
+    assert!(ddl[1].starts_with("CREATE TABLE IF NOT EXISTS \"follows\""));
+    assert!(ddl[2].starts_with("ALTER TABLE \"user\" ADD CONSTRAINT uq_user_email UNIQUE"));
+    assert!(ddl[3].starts_with("CREATE INDEX IF NOT EXISTS idx_user_score ON \"user\""));
+    assert!(ddl[4].starts_with("CREATE INDEX IF NOT EXISTS idx_follows_since ON \"follows\""));
+    assert!(ddl[5].starts_with("CREATE PROPERTY GRAPH social_g"));
+}
+
+#[test]
+fn test_duckpgq_schema_ddl_execution_order() {
+    let user = NodeSchema::new("User", vec!["User".to_string()])
+        .with_field(FieldDescriptor::new("uid", FieldType::String).primary_key())
+        .with_field(FieldDescriptor::new("email", FieldType::String).unique())
+        .with_field(FieldDescriptor::new("score", FieldType::Int64).indexed());
+    let follows = RelationshipSchema::new("Follows", "FOLLOWS")
+        .with_endpoints(vec!["User".to_string()], vec!["User".to_string()])
+        .with_field(FieldDescriptor::new("since", FieldType::Int64).indexed());
+
+    let ddl = emit_pgq_schema_ddl("duck_social_g", &[&user], &[&follows], "duckdb").unwrap();
+
+    // Must emit in run order:
+    // 1. Vertex table
+    // 2. Sequence for edge surrogate key
+    // 3. Edge table
+    // 4. Constraint (CREATE UNIQUE INDEX)
+    // 5. Node index
+    // 6. Rel index
+    // 7. CREATE PROPERTY GRAPH
+    assert_eq!(ddl.len(), 7);
+    assert!(ddl[0].starts_with("CREATE TABLE IF NOT EXISTS \"user\""));
+    assert_eq!(ddl[1], "CREATE SEQUENCE IF NOT EXISTS seq_follows_id;");
+    assert!(ddl[2].starts_with("CREATE TABLE IF NOT EXISTS \"follows\""));
+    assert!(ddl[2].contains("\"id\" BIGINT DEFAULT nextval('seq_follows_id') PRIMARY KEY"));
+    assert!(ddl[3].starts_with("CREATE UNIQUE INDEX IF NOT EXISTS uq_user_email ON \"user\""));
+    assert!(ddl[4].starts_with("CREATE INDEX IF NOT EXISTS idx_user_score ON \"user\""));
+    assert!(ddl[5].starts_with("CREATE INDEX IF NOT EXISTS idx_follows_since ON \"follows\""));
+    assert!(ddl[6].starts_with("CREATE PROPERTY GRAPH duck_social_g"));
+}
+
+#[test]
+fn test_duckpgq_property_graph_ddl() {
+    let user = NodeSchema::new("User", vec!["User".to_string()])
+        .with_field(FieldDescriptor::new("uid", FieldType::String).primary_key())
+        .with_field(FieldDescriptor::new("name", FieldType::String));
+    let follows = RelationshipSchema::new("Follows", "FOLLOWS")
+        .with_endpoints(vec!["User".to_string()], vec!["User".to_string()])
+        .with_field(FieldDescriptor::new("since", FieldType::Int64));
+
+    let duck_ddl =
+        emit_pgq_property_graph_ddl_with_dialect("duck_g", &[&user], &[&follows], "duckdb")
+            .unwrap();
+    // DuckPGQ requires omitting KEY and PROPERTIES
+    assert!(!duck_ddl.contains("KEY (\"uid\")"));
+    assert!(!duck_ddl.contains("PROPERTIES"));
+    assert!(duck_ddl.contains("\"user\" LABEL \"User\""));
+    assert!(duck_ddl.contains("SOURCE KEY (\"src_uid\") REFERENCES \"user\" (\"uid\")"));
+    assert!(duck_ddl.contains("DESTINATION KEY (\"dst_uid\") REFERENCES \"user\" (\"uid\")"));
+    assert!(duck_ddl.contains("LABEL \"FOLLOWS\""));
 }

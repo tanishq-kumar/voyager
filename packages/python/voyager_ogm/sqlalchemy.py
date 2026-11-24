@@ -45,6 +45,23 @@ else:
 _SQLALCHEMY_INSTALL_HINT = 'pip install "voyager-ogm[sqlalchemy]"'
 
 
+def _quote_ident(identifier: str) -> str:
+    """Quotes a SQL identifier, including each part of a schema-qualified name.
+
+    SQL:2023 PGQ table names and labels are identifiers. Quoting them preserves
+    the case declared in the relational model and matches the labels the SQL/PGQ
+    query emitter writes as quoted identifiers.
+    """
+    parts = identifier.split(".")
+    quoted: list[str] = []
+    for part in parts:
+        if len(part) >= 2 and part.startswith('"') and part.endswith('"'):
+            quoted.append(part)
+        else:
+            quoted.append('"' + part.replace('"', '""') + '"')
+    return ".".join(quoted)
+
+
 def _require_sqlalchemy(feature: str) -> None:
     """Raises a clear ImportError when SQLAlchemy is not installed.
 
@@ -207,6 +224,10 @@ class PropertyGraph:
     def generate_create_ddl(self, dialect: str = "sql_pgq") -> str:
         """Generates SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` DDL statement.
 
+        Table names come from the relational metadata (the tables that already
+        exist); labels, table names, key columns and the referenced vertex key
+        are double-quoted so they match the SQL/PGQ query emitter's identifiers.
+
         Args:
             dialect: Target dialect ('sql_pgq' or 'duckpgq').
 
@@ -214,16 +235,25 @@ class PropertyGraph:
             SQL DDL query string.
         """
         v_clauses: list[str] = []
+        key_columns = {v.table_name: v.key_column for v in self.vertex_tables}
         for v in self.vertex_tables:
-            v_clauses.append(f"    {v.table_name} LABEL {v.label}")
+            v_clauses.append(f"    {_quote_ident(v.table_name)} LABEL {_quote_ident(v.label)}")
+
+        def _reference(table_name: str) -> str:
+            reference = _quote_ident(table_name)
+            key_column = key_columns.get(table_name)
+            if key_column:
+                reference += f" ({_quote_ident(key_column)})"
+            return reference
 
         e_clauses: list[str] = []
         for e in self.edge_tables:
             e_clauses.append(
-                f"    {e.table_name}\n"
-                f"      SOURCE KEY ({e.source_key}) REFERENCES {e.source_table}\n"
-                f"      DESTINATION KEY ({e.destination_key}) REFERENCES {e.destination_table}\n"
-                f"      LABEL {e.label}"
+                f"    {_quote_ident(e.table_name)}\n"
+                f"      SOURCE KEY ({_quote_ident(e.source_key)}) REFERENCES {_reference(e.source_table)}\n"
+                f"      DESTINATION KEY ({_quote_ident(e.destination_key)}) "
+                f"REFERENCES {_reference(e.destination_table)}\n"
+                f"      LABEL {_quote_ident(e.label)}"
             )
 
         vertices_block = ",\n".join(v_clauses)

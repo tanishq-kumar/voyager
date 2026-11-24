@@ -2,7 +2,7 @@
 
 use crate::ast::{
     AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LiteralValue, NodeHandle,
-    ProjectionItem, QueryAstArena, UnaryOp,
+    PaginationValue, ProjectionItem, QueryAstArena, UnaryOp,
 };
 use crate::error::{Error, Result};
 use crate::visitor::{AstVisitor, ColumnMeta, CompiledQuery};
@@ -16,6 +16,7 @@ pub struct CypherEmitter {
     buffer: String,
     ignore_execution_mode: bool,
     node_params: HashMap<NodeHandle, String>,
+    age_label_predicates: bool,
 }
 
 impl CypherEmitter {
@@ -27,12 +28,22 @@ impl CypherEmitter {
             buffer: String::with_capacity(256),
             ignore_execution_mode: false,
             node_params: HashMap::new(),
+            age_label_predicates: false,
         }
     }
 
     /// Configures the emitter to ignore execution mode prefixes (used by subqueries and outer wrappers like Apache AGE).
     pub fn without_execution_mode(mut self) -> Self {
         self.ignore_execution_mode = true;
+        self
+    }
+
+    /// Renders label predicates in the form Apache AGE accepts.
+    ///
+    /// Apache AGE rejects `i:TextNode` in a `WHERE` clause, but accepts
+    /// `label(i) = 'TextNode'` for both nodes and relationships.
+    pub fn with_age_label_predicates(mut self) -> Self {
+        self.age_label_predicates = true;
         self
     }
 
@@ -255,6 +266,34 @@ impl CypherEmitter {
                 if !property.is_empty() {
                     self.buffer.push('.');
                     self.buffer.push_str(property);
+                }
+                Ok(())
+            }
+            AstNode::LabelPredicate { variable, labels } => {
+                if self.age_label_predicates {
+                    let wrap = nested && labels.len() > 1;
+                    if wrap {
+                        self.buffer.push('(');
+                    }
+                    for (index, label) in labels.iter().enumerate() {
+                        if index > 0 {
+                            self.buffer.push_str(" AND ");
+                        }
+                        self.buffer.push_str("label(");
+                        self.buffer.push_str(variable);
+                        self.buffer.push_str(") = '");
+                        self.buffer.push_str(label);
+                        self.buffer.push('\'');
+                    }
+                    if wrap {
+                        self.buffer.push(')');
+                    }
+                    return Ok(());
+                }
+                self.buffer.push_str(variable);
+                for label in labels {
+                    self.buffer.push(':');
+                    self.buffer.push_str(label);
                 }
                 Ok(())
             }
@@ -525,8 +564,8 @@ impl CypherEmitter {
         projections: &[ProjectionItem],
         distinct: bool,
         order_by: &[(NodeHandle, bool)],
-        skip: Option<u64>,
-        limit: Option<u64>,
+        skip: Option<PaginationValue>,
+        limit: Option<PaginationValue>,
     ) -> Result<()> {
         self.buffer.push_str(" RETURN ");
         if distinct {
@@ -938,7 +977,14 @@ impl AstVisitor for CypherEmitter {
                         limit,
                     } = ret_node
                     {
-                        self.emit_return(arena, projections, *distinct, order_by, *skip, *limit)?;
+                        self.emit_return(
+                            arena,
+                            projections,
+                            *distinct,
+                            order_by,
+                            skip.clone(),
+                            limit.clone(),
+                        )?;
                         columns = ColumnMeta::from_projections(arena, projections);
                     }
                 }

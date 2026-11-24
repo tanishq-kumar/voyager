@@ -19,8 +19,10 @@ from voyager_ogm.bridge import (
     MockBridge,
     create_bridge,
     validate_graph_name,
+    validate_pagination_parameters,
 )
 from voyager_ogm.config import get_config
+from voyager_ogm.expressions import ParamExpr
 from voyager_ogm.ingestion import (
     BulkIngestionPlan,
     create_bulk_create_plan,
@@ -703,6 +705,9 @@ class _SessionBase:
         self._identity_map: weakref.WeakValueDictionary[tuple[type[Any], Any], Any] = (
             weakref.WeakValueDictionary()
         )
+        self._pending_relationships: list[Any] = []
+        self._last_relationship_results: list[ExecutionResult] = []
+        self._is_async = is_async
         self._active_transaction: Any = None
 
         self._is_explicit_mock = (
@@ -931,6 +936,28 @@ class _SessionBase:
             node._attach_session(self)
         return node
 
+    def _stage_relationship(self, operation: Any) -> None:
+        """Stages a relationship connect/disconnect operation for the next flush."""
+        self._pending_relationships.append(operation)
+
+    @property
+    def last_relationship_results(self) -> list[ExecutionResult]:
+        """Returns the relationship write results from the most recent flush.
+
+        Relationship writes are executed by :meth:`flush` but reported here
+        instead of in the flush return value, which stays a list of
+        :class:`BulkExecutionResult` entries, one per model batch.
+        """
+        return list(self._last_relationship_results)
+
+    def _pending_relationship_snapshot(self) -> list[Any]:
+        """Returns a shallow copy of the staged relationship operations."""
+        return list(self._pending_relationships)
+
+    def _restore_pending_relationships(self, snapshot: list[Any]) -> None:
+        """Restores staged relationship operations from a snapshot."""
+        self._pending_relationships = list(snapshot)
+
     def get_node(self, model: type[Any], key: Any = None, **kwargs: Any) -> Any | None:
         """Retrieves a tracked node instance from the Identity Map if present."""
         if not self._enable_identity_map:
@@ -1084,6 +1111,7 @@ class _SessionBase:
         else:
             stmt = str(query_or_statement)
 
+        validate_pagination_parameters(stmt, params)
         params = {k: serialize_param_value(v) for k, v in params.items()}
         return stmt, params, q_obj
 
@@ -1198,12 +1226,12 @@ class _BoundQueryBase(Generic[_T_Session]):
         new_q = self._query.return_(*items)
         return self._spawn(new_q)
 
-    def limit(self, limit: int) -> Self:
+    def limit(self, limit: int | ParamExpr) -> Self:
         """Limits the maximum number of result records."""
         new_q = self._query.limit(limit)
         return self._spawn(new_q)
 
-    def skip(self, skip: int) -> Self:
+    def skip(self, skip: int | ParamExpr) -> Self:
         """Skips the specified number of records (OFFSET)."""
         new_q = self._query.skip(skip)
         return self._spawn(new_q)
@@ -1803,7 +1831,7 @@ class Session(_SessionBase):
         return self.run_bulk(plan)
 
     def flush(self, key_field: str | None = None) -> list[BulkExecutionResult]:
-        """Flushes all dirty entities tracked in the Identity Map in a single batch per model.
+        """Flushes dirty entities and staged relationship operations.
 
         Args:
             key_field: Explicit key property name applied to every model, or None
@@ -1811,6 +1839,8 @@ class Session(_SessionBase):
 
         Returns:
             One BulkExecutionResult per model batch that was executed.
+            Relationship write results are reported through
+            :attr:`last_relationship_results` instead of this list.
         """
         batches = self._prepare_flush_batches(key_field=key_field)
         results: list[BulkExecutionResult] = []
@@ -1820,6 +1850,13 @@ class Session(_SessionBase):
             for n in nodes:
                 if hasattr(n, "clear_dirty"):
                     n.clear_dirty()
+        self._last_relationship_results = []
+        if self._pending_relationships:
+            from voyager_ogm.relationships import flush_pending_relationships
+
+            pending = self._pending_relationships
+            self._last_relationship_results = flush_pending_relationships(self, pending)
+            self._pending_relationships = []
         return results
 
     def explore(self, target: Any = None, **kwargs: Any) -> Any:
@@ -2646,7 +2683,7 @@ class AsyncSession(_SessionBase):
         return await self.run_bulk(plan)
 
     async def flush(self, key_field: str | None = None) -> list[BulkExecutionResult]:
-        """Asynchronously flushes all dirty entities tracked in the Identity Map in a single batch per model.
+        """Asynchronously flushes dirty entities and staged relationship operations.
 
         Args:
             key_field: Explicit key property name applied to every model, or None
@@ -2654,6 +2691,8 @@ class AsyncSession(_SessionBase):
 
         Returns:
             One BulkExecutionResult per model batch that was executed.
+            Relationship write results are reported through
+            :attr:`last_relationship_results` instead of this list.
         """
         batches = self._prepare_flush_batches(key_field=key_field)
         results: list[BulkExecutionResult] = []
@@ -2663,6 +2702,13 @@ class AsyncSession(_SessionBase):
             for n in nodes:
                 if hasattr(n, "clear_dirty"):
                     n.clear_dirty()
+        self._last_relationship_results = []
+        if self._pending_relationships:
+            from voyager_ogm.relationships import async_flush_pending_relationships
+
+            pending = self._pending_relationships
+            self._last_relationship_results = await async_flush_pending_relationships(self, pending)
+            self._pending_relationships = []
         return results
 
     async def create_indexes(

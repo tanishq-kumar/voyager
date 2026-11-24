@@ -686,6 +686,54 @@ impl FieldDescriptor {
     }
 }
 
+/// Declarative relationship navigation metadata attached to a node model.
+///
+/// A declaration records the Python attribute name, the graph edge type, the
+/// traversal direction from the declaring node, the target node model name and
+/// an optional relationship model name that carries edge properties.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RelationshipDeclaration {
+    /// Attribute name on the declaring node model (e.g. `"friends"`).
+    pub name: String,
+    /// Graph relationship type (e.g. `"KNOWS"`).
+    pub rel_type: String,
+    /// Direction as seen from the declaring node.
+    pub direction: Direction,
+    /// Target node model name (e.g. `"Person"`).
+    pub target_model: String,
+    /// Optional relationship model name carrying edge properties.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub relationship_model: Option<String>,
+}
+
+impl RelationshipDeclaration {
+    /// Creates a declaration with no relationship model.
+    pub fn new(
+        name: impl Into<String>,
+        rel_type: impl Into<String>,
+        direction: Direction,
+        target_model: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            rel_type: rel_type.into(),
+            direction,
+            target_model: target_model.into(),
+            relationship_model: None,
+        }
+    }
+
+    /// Attaches an optional relationship model name.
+    pub fn with_relationship_model(mut self, model: impl Into<String>) -> Self {
+        self.relationship_model = Some(model.into());
+        self
+    }
+}
+
 /// Metadata schema defining a Graph Node entity.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -701,6 +749,12 @@ pub struct NodeSchema {
     /// Full-text search index configurations (single or multi-property).
     #[cfg_attr(feature = "serde", serde(default))]
     pub fulltext_indexes: Vec<FullTextIndexConfig>,
+    /// Declarative relationship navigation attributes declared on this model.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub relationship_declarations: Vec<RelationshipDeclaration>,
     /// Optional human-readable description of this node model.
     #[cfg_attr(
         feature = "serde",
@@ -718,6 +772,7 @@ impl NodeSchema {
             fields: BTreeMap::new(),
             primary_key: None,
             fulltext_indexes: Vec::new(),
+            relationship_declarations: Vec::new(),
             description: None,
         }
     }
@@ -741,6 +796,19 @@ impl NodeSchema {
     pub fn with_fulltext_index(mut self, config: FullTextIndexConfig) -> Self {
         self.fulltext_indexes.push(config);
         self
+    }
+
+    /// Appends a declarative relationship navigation attribute to this node schema.
+    pub fn with_relationship_declaration(mut self, declaration: RelationshipDeclaration) -> Self {
+        self.relationship_declarations.push(declaration);
+        self
+    }
+
+    /// Returns the declaration for a navigation attribute, if declared.
+    pub fn relationship_declaration(&self, name: &str) -> Option<&RelationshipDeclaration> {
+        self.relationship_declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
     }
 
     /// Returns the primary label for this node (defaults to the first label or the model name).
@@ -1103,6 +1171,39 @@ impl SchemaRegistry {
         })?;
         nodes.insert(model_id.clone(), schema);
         orders.insert(model_id, order);
+        Ok(())
+    }
+
+    /// Adds declarative relationship navigation attributes to a registered node.
+    ///
+    /// The node is looked up by model identity or bare class name, and keeps its
+    /// registration identity and order. This lets node models register their
+    /// fields first and attach relationship declarations afterwards without
+    /// widening the node registration signature.
+    ///
+    /// # Errors
+    /// Returns `Error::SchemaError` if the node is not registered or the lock is
+    /// poisoned.
+    pub fn add_relationship_declarations(
+        &self,
+        model: &str,
+        declarations: Vec<RelationshipDeclaration>,
+    ) -> Result<()> {
+        let key = self.node_lookup_key(model).ok_or_else(|| {
+            Error::SchemaError(format!(
+                "Cannot add relationship declarations: unknown node '{model}'"
+            ))
+        })?;
+        let mut nodes = self
+            .nodes
+            .write()
+            .map_err(|e| Error::SchemaError(format!("SchemaRegistry node lock poisoned: {e}")))?;
+        let node = nodes.get_mut(&key).ok_or_else(|| {
+            Error::SchemaError(format!(
+                "Cannot add relationship declarations: unknown node '{model}'"
+            ))
+        })?;
+        node.relationship_declarations.extend(declarations);
         Ok(())
     }
 
@@ -1630,24 +1731,122 @@ impl SchemaRegistry {
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for all registered entities.
     pub fn generate_pgq_ddl(&self, graph_name: &str) -> Result<String> {
+        self.generate_pgq_ddl_with_dialect(graph_name, "postgres")
+    }
+
+    /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for all registered entities with dialect targeting.
+    pub fn generate_pgq_ddl_with_dialect(&self, graph_name: &str, dialect: &str) -> Result<String> {
         let nodes = self.node_schemas();
         let rels = self.relationship_schemas();
         let node_refs: Vec<&NodeSchema> = nodes.iter().collect();
         let rel_refs: Vec<&RelationshipSchema> = rels.iter().collect();
-        crate::emitters::ddl::emit_pgq_property_graph_ddl(graph_name, &node_refs, &rel_refs)
+        crate::emitters::ddl::emit_pgq_property_graph_ddl_with_dialect(
+            graph_name, &node_refs, &rel_refs, dialect,
+        )
     }
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for specified model names.
+    ///
+    /// Endpoint node schemas are added automatically for every selected
+    /// relationship, so an edge requested on its own still references each
+    /// endpoint node's real key column.
     pub fn generate_pgq_ddl_for(&self, graph_name: &str, model_names: &[&str]) -> Result<String> {
+        self.generate_pgq_ddl_for_with_dialect(graph_name, model_names, "postgres")
+    }
+
+    /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for specified model names with dialect targeting.
+    pub fn generate_pgq_ddl_for_with_dialect(
+        &self,
+        graph_name: &str,
+        model_names: &[&str],
+        dialect: &str,
+    ) -> Result<String> {
         let all_nodes = self.node_schemas();
         let all_rels = self.relationship_schemas();
-        let (filtered_nodes, filtered_rels) =
+        let (mut filtered_nodes, filtered_rels) =
             Self::filter_models(&all_nodes, &all_rels, Some(model_names));
-        crate::emitters::ddl::emit_pgq_property_graph_ddl(
+        Self::add_pgq_endpoint_nodes(&all_nodes, &filtered_rels, &mut filtered_nodes);
+        crate::emitters::ddl::emit_pgq_property_graph_ddl_with_dialect(
             graph_name,
             &filtered_nodes,
             &filtered_rels,
+            dialect,
         )
+    }
+
+    /// Emits relational table DDL (`CREATE TABLE IF NOT EXISTS`) for all registered entities.
+    pub fn generate_table_ddl(&self, dialect: &str) -> Result<Vec<String>> {
+        let nodes = self.node_schemas();
+        let rels = self.relationship_schemas();
+        let node_refs: Vec<&NodeSchema> = nodes.iter().collect();
+        let rel_refs: Vec<&RelationshipSchema> = rels.iter().collect();
+        crate::emitters::ddl::emit_table_ddl(&node_refs, &rel_refs, dialect)
+    }
+
+    /// Emits relational table DDL (`CREATE TABLE IF NOT EXISTS`) for specified model names.
+    pub fn generate_table_ddl_for(
+        &self,
+        model_names: &[&str],
+        dialect: &str,
+    ) -> Result<Vec<String>> {
+        let all_nodes = self.node_schemas();
+        let all_rels = self.relationship_schemas();
+        let (mut filtered_nodes, filtered_rels) =
+            Self::filter_models(&all_nodes, &all_rels, Some(model_names));
+        Self::add_pgq_endpoint_nodes(&all_nodes, &filtered_rels, &mut filtered_nodes);
+        crate::emitters::ddl::emit_table_ddl(&filtered_nodes, &filtered_rels, dialect)
+    }
+
+    /// Emits full SQL/PGQ schema DDL in run order (tables, constraints, indexes, property graph).
+    pub fn generate_pgq_schema_ddl(&self, graph_name: &str, dialect: &str) -> Result<Vec<String>> {
+        let nodes = self.node_schemas();
+        let rels = self.relationship_schemas();
+        let node_refs: Vec<&NodeSchema> = nodes.iter().collect();
+        let rel_refs: Vec<&RelationshipSchema> = rels.iter().collect();
+        crate::emitters::ddl::emit_pgq_schema_ddl(graph_name, &node_refs, &rel_refs, dialect)
+    }
+
+    /// Emits full SQL/PGQ schema DDL for specified model names in run order.
+    pub fn generate_pgq_schema_ddl_for(
+        &self,
+        graph_name: &str,
+        model_names: &[&str],
+        dialect: &str,
+    ) -> Result<Vec<String>> {
+        let all_nodes = self.node_schemas();
+        let all_rels = self.relationship_schemas();
+        let (mut filtered_nodes, filtered_rels) =
+            Self::filter_models(&all_nodes, &all_rels, Some(model_names));
+        Self::add_pgq_endpoint_nodes(&all_nodes, &filtered_rels, &mut filtered_nodes);
+        crate::emitters::ddl::emit_pgq_schema_ddl(
+            graph_name,
+            &filtered_nodes,
+            &filtered_rels,
+            dialect,
+        )
+    }
+
+    /// Adds the endpoint node schemas of `relationships` that are not already selected.
+    fn add_pgq_endpoint_nodes<'a>(
+        all_nodes: &'a [NodeSchema],
+        relationships: &[&RelationshipSchema],
+        selected: &mut Vec<&'a NodeSchema>,
+    ) {
+        for rel in relationships {
+            for label in rel.source_labels.iter().chain(rel.target_labels.iter()) {
+                let already = selected.iter().any(|node| {
+                    node.labels.iter().any(|node_label| node_label == label) || &node.name == label
+                });
+                if already {
+                    continue;
+                }
+                if let Some(node) = all_nodes.iter().find(|node| {
+                    node.labels.iter().any(|node_label| node_label == label) || &node.name == label
+                }) {
+                    selected.push(node);
+                }
+            }
+        }
     }
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `DROP PROPERTY GRAPH` statement.

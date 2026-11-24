@@ -7,6 +7,7 @@ use url::Url;
 
 use crate::config::{Auth, TlsMode};
 use crate::error::{NetError, Result};
+use crate::redact::{RedactedParams, redact_uri};
 
 /// Supported graph and relational wire database protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,7 +85,11 @@ impl fmt::Display for DatabaseProtocol {
 }
 
 /// Fully parsed and normalized connection URI descriptor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` and `Display` never print a password or token: credentials in
+/// [`ParsedUri::auth`], the userinfo of [`ParsedUri::raw`], and credential-named
+/// query parameters appear as `"***"`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ParsedUri {
     /// Resolved database protocol.
     pub protocol: DatabaseProtocol,
@@ -169,7 +174,7 @@ impl ParsedUri {
         let parsed = Url::parse(trimmed).map_err(|e| {
             NetError::InvalidUri(format!(
                 "Malformed URI '{}': {}",
-                redact_credentials(trimmed),
+                redact_malformed_uri(trimmed),
                 e
             ))
         })?;
@@ -301,17 +306,45 @@ impl FromStr for ParsedUri {
     }
 }
 
+impl fmt::Debug for ParsedUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParsedUri")
+            .field("protocol", &self.protocol)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("auth", &self.auth)
+            .field("database", &self.database)
+            .field("tls", &self.tls)
+            .field("params", &RedactedParams(&self.params))
+            .field("backend_hint", &self.backend_hint)
+            .field("raw", &redact_uri(&self.raw))
+            .finish()
+    }
+}
+
 impl fmt::Display for ParsedUri {
     /// Shows the URI with any user name and password replaced by `***`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{} ({}) [db: {:?}, tls: {:?}]",
-            redact_credentials(&self.raw),
+            redact_uri(&self.raw),
             self.protocol,
             self.database,
             self.tls
         )
+    }
+}
+
+/// Redacts a URI that failed to parse. `redact_uri` masks only the password and keeps the
+/// user name, but it finds the user information by the first `/`, `?` or `#`; when a password
+/// contains one of those it masks nothing, so the whole user information is hidden instead.
+fn redact_malformed_uri(uri: &str) -> String {
+    let redacted = redact_uri(uri);
+    if redacted == uri {
+        redact_uri(&redact_credentials(uri))
+    } else {
+        redacted
     }
 }
 
@@ -345,6 +378,53 @@ mod tests {
             }
             Err(other) => panic!("unexpected parse error for {uri}: {other}"),
         }
+    }
+
+    /// A value distinctive enough that an accidental leak is unmistakable.
+    const SECRET: &str = "s3cr3t-326";
+
+    #[cfg(feature = "bolt")]
+    #[test]
+    fn debug_and_display_redact_uri_userinfo() {
+        let parsed =
+            ParsedUri::parse(&format!("bolt://neo4j:{SECRET}@db:7687/movies")).expect("parse URI");
+
+        let debug = format!("{parsed:?}");
+        assert!(!debug.contains(SECRET), "{debug}");
+        assert!(debug.contains("password: \"***\""), "{debug}");
+        assert!(debug.contains("bolt://neo4j:***@db:7687/movies"), "{debug}");
+        assert!(debug.contains("host: \"db\""), "{debug}");
+
+        let display = format!("{parsed}");
+        assert!(!display.contains(SECRET), "{display}");
+        assert!(
+            display.contains("bolt://neo4j:***@db:7687/movies"),
+            "{display}"
+        );
+    }
+
+    #[cfg(feature = "bolt")]
+    #[test]
+    fn debug_redacts_sensitive_query_parameters() {
+        let parsed = ParsedUri::parse(&format!("neo4j://db:7687?token={SECRET}&database=movies"))
+            .expect("parse URI");
+        let rendered = format!("{parsed:?}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(rendered.contains("\"token\": \"***\""), "{rendered}");
+        assert!(rendered.contains("\"database\": \"movies\""), "{rendered}");
+    }
+
+    #[cfg(feature = "bolt")]
+    #[test]
+    fn malformed_uri_error_redacts_userinfo() {
+        let error = ParsedUri::parse(&format!("bolt://neo4j:{SECRET}@db:not-a-port"))
+            .expect_err("port is not a number");
+        let rendered = error.to_string();
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(
+            rendered.contains("bolt://neo4j:***@db:not-a-port"),
+            "{rendered}"
+        );
     }
 
     #[test]

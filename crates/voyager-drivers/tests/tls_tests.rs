@@ -187,7 +187,18 @@ fn uri_errors_and_display_do_not_show_credentials() {
             .to_string();
     assert!(error.contains("Malformed URI"), "{error}");
     assert!(
-        !error.contains("SECRET123") && !error.contains("user:"),
+        !error.contains("SECRET123") && error.contains("user:***@"),
+        "{error}"
+    );
+
+    // A password containing '/' ends the authority early for a URL parser, so the
+    // malformed-URI error must still hide everything up to the last '@'.
+    let error = voyager_drivers::ParsedUri::parse("bolt://neo4j:pa/SECRET9@word@db:notaport")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Malformed URI"), "{error}");
+    assert!(
+        !error.contains("SECRET9") && !error.contains("neo4j:"),
         "{error}"
     );
 

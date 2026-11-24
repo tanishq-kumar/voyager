@@ -246,21 +246,21 @@ EDGE_PROPS_HOPS_SPEC = _match_spec(
             MATCH_NODE_PROPS_SPEC,
             "sql_pgq",
             "SELECT * FROM GRAPH_TABLE (graph_table MATCH "
-            "(b IS Person WHERE b.name = $p0) COLUMNS (b.name AS n))",
+            '(b IS "Person" WHERE b.name = $p0) COLUMNS (b.name AS n))',
         ),
         (
             MATCH_PARAM_PROP_SPEC,
             "sql_pgq",
             "SELECT * FROM GRAPH_TABLE (graph_table MATCH "
-            "(b IS Person WHERE b.email = $email) COLUMNS (b.name AS n))",
+            '(b IS "Person" WHERE b.email = $email) COLUMNS (b.name AS n))',
         ),
         (
             MATCH_NODE_EDGE_PROPS_SPEC,
             "sql_pgq",
             "SELECT * FROM GRAPH_TABLE (graph_table MATCH "
-            "(a IS Person WHERE a.name = $p0) "
-            "-[r IS KNOWS WHERE r.since = $p1]-> "
-            "(b IS Person) COLUMNS (b.name AS n))",
+            '(a IS "Person" WHERE a.name = $p0) '
+            '-[r IS "KNOWS" WHERE r.since = $p1]-> '
+            '(b IS "Person") COLUMNS (b.name AS n))',
         ),
         (
             EDGE_PROPS_HOPS_SPEC,
@@ -270,8 +270,8 @@ EDGE_PROPS_HOPS_SPEC = _match_spec(
         (
             EDGE_PROPS_HOPS_SPEC,
             "sql_pgq",
-            "SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS Person) "
-            "-[r IS KNOWS WHERE r.since = $p0]->{1,3} (b IS Person) "
+            'SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS "Person") '
+            '-[r IS "KNOWS" WHERE r.since = $p0]->{1,3} (b IS "Person") '
             "COLUMNS (b.name AS n))",
         ),
         (

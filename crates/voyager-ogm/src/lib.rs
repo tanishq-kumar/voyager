@@ -40,7 +40,7 @@ pub mod visitor;
 
 pub use ast::{
     AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LabelExpression, LiteralValue,
-    NodeHandle, ProjectionItem, QueryAstArena,
+    NodeHandle, PaginationValue, ProjectionItem, QueryAstArena,
 };
 pub use bridge::{DatabaseBridge, MockDatabaseBridge, QueryResult, QuerySummary};
 pub use builder::QueryBuilder;
@@ -53,10 +53,13 @@ pub use emitters::{
     emit_node_constraint_ddl, emit_node_constraint_ddl_with_graph, emit_node_drop_constraint_ddl,
     emit_node_drop_constraint_ddl_with_graph, emit_node_drop_index_ddl,
     emit_node_drop_index_ddl_with_graph, emit_node_index_ddl, emit_node_index_ddl_with_graph,
-    emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl, emit_rel_constraint_ddl,
+    emit_node_table_ddl, emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl,
+    emit_pgq_property_graph_ddl_with_dialect, emit_pgq_schema_ddl, emit_rel_constraint_ddl,
     emit_rel_constraint_ddl_with_graph, emit_rel_drop_constraint_ddl,
     emit_rel_drop_constraint_ddl_with_graph, emit_rel_drop_index_ddl,
     emit_rel_drop_index_ddl_with_graph, emit_rel_index_ddl, emit_rel_index_ddl_with_graph,
+    emit_rel_table_ddl, emit_table_ddl, field_type_to_sql, pgq_edge_sequence_name,
+    resolve_edge_surrogate_key_name,
 };
 pub use error::{Error, ErrorCode, Result};
 pub use optimizer::{AstOptimizer, OptimizationLevel};

@@ -24,6 +24,7 @@ fn ast_node_kind(node: &AstNode) -> &'static str {
         AstNode::CountSubquery { .. } => "CountSubquery",
         AstNode::ListLiteral(_) => "ListLiteral",
         AstNode::PropertyAccess { .. } => "PropertyAccess",
+        AstNode::LabelPredicate { .. } => "LabelPredicate",
         AstNode::Literal(_) => "Literal",
         AstNode::Identifier(_) => "Identifier",
         AstNode::Parameter(_) => "Parameter",
@@ -47,6 +48,10 @@ fn ast_node_kind(node: &AstNode) -> &'static str {
 }
 
 /// Emits standardized ISO/IEC 9075-16:2023 SQL:PGQ `GRAPH_TABLE` queries.
+///
+/// Labels in `IS` patterns are double-quoted (for example `IS "User"`), so
+/// PostgreSQL 19 matches the declared label spelling exactly, the same
+/// case-exact rule Cypher uses.
 #[derive(Debug)]
 pub struct SqlPgqEmitter {
     graph_name: String,
@@ -264,6 +269,11 @@ impl SqlPgqEmitter {
                 }
                 Ok(())
             }
+            AstNode::LabelPredicate { .. } => Err(Error::UnsupportedFeature {
+                dialect: "sql_pgq".to_string(),
+                feature: "Label predicate expressions (label) - SQL:2023 PGQ GRAPH_TABLE only supports a label test inside an element pattern, not in a WHERE clause"
+                    .to_string(),
+            }),
             AstNode::Literal(lit) => {
                 let param_name = format!("p{}", self.param_counter);
                 self.param_counter += 1;
@@ -273,25 +283,46 @@ impl SqlPgqEmitter {
                 Ok(())
             }
             AstNode::BinaryExpression { left, op, right } => {
+                if matches!(op, BinaryOp::In | BinaryOp::NotIn) {
+                    return self.emit_membership(arena, *left, *op, *right, nested);
+                }
+                if *op == BinaryOp::Xor {
+                    return self.emit_xor(arena, *left, *right, nested);
+                }
                 if nested {
                     self.buffer.push('(');
                 }
+                if matches!(
+                    op,
+                    BinaryOp::Contains | BinaryOp::StartsWith | BinaryOp::EndsWith
+                ) {
+                    // Wildcard-free functions: LIKE would read `%` and `_` in the
+                    // search value as wildcards, while Cypher matches it literally.
+                    // A NULL operand still yields NULL.
+                    let left_sql = self.render_expression_to_string(arena, *left)?;
+                    let right_sql = self.render_expression_to_string(arena, *right)?;
+                    match op {
+                        BinaryOp::Contains => {
+                            self.buffer
+                                .push_str(&format!("strpos({left_sql}, {right_sql}) > 0"));
+                        }
+                        BinaryOp::StartsWith => {
+                            self.buffer
+                                .push_str(&format!("starts_with({left_sql}, {right_sql})"));
+                        }
+                        _ => {
+                            self.buffer.push_str(&format!(
+                                "right({left_sql}, length({right_sql})) = {right_sql}"
+                            ));
+                        }
+                    }
+                    if nested {
+                        self.buffer.push(')');
+                    }
+                    return Ok(());
+                }
                 self.emit_expression(arena, *left, true)?;
                 match op {
-                    BinaryOp::Contains => {
-                        self.buffer.push_str(" LIKE '%' || ");
-                        self.emit_expression(arena, *right, true)?;
-                        self.buffer.push_str(" || '%'");
-                    }
-                    BinaryOp::StartsWith => {
-                        self.buffer.push_str(" LIKE ");
-                        self.emit_expression(arena, *right, true)?;
-                        self.buffer.push_str(" || '%'");
-                    }
-                    BinaryOp::EndsWith => {
-                        self.buffer.push_str(" LIKE '%' || ");
-                        self.emit_expression(arena, *right, true)?;
-                    }
                     BinaryOp::Concat => {
                         self.buffer.push_str(" || ");
                         self.emit_expression(arena, *right, true)?;
@@ -453,6 +484,87 @@ impl SqlPgqEmitter {
         res.map(|_| expr_str)
     }
 
+    /// Emits `IN` / `NOT IN` in the spellings PostgreSQL and DuckDB accept.
+    ///
+    /// A literal list becomes `x IN (a, b)` (and `x NOT IN (a, b)`); an empty
+    /// literal list becomes `FALSE` (`TRUE` when negated), because `IN ()` is
+    /// not valid SQL and Cypher's membership in an empty list is always false.
+    /// Any other operand is a parameter or a list-valued expression, which is
+    /// rendered as `x = ANY($p)` (`x <> ALL($p)` when negated).
+    fn emit_membership(
+        &mut self,
+        arena: &QueryAstArena,
+        left: NodeHandle,
+        op: BinaryOp,
+        right: NodeHandle,
+        nested: bool,
+    ) -> Result<()> {
+        let negated = matches!(op, BinaryOp::NotIn);
+        if let AstNode::ListLiteral(items) = arena.get(right)? {
+            if items.is_empty() {
+                self.buffer.push_str(if negated { "TRUE" } else { "FALSE" });
+                return Ok(());
+            }
+            if nested {
+                self.buffer.push('(');
+            }
+            self.emit_expression(arena, left, true)?;
+            self.buffer
+                .push_str(if negated { " NOT IN (" } else { " IN (" });
+            for (i, &item) in items.iter().enumerate() {
+                if i > 0 {
+                    self.buffer.push_str(", ");
+                }
+                self.emit_expression(arena, item, true)?;
+            }
+            self.buffer.push(')');
+            if nested {
+                self.buffer.push(')');
+            }
+            return Ok(());
+        }
+
+        if nested {
+            self.buffer.push('(');
+        }
+        self.emit_expression(arena, left, true)?;
+        self.buffer
+            .push_str(if negated { " <> ALL(" } else { " = ANY(" });
+        self.emit_expression(arena, right, true)?;
+        self.buffer.push(')');
+        if nested {
+            self.buffer.push(')');
+        }
+        Ok(())
+    }
+
+    /// Lowers `XOR` to SQL, which has no XOR operator.
+    ///
+    /// `(a OR b) AND NOT (a AND b)` has the same three-valued result as Cypher
+    /// `XOR`, including when one or both operands are `NULL`. Each operand is
+    /// rendered once, so a parameter used by the expansion keeps its name and
+    /// the bridges bind it once (or once per occurrence, as they already do).
+    fn emit_xor(
+        &mut self,
+        arena: &QueryAstArena,
+        left: NodeHandle,
+        right: NodeHandle,
+        nested: bool,
+    ) -> Result<()> {
+        let left_sql = self.render_expression_to_string(arena, left)?;
+        let right_sql = self.render_expression_to_string(arena, right)?;
+        if nested {
+            self.buffer.push('(');
+        }
+        self.buffer.push_str(&format!(
+            "(({left_sql}) OR ({right_sql})) AND NOT (({left_sql}) AND ({right_sql}))"
+        ));
+        if nested {
+            self.buffer.push(')');
+        }
+        Ok(())
+    }
+
     fn emit_where(&mut self, arena: &QueryAstArena, handle: NodeHandle) -> Result<()> {
         let node = arena.get(handle)?;
         if let AstNode::WhereClause { root_predicate } = node {
@@ -503,34 +615,134 @@ impl SqlPgqEmitter {
                     variable: Some(v2), ..
                 }),
             ) => v1 == v2,
+            (
+                Ok(AstNode::BinaryExpression {
+                    left: l1,
+                    op: op1,
+                    right: r1,
+                }),
+                Ok(AstNode::BinaryExpression {
+                    left: l2,
+                    op: op2,
+                    right: r2,
+                }),
+            ) => {
+                op1 == op2
+                    && self.expressions_match(arena, *l1, *l2)
+                    && self.expressions_match(arena, *r1, *r2)
+            }
+            (
+                Ok(AstNode::UnaryExpression {
+                    op: op1,
+                    operand: o1,
+                }),
+                Ok(AstNode::UnaryExpression {
+                    op: op2,
+                    operand: o2,
+                }),
+            ) => op1 == op2 && self.expressions_match(arena, *o1, *o2),
+            (Ok(AstNode::Literal(lit1)), Ok(AstNode::Literal(lit2))) => lit1 == lit2,
+            (Ok(AstNode::Parameter(p1)), Ok(AstNode::Parameter(p2))) => p1 == p2,
             _ => false,
         }
     }
 
-    fn resolve_projected_column_name(
+    fn resolve_returned_column_name(
         &self,
         arena: &QueryAstArena,
         expr_handle: NodeHandle,
         projections: &[ProjectionItem],
-    ) -> String {
+    ) -> Option<String> {
         for proj in projections {
             if self.expressions_match(arena, proj.expression, expr_handle) {
                 if let Some(alias) = &proj.alias {
-                    return alias.clone();
+                    return Some(alias.clone());
                 } else if let Ok(AstNode::PropertyAccess { property, .. }) =
                     arena.get(proj.expression)
                 {
-                    return property.clone();
+                    return Some(property.clone());
+                } else if let Ok(AstNode::Identifier(id)) = arena.get(proj.expression) {
+                    return Some(id.clone());
+                }
+            }
+        }
+        for proj in projections {
+            if let Some(func) = proj.aggregation {
+                if let Ok(AstNode::FunctionCall { name, arguments }) = arena.get(expr_handle) {
+                    let func_name_matches = match func {
+                        AggregationFunc::Count => name.eq_ignore_ascii_case("count"),
+                        AggregationFunc::CountDistinct => name.eq_ignore_ascii_case("count"),
+                        AggregationFunc::Sum => name.eq_ignore_ascii_case("sum"),
+                        AggregationFunc::Avg => name.eq_ignore_ascii_case("avg"),
+                        AggregationFunc::Min => name.eq_ignore_ascii_case("min"),
+                        AggregationFunc::Max => name.eq_ignore_ascii_case("max"),
+                        AggregationFunc::Collect => name.eq_ignore_ascii_case("collect"),
+                    };
+                    if arguments.len() == 1
+                        && func_name_matches
+                        && self.expressions_match(arena, proj.expression, arguments[0])
+                    {
+                        if let Some(alias) = &proj.alias {
+                            return Some(alias.clone());
+                        } else {
+                            let base = self.get_expr_leaf_name(arena, proj.expression);
+                            return Some(format!("{func:?}({base})").to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(AstNode::Identifier(id)) = arena.get(expr_handle) {
+            for proj in projections {
+                if let Some(alias) = &proj.alias {
+                    if alias == id {
+                        return Some(alias.clone());
+                    }
+                } else if let Ok(AstNode::PropertyAccess { property, .. }) =
+                    arena.get(proj.expression)
+                {
+                    if property == id {
+                        return Some(property.clone());
+                    }
+                } else if let Ok(AstNode::Identifier(proj_id)) = arena.get(proj.expression) {
+                    if proj_id == id {
+                        return Some(proj_id.clone());
+                    }
                 }
             }
         }
         if let Ok(AstNode::PropertyAccess { property, .. }) = arena.get(expr_handle) {
-            return property.clone();
+            for proj in projections {
+                if let Some(alias) = &proj.alias {
+                    if alias == property {
+                        return Some(alias.clone());
+                    }
+                }
+            }
         }
-        if let Ok(AstNode::Identifier(id)) = arena.get(expr_handle) {
-            return id.clone();
+        None
+    }
+
+    fn get_projection_column_name(
+        &self,
+        arena: &QueryAstArena,
+        proj: &ProjectionItem,
+        idx: usize,
+    ) -> String {
+        if let Some(alias) = &proj.alias {
+            alias.clone()
+        } else if let Ok(AstNode::PropertyAccess { property, .. }) = arena.get(proj.expression) {
+            property.clone()
+        } else if let Ok(AstNode::Identifier(id)) = arena.get(proj.expression) {
+            id.clone()
+        } else {
+            let leaf = self.get_expr_leaf_name(arena, proj.expression);
+            if !leaf.is_empty() {
+                leaf
+            } else {
+                format!("col_{idx}")
+            }
         }
-        String::new()
     }
 
     fn get_expr_leaf_name(&self, arena: &QueryAstArena, expr_handle: NodeHandle) -> String {
@@ -643,7 +855,7 @@ impl SqlPgqEmitter {
 
     fn validate_edge_label_expression(expr: &LabelExpression) -> Result<()> {
         if expr.is_simple_disjunction() {
-            // Single type or plain disjunction: -[r IS KNOWS]-> or -[r IS KNOWS | HATES]->
+            // Single type or plain disjunction: -[r IS "KNOWS"]-> or -[r IS "KNOWS" | "HATES"]->
             Ok(())
         } else {
             Err(Error::UnsupportedFeature {
@@ -853,8 +1065,8 @@ impl AstVisitor for SqlPgqEmitter {
                     distinct = *return_distinct;
                     projections_list = projections.clone();
                     order_by_clause = Some(order_by);
-                    limit_clause = *limit;
-                    skip_clause = *skip;
+                    limit_clause = limit.clone();
+                    skip_clause = skip.clone();
                 }
             }
 
@@ -865,6 +1077,13 @@ impl AstVisitor for SqlPgqEmitter {
             };
 
             self.validate_matches(arena, matches)?;
+
+            if projections_list.is_empty() {
+                return Err(Error::EmissionError(
+                    "SQL:PGQ GRAPH_TABLE queries require at least one projection; add a RETURN clause with at least one field or expression."
+                        .to_string(),
+                ));
+            }
 
             for proj in &projections_list {
                 if proj.aggregation.is_none() {
@@ -880,6 +1099,68 @@ impl AstVisitor for SqlPgqEmitter {
             }
 
             let has_aggregates = projections_list.iter().any(|p| p.aggregation.is_some());
+
+            let mut hidden_columns: Vec<(NodeHandle, String)> = Vec::new();
+            let mut order_by_compiled: Vec<(String, bool)> = Vec::new();
+
+            if let Some(order_by) = order_by_clause
+                && !order_by.is_empty()
+            {
+                let mut returned_names: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for (idx, proj) in projections_list.iter().enumerate() {
+                    returned_names.insert(self.get_projection_column_name(arena, proj, idx));
+                }
+
+                let mut alias_counter = 0;
+                for (order_expr, is_asc) in order_by {
+                    if let Some(col_name) =
+                        self.resolve_returned_column_name(arena, *order_expr, &projections_list)
+                    {
+                        order_by_compiled.push((col_name, *is_asc));
+                    } else {
+                        if let Some(var) = self.is_whole_entity_expression(arena, *order_expr)? {
+                            return Err(Error::UnsupportedFeature {
+                                dialect: "sql_pgq".to_string(),
+                                feature: format!(
+                                    "Whole entity column projection ('{var}') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables"
+                                ),
+                            });
+                        }
+                        let existing = hidden_columns
+                            .iter()
+                            .find(|(expr, _)| self.expressions_match(arena, *expr, *order_expr));
+                        let alias = if let Some((_, alias)) = existing {
+                            alias.clone()
+                        } else {
+                            loop {
+                                let candidate = format!("_ord_{alias_counter}");
+                                alias_counter += 1;
+                                if !returned_names.contains(&candidate) {
+                                    hidden_columns.push((*order_expr, candidate.clone()));
+                                    break candidate;
+                                }
+                            }
+                        };
+                        order_by_compiled.push((alias, *is_asc));
+                    }
+                }
+            }
+
+            if !hidden_columns.is_empty() {
+                if distinct {
+                    return Err(Error::UnsupportedFeature {
+                        dialect: "sql_pgq".to_string(),
+                        feature: "ORDER BY on non-projected expressions with DISTINCT - SQL/PGQ requires ordering expressions under DISTINCT to be projected columns to preserve DISTINCT semantics".to_string(),
+                    });
+                }
+                if has_aggregates {
+                    return Err(Error::UnsupportedFeature {
+                        dialect: "sql_pgq".to_string(),
+                        feature: "ORDER BY on unprojected expressions with aggregation - SQL/PGQ requires ordering expressions in aggregating queries to appear in the projection or GROUP BY".to_string(),
+                    });
+                }
+            }
 
             if has_aggregates {
                 let mut inner_columns: Vec<(String, String)> = Vec::new();
@@ -986,6 +1267,40 @@ impl AstVisitor for SqlPgqEmitter {
                         self.buffer.push_str(key);
                     }
                 }
+            } else if !hidden_columns.is_empty() {
+                self.buffer.push_str(prefix);
+                self.buffer.push_str("SELECT ");
+                for (i, proj) in projections_list.iter().enumerate() {
+                    if i > 0 {
+                        self.buffer.push_str(", ");
+                    }
+                    self.buffer
+                        .push_str(&self.get_projection_column_name(arena, proj, i));
+                }
+                self.buffer.push_str(" FROM GRAPH_TABLE (");
+                self.buffer.push_str(&self.graph_name);
+                self.buffer.push_str(" MATCH ");
+
+                self.emit_matches_and_where(arena, matches)?;
+
+                self.buffer.push_str(" COLUMNS (");
+                for (i, proj) in projections_list.iter().enumerate() {
+                    if i > 0 {
+                        self.buffer.push_str(", ");
+                    }
+                    self.emit_expression(arena, proj.expression, false)?;
+                    if let Some(alias) = &proj.alias {
+                        self.buffer.push_str(" AS ");
+                        self.buffer.push_str(alias);
+                    }
+                }
+                for (expr, alias) in &hidden_columns {
+                    self.buffer.push_str(", ");
+                    self.emit_expression(arena, *expr, false)?;
+                    self.buffer.push_str(" AS ");
+                    self.buffer.push_str(alias);
+                }
+                self.buffer.push_str("))");
             } else {
                 self.buffer.push_str(prefix);
                 self.buffer.push_str(if distinct {
@@ -998,36 +1313,21 @@ impl AstVisitor for SqlPgqEmitter {
 
                 self.emit_matches_and_where(arena, matches)?;
 
-                if projections_list.is_empty() {
-                    return Err(Error::EmissionError(
-                        "SQL:PGQ GRAPH_TABLE queries require at least one projection; add a RETURN clause with at least one field or expression."
-                            .to_string(),
-                    ));
-                }
-
                 self.emit_columns(arena, &projections_list)?;
                 self.buffer.push(')');
             }
 
-            if let Some(order_by) = order_by_clause
-                && !order_by.is_empty()
-            {
+            if !order_by_compiled.is_empty() {
                 self.buffer.push_str(" ORDER BY ");
-                for (i, (order_expr, is_asc)) in order_by.iter().enumerate() {
+                for (i, (col, is_asc)) in order_by_compiled.iter().enumerate() {
                     if i > 0 {
                         self.buffer.push_str(", ");
                     }
-                    let resolved =
-                        self.resolve_projected_column_name(arena, *order_expr, &projections_list);
-                    if !resolved.is_empty() {
-                        self.buffer.push_str(&resolved);
-                    } else {
-                        self.emit_expression(arena, *order_expr, false)?;
-                    }
+                    self.buffer.push_str(col);
                     if *is_asc {
-                        self.buffer.push_str(" ASC");
+                        self.buffer.push_str(" ASC NULLS LAST");
                     } else {
-                        self.buffer.push_str(" DESC");
+                        self.buffer.push_str(" DESC NULLS FIRST");
                     }
                 }
             }
@@ -1061,6 +1361,34 @@ impl AstVisitor for SqlPgqEmitter {
 mod tests {
     use super::*;
     use crate::builder::QueryBuilder;
+
+    fn string_predicate_statement(op: BinaryOp, value: &str) -> (String, String) {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .where_property("p", "name", op, value)
+            .field("p", "name", None::<String>);
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("g");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+        let p0 = compiled.parameters.get("p0").cloned().unwrap();
+        (compiled.statement, format!("{p0:?}"))
+    }
+
+    #[test]
+    fn sql_pgq_string_predicates_avoid_like_wildcards() {
+        let cases = [
+            (BinaryOp::StartsWith, "starts_with(p.name, $p0)"),
+            (BinaryOp::Contains, "strpos(p.name, $p0) > 0"),
+            (BinaryOp::EndsWith, "right(p.name, length($p0)) = $p0"),
+        ];
+        for (op, expected) in cases {
+            let (statement, param) = string_predicate_statement(op, "10%_\\x");
+            assert!(statement.contains(expected), "{statement}");
+            assert!(!statement.contains("LIKE"), "{statement}");
+            assert!(param.contains("10%_"), "{param}");
+        }
+    }
 
     #[test]
     fn sql_pgq_rejects_multi_label_node_patterns() {
@@ -1121,7 +1449,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS Person) COLUMNS (p.name AS actor))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS \"Person\") COLUMNS (p.name AS actor))"
         );
     }
 
@@ -1143,7 +1471,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS Person) -[r IS KNOWS | HATES]-> (b IS Person) COLUMNS (a.name, b.name))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\" | \"HATES\"]-> (b IS \"Person\") COLUMNS (a.name, b.name))"
         );
     }
 
@@ -1163,7 +1491,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (n IS Person | Company) COLUMNS (n.name))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (n IS \"Person\" | \"Company\") COLUMNS (n.name))"
         );
     }
 
@@ -1190,6 +1518,156 @@ mod tests {
         }
     }
 
+    fn compile_in_predicate(
+        right: NodeHandle,
+        op: BinaryOp,
+        mut builder: QueryBuilder,
+    ) -> CompiledQuery {
+        let name = builder.prop("p", "name");
+        let predicate = builder.binary_expr(name, op, right);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .where_predicate(predicate)
+            .field("p", "name", None::<String>);
+        let (arena, root) = builder.build();
+        SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap()
+    }
+
+    #[test]
+    fn sql_pgq_in_literal_list_uses_parenthesised_values() {
+        let mut builder = QueryBuilder::new();
+        let alice = builder.literal(LiteralValue::String("Alice".into()));
+        let bob = builder.literal(LiteralValue::String("Bob".into()));
+        let list = builder.list_literal(vec![alice, bob]);
+        let compiled = compile_in_predicate(list, BinaryOp::In, builder);
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") WHERE p.name IN ($p0, $p1) COLUMNS (p.name))"
+        );
+        assert_eq!(
+            compiled.parameters.get("p0"),
+            Some(&LiteralValue::String("Alice".into()))
+        );
+        assert_eq!(
+            compiled.parameters.get("p1"),
+            Some(&LiteralValue::String("Bob".into()))
+        );
+    }
+
+    #[test]
+    fn sql_pgq_not_in_literal_list_uses_parenthesised_values() {
+        let mut builder = QueryBuilder::new();
+        let alice = builder.literal(LiteralValue::String("Alice".into()));
+        let list = builder.list_literal(vec![alice]);
+        let compiled = compile_in_predicate(list, BinaryOp::NotIn, builder);
+
+        assert!(
+            compiled
+                .statement
+                .contains("WHERE p.name NOT IN ($p0) COLUMNS"),
+            "statement was {}",
+            compiled.statement
+        );
+    }
+
+    #[test]
+    fn sql_pgq_in_empty_literal_list_is_a_constant() {
+        let mut builder = QueryBuilder::new();
+        let list = builder.list_literal(vec![]);
+        let compiled = compile_in_predicate(list, BinaryOp::In, builder);
+        assert!(
+            compiled.statement.contains("WHERE FALSE COLUMNS"),
+            "statement was {}",
+            compiled.statement
+        );
+        assert!(compiled.parameters.is_empty());
+
+        let mut builder = QueryBuilder::new();
+        let list = builder.list_literal(vec![]);
+        let compiled = compile_in_predicate(list, BinaryOp::NotIn, builder);
+        assert!(
+            compiled.statement.contains("WHERE TRUE COLUMNS"),
+            "statement was {}",
+            compiled.statement
+        );
+        assert!(compiled.parameters.is_empty());
+    }
+
+    #[test]
+    fn sql_pgq_in_parameter_uses_any_and_not_in_uses_all() {
+        for (op, expected) in [
+            (BinaryOp::In, "p.name = ANY($names)"),
+            (BinaryOp::NotIn, "p.name <> ALL($names)"),
+        ] {
+            let mut builder = QueryBuilder::new();
+            let param = builder.param("names");
+            let compiled = compile_in_predicate(param, op, builder);
+            assert!(
+                compiled.statement.contains(expected),
+                "statement was {}",
+                compiled.statement
+            );
+            assert!(compiled.parameters.is_empty());
+        }
+    }
+
+    #[test]
+    fn sql_pgq_not_over_in_literal_list_stays_negated() {
+        let mut builder = QueryBuilder::new();
+        let name = builder.prop("p", "name");
+        let alice = builder.literal(LiteralValue::String("Alice".into()));
+        let list = builder.list_literal(vec![alice]);
+        let predicate = builder.binary_expr(name, BinaryOp::In, list);
+        let predicate = builder.unary_expr(UnaryOp::Not, predicate);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .where_predicate(predicate)
+            .field("p", "name", None::<String>);
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert!(
+            compiled
+                .statement
+                .contains("WHERE NOT (p.name IN ($p0)) COLUMNS"),
+            "statement was {}",
+            compiled.statement
+        );
+    }
+
+    #[test]
+    fn sql_pgq_xor_lowers_without_the_keyword_and_reuses_parameters() {
+        let mut builder = QueryBuilder::new();
+        let age = builder.prop("p", "age");
+        let min = builder.param("min_age");
+        let lower = builder.binary_expr(age, BinaryOp::Gt, min);
+        let city = builder.prop("p", "city");
+        let paris = builder.literal(LiteralValue::String("Paris".into()));
+        let upper = builder.binary_expr(city, BinaryOp::Eq, paris);
+        let xor = builder.binary_expr(lower, BinaryOp::Xor, upper);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .where_predicate(xor)
+            .field("p", "name", None::<String>);
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert!(
+            compiled.statement.contains(
+                "WHERE ((p.age > $min_age) OR (p.city = $p0)) AND NOT ((p.age > $min_age) AND (p.city = $p0))"
+            ),
+            "statement was {}",
+            compiled.statement
+        );
+        assert!(!compiled.statement.contains(" XOR "));
+        assert_eq!(compiled.parameters.len(), 1);
+        assert_eq!(
+            compiled.parameters.get("p0"),
+            Some(&LiteralValue::String("Paris".into()))
+        );
+    }
+
     #[test]
     fn sql_pgq_rejects_edge_label_expressions_with_negation_or_conjunction() {
         let mut builder = QueryBuilder::new();
@@ -1214,6 +1692,187 @@ mod tests {
                         "Relationship type expression with negation/conjunction/grouping"
                     )
                 );
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_pgq_order_by_expression_exposed_in_columns() {
+        let mut builder = QueryBuilder::new();
+        let age = builder.prop("p", "age");
+        let one = builder.literal(LiteralValue::Int64(1));
+        let age_plus_one = builder.binary_expr(age, BinaryOp::Add, one);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .field("p", "age", None::<String>)
+            .order_by(age_plus_one, true);
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name, age FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
+        );
+        assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
+    }
+
+    #[test]
+    fn sql_pgq_order_by_non_returned_property_exposed_in_columns() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .order_by_asc("p", "age");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
+        );
+        assert!(compiled.parameters.is_empty());
+    }
+
+    #[test]
+    fn sql_pgq_order_by_returned_property_stays_select_star() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .field("p", "age", None::<String>)
+            .order_by_asc("p", "age");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY age ASC NULLS LAST"
+        );
+        assert!(compiled.parameters.is_empty());
+    }
+
+    #[test]
+    fn sql_pgq_order_by_multiple_mixed_keys() {
+        let mut builder = QueryBuilder::new();
+        let age = builder.prop("p", "age");
+        let one = builder.literal(LiteralValue::Int64(1));
+        let age_plus_one = builder.binary_expr(age, BinaryOp::Add, one);
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .field("p", "city", None::<String>)
+            .order_by_asc("p", "age")
+            .order_by_desc("p", "city")
+            .order_by(age_plus_one, true);
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name, city FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) ORDER BY _ord_0 ASC NULLS LAST, city DESC NULLS FIRST, _ord_1 ASC NULLS LAST"
+        );
+        assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
+    }
+
+    #[test]
+    fn sql_pgq_order_by_duplicate_non_returned_key_reuses_alias() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .order_by_asc("p", "age")
+            .order_by_desc("p", "age");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST, _ord_0 DESC NULLS FIRST"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_order_by_asc_emits_nulls_last() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .order_by_asc("p", "name");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name ASC NULLS LAST"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_order_by_desc_emits_nulls_first() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .order_by_desc("p", "name");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name DESC NULLS FIRST"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_order_by_distinct_with_non_returned_key_rejected() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .distinct(true)
+            .order_by_asc("p", "age");
+
+        let (arena, root) = builder.build();
+        let err = SqlPgqEmitter::new("g")
+            .visit_query(&arena, root)
+            .unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "sql_pgq");
+                assert!(feature.contains("ORDER BY on non-projected expressions with DISTINCT"));
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_pgq_order_by_aggregation_with_non_returned_key_rejected() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "city", None::<String>)
+            .select_property_aggregate("p", "name", AggregationFunc::Count, Some("total"))
+            .order_by_asc("p", "age");
+
+        let (arena, root) = builder.build();
+        let err = SqlPgqEmitter::new("g")
+            .visit_query(&arena, root)
+            .unwrap_err();
+
+        match err {
+            Error::UnsupportedFeature { dialect, feature } => {
+                assert_eq!(dialect, "sql_pgq");
+                assert!(feature.contains("ORDER BY on unprojected expressions with aggregation"));
             }
             other => panic!("Expected UnsupportedFeature, got {other:?}"),
         }

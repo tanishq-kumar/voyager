@@ -301,7 +301,7 @@ fn test_sql_pgq_rich_expressions() {
     let compiled = pgq_emitter.visit_query(&arena, root).unwrap();
     assert_eq!(
         compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (social_graph MATCH (p IS Person) COLUMNS (UPPER(p.name) AS upper_name))"
+        "SELECT * FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") COLUMNS (UPPER(p.name) AS upper_name))"
     );
 }
 
@@ -336,6 +336,6 @@ fn test_spatial_distance_functions() {
     let compiled_pgq = pgq_emitter.visit_query(&arena, root).unwrap();
     assert_eq!(
         compiled_pgq.statement,
-        "SELECT * FROM GRAPH_TABLE (places_graph MATCH (p IS Place) COLUMNS (ST_Distance(p.location, p.destination) AS dist))"
+        "SELECT * FROM GRAPH_TABLE (places_graph MATCH (p IS \"Place\") COLUMNS (ST_Distance(p.location, p.destination) AS dist))"
     );
 }

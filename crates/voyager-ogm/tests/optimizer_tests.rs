@@ -627,7 +627,7 @@ fn test_optimizer_sql_pgq_hoisted_predicate_preserved() {
     assert!(
         res_pgq
             .statement
-            .contains("(p IS Person WHERE p.name = $p0)"),
+            .contains("(p IS \"Person\" WHERE p.name = $p0)"),
         "Hoisted predicate must be preserved in SqlPgqEmitter: {}",
         res_pgq.statement
     );

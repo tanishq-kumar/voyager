@@ -1,9 +1,10 @@
-"""Model schema export: a plain-dict graph schema and per-model JSON Schema.
+"""Model schema export, live schema introspection and per-model JSON Schema.
 
 ``export_schema`` describes declared ``Node`` and ``Relationship`` models as a
 JSON-serialisable dict built from the same native registry entries that drive
-DDL generation. ``model_json_schema`` (exposed as ``Model.to_json_schema()``)
-emits a JSON Schema draft 2020-12 document for the properties of one model.
+DDL generation. ``introspect_schema`` reads the same structure from a live
+database. ``model_json_schema`` (exposed as ``Model.to_json_schema()``) emits a
+JSON Schema draft 2020-12 document for the properties of one model.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import copy
 import datetime
 import enum
+import json
 import math
 import types
 import typing
@@ -30,6 +32,10 @@ from voyager_ogm.types import Point, to_iso_duration
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 _NO_JSON = object()
+
+#: Default number of entities sampled per label or relationship type by
+#: ``introspect_schema`` (matches the Rust and CLI default).
+DEFAULT_SAMPLE_SIZE = 1000
 
 # Keyword names used by ``export_schema`` for Field value constraints.
 _CONSTRAINT_ATTRS = ("pattern", "ge", "gt", "le", "lt", "min_length", "max_length", "choices")
@@ -190,10 +196,11 @@ def export_schema(models: Iterable[type[Node] | type[Relationship]]) -> dict[str
     Returns:
         ``{"nodes": [...], "relationships": [...]}``. Each node has ``name``,
         ``model`` (module-qualified identity), ``labels``, ``description``,
-        ``primary_key`` and ``properties``; each relationship has ``name``,
-        ``model``, ``type``, ``source_labels``, ``target_labels`` (empty when
-        the model declares no endpoints), ``directed``, ``description`` and
-        ``properties``.
+        ``primary_key``, ``properties`` and ``relationship_attributes`` (the
+        declarative navigation attributes, or an empty list); each relationship
+        has ``name``, ``model``, ``type``, ``source_labels``,
+        ``target_labels`` (empty when the model declares no endpoints),
+        ``directed``, ``description`` and ``properties``.
 
     Raises:
         TypeError: If ``models`` is a single class or contains anything other
@@ -233,9 +240,84 @@ def export_schema(models: Iterable[type[Node] | type[Relationship]]) -> dict[str
                     "description": entry["description"],
                     "primary_key": entry["primary_key"],
                     "properties": _export_properties(model, entry),
+                    "relationship_attributes": list(entry.get("relationship_declarations", [])),
                 }
             )
     return {"nodes": nodes, "relationships": rels}
+
+
+def _introspection_uri(source: Any) -> str:
+    """Returns the connection URI of a URI string, ``NativeClient`` or session."""
+    if isinstance(source, str):
+        return source
+    native = getattr(source, "_native_client", None)
+    for candidate in (native, source):
+        uri = getattr(candidate, "uri", None) if candidate is not None else None
+        if isinstance(uri, str) and "://" in uri:
+            return uri
+    raise TypeError(
+        "introspect_schema expects a connection URI, a NativeClient, or a Session or "
+        f"AsyncSession that uses the native backend; got {type(source).__name__}. "
+        "Pass the connection URI for sessions built on a Python driver bridge."
+    )
+
+
+def introspect_schema(source: Any, *, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict[str, Any]:
+    """Reads a live database's graph schema in the shape of ``export_schema``.
+
+    Introspection runs in Rust (``voyager_drivers::introspect``), the same code
+    as ``voyager introspect --format json``, on its own short-lived connection;
+    the GIL is released while it runs. Supported engines: Neo4j 5.13+ and
+    Memgraph (``bolt://``), FalkorDB (``redis://`` / ``falkordb://``, the graph
+    named in the URI) and PostgreSQL 19 SQL/PGQ property graphs
+    (``postgresql://...?graph=<name>``).
+
+    ``nodes`` and ``relationships`` have the keys of ``export_schema``, so the
+    two can be compared. Keys the database cannot know are ``None``: ``model``,
+    ``description``, ``attribute``, ``has_default``, ``constraints`` (the
+    ``Field`` value constraints) and a node's ``relationship_attributes``;
+    ``default`` is absent. ``primary_key`` is
+    ``None`` unless the engine has a key constraint (Neo4j Enterprise node key,
+    PostgreSQL primary key). ``nullable`` is ``False`` only with an existence
+    (``NOT NULL``) or key constraint. ``indexed`` / ``index_type`` describe a
+    single-property index that does not back a constraint. Property ``type``
+    comes from a type constraint or declared column type, otherwise from the
+    values of at most ``sample_size`` entities per label or relationship type
+    (``ANY`` for mixed values, ``None`` when no value was seen); relationship
+    endpoints are sampled the same way except on PostgreSQL, where they are
+    declared. The extra top-level keys ``constraints``, ``indexes`` and
+    ``source`` list the catalog as the engine reports it.
+
+    Args:
+        source: A connection URI (credentials in the userinfo), a
+            ``NativeClient``, or a ``Session`` / ``AsyncSession`` using the
+            native backend.
+        sample_size: Maximum entities sampled per label or relationship type;
+            ``0`` disables sampling.
+
+    Returns:
+        ``{"nodes": [...], "relationships": [...], "constraints": [...],
+        "indexes": [...], "source": {...}}``.
+
+    Raises:
+        TypeError: If ``source`` is not a URI, ``NativeClient`` or native session.
+        ValueError: If ``sample_size`` is negative.
+        VoyagerError: On connection or catalog query failures, and with code
+            ``UNSUPPORTED_FEATURE`` for Apache AGE and DuckDB.
+
+    Example:
+        >>> live = introspect_schema("bolt://neo4j:secret@localhost:7687")
+        >>> [node["name"] for node in live["nodes"]]
+        ['Movie', 'Person']
+    """
+    if isinstance(sample_size, bool) or not isinstance(sample_size, int) or sample_size < 0:
+        raise ValueError(f"sample_size must be a non-negative integer, got {sample_size!r}")
+    from voyager_ogm._voyager_rs import introspect_schema_json
+
+    result: dict[str, Any] = json.loads(
+        introspect_schema_json(_introspection_uri(source), sample_size)
+    )
+    return result
 
 
 def _type_schema(annotation: Any) -> dict[str, Any]:

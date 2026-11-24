@@ -327,7 +327,7 @@ def test_postgres_sync_bridge_simulation():
 
     # 1. Test GRAPH_TABLE query with parameters ($p0 -> %s binding, Issue #226)
     pgq_stmt = (
-        "SELECT * FROM GRAPH_TABLE (g MATCH (p IS Person) WHERE p.city = $p0 COLUMNS (p.name))"
+        'SELECT * FROM GRAPH_TABLE (g MATCH (p IS "Person") WHERE p.city = $p0 COLUMNS (p.name))'
     )
     records = session.execute(pgq_stmt, {"p0": "London"})
     assert len(records) == 2
