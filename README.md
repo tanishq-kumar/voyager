@@ -450,6 +450,8 @@ Voyager is verified against 6 database backends:
 | **FalkorDB**         | openCypher                                              | Redis RESP / Bolt        |
 | **PostgreSQL**       | Relational / Recursive SQL (14–18)<br>SQL:2023 PGQ (19+) | PostgreSQL Wire Protocol |
 
+> **FalkorDB graph names:** one FalkorDB server holds several independent named graphs, and Voyager runs every query against one of them. Name it in the URI path (`redis://localhost:6379/social`), with `?graph=social`, or with `graph_name="social"`. Without a name, both the native client and the `falkordb` driver bridge use `voyager_graph`.
+
 > **Neo4j Community Edition:** uniqueness constraints are supported, but existence (`IS NOT NULL`) and key constraints require Neo4j Enterprise Edition. `create_constraints()` and `apply_schema()` apply every statement the server accepts, then raise one `VoyagerError` with code `SCHEMA_ERROR`; its `skipped` attribute lists the Enterprise-only constraint statements that were not applied. The accepted constraints (and any indexes applied by `apply_schema()`) stay in place.
 
 ---
