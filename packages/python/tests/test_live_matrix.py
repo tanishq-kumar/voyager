@@ -1097,11 +1097,11 @@ class TestDuckDbLiveMatrix:
                 ('u2', 'u3', 2022);
 
             CREATE PROPERTY GRAPH duck_matrix_graph
-              VERTEX TABLES (users LABEL MatrixUser)
+              VERTEX TABLES (users LABEL "MatrixUser")
               EDGE TABLES (
                 follows SOURCE KEY (from_id) REFERENCES users (user_id)
                         DESTINATION KEY (to_id) REFERENCES users (user_id)
-                LABEL MATRIX_FOLLOWS
+                LABEL "MATRIX_FOLLOWS"
               );
             """
         )
@@ -1243,16 +1243,16 @@ class TestDuckDbLiveMatrix:
                 (3, 20, 2015, 'Director');
             CREATE PROPERTY GRAPH all_scenarios_graph
             VERTEX TABLES (
-                Person LABEL Person,
-                Company LABEL Company
+                Person LABEL "Person",
+                Company LABEL "Company"
             )
             EDGE TABLES (
                 Knows SOURCE KEY (src) REFERENCES Person (id)
                       DESTINATION KEY (dst) REFERENCES Person (id)
-                      LABEL KNOWS,
+                      LABEL "KNOWS",
                 WorksAt SOURCE KEY (person_id) REFERENCES Person (id)
                         DESTINATION KEY (company_id) REFERENCES Company (id)
-                        LABEL WORKS_AT
+                        LABEL "WORKS_AT"
             );
             """
         )
@@ -1538,12 +1538,12 @@ class TestPostgres19LiveMatrix:
                     (1, 2, 2021),
                     (1, 3, 2023);
                 CREATE PROPERTY GRAPH live_pgq_graph
-                    VERTEX TABLES (users LABEL MatrixUser PROPERTIES (username, age, city))
+                    VERTEX TABLES (users LABEL "MatrixUser" PROPERTIES (username, age, city))
                     EDGE TABLES (
                         follows
                         SOURCE KEY (from_id) REFERENCES users (id)
                         DESTINATION KEY (to_id) REFERENCES users (id)
-                        LABEL MATRIX_FOLLOWS
+                        LABEL "MATRIX_FOLLOWS"
                         PROPERTIES (since)
                     );
             """)
@@ -1614,7 +1614,7 @@ class TestPostgres19LiveMatrix:
                     ('fn_1', 'Alice Smith', 'London', 36, true),
                     ('fn_2', 'Bob Jones', 'Berlin', 28, false);
                 CREATE PROPERTY GRAPH live_fn_pgq_graph
-                    VERTEX TABLES (fn_users LABEL MatrixUser PROPERTIES (username, city, age, active));
+                    VERTEX TABLES (fn_users LABEL "MatrixUser" PROPERTIES (username, city, age, active));
                 """
             )
 

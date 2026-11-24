@@ -364,7 +364,7 @@ def test_live_postgres19_pgq_pagination_parameters() -> None:
             )
             cur.execute(
                 f"CREATE PROPERTY GRAPH {graph_name} VERTEX TABLES "
-                "(feat321_pagination_users LABEL PaginationUser "
+                '(feat321_pagination_users LABEL "PaginationUser" '
                 "PROPERTIES (username))"
             )
         bridge = PostgresBridge(conn)
@@ -399,7 +399,7 @@ def test_live_duckpgq_pagination_parameters() -> None:
             "INSERT INTO feat321_pagination_users VALUES "
             "('1','a'),('2','b'),('3','c'),('4','d');"
             f"CREATE PROPERTY GRAPH {graph_name} VERTEX TABLES "
-            "(feat321_pagination_users LABEL PaginationUser);"
+            '(feat321_pagination_users LABEL "PaginationUser");'
         )
         bridge = DuckDbBridge(conn)
         compiled = compile_query_from_spec(_graph_table_spec(), "duckpgq", graph_name=graph_name)

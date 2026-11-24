@@ -114,7 +114,7 @@ def duckpgq_bridge():
     connection.execute("LOAD duckpgq;")
     connection.execute(f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT);")
     connection.executemany(f"INSERT INTO {PERSON} VALUES (?, ?);", ROWS)
-    connection.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL Person);")
+    connection.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "Person");')
     yield DuckDbBridge(connection)
     connection.close()
 
@@ -159,7 +159,7 @@ class TestPostgres19StringPredicates:
             cur.execute(f"DROP TABLE IF EXISTS {PERSON} CASCADE;")
             cur.execute(f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT);")
             cur.executemany(f"INSERT INTO {PERSON} VALUES (%s, %s);", ROWS)
-            cur.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL Person);")
+            cur.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "Person");')
         yield conn
         with conn.cursor() as cur:
             cur.execute(f"DROP PROPERTY GRAPH IF EXISTS {GRAPH} CASCADE;")

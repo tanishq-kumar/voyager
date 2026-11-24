@@ -495,18 +495,18 @@ def test_live_postgres19_supported_forms() -> None:
                     INSERT INTO live_pg19_fix_286_hates VALUES (1, 3);
                     CREATE PROPERTY GRAPH live_pg19_fix_286_graph
                         VERTEX TABLES (
-                            live_pg19_fix_286_person LABEL Person,
-                            live_pg19_fix_286_company LABEL Company
+                            live_pg19_fix_286_person LABEL "Person",
+                            live_pg19_fix_286_company LABEL "Company"
                         )
                         EDGE TABLES (
                             live_pg19_fix_286_knows
                                 SOURCE KEY (src_id) REFERENCES live_pg19_fix_286_person (id)
                                 DESTINATION KEY (dst_id) REFERENCES live_pg19_fix_286_person (id)
-                                LABEL KNOWS,
+                                LABEL "KNOWS",
                             live_pg19_fix_286_hates
                                 SOURCE KEY (src_id) REFERENCES live_pg19_fix_286_person (id)
                                 DESTINATION KEY (dst_id) REFERENCES live_pg19_fix_286_person (id)
-                                LABEL HATES
+                                LABEL "HATES"
                         );
                     """
                 )

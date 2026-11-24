@@ -1325,9 +1325,9 @@ impl AstVisitor for SqlPgqEmitter {
                     }
                     self.buffer.push_str(col);
                     if *is_asc {
-                        self.buffer.push_str(" ASC");
+                        self.buffer.push_str(" ASC NULLS LAST");
                     } else {
-                        self.buffer.push_str(" DESC");
+                        self.buffer.push_str(" DESC NULLS FIRST");
                     }
                 }
             }
@@ -1714,7 +1714,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name, age FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC"
+            "SELECT name, age FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
         );
         assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
     }
@@ -1732,7 +1732,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC"
+            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
         );
         assert!(compiled.parameters.is_empty());
     }
@@ -1751,7 +1751,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY age ASC"
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY age ASC NULLS LAST"
         );
         assert!(compiled.parameters.is_empty());
     }
@@ -1775,7 +1775,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name, city FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) ORDER BY _ord_0 ASC, city DESC, _ord_1 ASC"
+            "SELECT name, city FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) ORDER BY _ord_0 ASC NULLS LAST, city DESC NULLS FIRST, _ord_1 ASC NULLS LAST"
         );
         assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
     }
@@ -1794,7 +1794,41 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC, _ord_0 DESC"
+            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST, _ord_0 DESC NULLS FIRST"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_order_by_asc_emits_nulls_last() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .order_by_asc("p", "name");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name ASC NULLS LAST"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_order_by_desc_emits_nulls_first() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .field("p", "name", None::<String>)
+            .order_by_desc("p", "name");
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name DESC NULLS FIRST"
         );
     }
 

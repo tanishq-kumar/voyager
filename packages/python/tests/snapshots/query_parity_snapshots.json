@@ -589,7 +589,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY age DESC, name ASC LIMIT 25 OFFSET 10",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY age DESC NULLS FIRST, name ASC NULLS LAST LIMIT 25 OFFSET 10",
       "status": "ok"
     }
   },
