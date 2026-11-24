@@ -52,6 +52,10 @@ logger = logging.getLogger("voyager_ogm")
 
 _T = TypeVar("_T")
 
+# Distinguishes an annotated attribute that is absent from the class body from
+# one explicitly assigned ``None``: ``None`` is a real default (#333).
+_MISSING_CLASS_ATTR = object()
+
 # Thread-local alias counter for deterministic auto-aliasing
 _alias_state = threading.local()
 
@@ -1558,7 +1562,7 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
         if isinstance(type_hint, str) and type_hint in _BUILTIN_TYPES:
             type_hint = _BUILTIN_TYPES[type_hint]
 
-        existing_val = getattr(cls, attr_name, None)
+        existing_val = getattr(cls, attr_name, _MISSING_CLASS_ATTR)
         if isinstance(existing_val, RelationshipDescriptor):
             existing_val._set_owner(cls, attr_name)
             continue
@@ -1574,7 +1578,7 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
             fields_map[attr_name] = existing_val
         elif not inspect.isroutine(existing_val):
             field_desc: Field[Any] = Field(
-                default=existing_val if existing_val is not None else ...,
+                default=... if existing_val is _MISSING_CLASS_ATTR else existing_val,
                 name=attr_name,
                 type_annotation=type_hint,
             )

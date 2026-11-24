@@ -106,6 +106,12 @@ def _prepare_batch_records(
     are never mutated. Defaults are applied through the same model-level helper
     used by instance construction, keeping one source of truth.
 
+    A ``None`` default is a real default (#333), but graph engines remove a
+    property when it is assigned null, so a value that came only from a ``None``
+    default is dropped from the record and the create-only set instead of being
+    sent as an explicit null. A caller-supplied ``None`` is still explicit and
+    keeps its existing write behaviour.
+
     Args:
         raw_batches: Chunked input records.
         fields: Declared field descriptors for the target model.
@@ -129,6 +135,10 @@ def _prepare_batch_records(
             create_only = set(filled)
             if marker:
                 create_only.update(k for k in marker if k in enriched)
+            for name in list(create_only):
+                if enriched.get(name) is None:
+                    del enriched[name]
+                    create_only.discard(name)
             batch.append((serialize_param_value(enriched), frozenset(create_only)))
         prepared.append(batch)
     return prepared
@@ -154,6 +164,56 @@ def _prepare_batches(
         [record for record, _ in chunk]
         for chunk in _prepare_batch_records(raw_batches, fields, defaulted_fields)
     ]
+
+
+def _bulk_create_properties(
+    fields: dict[str, Any],
+    batches: list[list[dict[str, Any]]],
+) -> list[str]:
+    """Returns the properties to assign on a bulk CREATE statement.
+
+    Every declared property is kept, matching the previous behaviour, except a
+    field whose declared default is ``None`` when no record supplies a concrete
+    value. Such a value means "absent" rather than an explicit null (#333), so
+    omitting it leaves the statement and parameters smaller.
+
+    Args:
+        fields: Declared field descriptors keyed by attribute name.
+        batches: Prepared records after defaults were applied.
+
+    Returns:
+        Property names in declaration order.
+    """
+    properties = list(fields.keys())
+    for name in list(properties):
+        field = fields.get(name)
+        if field is None or not field.has_default or field.default_factory is not None:
+            continue
+        if field.default is not None:
+            continue
+        if any(record.get(name) is not None for batch in batches for record in batch):
+            continue
+        properties.remove(name)
+    return properties
+
+
+def _prune_bulk_create_records(
+    batches: list[list[dict[str, Any]]],
+    fields: dict[str, Any],
+    properties: list[str],
+) -> None:
+    """Removes declared fields that the bulk CREATE statement will not assign.
+
+    This is the ``None``-default case from :func:`_bulk_create_properties`; the
+    values would otherwise sit unused in every batch parameter.
+    """
+    assigned = set(properties)
+    for name in fields:
+        if name in assigned:
+            continue
+        for chunk in batches:
+            for record in chunk:
+                record.pop(name, None)
 
 
 @dataclass
@@ -241,14 +301,15 @@ def create_bulk_create_plan(
     labels = getattr(model, "__labels__", [model.__name__])
     label = labels[0] if labels else model.__name__
     fields = getattr(model, "_schema_fields", getattr(model, "__fields__", {}))
-    properties = list(fields.keys())
 
     raw_batches = list(chunk_dataframe(data, batch_size=batch_size))
     batches = _prepare_batches(raw_batches, fields)
     total_records = sum(len(b) for b in batches)
 
+    properties = _bulk_create_properties(fields, batches) if fields else []
     if not properties and batches and batches[0]:
         properties = list(batches[0][0].keys())
+    _prune_bulk_create_records(batches, fields, properties)
 
     compiled = _rs_compile_bulk_create(
         label=label,
@@ -284,12 +345,15 @@ def create_bulk_merge_plan(
     Only properties a record actually supplies are written to ``ON CREATE SET``
     and ``ON MATCH SET``, so merging a partial row preserves properties the row
     omits. A property present in a record with the value ``None`` is supplied
-    explicitly and therefore clears the stored property.
+    explicitly and therefore clears the stored property. A value that came only
+    from a declared ``None`` default is not supplied at all: it is not part of
+    the MERGE key and is not written on either path (#333), because a graph
+    database removes a property assigned null.
 
     Fields that were filled from a declared default are create-only: they are
     assigned in ``ON CREATE SET`` and never in ``ON MATCH SET``, so an existing
     node keeps its stored value. A default-filled field is still a supplied
-    property for the row that defaulted it.
+    property for the row that defaulted it, unless the default is ``None``.
 
     Records are grouped by both their supplied property names (excluding
     ``key_field``) and their default-filled property names, so one record
@@ -461,10 +525,11 @@ def create_bulk_create_rel_plan(
             props = []
     else:
         fields = rel_fields
-        props = list(fields.keys())
+        props = _bulk_create_properties(fields, batches) if fields else []
         if not props and batches and batches[0]:
             skip_keys = {expected_from, expected_to}
             props = [k for k in batches[0][0].keys() if k not in skip_keys]
+        _prune_bulk_create_records(batches, fields, props)
 
     compiled = _rs_compile_bulk_create_rel(
         rel_type=rel_type,
