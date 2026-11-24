@@ -570,6 +570,11 @@ impl VectorIndexConfig {
     }
 }
 
+#[cfg(feature = "serde")]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Metadata descriptor for a single entity property field.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -580,6 +585,22 @@ pub struct FieldDescriptor {
     pub field_type: FieldType,
     /// Whether this field accepts null values.
     pub nullable: bool,
+    /// Whether nullability was explicitly requested rather than inferred.
+    ///
+    /// `Some(false)` is what makes a field eligible for an executable existence
+    /// constraint; inferred non-nullability only affects declarative schema output.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub nullable_explicit: Option<bool>,
+    /// Whether non-nullability was inferred from a type annotation.
+    ///
+    /// This is a persistence marker only: it lets a restored snapshot keep
+    /// inference distinct from a pre-inference explicit `nullable=False`.
+    #[doc(hidden)]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
+    pub nullable_inferred: bool,
     /// Whether this field serves as the entity's primary key.
     pub primary_key: bool,
     /// Whether this field has a unique constraint.
@@ -607,6 +628,8 @@ impl FieldDescriptor {
             name: name.into(),
             field_type,
             nullable: true,
+            nullable_explicit: None,
+            nullable_inferred: false,
             primary_key: false,
             unique: false,
             indexed: false,
@@ -637,10 +660,24 @@ impl FieldDescriptor {
         self
     }
 
-    /// Sets nullability on this field.
+    /// Sets nullability on this field and records it as explicit.
+    ///
+    /// The explicit flag keeps Rust-defined `.nullable(false)` fields in the
+    /// executable existence-constraint DDL, exactly as before inference existed.
     pub fn nullable(mut self, nullable: bool) -> Self {
         self.nullable = nullable;
+        self.nullable_explicit = Some(nullable);
+        self.nullable_inferred = false;
         self
+    }
+
+    /// Whether the field is eligible for an executable existence constraint.
+    ///
+    /// Only primary keys and explicitly non-nullable fields qualify. Inferred
+    /// non-nullability is declarative-only so Neo4j Community never receives an
+    /// Enterprise-only constraint for every plain-annotated property.
+    pub fn emits_existence_constraint(&self) -> bool {
+        !self.nullable && (self.primary_key || self.nullable_explicit == Some(false))
     }
 
     /// Marks this field as indexed with the default B-Tree index.
@@ -1512,10 +1549,25 @@ impl SchemaRegistry {
     }
 
     /// Deserializes and restores the registry state from a JSON string.
+    ///
+    /// Snapshots written before `nullable_explicit` existed recorded every
+    /// non-nullable field as `"nullable": false`, whether the user wrote
+    /// `nullable=False` or (after inference) the annotation implied it. Treating
+    /// those fields as explicit keeps their generated DDL byte-identical.
     #[cfg(feature = "serde")]
     pub fn from_json(&self, json_str: &str) -> Result<()> {
-        let snap: SchemaSnapshot =
+        let mut snap: SchemaSnapshot =
             serde_json::from_str(json_str).map_err(|e| Error::SchemaError(e.to_string()))?;
+        for node in snap.nodes.values_mut() {
+            for field in node.fields.values_mut() {
+                normalize_restored_nullability(field);
+            }
+        }
+        for rel in snap.relationships.values_mut() {
+            for field in rel.fields.values_mut() {
+                normalize_restored_nullability(field);
+            }
+        }
         self.restore(snap)
     }
 
@@ -2388,6 +2440,17 @@ where
         }
     }
     best.map(|(s, _)| s.to_string())
+}
+
+#[cfg(feature = "serde")]
+fn normalize_restored_nullability(field: &mut FieldDescriptor) {
+    if field.nullable_explicit.is_none()
+        && !field.nullable
+        && !field.primary_key
+        && !field.nullable_inferred
+    {
+        field.nullable_explicit = Some(false);
+    }
 }
 
 /// Point-in-time snapshot of all registered node and relationship schemas.
