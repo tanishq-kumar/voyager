@@ -31,8 +31,24 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
         run: |
           set -euo pipefail
+
+          # A run whose branch has moved on was cancelled because a newer run for the
+          # same branch replaced it (CI cancels in-progress runs per branch). Re-running
+          # it would test an old commit and, sharing the concurrency group, cancel the
+          # newer run. Runs from forks and from tags are never skipped here.
+          if [[ "${HEAD_REPO}" == "${REPO}" ]] && current_sha="$(gh api "repos/${REPO}/git/ref/heads/${HEAD_BRANCH}" \
+            --jq '.object.sha' 2>/dev/null)"; then
+            if [[ "${current_sha}" != "${HEAD_SHA}" ]]; then
+              echo "Run ${RUN_ID} is for ${HEAD_SHA}, but ${HEAD_BRANCH} is now at ${current_sha}; not re-running a superseded run."
+              exit 0
+            fi
+          fi
+
           jobs_json="$(gh api --paginate \
             "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${ATTEMPT}/jobs?per_page=100" \
             --jq '.jobs[]')"
