@@ -234,7 +234,7 @@ def test_compile_graph_table_matching_query1():
     assert "(s IS Student) -[e IS enrolled_in]-> (sch IS School)" in stmt
     assert "WHERE s.age >= $p0" in stmt
     assert "COLUMNS (s.name AS s_name, sch.name AS sch_name, e.year AS enroll_year)" in stmt
-    assert "ORDER BY s_name ASC" in stmt
+    assert "ORDER BY s_name ASC NULLS LAST" in stmt
     assert compiled.parameters == {"p0": 20}
 
 
@@ -276,7 +276,7 @@ def test_compile_variable_length_paths_query():
     assert "(p1 IS Person) -[k IS knows]->{1,3} (p2 IS Person)" in stmt
     assert "WHERE p1.name = $p0" in stmt
     assert "COLUMNS (p1.name AS start_person, p2.name AS reachable_person)" in stmt
-    assert "ORDER BY reachable_person ASC" in stmt
+    assert "ORDER BY reachable_person ASC NULLS LAST" in stmt
     assert compiled.parameters == {"p0": "Alice"}
 
 
@@ -296,7 +296,7 @@ def test_compile_aggregations_grouping_query():
     )
     assert "FROM GRAPH_TABLE (corp_pg MATCH (e IS Employee)" in stmt
     assert "GROUP BY dept" in stmt
-    assert "ORDER BY dept ASC" in stmt
+    assert "ORDER BY dept ASC NULLS LAST" in stmt
 
 
 def test_translate_pgq_to_duckpgq_ddl():

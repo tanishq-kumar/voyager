@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Query Spec v1 Rejects Dropped or Misattached Clauses (#187)**: **Breaking** for specs that were previously accepted and compiled to a different query. Root `distinct`/`order_by`/`skip`/`offset`/`limit` without a non-empty root `projections` list now raise `INVALID_SPEC` at the first offending key instead of being dropped or folded into the last `WITH`; a query that would end in `WITH` (with clauses, no root projections, no mutations) raises at `/projections`; `with_clauses[i].projections: []` raises at `/with_clauses/i/projections`; and `matches[i].paths: []` raises at `/matches/i/paths`. Mutations-only specs still compile.
 
 ### Fixed
+- **SQL/PGQ ORDER BY Null Placement (#322)**: SQL/PGQ now emits `ASC NULLS LAST` and `DESC NULLS FIRST` for ORDER BY keys, ensuring DuckPGQ ordering matches Cypher and PostgreSQL 19 on keys that contain null values.
 - **Query Spec: `ORDER BY` and `WHERE` under `DISTINCT` or an aggregation may repeat a projected expression**, as Neo4j allows.
   - Accepted now: `RETURN DISTINCT p.city ORDER BY p.city`, `ORDER BY p.city + 1`, `RETURN COUNT(p) AS c ORDER BY count(p)`, and the same forms in a `WITH`'s own `order_by` and `where`.
   - Still rejected: a variable that is not projected, such as `ORDER BY p.age`.

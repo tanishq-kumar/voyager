@@ -36,7 +36,7 @@ fn test_pgq_single_node_and_where_conformance() {
         res.statement
             .contains("COLUMNS (p.name AS name, p.age AS age)")
     );
-    assert!(res.statement.contains("ORDER BY age ASC"));
+    assert!(res.statement.contains("ORDER BY age ASC NULLS LAST"));
     assert_eq!(res.parameters.get("p0"), Some(&LiteralValue::Int64(30)));
 }
 

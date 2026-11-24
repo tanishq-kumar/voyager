@@ -63,11 +63,11 @@
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n, p.age AS a)) ORDER BY a DESC, n ASC",
+      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n, p.age AS a)) ORDER BY a DESC NULLS FIRST, n ASC NULLS LAST",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n, p.age AS a)) ORDER BY a DESC, n ASC",
+      "statement": "SELECT DISTINCT * FROM GRAPH_TABLE (graph_table MATCH (p IS Person) COLUMNS (p.name AS n, p.age AS a)) ORDER BY a DESC NULLS FIRST, n ASC NULLS LAST",
       "parameters": {}
     }
   }

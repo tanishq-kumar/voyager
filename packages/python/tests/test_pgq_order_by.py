@@ -100,7 +100,7 @@ def test_order_by_expression_compiles_inside_columns(dialect: str) -> None:
     )
     expected = (
         f"SELECT name, age FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
-        "COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC"
+        "COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
     )
     assert compiled.statement == expected
     assert compiled.parameters == {"p0": 1}
@@ -112,7 +112,7 @@ def test_order_by_non_returned_property_compiles_inside_columns(dialect: str) ->
     compiled = Query.match(p).return_(p.name).order_by(p.age).compile(dialect, graph_name=GRAPH)
     expected = (
         f"SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
-        "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC"
+        "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
     )
     assert compiled.statement == expected
     assert compiled.parameters == {}
@@ -126,7 +126,7 @@ def test_order_by_returned_property_stays_select_star(dialect: str) -> None:
     )
     expected = (
         f"SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
-        "COLUMNS (p.name, p.age)) ORDER BY age ASC"
+        "COLUMNS (p.name, p.age)) ORDER BY age ASC NULLS LAST"
     )
     assert compiled.statement == expected
     assert compiled.parameters == {}
@@ -146,7 +146,7 @@ def test_order_by_multiple_mixed_keys_compiles(dialect: str) -> None:
     expected = (
         f"SELECT name, city FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
         "COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) "
-        "ORDER BY _ord_0 ASC, city DESC, _ord_1 ASC"
+        "ORDER BY _ord_0 ASC NULLS LAST, city DESC NULLS FIRST, _ord_1 ASC NULLS LAST"
     )
     assert compiled.statement == expected
     assert compiled.parameters == {"p0": 1}
@@ -164,7 +164,7 @@ def test_order_by_duplicate_key_reuses_alias(dialect: str) -> None:
     )
     expected = (
         f"SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS {LABEL}) "
-        "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC, _ord_0 DESC"
+        "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST, _ord_0 DESC NULLS FIRST"
     )
     assert compiled.statement == expected
 
@@ -244,7 +244,7 @@ def test_duckpgq_order_by_expression(duckpgq_bridge) -> None:
     assert [r["name"] for r in rows_asc] == ["Bob", "Charlie", "Alice", "Eve", "David"]
     assert [r["age"] for r in rows_asc] == [25, 25, 30, 40, None]
 
-    # DESC: DuckDB orders NULLs last by default: 40 (Eve), 30 (Alice), 25 (Bob, Charlie), None (David)
+    # DESC: DuckDB with NULLS FIRST orders NULLs first: None (David), 40 (Eve), 30 (Alice), 25 (Bob, Charlie)
     compiled_desc = (
         Query.match(p)
         .return_(p.name, p.age)
@@ -254,7 +254,8 @@ def test_duckpgq_order_by_expression(duckpgq_bridge) -> None:
     )
     rows_desc = duckpgq_bridge.execute(compiled_desc.statement, compiled_desc.parameters)
     assert list(rows_desc[0].keys()) == ["name", "age"]
-    assert [r["name"] for r in rows_desc] == ["Eve", "Alice", "Bob", "Charlie", "David"]
+    assert [r["name"] for r in rows_desc] == ["David", "Eve", "Alice", "Bob", "Charlie"]
+    assert [r["age"] for r in rows_desc] == [None, 40, 30, 25, 25]
 
 
 @pytest.mark.skipif(not HAS_DUCKPGQ, reason="DuckPGQ extension is not available")
@@ -272,7 +273,7 @@ def test_duckpgq_order_by_non_returned_property(duckpgq_bridge) -> None:
     assert list(rows_asc[0].keys()) == ["name"]
     assert [r["name"] for r in rows_asc] == ["Bob", "Charlie", "Alice", "Eve", "David"]
 
-    # DESC: DuckDB orders NULLs last by default
+    # DESC: DuckDB with NULLS FIRST orders NULLs first
     compiled_desc = (
         Query.match(p)
         .return_(p.name)
@@ -282,7 +283,7 @@ def test_duckpgq_order_by_non_returned_property(duckpgq_bridge) -> None:
     )
     rows_desc = duckpgq_bridge.execute(compiled_desc.statement, compiled_desc.parameters)
     assert list(rows_desc[0].keys()) == ["name"]
-    assert [r["name"] for r in rows_desc] == ["Eve", "Alice", "Bob", "Charlie", "David"]
+    assert [r["name"] for r in rows_desc] == ["David", "Eve", "Alice", "Bob", "Charlie"]
 
 
 @pytest.mark.skipif(not HAS_DUCKPGQ, reason="DuckPGQ extension is not available")
@@ -485,3 +486,103 @@ class TestLivePostgres19AndNeo4jParity:
             ).data()
 
         assert pg_rows == neo_res
+
+    @pytest.mark.skipif(not HAS_DUCKPGQ, reason="DuckPGQ extension is not available")
+    def test_live_322_null_ordering_parity_neo4j_pg19_duckpgq(self, setup_and_teardown) -> None:
+        """Issue #322: ORDER BY on a key with nulls matches Cypher across Neo4j, PG19, and DuckPGQ."""
+        pg_conn, neo_driver = setup_and_teardown
+        pg_bridge = PostgresBridge(pg_conn)
+
+        duck_conn = duckdb.connect()
+        duck_conn.execute("LOAD duckpgq;")
+        duck_conn.execute(
+            f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
+        )
+        duck_conn.executemany(f"INSERT INTO {PERSON} VALUES (?, ?, ?, ?);", ROWS)
+        duck_conn.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL {LABEL});")
+        duck_bridge = DuckDbBridge(duck_conn)
+
+        try:
+            p = Person(alias="p")
+
+            # 1. ASC without LIMIT (nulls last)
+            q_asc = Query.match(p).return_(p.name, p.age).order_by(p.age).order_by(p.name)
+            pgq_asc = q_asc.compile("sql_pgq", graph_name=GRAPH)
+            duck_asc = q_asc.compile("duckpgq", graph_name=GRAPH)
+
+            pg_res_asc = pg_bridge.execute(pgq_asc.statement, pgq_asc.parameters)
+            duck_res_asc = duck_bridge.execute(duck_asc.statement, duck_asc.parameters)
+            with neo_driver.session() as s:
+                neo_res_asc = s.run(
+                    f"MATCH (p:{LABEL}) RETURN p.name AS name, p.age AS age ORDER BY p.age ASC, p.name ASC"
+                ).data()
+
+            assert pg_res_asc == neo_res_asc
+            assert duck_res_asc == neo_res_asc
+            assert [r["name"] for r in duck_res_asc] == ["Bob", "Charlie", "Alice", "Eve", "David"]
+
+            # 2. ASC with LIMIT (nulls last)
+            q_asc_lim = (
+                Query.match(p).return_(p.name, p.age).order_by(p.age).order_by(p.name).limit(3)
+            )
+            pgq_asc_lim = q_asc_lim.compile("sql_pgq", graph_name=GRAPH)
+            duck_asc_lim = q_asc_lim.compile("duckpgq", graph_name=GRAPH)
+
+            pg_res_asc_lim = pg_bridge.execute(pgq_asc_lim.statement, pgq_asc_lim.parameters)
+            duck_res_asc_lim = duck_bridge.execute(duck_asc_lim.statement, duck_asc_lim.parameters)
+            with neo_driver.session() as s:
+                neo_res_asc_lim = s.run(
+                    f"MATCH (p:{LABEL}) RETURN p.name AS name, p.age AS age ORDER BY p.age ASC, p.name ASC LIMIT 3"
+                ).data()
+
+            assert pg_res_asc_lim == neo_res_asc_lim
+            assert duck_res_asc_lim == neo_res_asc_lim
+            assert [r["name"] for r in duck_res_asc_lim] == ["Bob", "Charlie", "Alice"]
+
+            # 3. DESC without LIMIT (nulls first)
+            q_desc = (
+                Query.match(p)
+                .return_(p.name, p.age)
+                .order_by(p.age, ascending=False)
+                .order_by(p.name)
+            )
+            pgq_desc = q_desc.compile("sql_pgq", graph_name=GRAPH)
+            duck_desc = q_desc.compile("duckpgq", graph_name=GRAPH)
+
+            pg_res_desc = pg_bridge.execute(pgq_desc.statement, pgq_desc.parameters)
+            duck_res_desc = duck_bridge.execute(duck_desc.statement, duck_desc.parameters)
+            with neo_driver.session() as s:
+                neo_res_desc = s.run(
+                    f"MATCH (p:{LABEL}) RETURN p.name AS name, p.age AS age ORDER BY p.age DESC, p.name ASC"
+                ).data()
+
+            assert pg_res_desc == neo_res_desc
+            assert duck_res_desc == neo_res_desc
+            assert [r["name"] for r in duck_res_desc] == ["David", "Eve", "Alice", "Bob", "Charlie"]
+
+            # 4. DESC with LIMIT (nulls first)
+            q_desc_lim = (
+                Query.match(p)
+                .return_(p.name, p.age)
+                .order_by(p.age, ascending=False)
+                .order_by(p.name)
+                .limit(3)
+            )
+            pgq_desc_lim = q_desc_lim.compile("sql_pgq", graph_name=GRAPH)
+            duck_desc_lim = q_desc_lim.compile("duckpgq", graph_name=GRAPH)
+
+            pg_res_desc_lim = pg_bridge.execute(pgq_desc_lim.statement, pgq_desc_lim.parameters)
+            duck_res_desc_lim = duck_bridge.execute(
+                duck_desc_lim.statement, duck_desc_lim.parameters
+            )
+            with neo_driver.session() as s:
+                neo_res_desc_lim = s.run(
+                    f"MATCH (p:{LABEL}) RETURN p.name AS name, p.age AS age ORDER BY p.age DESC, p.name ASC"
+                    " LIMIT 3"
+                ).data()
+
+            assert pg_res_desc_lim == neo_res_desc_lim
+            assert duck_res_desc_lim == neo_res_desc_lim
+            assert [r["name"] for r in duck_res_desc_lim] == ["David", "Eve", "Alice"]
+        finally:
+            duck_conn.close()
