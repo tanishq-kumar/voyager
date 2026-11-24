@@ -197,8 +197,8 @@ Python). `nodes` and `relationships` have the shape of the Python
 `export_schema(models)` result, so a model export and a live database can be
 compared key by key. `constraints`, `indexes` and `source` (engine, version,
 edition, database, sample size) are added. Keys a database cannot know are
-`null`: `model`, `description`, `attribute`, `has_default` and `constraints`
-(the `Field` value constraints).
+`null`: `model`, `description`, `attribute`, `has_default`, `constraints`
+(the `Field` value constraints) and a node's `relationship_attributes`.
 
 How properties are filled in:
 

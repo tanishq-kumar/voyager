@@ -274,8 +274,9 @@ def introspect_schema(source: Any, *, sample_size: int = DEFAULT_SAMPLE_SIZE) ->
 
     ``nodes`` and ``relationships`` have the keys of ``export_schema``, so the
     two can be compared. Keys the database cannot know are ``None``: ``model``,
-    ``description``, ``attribute``, ``has_default`` and ``constraints`` (the
-    ``Field`` value constraints); ``default`` is absent. ``primary_key`` is
+    ``description``, ``attribute``, ``has_default``, ``constraints`` (the
+    ``Field`` value constraints) and a node's ``relationship_attributes``;
+    ``default`` is absent. ``primary_key`` is
     ``None`` unless the engine has a key constraint (Neo4j Enterprise node key,
     PostgreSQL primary key). ``nullable`` is ``False`` only with an existence
     (``NOT NULL``) or key constraint. ``indexed`` / ``index_type`` describe a

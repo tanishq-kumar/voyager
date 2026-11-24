@@ -67,7 +67,15 @@ def test_connection_failures_raise_voyager_error() -> None:
 def test_export_keys_that_live_introspection_mirrors() -> None:
     """Pins the export keys the live schema reproduces (see the live tests)."""
     exported = export_schema([IntroUnitPerson])["nodes"][0]
-    assert list(exported) == ["name", "model", "labels", "description", "primary_key", "properties"]
+    assert list(exported) == [
+        "name",
+        "model",
+        "labels",
+        "description",
+        "primary_key",
+        "properties",
+        "relationship_attributes",
+    ]
     prop = exported["properties"]["email"]
     assert set(prop) >= {
         "name",
