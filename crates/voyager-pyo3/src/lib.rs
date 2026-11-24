@@ -4473,6 +4473,16 @@ fn parse_field_descriptor(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<FieldD
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(!primary_key);
 
+        let nullable_explicit = match dict.get_item("nullable_explicit")? {
+            Some(value) => value.extract::<Option<bool>>().unwrap_or(None),
+            // Dictionaries written before inference only had `nullable`; a value
+            // there was always an explicit request.
+            None => dict
+                .get_item("nullable")?
+                .and_then(|v| v.extract::<bool>().ok()),
+        };
+        let nullable_inferred = nullable_explicit.is_none() && !nullable && !primary_key;
+
         let mut indexed = dict
             .get_item("indexed")?
             .or(dict.get_item("index")?)
@@ -4584,6 +4594,8 @@ fn parse_field_descriptor(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<FieldD
             name: field_name,
             field_type,
             nullable,
+            nullable_explicit,
+            nullable_inferred,
             primary_key,
             unique,
             indexed,
@@ -4640,6 +4652,19 @@ fn parse_field_descriptor(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<FieldD
         } else {
             !primary_key
         };
+
+        let nullable_explicit = if obj.hasattr("nullable_explicit")? {
+            obj.getattr("nullable_explicit")?
+                .extract::<Option<bool>>()
+                .unwrap_or(None)
+        } else if obj.hasattr("nullable")? {
+            // Objects written before inference only had `nullable`; a value
+            // there was always an explicit request.
+            obj.getattr("nullable")?.extract::<bool>().ok()
+        } else {
+            None
+        };
+        let nullable_inferred = nullable_explicit.is_none() && !nullable && !primary_key;
 
         let mut index_type = if obj.hasattr("index_type")? {
             let it = obj.getattr("index_type")?;
@@ -4754,6 +4779,8 @@ fn parse_field_descriptor(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<FieldD
             name: field_name,
             field_type,
             nullable,
+            nullable_explicit,
+            nullable_inferred,
             primary_key,
             unique,
             indexed,

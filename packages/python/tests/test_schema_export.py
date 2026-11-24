@@ -206,7 +206,7 @@ class TestExportSchema:
         assert props["score"]["type"] == "FLOAT"
         assert props["active"]["type"] == "BOOLEAN"
         assert props["tags"]["type"] == "LIST"
-        assert props["age"]["nullable"] is True
+        assert props["age"]["nullable"] is False
 
     def test_optional_annotations_use_inner_type(self) -> None:
         class ExpOptional(Node):
@@ -323,8 +323,9 @@ class TestToJsonSchema:
         assert ExpActedIn.to_json_schema()["description"] == "Who acted in which movie."
 
     def test_required_rule(self) -> None:
-        # Required = not nullable and no default (plain or factory).
-        assert ExpPerson.to_json_schema()["required"] == ["id", "name"]
+        # Required = resolved not nullable and no default (plain or factory).
+        # `str`/`int` annotations are inferred non-nullable; `... | None` stays optional.
+        assert ExpPerson.to_json_schema()["required"] == ["id", "name", "email", "age"]
         assert ExpMovie.to_json_schema()["required"] == ["title"]
         assert ExpActedIn.to_json_schema()["required"] == ["role"]
         assert "required" not in ExpKnows.to_json_schema()
@@ -333,16 +334,16 @@ class TestToJsonSchema:
         props = ExpPerson.to_json_schema()["properties"]
         assert props["id"]["type"] == "string"
         assert props["name"]["type"] == "string"
-        assert props["age"]["type"] == ["integer", "null"]
-        assert props["score"]["type"] == ["number", "null"]
-        assert props["active"]["type"] == ["boolean", "null"]
+        assert props["age"]["type"] == "integer"
+        assert props["score"]["type"] == "number"
+        assert props["active"]["type"] == "boolean"
         assert props["nickname"]["type"] == ["string", "null"]
-        assert props["tags"]["type"] == ["array", "null"]
+        assert props["tags"]["type"] == "array"
         assert props["tags"]["items"] == {"type": "string"}
-        assert props["attrs"]["type"] == ["object", "null"]
+        assert props["attrs"]["type"] == "object"
         assert props["attrs"]["additionalProperties"] == {"type": "integer"}
         assert props["born"] == {
-            "type": ["string", "null"],
+            "type": "string",
             "format": "date",
             "default": "2000-01-02",
         }
@@ -358,7 +359,7 @@ class TestToJsonSchema:
     def test_enum_literal_and_vector(self) -> None:
         props = ExpMovie.to_json_schema()["properties"]
         assert props["color"] == {"enum": ["red", "blue", None]}
-        assert props["rating"] == {"enum": ["G", "PG", "R", None], "default": "G"}
+        assert props["rating"] == {"enum": ["G", "PG", "R"], "default": "G"}
         assert props["embedding"]["items"] == {"type": "number"}
         assert props["embedding"]["minItems"] == 3
         assert props["embedding"]["maxItems"] == 3
@@ -383,13 +384,13 @@ class TestToJsonSchema:
         assert props["age"]["maximum"] == 150
         assert props["score"]["exclusiveMinimum"] == 0.0
         assert props["score"]["exclusiveMaximum"] == 1.0
-        assert props["status"]["enum"] == ["active", "inactive", None]
+        assert props["status"]["enum"] == ["active", "inactive"]
         assert props["tags"]["maxItems"] == 3
         assert "maxLength" not in props["tags"]
         assert ExpDecorated.to_json_schema()["properties"]["code"]["pattern"] == r"^[A-Z]{3}$"
 
     def test_valid_instances(self) -> None:
-        assert _valid(ExpPerson, {"id": "p1", "name": "Ann"})
+        assert _valid(ExpPerson, {"id": "p1", "name": "Ann", "email": "ann@example.com", "age": 1})
         full = {
             "id": "p1",
             "name": "Ann",

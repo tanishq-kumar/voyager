@@ -92,6 +92,32 @@ fn test_cypher_node_ddl_and_drop() {
 }
 
 #[test]
+fn test_inferred_non_nullability_does_not_emit_existence_constraint() {
+    // Python inference records `nullable: false` without `nullable_explicit`;
+    // only the latter (or a primary key) may emit an executable constraint.
+    let mut inferred = FieldDescriptor::new("name", FieldType::String);
+    inferred.nullable = false;
+    assert_eq!(inferred.nullable_explicit, None);
+    assert!(!inferred.emits_existence_constraint());
+
+    let node = NodeSchema::new("Inferred", vec!["Inferred".to_string()]).with_field(inferred);
+    let ddl = emit_cypher_node_ddl(&node, false);
+    assert!(!ddl.iter().any(|s| s.contains("not_null")));
+
+    // The Rust builder records the explicit request and keeps today's DDL.
+    let explicit = FieldDescriptor::new("name", FieldType::String).nullable(false);
+    assert!(explicit.emits_existence_constraint());
+    let explicit_node =
+        NodeSchema::new("Explicit", vec!["Explicit".to_string()]).with_field(explicit);
+    let explicit_ddl = emit_cypher_node_ddl(&explicit_node, false);
+    assert!(
+        explicit_ddl
+            .iter()
+            .any(|s| s.contains("REQUIRE n.name IS NOT NULL"))
+    );
+}
+
+#[test]
 fn test_cypher_rel_ddl_and_drop() {
     let rel = create_test_rel_schema();
 
