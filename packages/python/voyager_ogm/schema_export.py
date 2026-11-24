@@ -196,10 +196,11 @@ def export_schema(models: Iterable[type[Node] | type[Relationship]]) -> dict[str
     Returns:
         ``{"nodes": [...], "relationships": [...]}``. Each node has ``name``,
         ``model`` (module-qualified identity), ``labels``, ``description``,
-        ``primary_key`` and ``properties``; each relationship has ``name``,
-        ``model``, ``type``, ``source_labels``, ``target_labels`` (empty when
-        the model declares no endpoints), ``directed``, ``description`` and
-        ``properties``.
+        ``primary_key``, ``properties`` and ``relationship_attributes`` (the
+        declarative navigation attributes, or an empty list); each relationship
+        has ``name``, ``model``, ``type``, ``source_labels``,
+        ``target_labels`` (empty when the model declares no endpoints),
+        ``directed``, ``description`` and ``properties``.
 
     Raises:
         TypeError: If ``models`` is a single class or contains anything other
@@ -239,6 +240,7 @@ def export_schema(models: Iterable[type[Node] | type[Relationship]]) -> dict[str
                     "description": entry["description"],
                     "primary_key": entry["primary_key"],
                     "properties": _export_properties(model, entry),
+                    "relationship_attributes": list(entry.get("relationship_declarations", [])),
                 }
             )
     return {"nodes": nodes, "relationships": rels}

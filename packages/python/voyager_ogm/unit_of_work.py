@@ -116,8 +116,12 @@ class UnitOfWork:
         self._native = NativeUnitOfWorkScope(resolved_id)
         self._session = session
         self._snapshots: dict[str, _Snapshot] = {}
+        self._relationship_snapshots: dict[str, list[Any]] = {}
         self._initial_snapshot: _Snapshot | None = (
             self._capture_snapshot() if session is not None else None
+        )
+        self._initial_relationships: list[Any] | None = (
+            session._pending_relationship_snapshot() if session is not None else None
         )
 
     @property
@@ -163,6 +167,7 @@ class UnitOfWork:
         self._native.savepoint(name)
         if self._session is not None:
             self._snapshots[name] = self._capture_snapshot()
+            self._relationship_snapshots[name] = self._session._pending_relationship_snapshot()
 
     def rollback_to_savepoint(self, name: str) -> None:
         """Rolls back the active unit of work state to a named savepoint.
@@ -177,6 +182,9 @@ class UnitOfWork:
         snapshot = self._snapshots.get(name)
         if snapshot is not None:
             self._restore_snapshot(snapshot)
+        relationship_snapshot = self._relationship_snapshots.get(name)
+        if relationship_snapshot is not None and self._session is not None:
+            self._session._restore_pending_relationships(relationship_snapshot)
 
     def release_savepoint(self, name: str) -> None:
         """Releases a named savepoint from the unit of work.
@@ -189,6 +197,7 @@ class UnitOfWork:
         """
         self._native.release_savepoint(name)
         self._snapshots.pop(name, None)
+        self._relationship_snapshots.pop(name, None)
 
     def commit(self) -> None:
         """Commits the unit of work, keeping entity state pending for `session.flush()`.
@@ -198,7 +207,9 @@ class UnitOfWork:
         """
         self._native.commit()
         self._snapshots.clear()
+        self._relationship_snapshots.clear()
         self._initial_snapshot = None
+        self._initial_relationships = None
 
     def rollback(self) -> None:
         """Rolls back the unit of work and restores the session's in-memory entities.
@@ -209,8 +220,12 @@ class UnitOfWork:
         self._native.rollback()
         if self._initial_snapshot is not None:
             self._restore_snapshot(self._initial_snapshot)
+        if self._initial_relationships is not None and self._session is not None:
+            self._session._restore_pending_relationships(self._initial_relationships)
         self._snapshots.clear()
+        self._relationship_snapshots.clear()
         self._initial_snapshot = None
+        self._initial_relationships = None
 
     def __enter__(self) -> UnitOfWork:
         """Enters the unit-of-work context."""

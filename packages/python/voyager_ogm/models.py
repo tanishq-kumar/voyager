@@ -26,6 +26,13 @@ from voyager_ogm.expressions import (
     PropExpr,
     to_expression,
 )
+from voyager_ogm.relationships import (
+    RelationshipDescriptor,
+    RelationshipFrom,  # noqa: F401 - re-exported from voyager_ogm.models
+    RelationshipTo,  # noqa: F401 - re-exported from voyager_ogm.models
+    collect_relationship_descriptors,
+    register_model_class,
+)
 from voyager_ogm.types import (
     Point,
     _hydrate_date,
@@ -1442,6 +1449,9 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
             type_hint = _BUILTIN_TYPES[type_hint]
 
         existing_val = getattr(cls, attr_name, None)
+        if isinstance(existing_val, RelationshipDescriptor):
+            existing_val._set_owner(cls, attr_name)
+            continue
         if isinstance(existing_val, Field):
             existing_val.type_annotation = type_hint
             if existing_val.name is None:
@@ -1596,6 +1606,7 @@ class Node:
     __labels__: ClassVar[list[str]] = []
     __description__: ClassVar[str | None] = None
     _schema_fields: ClassVar[dict[str, Field]] = {}
+    _schema_relationships: ClassVar[dict[str, RelationshipDescriptor[Any]]] = {}
     _cached_labels: ClassVar[list[str]] = ["Node"]
     _cached_label: ClassVar[str] = "Node"
 
@@ -1634,6 +1645,8 @@ class Node:
         cls._cached_labels = list(cls.__labels__)
         cls._cached_label = cls.__labels__[0] if cls.__labels__ else cls.__name__
         _process_type_annotations(cls)
+        collect_relationship_descriptors(cls)
+        register_model_class(cls)
         cls.register_schema()
 
     @classmethod
@@ -1664,13 +1677,34 @@ class Node:
                     ft.to_dict() if hasattr(ft, "to_dict") else ft for ft in fulltext_indexes
                 ]
             description = cls.__dict__.get("__description__", None)
+            declarations = [
+                declaration.to_declaration()
+                for declaration in getattr(cls, "_schema_relationships", {}).values()
+            ]
             register_with_identity = getattr(reg, "register_node_with_identity", None)
             if callable(register_with_identity):
                 register_with_identity(
-                    model_id, name, labels, fields, ft_list, description=description
+                    model_id,
+                    name,
+                    labels,
+                    fields,
+                    ft_list,
+                    description=description,
                 )
+                registered_id = model_id
             else:
-                reg.register_node(name, labels, fields, None, ft_list, description=description)
+                reg.register_node(
+                    name,
+                    labels,
+                    fields,
+                    None,
+                    ft_list,
+                    description=description,
+                )
+                registered_id = name
+            register_declarations = getattr(reg, "register_relationship_declarations", None)
+            if declarations and callable(register_declarations):
+                register_declarations(registered_id, declarations)
         except Exception as e:
             logger.warning("Failed to register schema for node model %s: %s", cls.__name__, e)
             raise
@@ -2115,6 +2149,7 @@ class Relationship:
         cls._cached_type = cls.__type__
         cls._cached_types = [cls.__type__]
         _process_type_annotations(cls)
+        register_model_class(cls)
         cls.register_schema()
 
     @classmethod
