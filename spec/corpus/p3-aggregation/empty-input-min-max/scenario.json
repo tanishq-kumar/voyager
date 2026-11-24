@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/empty-input-min-max",
+  "pack": "p3-aggregation",
+  "description": "MIN and MAX aggregates over an empty match produce null.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p3-aggregation",
+    "scenario": "empty-input-min-max"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

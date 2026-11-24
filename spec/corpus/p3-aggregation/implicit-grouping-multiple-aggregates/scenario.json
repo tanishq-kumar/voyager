@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/implicit-grouping-multiple-aggregates",
+  "pack": "p3-aggregation",
+  "description": "Implicit grouping key with multiple aggregation functions.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return6.feature",
+    "scenario": "[12] Counting matches per group"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

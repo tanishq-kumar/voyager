@@ -1,0 +1,28 @@
+{
+  "id": "p3-aggregation/empty-input-collect",
+  "pack": "p3-aggregation",
+  "description": "COLLECT aggregate over an empty match produces [] in Cypher/AGE, but null in SQL/PGQ.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p3-aggregation",
+    "scenario": "empty-input-collect"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ ARRAY_AGG returns null for empty input, whereas openCypher/Neo4j returns an empty list []."
+    }
+  }
+}

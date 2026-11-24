@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/empty-input-implicit-grouping",
+  "pack": "p3-aggregation",
+  "description": "Implicit grouping key on an empty match produces 0 rows.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p3-aggregation",
+    "scenario": "empty-input-implicit-grouping"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

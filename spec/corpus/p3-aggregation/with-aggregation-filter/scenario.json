@@ -1,0 +1,28 @@
+{
+  "id": "p3-aggregation/with-aggregation-filter",
+  "pack": "p3-aggregation",
+  "description": "Filtering on an aggregated result in a WITH clause pipeline.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/with/With6.feature",
+    "scenario": "[1] Filter on aggregated result"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: WITH clauses - SQL:PGQ GRAPH_TABLE operator does not support Cypher-style intermediate WITH projection pipelines"
+    }
+  }
+}

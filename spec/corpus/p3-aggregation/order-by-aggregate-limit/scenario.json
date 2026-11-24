@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/order-by-aggregate-limit",
+  "pack": "p3-aggregation",
+  "description": "Ordering aggregated results by aggregate count descending with LIMIT pagination.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-skip-limit/ReturnSkipLimit2.feature",
+    "scenario": "[2] Limit to two hits with explicit order"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

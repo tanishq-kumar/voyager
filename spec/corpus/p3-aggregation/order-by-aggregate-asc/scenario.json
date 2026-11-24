@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/order-by-aggregate-asc",
+  "pack": "p3-aggregation",
+  "description": "Ordering aggregated results by aggregate count ascending and tie-breaking by grouping key.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-orderby/ReturnOrderBy2.feature",
+    "scenario": "[3] Sort on aggregated function"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

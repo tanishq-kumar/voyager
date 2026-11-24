@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/multiple-aggregates-single-group",
+  "pack": "p3-aggregation",
+  "description": "Multiple aggregates (count, sum, avg, min, max) without grouping keys.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return6.feature",
+    "scenario": "[10] Multiple aggregates on same variable"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

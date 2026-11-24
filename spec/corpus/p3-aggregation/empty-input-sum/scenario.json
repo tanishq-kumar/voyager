@@ -1,0 +1,29 @@
+{
+  "id": "p3-aggregation/empty-input-sum",
+  "pack": "p3-aggregation",
+  "description": "SUM aggregate over an empty match produces 0 in Cypher, but null in AGE and SQL/PGQ.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p3-aggregation",
+    "scenario": "empty-input-sum"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "known-diff",
+      "reason": "Apache AGE returns null for SUM over empty input, whereas openCypher/Neo4j returns 0."
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 returns null for SUM over empty input, whereas openCypher/Neo4j returns 0."
+    }
+  }
+}

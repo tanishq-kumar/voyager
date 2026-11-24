@@ -1,0 +1,67 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "n",
+            [
+              "Person"
+            ]
+          ]
+        ]
+      ]
+    }
+  ],
+  "with_clauses": [
+    {
+      "projections": [
+        [
+          "field",
+          "n",
+          "city",
+          "city"
+        ],
+        [
+          "agg",
+          "n",
+          "age",
+          "count",
+          "cnt"
+        ]
+      ],
+      "where": [
+        "bin",
+        "gt",
+        [
+          "ident",
+          "cnt"
+        ],
+        [
+          "lit",
+          1
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "expr",
+      [
+        "ident",
+        "city"
+      ],
+      null
+    ],
+    [
+      "expr",
+      [
+        "ident",
+        "cnt"
+      ],
+      null
+    ]
+  ]
+}

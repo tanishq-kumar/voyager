@@ -1,0 +1,12 @@
+{
+  "columns": [
+    "min_age",
+    "max_age"
+  ],
+  "rows": [
+    [
+      null,
+      null
+    ]
+  ]
+}

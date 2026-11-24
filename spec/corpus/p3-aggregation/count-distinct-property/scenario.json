@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/count-distinct-property",
+  "pack": "p3-aggregation",
+  "description": "COUNT(DISTINCT ...) aggregation on a property with duplicates and nulls.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return5.feature",
+    "scenario": "[2] DISTINCT on nullable values"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

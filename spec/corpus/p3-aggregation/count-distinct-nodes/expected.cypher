@@ -1,0 +1,1 @@
+MATCH (n:Person) RETURN COUNT(DISTINCT n) AS cnt

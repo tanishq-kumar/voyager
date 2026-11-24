@@ -1,0 +1,12 @@
+{
+  "columns": [
+    "city",
+    "cnt"
+  ],
+  "rows": [
+    [
+      "London",
+      2
+    ]
+  ]
+}

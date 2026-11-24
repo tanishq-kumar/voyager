@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/count-property",
+  "pack": "p3-aggregation",
+  "description": "COUNT aggregation over a non-null node property.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return6.feature",
+    "scenario": "[7] Aggregate on property"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}
