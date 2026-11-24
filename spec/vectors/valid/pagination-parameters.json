@@ -55,11 +55,11 @@
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name ASC LIMIT $l OFFSET $s",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name ASC NULLS LAST LIMIT $l OFFSET $s",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name ASC LIMIT $l OFFSET $s",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name ASC NULLS LAST LIMIT $l OFFSET $s",
       "parameters": {}
     }
   }

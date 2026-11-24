@@ -236,7 +236,7 @@ def test_pgq_aggregations_and_projections():
     assert 'FROM GRAPH_TABLE (g MATCH (p IS "Person")' in compiled.statement
     assert "COLUMNS (p.city AS city, p.name AS name, p.age AS age))" in compiled.statement
     assert "GROUP BY city" in compiled.statement
-    assert "ORDER BY city ASC LIMIT 10 OFFSET 5" in compiled.statement
+    assert "ORDER BY city ASC NULLS LAST LIMIT 10 OFFSET 5" in compiled.statement
 
 
 # ---------------------------------------------------------------------------

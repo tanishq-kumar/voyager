@@ -363,7 +363,7 @@ def test_duckdb_duckpgq_graph_table_literal_encoding_live():
             (1, 'Alice', 30, 95.5, true, DATE '2026-01-15'),
             (2, 'Bob', 25, 80.0, false, DATE '2026-02-20'),
             (3, 'x'') OR 1=1 --', 40, 50.0, true, DATE '2026-03-25');
-        CREATE PROPERTY GRAPH duck_test_pg VERTEX TABLES (duck_person LABEL Person);
+        CREATE PROPERTY GRAPH duck_test_pg VERTEX TABLES (duck_person LABEL "Person");
         """
     )
 
@@ -452,7 +452,7 @@ class TestPostgres19PgqParameterBindingLive:
                     (3, 'Charlie', 35, 70.0, TRUE, NULL),
                     (4, 'x'') OR 1=1 --', 40, 50.0, FALSE, ARRAY['test']);
                 CREATE PROPERTY GRAPH pg19_param_graph
-                    VERTEX TABLES (pg19_param_person LABEL Person);
+                    VERTEX TABLES (pg19_param_person LABEL "Person");
                 """
             )
 

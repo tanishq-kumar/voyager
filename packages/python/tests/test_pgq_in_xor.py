@@ -294,7 +294,7 @@ def duckpgq_bridge():
         f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
     )
     connection.executemany(f"INSERT INTO {PERSON} VALUES (?, ?, ?, ?);", ROWS)
-    connection.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL Person);")
+    connection.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "Person");')
     yield DuckDbBridge(connection)
     connection.close()
 
@@ -324,7 +324,7 @@ def _setup_postgres19(conn: Any) -> None:
         cur.execute(f"DROP TABLE IF EXISTS {PERSON} CASCADE;")
         cur.execute(f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);")
         cur.executemany(f"INSERT INTO {PERSON} VALUES (%s, %s, %s, %s);", ROWS)
-        cur.execute(f"CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL Person);")
+        cur.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "Person");')
 
 
 def _teardown_postgres19(conn: Any) -> None:
