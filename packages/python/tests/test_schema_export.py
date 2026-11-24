@@ -358,7 +358,7 @@ class TestToJsonSchema:
 
     def test_enum_literal_and_vector(self) -> None:
         props = ExpMovie.to_json_schema()["properties"]
-        assert props["color"] == {"enum": ["red", "blue", None]}
+        assert props["color"] == {"enum": ["red", "blue", None], "default": None}
         assert props["rating"] == {"enum": ["G", "PG", "R"], "default": "G"}
         assert props["embedding"]["items"] == {"type": "number"}
         assert props["embedding"]["minItems"] == 3
@@ -373,7 +373,7 @@ class TestToJsonSchema:
         assert props["status"]["default"] == "active"
         assert "default" not in props["tags"]
         assert "default" not in props["token"]
-        assert "default" not in props["nickname"]
+        assert props["nickname"]["default"] is None
 
     def test_constraint_keywords(self) -> None:
         props = ExpPerson.to_json_schema()["properties"]
@@ -466,12 +466,14 @@ class TestToJsonSchema:
             raw_list: list | None = None
 
         props = ExpOdd.to_json_schema()["properties"]
-        assert props["anything"] == {}
+        assert props["anything"] == {"default": None}
         assert props["either"] == {
-            "anyOf": [{"type": "integer"}, {"type": "string"}, {"type": "null"}]
+            "anyOf": [{"type": "integer"}, {"type": "string"}, {"type": "null"}],
+            "default": None,
         }
         assert props["pair"]["prefixItems"] == [{"type": "integer"}, {"type": "string"}]
-        assert props["raw_list"] == {"type": ["array", "null"]}
+        assert props["pair"]["default"] is None
+        assert props["raw_list"] == {"type": ["array", "null"], "default": None}
         Draft202012Validator.check_schema(ExpOdd.to_json_schema())
 
     def test_string_or_list_length_constraint(self) -> None:
