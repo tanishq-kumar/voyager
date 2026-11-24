@@ -25,6 +25,10 @@ from voyager_ogm._voyager_rs import (
     emit_gql_alter_rel_ddl,
     emit_gql_drop_graph_type_ddl,
     emit_gql_graph_type_ddl,
+    emit_memgraph_drop_node_ddl,
+    emit_memgraph_drop_rel_ddl,
+    emit_memgraph_node_ddl,
+    emit_memgraph_rel_ddl,
     emit_node_constraint_ddl,
     emit_node_drop_constraint_ddl,
     emit_node_drop_index_ddl,
@@ -78,6 +82,34 @@ def _is_enterprise_only_constraint_error(exc: BaseException) -> bool:
     server message, so matching the text covers both execution paths.
     """
     return _ENTERPRISE_ONLY_MARKER in str(exc).lower()
+
+
+def _is_idempotent_ddl_error(exc: BaseException, dialect: str, is_drop: bool = False) -> bool:
+    """Returns True if the database error indicates an idempotent DDL condition that can be safely absorbed."""
+    msg = str(exc).lower()
+    dialect_norm = dialect.lower()
+    if dialect_norm == "memgraph":
+        if is_drop:
+            return any(
+                p in msg
+                for p in (
+                    "does not exist",
+                    "no such constraint",
+                    "no such index",
+                    "not found",
+                    "cannot find",
+                )
+            )
+        return any(
+            p in msg
+            for p in (
+                "already exists",
+                "already constrained",
+                "already indexed",
+                "there is an existing",
+            )
+        )
+    return False
 
 
 def _constraint_kind_for_requirement(requirement: str) -> str | None:
@@ -463,20 +495,26 @@ class SchemaManager:
             return emit_cypher_rel_ddl(model, include_type_constraints)
         return emit_cypher_node_ddl(model, include_type_constraints)
 
-    @staticmethod
+    @classmethod
     def generate_drop_ddl(
+        cls,
         model: type[Node] | type[Relationship] | dict[str, Any] | str,
         include_type_constraints: bool = False,
+        dialect: str = "cypher",
     ) -> list[str]:
-        """Generates drop statements for constraints and indexes.
+        """Generates drop statements for constraints and indexes across dialects.
 
         Args:
             model: Target Node or Relationship model class, schema dict, or registered model name.
             include_type_constraints: Whether to emit drop statements for Property Type constraints.
+            dialect: Target dialect ('cypher', 'memgraph', etc.). Defaults to 'cypher'.
 
         Returns:
             List of executable DROP statement strings.
         """
+        dialect_norm = dialect.lower()
+        if dialect_norm == "memgraph":
+            return cls.generate_memgraph_drop_ddl(model)
         if isinstance(model, str):
             registry = SchemaRegistry.global_registry()
             return registry.generate_cypher_drop_ddl(
@@ -485,6 +523,46 @@ class SchemaManager:
         if _is_relationship_model(model):
             return emit_cypher_drop_rel_ddl(model, include_type_constraints)
         return emit_cypher_drop_node_ddl(model, include_type_constraints)
+
+    @classmethod
+    def generate_memgraph_ddl(
+        cls,
+        model: type[Node] | type[Relationship] | dict[str, Any] | str,
+    ) -> list[str]:
+        """Generates native Memgraph DDL statements (constraints and indexes) for a model.
+
+        Args:
+            model: Target Node or Relationship model class, schema dict, or registered model name.
+
+        Returns:
+            List of executable Memgraph DDL statement strings.
+        """
+        if isinstance(model, str):
+            registry = SchemaRegistry.global_registry()
+            return registry.generate_memgraph_ddl(model_name=model)
+        if _is_relationship_model(model):
+            return emit_memgraph_rel_ddl(model)
+        return emit_memgraph_node_ddl(model)
+
+    @classmethod
+    def generate_memgraph_drop_ddl(
+        cls,
+        model: type[Node] | type[Relationship] | dict[str, Any] | str,
+    ) -> list[str]:
+        """Generates native Memgraph DROP statements (constraints and indexes) for a model.
+
+        Args:
+            model: Target Node or Relationship model class, schema dict, or registered model name.
+
+        Returns:
+            List of executable Memgraph DROP statement strings.
+        """
+        if isinstance(model, str):
+            registry = SchemaRegistry.global_registry()
+            return registry.generate_memgraph_drop_ddl(model_name=model)
+        if _is_relationship_model(model):
+            return emit_memgraph_drop_rel_ddl(model)
+        return emit_memgraph_drop_node_ddl(model)
 
     @classmethod
     def _validate_cypher_dialect(cls, session: Session, op_name: str) -> None:
@@ -547,8 +625,10 @@ class SchemaManager:
             List of executable DDL statement strings.
         """
         dialect_norm = dialect.lower()
-        if dialect_norm in ("cypher", "opencypher", "neo4j", "memgraph"):
+        if dialect_norm in ("cypher", "opencypher", "neo4j"):
             return cls.generate_cypher_ddl(model, include_type_constraints=include_type_constraints)
+        if dialect_norm == "memgraph":
+            return cls.generate_memgraph_ddl(model)
         if dialect_norm in ("gql", "iso_gql"):
             if isinstance(model, str):
                 reg = SchemaRegistry.global_registry()
@@ -763,6 +843,8 @@ class SchemaManager:
                         first_err = exc
                     skipped.append(stmt)
                     continue
+                if _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=False):
+                    continue
                 raise
             applied.append(stmt)
         if skipped and first_err is not None:
@@ -837,7 +919,12 @@ class SchemaManager:
             graph_name=target_graph,
         )
         for stmt in dropped:
-            session.execute(stmt)
+            try:
+                session.execute(stmt)
+            except Exception as exc:
+                if _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=True):
+                    continue
+                raise
         return dropped
 
     @classmethod
@@ -867,7 +954,12 @@ class SchemaManager:
         )
         dropped = cls.generate_drop_index_ddl(*models, dialect=dialect, graph_name=target_graph)
         for stmt in dropped:
-            session.execute(stmt)
+            try:
+                session.execute(stmt)
+            except Exception as exc:
+                if _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=True):
+                    continue
+                raise
         return dropped
 
     @classmethod
@@ -926,6 +1018,8 @@ class SchemaManager:
                             first_err = exc
                         skipped.append(stmt)
                         continue
+                    if _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=False):
+                        continue
                     raise
                 applied.append(stmt)
         except NotImplementedError:
@@ -933,7 +1027,12 @@ class SchemaManager:
 
         i_stmts = cls.generate_index_ddl(*models, dialect=dialect, graph_name=target_graph)
         for stmt in i_stmts:
-            session.execute(stmt)
+            try:
+                session.execute(stmt)
+            except Exception as exc:
+                if _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=False):
+                    continue
+                raise
             applied.append(stmt)
         if skipped and first_err is not None:
             _raise_enterprise_constraint_error(skipped, first_err)
@@ -995,6 +1094,8 @@ class SchemaManager:
                             first_err = exc
                         skipped.append(stmt)
                         continue
+                    if _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=False):
+                        continue
                     raise
                 applied.append(stmt)
         except NotImplementedError:
@@ -1002,7 +1103,12 @@ class SchemaManager:
 
         i_stmts = cls.generate_index_ddl(*models, dialect=dialect, graph_name=target_graph)
         for stmt in i_stmts:
-            await session.execute(stmt)
+            try:
+                await session.execute(stmt)
+            except Exception as exc:
+                if _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=False):
+                    continue
+                raise
             applied.append(stmt)
         if skipped and first_err is not None:
             _raise_enterprise_constraint_error(skipped, first_err)
@@ -1029,13 +1135,18 @@ class SchemaManager:
             NotImplementedError: If the session dialect does not support openCypher constraint DDL.
         """
         cls._validate_cypher_dialect(session, "create_all")
+        dialect = getattr(session, "dialect", getattr(session, "_dialect", "cypher"))
         applied: list[str] = []
         for model in models:
-            for stmt in cls.generate_cypher_ddl(
-                model, include_type_constraints=include_type_constraints
+            for stmt in cls.generate_ddl(
+                model, dialect=dialect, include_type_constraints=include_type_constraints
             ):
-                session.execute(stmt)
-                applied.append(stmt)
+                try:
+                    session.execute(stmt)
+                    applied.append(stmt)
+                except Exception as exc:
+                    if not _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=False):
+                        raise
         return applied
 
     @classmethod
@@ -1059,13 +1170,18 @@ class SchemaManager:
             NotImplementedError: If the session dialect does not support openCypher DROP constraint DDL.
         """
         cls._validate_cypher_dialect(session, "drop_all")
+        dialect = getattr(session, "dialect", getattr(session, "_dialect", "cypher"))
         dropped: list[str] = []
         for model in models:
             for stmt in cls.generate_drop_ddl(
-                model, include_type_constraints=include_type_constraints
+                model, include_type_constraints=include_type_constraints, dialect=dialect
             ):
-                session.execute(stmt)
-                dropped.append(stmt)
+                try:
+                    session.execute(stmt)
+                    dropped.append(stmt)
+                except Exception as exc:
+                    if not _is_idempotent_ddl_error(exc, dialect=dialect, is_drop=True):
+                        raise
         return dropped
 
     @classmethod

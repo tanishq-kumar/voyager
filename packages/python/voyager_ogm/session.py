@@ -1983,6 +1983,7 @@ class Session(_SessionBase):
         from voyager_ogm.schema import (
             SchemaManager,
             _is_enterprise_only_constraint_error,
+            _is_idempotent_ddl_error,
             _raise_enterprise_constraint_error,
         )
 
@@ -2006,6 +2007,8 @@ class Session(_SessionBase):
                     if first_err is None:
                         first_err = exc
                     skipped.append(stmt)
+                    continue
+                if _is_idempotent_ddl_error(exc, dialect=self._dialect, is_drop=False):
                     continue
                 raise
             applied.append(stmt)
@@ -2057,7 +2060,7 @@ class Session(_SessionBase):
         Returns:
             List of executed drop constraint queries.
         """
-        from voyager_ogm.schema import SchemaManager
+        from voyager_ogm.schema import SchemaManager, _is_idempotent_ddl_error
 
         target_graph = graph_name if graph_name is not None else self._graph_name
         if target_graph is not None:
@@ -2070,7 +2073,12 @@ class Session(_SessionBase):
         )
         dropped: list[str] = []
         for stmt in statements:
-            self.execute(stmt)
+            try:
+                self.execute(stmt)
+            except Exception as exc:
+                if _is_idempotent_ddl_error(exc, dialect=self._dialect, is_drop=True):
+                    continue
+                raise
             dropped.append(stmt)
         return dropped
 
@@ -2852,6 +2860,7 @@ class AsyncSession(_SessionBase):
         from voyager_ogm.schema import (
             SchemaManager,
             _is_enterprise_only_constraint_error,
+            _is_idempotent_ddl_error,
             _raise_enterprise_constraint_error,
         )
 
@@ -2875,6 +2884,8 @@ class AsyncSession(_SessionBase):
                     if first_err is None:
                         first_err = exc
                     skipped.append(stmt)
+                    continue
+                if _is_idempotent_ddl_error(exc, dialect=self._dialect, is_drop=False):
                     continue
                 raise
             applied.append(stmt)
@@ -2926,7 +2937,7 @@ class AsyncSession(_SessionBase):
         Returns:
             List of executed drop constraint queries.
         """
-        from voyager_ogm.schema import SchemaManager
+        from voyager_ogm.schema import SchemaManager, _is_idempotent_ddl_error
 
         target_graph = graph_name if graph_name is not None else self._graph_name
         if target_graph is not None:
@@ -2939,7 +2950,12 @@ class AsyncSession(_SessionBase):
         )
         dropped: list[str] = []
         for stmt in statements:
-            await self.execute(stmt)
+            try:
+                await self.execute(stmt)
+            except Exception as exc:
+                if _is_idempotent_ddl_error(exc, dialect=self._dialect, is_drop=True):
+                    continue
+                raise
             dropped.append(stmt)
         return dropped
 

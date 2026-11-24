@@ -10,9 +10,11 @@ use voyager_ogm::{
     emit_cypher_drop_node_ddl, emit_cypher_drop_rel_ddl, emit_cypher_node_ddl, emit_cypher_rel_ddl,
     emit_cypher25_drop_graph_type_ddl, emit_cypher25_graph_type_ddl, emit_gql_alter_node_ddl,
     emit_gql_alter_rel_ddl, emit_gql_drop_graph_type_ddl, emit_gql_graph_type_ddl,
+    emit_memgraph_drop_node_ddl, emit_memgraph_drop_rel_ddl, emit_memgraph_node_ddl,
+    emit_memgraph_rel_ddl, emit_node_constraint_ddl, emit_node_drop_constraint_ddl,
     emit_node_table_ddl, emit_pgq_drop_property_graph_ddl, emit_pgq_property_graph_ddl,
-    emit_pgq_property_graph_ddl_with_dialect, emit_pgq_schema_ddl, emit_rel_table_ddl,
-    emit_table_ddl, field_type_to_sql,
+    emit_pgq_property_graph_ddl_with_dialect, emit_pgq_schema_ddl, emit_rel_constraint_ddl,
+    emit_rel_drop_constraint_ddl, emit_rel_table_ddl, emit_table_ddl, field_type_to_sql,
 };
 
 fn create_test_node_schema() -> NodeSchema {
@@ -88,6 +90,76 @@ fn test_cypher_node_ddl_and_drop() {
     assert!(drop_ddl.contains(&"DROP INDEX index_user_bio IF EXISTS".to_string()));
     assert!(
         drop_ddl.contains(&"DROP CONSTRAINT constraint_user_user_id_type IF EXISTS".to_string())
+    );
+}
+
+#[test]
+fn test_memgraph_node_ddl_and_drop() {
+    let node = create_test_node_schema();
+
+    // 1. Memgraph DDL generation (un-named native constraints and indexes)
+    let ddl = emit_memgraph_node_ddl(&node);
+    assert_eq!(ddl.len(), 5);
+    assert_eq!(
+        ddl,
+        vec![
+            "CREATE CONSTRAINT ON (n:User) ASSERT n.email IS UNIQUE;",
+            "CREATE CONSTRAINT ON (n:User) ASSERT n.user_id IS UNIQUE;",
+            "CREATE CONSTRAINT ON (n:User) ASSERT EXISTS (n.user_id);",
+            "CREATE INDEX ON :User(age);",
+            "CREATE INDEX ON :User(bio);",
+        ]
+    );
+
+    // 2. Memgraph DROP DDL generation (matches creation in reverse/symmetry)
+    let drop_ddl = emit_memgraph_drop_node_ddl(&node);
+    assert_eq!(drop_ddl.len(), 5);
+    assert_eq!(
+        drop_ddl,
+        vec![
+            "DROP CONSTRAINT ON (n:User) ASSERT n.email IS UNIQUE;",
+            "DROP CONSTRAINT ON (n:User) ASSERT n.user_id IS UNIQUE;",
+            "DROP CONSTRAINT ON (n:User) ASSERT EXISTS (n.user_id);",
+            "DROP INDEX ON :User(age);",
+            "DROP INDEX ON :User(bio);",
+        ]
+    );
+
+    // 3. Standalone constraint emitters
+    let c_ddl = emit_node_constraint_ddl(&node, "memgraph", false).unwrap();
+    assert_eq!(
+        c_ddl,
+        vec![
+            "CREATE CONSTRAINT ON (n:User) ASSERT n.email IS UNIQUE;",
+            "CREATE CONSTRAINT ON (n:User) ASSERT n.user_id IS UNIQUE;",
+            "CREATE CONSTRAINT ON (n:User) ASSERT EXISTS (n.user_id);",
+        ]
+    );
+    let drop_c_ddl = emit_node_drop_constraint_ddl(&node, "memgraph", false).unwrap();
+    assert_eq!(
+        drop_c_ddl,
+        vec![
+            "DROP CONSTRAINT ON (n:User) ASSERT n.email IS UNIQUE;",
+            "DROP CONSTRAINT ON (n:User) ASSERT n.user_id IS UNIQUE;",
+            "DROP CONSTRAINT ON (n:User) ASSERT EXISTS (n.user_id);",
+        ]
+    );
+
+    // 4. Standalone relationship emitters
+    let rel = create_test_rel_schema();
+    let rel_ddl = emit_memgraph_rel_ddl(&rel);
+    assert_eq!(rel_ddl, vec!["CREATE EDGE INDEX ON :FOLLOWS(role);"]);
+    let rel_drop_ddl = emit_memgraph_drop_rel_ddl(&rel);
+    assert_eq!(rel_drop_ddl, vec!["DROP EDGE INDEX ON :FOLLOWS(role);"]);
+    assert!(
+        emit_rel_constraint_ddl(&rel, "memgraph", false)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        emit_rel_drop_constraint_ddl(&rel, "memgraph", false)
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -436,6 +508,28 @@ fn test_schema_registry_ddl_methods() {
     let rel_cypher = registry.generate_rel_cypher_ddl("Follows", false);
     assert!(rel_cypher.is_some());
     assert_eq!(rel_cypher.unwrap().len(), 2);
+
+    let memgraph_ddl = registry.generate_memgraph_ddl();
+    assert_eq!(memgraph_ddl.len(), 6);
+
+    let node_memgraph = registry.generate_node_memgraph_ddl("User");
+    assert!(node_memgraph.is_some());
+    assert_eq!(node_memgraph.unwrap().len(), 5);
+
+    let rel_memgraph = registry.generate_rel_memgraph_ddl("Follows");
+    assert!(rel_memgraph.is_some());
+    assert_eq!(rel_memgraph.unwrap().len(), 1);
+
+    let memgraph_drop = registry.generate_memgraph_drop_ddl();
+    assert_eq!(memgraph_drop.len(), 6);
+
+    let node_memgraph_drop = registry.generate_node_memgraph_drop_ddl("User");
+    assert!(node_memgraph_drop.is_some());
+    assert_eq!(node_memgraph_drop.unwrap().len(), 5);
+
+    let rel_memgraph_drop = registry.generate_rel_memgraph_drop_ddl("Follows");
+    assert!(rel_memgraph_drop.is_some());
+    assert_eq!(rel_memgraph_drop.unwrap().len(), 1);
 
     let cypher25_ddl = registry.generate_cypher25_graph_type_ddl();
     assert!(cypher25_ddl.starts_with("ALTER CURRENT GRAPH TYPE SET {"));

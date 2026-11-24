@@ -5883,6 +5883,42 @@ impl PyNativeSchemaRegistry {
         }
     }
 
+    /// Generates native Memgraph DDL statements (constraints and indexes).
+    #[pyo3(signature = (model_name=None))]
+    fn generate_memgraph_ddl(&self, model_name: Option<&str>) -> PyResult<Vec<String>> {
+        if let Some(name) = model_name {
+            if let Some(stmts) = self.registry().generate_node_memgraph_ddl(name) {
+                return Ok(stmts);
+            }
+            if let Some(stmts) = self.registry().generate_rel_memgraph_ddl(name) {
+                return Ok(stmts);
+            }
+            Err(PyValueError::new_err(format!(
+                "No node or relationship registered with name '{name}'"
+            )))
+        } else {
+            Ok(self.registry().generate_memgraph_ddl())
+        }
+    }
+
+    /// Generates native Memgraph DROP statements (constraints and indexes).
+    #[pyo3(signature = (model_name=None))]
+    fn generate_memgraph_drop_ddl(&self, model_name: Option<&str>) -> PyResult<Vec<String>> {
+        if let Some(name) = model_name {
+            if let Some(stmts) = self.registry().generate_node_memgraph_drop_ddl(name) {
+                return Ok(stmts);
+            }
+            if let Some(stmts) = self.registry().generate_rel_memgraph_drop_ddl(name) {
+                return Ok(stmts);
+            }
+            Err(PyValueError::new_err(format!(
+                "No node or relationship registered with name '{name}'"
+            )))
+        } else {
+            Ok(self.registry().generate_memgraph_drop_ddl())
+        }
+    }
+
     /// Emits an ISO GQL `CREATE GRAPH TYPE <name> AS { ... }` DDL statement.
     #[pyo3(signature = (graph_type_name, model_names=None))]
     fn generate_gql_graph_type_ddl(
@@ -6153,6 +6189,30 @@ fn emit_cypher_drop_rel_ddl(
         &schema,
         include_type_constraints,
     ))
+}
+
+#[pyfunction]
+fn emit_memgraph_node_ddl(node: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let schema = extract_node_schema(node)?;
+    Ok(voyager_ogm::emit_memgraph_node_ddl(&schema))
+}
+
+#[pyfunction]
+fn emit_memgraph_rel_ddl(rel: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let schema = extract_rel_schema(rel)?;
+    Ok(voyager_ogm::emit_memgraph_rel_ddl(&schema))
+}
+
+#[pyfunction]
+fn emit_memgraph_drop_node_ddl(node: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let schema = extract_node_schema(node)?;
+    Ok(voyager_ogm::emit_memgraph_drop_node_ddl(&schema))
+}
+
+#[pyfunction]
+fn emit_memgraph_drop_rel_ddl(rel: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let schema = extract_rel_schema(rel)?;
+    Ok(voyager_ogm::emit_memgraph_drop_rel_ddl(&schema))
 }
 
 #[pyfunction]
@@ -6564,6 +6624,10 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(emit_cypher_rel_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_cypher_drop_node_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_cypher_drop_rel_ddl, m)?)?;
+    m.add_function(wrap_pyfunction!(emit_memgraph_node_ddl, m)?)?;
+    m.add_function(wrap_pyfunction!(emit_memgraph_rel_ddl, m)?)?;
+    m.add_function(wrap_pyfunction!(emit_memgraph_drop_node_ddl, m)?)?;
+    m.add_function(wrap_pyfunction!(emit_memgraph_drop_rel_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_gql_alter_node_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_gql_alter_rel_ddl, m)?)?;
     m.add_function(wrap_pyfunction!(emit_gql_graph_type_ddl, m)?)?;

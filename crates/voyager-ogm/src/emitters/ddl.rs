@@ -134,7 +134,7 @@ pub fn cypher_rel_index_name(rel_type: &str, prop: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// openCypher DDL Emitter (Neo4j / Memgraph)
+// openCypher DDL Emitter (Neo4j)
 // ---------------------------------------------------------------------------
 
 /// Emits openCypher constraint and index creation statements for a node schema.
@@ -408,6 +408,38 @@ pub fn emit_cypher_drop_rel_ddl(
         statements.push(format!("DROP INDEX {i_name} IF EXISTS"));
     }
 
+    statements
+}
+
+// ---------------------------------------------------------------------------
+// Memgraph DDL Emitter
+// ---------------------------------------------------------------------------
+
+/// Emits Memgraph constraint and index creation statements for a node schema.
+pub fn emit_memgraph_node_ddl(node: &NodeSchema) -> Vec<String> {
+    let mut statements = emit_node_constraint_ddl(node, "memgraph", false).unwrap_or_default();
+    statements.extend(emit_node_index_ddl(node, "memgraph").unwrap_or_default());
+    statements
+}
+
+/// Emits Memgraph constraint and index drop statements for a node schema.
+pub fn emit_memgraph_drop_node_ddl(node: &NodeSchema) -> Vec<String> {
+    let mut statements = emit_node_drop_constraint_ddl(node, "memgraph", false).unwrap_or_default();
+    statements.extend(emit_node_drop_index_ddl(node, "memgraph").unwrap_or_default());
+    statements
+}
+
+/// Emits Memgraph constraint and index creation statements for a relationship schema.
+pub fn emit_memgraph_rel_ddl(rel: &RelationshipSchema) -> Vec<String> {
+    let mut statements = emit_rel_constraint_ddl(rel, "memgraph", false).unwrap_or_default();
+    statements.extend(emit_rel_index_ddl(rel, "memgraph").unwrap_or_default());
+    statements
+}
+
+/// Emits Memgraph constraint and index drop statements for a relationship schema.
+pub fn emit_memgraph_drop_rel_ddl(rel: &RelationshipSchema) -> Vec<String> {
+    let mut statements = emit_rel_drop_constraint_ddl(rel, "memgraph", false).unwrap_or_default();
+    statements.extend(emit_rel_drop_index_ddl(rel, "memgraph").unwrap_or_default());
     statements
 }
 

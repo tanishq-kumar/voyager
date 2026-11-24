@@ -1667,6 +1667,62 @@ impl SchemaRegistry {
         ))
     }
 
+    /// Generates Memgraph DDL statements (constraints and indexes) for all registered entities.
+    pub fn generate_memgraph_ddl(&self) -> Vec<String> {
+        let mut statements = Vec::new();
+        for node in self.node_schemas() {
+            statements.extend(crate::emitters::ddl::emit_memgraph_node_ddl(&node));
+        }
+        for rel in self.relationship_schemas() {
+            statements.extend(crate::emitters::ddl::emit_memgraph_rel_ddl(&rel));
+        }
+        statements
+    }
+
+    /// Generates Memgraph DDL for a single node by model name or label.
+    pub fn generate_node_memgraph_ddl(&self, node_name: &str) -> Option<Vec<String>> {
+        let node = self
+            .get_node(node_name)
+            .or_else(|| self.get_node_by_label(node_name))?;
+        Some(crate::emitters::ddl::emit_memgraph_node_ddl(&node))
+    }
+
+    /// Generates Memgraph DDL for a single relationship by model name or type.
+    pub fn generate_rel_memgraph_ddl(&self, rel_name: &str) -> Option<Vec<String>> {
+        let rel = self
+            .get_relationship(rel_name)
+            .or_else(|| self.get_relationship_by_type(rel_name))?;
+        Some(crate::emitters::ddl::emit_memgraph_rel_ddl(&rel))
+    }
+
+    /// Generates Memgraph DROP statements for all registered entities.
+    pub fn generate_memgraph_drop_ddl(&self) -> Vec<String> {
+        let mut statements = Vec::new();
+        for node in self.node_schemas() {
+            statements.extend(crate::emitters::ddl::emit_memgraph_drop_node_ddl(&node));
+        }
+        for rel in self.relationship_schemas() {
+            statements.extend(crate::emitters::ddl::emit_memgraph_drop_rel_ddl(&rel));
+        }
+        statements
+    }
+
+    /// Generates Memgraph DROP DDL for a single node by model name or label.
+    pub fn generate_node_memgraph_drop_ddl(&self, node_name: &str) -> Option<Vec<String>> {
+        let node = self
+            .get_node(node_name)
+            .or_else(|| self.get_node_by_label(node_name))?;
+        Some(crate::emitters::ddl::emit_memgraph_drop_node_ddl(&node))
+    }
+
+    /// Generates Memgraph DROP DDL for a single relationship by model name or type.
+    pub fn generate_rel_memgraph_drop_ddl(&self, rel_name: &str) -> Option<Vec<String>> {
+        let rel = self
+            .get_relationship(rel_name)
+            .or_else(|| self.get_relationship_by_type(rel_name))?;
+        Some(crate::emitters::ddl::emit_memgraph_drop_rel_ddl(&rel))
+    }
+
     /// Emits an ISO GQL `CREATE GRAPH TYPE <name> AS { ... }` definition for all registered entities.
     pub fn generate_gql_graph_type_ddl(&self, graph_type_name: &str) -> String {
         let nodes = self.node_schemas();
