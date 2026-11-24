@@ -1,0 +1,89 @@
+# TLS overlay for the Voyager test stack. Test certificates only.
+#
+#   containers/tls/gen-certs.sh [IP:<host address> ...]   # once: test CA, server + client certificates
+#   podman compose -f compose.yaml -f compose.tls.yaml up -d
+#   VOYAGER_TEST_HOST=<host> cargo nextest run -p voyager-drivers --test live_tls_tests
+#
+# Plaintext ports keep working, so the rest of the test suite is unaffected:
+# - Neo4j 7687: Bolt TLS is OPTIONAL, so the same port accepts plain and TLS (bolt+s / bolt+ssc).
+# - Apache AGE 5455 and PostgreSQL 19 5456: ssl=on; the client chooses (sslmode=require / verify-full).
+# - Memgraph and FalkorDB cannot mix plain and TLS on one port, so each gets a TLS-only instance:
+#   Memgraph Bolt+TLS on 7690, FalkorDB Redis+TLS on 6380. Both start empty (no data volume).
+# - FalkorDB with mutual TLS on 6381 (falkordb-mtls): clients must present a certificate
+#   signed by the test CA (containers/tls/certs/client.crt + client.key).
+# Clients verify the servers with containers/tls/certs/ca.crt (VOYAGER_TEST_TLS_CA overrides
+# the path in the live tests).
+
+x-pg-tls-entrypoint: &pg-tls-entrypoint
+  - sh
+  - -c
+  - >-
+    install -o postgres -g postgres -m 600 /tls/server.key /tmp/server.key &&
+    install -o postgres -g postgres -m 644 /tls/server.crt /tmp/server.crt &&
+    exec docker-entrypoint.sh postgres -c ssl=on
+    -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key
+
+services:
+  neo4j:
+    environment:
+      - NEO4J_dbms_ssl_policy_bolt_enabled=true
+      - NEO4J_dbms_ssl_policy_bolt_base__directory=/ssl/bolt
+      - NEO4J_dbms_ssl_policy_bolt_private__key=private.key
+      - NEO4J_dbms_ssl_policy_bolt_public__certificate=public.crt
+      - NEO4J_dbms_ssl_policy_bolt_client__auth=NONE
+      - NEO4J_server_bolt_tls__level=OPTIONAL
+    volumes:
+      - ./tls/certs/neo4j:/ssl:ro,z
+
+  apache-age:
+    entrypoint: *pg-tls-entrypoint
+    volumes:
+      - ./tls/certs:/tls:ro,z
+
+  postgres19:
+    entrypoint: *pg-tls-entrypoint
+    volumes:
+      - ./tls/certs:/tls:ro,z
+
+  memgraph-tls:
+    image: docker.io/memgraph/memgraph-mage:${MEMGRAPH_TAG:-3.14.0}
+    container_name: voyager-memgraph-tls
+    ports:
+      - "7690:7687"
+    command:
+      - --bolt-port=7687
+      - --log-level=WARNING
+      - --bolt-cert-file=/tls/server.crt
+      - --bolt-key-file=/tls/server.key
+    volumes:
+      - ./tls/certs:/tls:ro,z
+
+  falkordb-tls:
+    image: docker.io/falkordb/falkordb:${FALKORDB_TAG:-6.0.4}
+    container_name: voyager-falkordb-tls
+    ports:
+      - "6380:6379"
+    # The image's TLS=1 mode generates its own certificates, so TLS is configured
+    # through REDIS_ARGS with the test CA's server certificate instead.
+    environment:
+      - BROWSER=0
+      - >-
+        REDIS_ARGS=--port 0 --tls-port 6379
+        --tls-cert-file /tls/server.crt --tls-key-file /tls/server.key
+        --tls-ca-cert-file /tls/ca.crt --tls-auth-clients no
+    volumes:
+      - ./tls/certs:/tls:ro,z
+
+  falkordb-mtls:
+    image: docker.io/falkordb/falkordb:${FALKORDB_TAG:-6.0.4}
+    container_name: voyager-falkordb-mtls
+    ports:
+      - "6381:6379"
+    environment:
+      - BROWSER=0
+      - >-
+        REDIS_ARGS=--port 0 --tls-port 6379
+        --tls-cert-file /tls/server.crt --tls-key-file /tls/server.key
+        --tls-ca-cert-file /tls/ca.crt --tls-auth-clients yes
+    volumes:
+      - ./tls/certs:/tls:ro,z

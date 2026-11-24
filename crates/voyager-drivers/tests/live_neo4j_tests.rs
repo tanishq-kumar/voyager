@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 
 use voyager_drivers::bolt::BoltConnection;
 use voyager_drivers::config::{ConnectionConfig, PoolConfig};
@@ -129,8 +128,8 @@ struct LiveBoltFactory {
 }
 
 #[async_trait::async_trait]
-impl ConnectionFactory<BoltConnection<TcpStream>> for LiveBoltFactory {
-    async fn create(&self) -> voyager_drivers::Result<BoltConnection<TcpStream>> {
+impl ConnectionFactory<BoltConnection> for LiveBoltFactory {
+    async fn create(&self) -> voyager_drivers::Result<BoltConnection> {
         BoltConnection::connect(&self.config).await
     }
 }

@@ -172,7 +172,11 @@ impl ParsedUri {
         }
 
         let parsed = Url::parse(trimmed).map_err(|e| {
-            NetError::InvalidUri(format!("Malformed URI '{}': {}", redact_uri(trimmed), e))
+            NetError::InvalidUri(format!(
+                "Malformed URI '{}': {}",
+                redact_malformed_uri(trimmed),
+                e
+            ))
         })?;
 
         let scheme = parsed.scheme().to_lowercase();
@@ -186,12 +190,15 @@ impl ParsedUri {
             "postgresql+s" | "postgres+s" | "age+s" => {
                 (DatabaseProtocol::Postgres, TlsMode::Required)
             }
+            "postgresql+ssc" | "postgres+ssc" | "age+ssc" => {
+                (DatabaseProtocol::Postgres, TlsMode::SelfSigned)
+            }
             "redis" | "falkordb" | "valkey" => (DatabaseProtocol::Redis, TlsMode::Disabled),
             "rediss" | "falkordbs" | "valkeys" => (DatabaseProtocol::Redis, TlsMode::Required),
             "duckdb" => (DatabaseProtocol::DuckDb, TlsMode::Disabled),
             other => {
                 return Err(NetError::InvalidUri(format!(
-                    "Unsupported database URI scheme '{}'. Supported schemes: bolt://, neo4j://, memgraph://, postgresql://, age://, redis://, falkordb://, valkey://, duckdb://",
+                    "Unsupported database URI scheme '{}'. Supported schemes: bolt://, neo4j://, memgraph://, postgresql://, age://, redis://, falkordb://, valkey://, duckdb:// (TLS: bolt+s, bolt+ssc, neo4j+s, neo4j+ssc, memgraph+s, memgraph+ssc, postgresql+s, postgresql+ssc, age+s, age+ssc, rediss, falkordbs, valkeys)",
                     other
                 )));
             }
@@ -213,10 +220,23 @@ impl ParsedUri {
             Auth::None
         };
 
-        // Extract query parameters
+        // Extract query parameters. TLS parameter names are matched case-insensitively
+        // (stored lower-cased), and a TLS parameter given twice must repeat the same value.
         let mut params: HashMap<String, String> = HashMap::new();
         for (k, v) in parsed.query_pairs() {
-            params.insert(k.to_string(), v.to_string());
+            let lower = k.to_ascii_lowercase();
+            if crate::tls::TLS_PARAMETERS.contains(&lower.as_str()) {
+                if let Some(previous) = params.get(&lower)
+                    && *previous != v
+                {
+                    return Err(NetError::InvalidUri(format!(
+                        "TLS parameter '{lower}' is given more than once with different values ('{previous}' and '{v}')"
+                    )));
+                }
+                params.insert(lower, v.into_owned());
+            } else {
+                params.insert(k.into_owned(), v.into_owned());
+            }
         }
 
         // Database catalog / graph extraction
@@ -243,23 +263,10 @@ impl ParsedUri {
             database = Some(graph_param.clone());
         }
 
-        // Resolve TLS mode from query parameters if present (e.g. ?ssl=true or ?sslmode=require)
-        let mut tls = default_tls;
-        if let Some(ssl) = params.get("ssl").or_else(|| params.get("tls")) {
-            match ssl.to_lowercase().as_str() {
-                "true" | "1" | "require" | "required" => tls = TlsMode::Required,
-                "self-signed" | "ssc" | "allow_invalid" | "insecure" => tls = TlsMode::SelfSigned,
-                "false" | "0" | "disable" | "disabled" => tls = TlsMode::Disabled,
-                _ => {}
-            }
-        } else if let Some(sslmode) = params.get("sslmode") {
-            match sslmode.to_lowercase().as_str() {
-                "require" | "verify-ca" | "verify-full" => tls = TlsMode::Required,
-                "prefer" | "allow" => tls = TlsMode::Required,
-                "disable" => tls = TlsMode::Disabled,
-                _ => {}
-            }
-        }
+        // Resolve the TLS mode from the scheme and the TLS parameters (?ssl=, ?tls=,
+        // ?sslmode=, ?sslrootcert=system). A parameter may strengthen a TLS scheme but never
+        // weaken it, and contradictory parameters are rejected.
+        let tls = crate::tls::resolve_uri_tls(&scheme, default_tls, &params)?;
 
         protocol.ensure_enabled()?;
 
@@ -316,6 +323,7 @@ impl fmt::Debug for ParsedUri {
 }
 
 impl fmt::Display for ParsedUri {
+    /// Shows the URI with any user name and password replaced by `***`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -326,6 +334,32 @@ impl fmt::Display for ParsedUri {
             self.tls
         )
     }
+}
+
+/// Redacts a URI that failed to parse. `redact_uri` masks only the password and keeps the
+/// user name, but it finds the user information by the first `/`, `?` or `#`; when a password
+/// contains one of those it masks nothing, so the whole user information is hidden instead.
+fn redact_malformed_uri(uri: &str) -> String {
+    let redacted = redact_uri(uri);
+    if redacted == uri {
+        redact_uri(&redact_credentials(uri))
+    } else {
+        redacted
+    }
+}
+
+/// Replaces the user information (user name and password) of a URI with `***`, so the URI
+/// can appear in errors and logs. Everything between `://` and the last `@` is replaced,
+/// which also covers malformed URIs whose password contains `/`, `?`, `#` or `@`.
+pub fn redact_credentials(uri: &str) -> String {
+    let Some(at) = uri.rfind('@') else {
+        return uri.to_string();
+    };
+    let start = uri.find("://").map_or(0, |index| index + 3);
+    if start > at {
+        return uri.to_string();
+    }
+    format!("{}***{}", &uri[..start], &uri[at..])
 }
 
 #[cfg(test)]
@@ -391,6 +425,20 @@ mod tests {
             rendered.contains("bolt://neo4j:***@db:not-a-port"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn redact_credentials_hides_user_information() {
+        assert_eq!(
+            redact_credentials("postgresql://user:SECRET@h:5432/db"),
+            "postgresql://***@h:5432/db"
+        );
+        assert_eq!(
+            redact_credentials("vn:bolt://neo4j:pa/ss@word@h:7687?x=1"),
+            "vn:bolt://***@h:7687?x=1"
+        );
+        assert_eq!(redact_credentials("bolt://h:7687"), "bolt://h:7687");
+        assert_eq!(redact_credentials("bolt:user:pw@h"), "***@h");
     }
 
     #[test]
