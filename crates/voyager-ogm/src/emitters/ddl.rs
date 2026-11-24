@@ -659,6 +659,147 @@ pub fn emit_gql_drop_graph_type_ddl(graph_type_name: &str) -> String {
 // SQL:2023 PGQ DDL Emitter (PostgreSQL / DuckPGQ)
 // ---------------------------------------------------------------------------
 
+pub(crate) fn escape_sql_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Parses and validates a dialect string for SQL table DDL generation.
+pub fn parse_table_ddl_dialect(dialect: &str) -> Result<DdlDialect> {
+    let norm = dialect.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "sql" | "postgres" | "postgresql" | "sql_pgq" | "pgq" => Ok(DdlDialect::Sql),
+        "duckdb" | "duckpgq" => Ok(DdlDialect::DuckDb),
+        _ => Err(Error::UnsupportedDialect {
+            dialect: dialect.to_string(),
+            feature: "relational table DDL generation (supported: 'postgres', 'duckdb')"
+                .to_string(),
+        }),
+    }
+}
+
+/// Maps a canonical `FieldType` to dialect-specific SQL column data type.
+///
+/// Supported dialects: PostgreSQL (`DdlDialect::Sql`) and DuckDB (`DdlDialect::DuckDb`).
+/// For types that cannot be represented in the chosen dialect, returns
+/// `Error::UnsupportedFeature` naming the field.
+pub fn field_type_to_sql(ft: &FieldType, dialect: DdlDialect, field_name: &str) -> Result<String> {
+    let dialect_name = match dialect {
+        DdlDialect::DuckDb => "duckdb",
+        _ => "postgres",
+    };
+
+    match ft {
+        FieldType::String => Ok(match dialect {
+            DdlDialect::DuckDb => "VARCHAR".to_string(),
+            _ => "TEXT".to_string(),
+        }),
+        FieldType::Int64 => Ok("BIGINT".to_string()),
+        FieldType::Float64 => Ok("DOUBLE PRECISION".to_string()),
+        FieldType::Boolean => Ok("BOOLEAN".to_string()),
+        FieldType::DateTime => Ok(match dialect {
+            DdlDialect::DuckDb => "TIMESTAMPTZ".to_string(),
+            _ => "TIMESTAMP WITH TIME ZONE".to_string(),
+        }),
+        FieldType::Date => Ok("DATE".to_string()),
+        FieldType::Duration => Ok("INTERVAL".to_string()),
+        FieldType::Map => Ok(match dialect {
+            DdlDialect::DuckDb => "JSON".to_string(),
+            _ => "JSONB".to_string(),
+        }),
+        FieldType::Any => Ok(match dialect {
+            DdlDialect::DuckDb => "VARCHAR".to_string(),
+            _ => "TEXT".to_string(),
+        }),
+        FieldType::List(inner) => match inner.as_ref() {
+            FieldType::String => Ok(match dialect {
+                DdlDialect::DuckDb => "VARCHAR[]".to_string(),
+                _ => "TEXT[]".to_string(),
+            }),
+            FieldType::Int64 => Ok("BIGINT[]".to_string()),
+            FieldType::Float64 => Ok("DOUBLE PRECISION[]".to_string()),
+            FieldType::Boolean => Ok("BOOLEAN[]".to_string()),
+            FieldType::Date => Ok("DATE[]".to_string()),
+            FieldType::DateTime => Ok(match dialect {
+                DdlDialect::DuckDb => "TIMESTAMPTZ[]".to_string(),
+                _ => "TIMESTAMP WITH TIME ZONE[]".to_string(),
+            }),
+            FieldType::Any => Ok(match dialect {
+                DdlDialect::DuckDb => "VARCHAR[]".to_string(),
+                _ => "TEXT[]".to_string(),
+            }),
+            FieldType::Map | FieldType::List(_) => Ok(match dialect {
+                DdlDialect::DuckDb => "JSON".to_string(),
+                _ => "JSONB".to_string(),
+            }),
+            FieldType::Custom(custom) => {
+                let inner_sql =
+                    field_type_to_sql(&FieldType::parse_str(custom), dialect, field_name)?;
+                Ok(format!("{inner_sql}[]"))
+            }
+            FieldType::Duration => Ok("INTERVAL[]".to_string()),
+        },
+        FieldType::Custom(s) => {
+            let upper = s.trim().to_ascii_uppercase();
+            match upper.as_str() {
+                "STR" | "STRING" | "TEXT" | "VARCHAR" => Ok(match dialect {
+                    DdlDialect::DuckDb => "VARCHAR".to_string(),
+                    _ => "TEXT".to_string(),
+                }),
+                "INT" | "INT64" | "INTEGER" | "BIGINT" | "INT8" => Ok("BIGINT".to_string()),
+                "SMALLINT" | "INT2" | "INT4" => Ok("INTEGER".to_string()),
+                "FLOAT" | "FLOAT64" | "DOUBLE" | "REAL" | "FLOAT8" => {
+                    Ok("DOUBLE PRECISION".to_string())
+                }
+                "FLOAT4" => Ok("REAL".to_string()),
+                "BOOL" | "BOOLEAN" => Ok("BOOLEAN".to_string()),
+                "DATETIME" | "TIMESTAMP" | "TIMESTAMPTZ" => Ok(match dialect {
+                    DdlDialect::DuckDb => "TIMESTAMPTZ".to_string(),
+                    _ => "TIMESTAMP WITH TIME ZONE".to_string(),
+                }),
+                "DATE" => Ok("DATE".to_string()),
+                "TIME" | "TIMETZ" => Ok(match dialect {
+                    DdlDialect::DuckDb => "TIME".to_string(),
+                    _ => "TIME WITHOUT TIME ZONE".to_string(),
+                }),
+                "DURATION" | "INTERVAL" => Ok("INTERVAL".to_string()),
+                "DECIMAL" | "NUMERIC" => Ok("NUMERIC".to_string()),
+                "BYTES" | "BYTEA" | "BLOB" => Ok(match dialect {
+                    DdlDialect::DuckDb => "BLOB".to_string(),
+                    _ => "BYTEA".to_string(),
+                }),
+                "JSON" | "JSONB" | "MAP" | "DICT" => Ok(match dialect {
+                    DdlDialect::DuckDb => "JSON".to_string(),
+                    _ => "JSONB".to_string(),
+                }),
+                "LIST" | "ARRAY" => Ok(match dialect {
+                    DdlDialect::DuckDb => "VARCHAR[]".to_string(),
+                    _ => "TEXT[]".to_string(),
+                }),
+                "POINT" => match dialect {
+                    DdlDialect::DuckDb => Err(Error::UnsupportedFeature {
+                        dialect: dialect_name.to_string(),
+                        feature: format!("column '{field_name}' of type POINT"),
+                    }),
+                    _ => Ok("POINT".to_string()),
+                },
+                "VECTOR" => match dialect {
+                    DdlDialect::DuckDb => Ok("FLOAT[]".to_string()),
+                    _ => Err(Error::UnsupportedFeature {
+                        dialect: dialect_name.to_string(),
+                        feature: format!(
+                            "column '{field_name}' of type VECTOR (requires pgvector extension)"
+                        ),
+                    }),
+                },
+                _ => Err(Error::UnsupportedFeature {
+                    dialect: dialect_name.to_string(),
+                    feature: format!("column '{field_name}' with unsupported type '{s}'"),
+                }),
+            }
+        }
+    }
+}
+
 /// Returns the SQL:2023 PGQ vertex table name for a node label.
 ///
 /// The table name is the primary label folded to ASCII lower case. That is the
@@ -692,6 +833,243 @@ pub fn pgq_edge_destination_key(primary_key: &str) -> String {
     format!("dst_{primary_key}")
 }
 
+/// Returns the sequence name for a DuckDB edge table surrogate key.
+pub fn pgq_edge_sequence_name(type_name: &str, surrogate_col: &str) -> String {
+    format!("seq_{}_{}", pgq_edge_table_name(type_name), surrogate_col)
+}
+
+/// Resolves a non-clashing surrogate key column name for an edge table.
+///
+/// Defaults to `"id"`. If a field named `"id"` exists in the relationship model,
+/// tries `"<edge_table>_id"`, then `"edge_id"`, and finally `"id_{counter}"`,
+/// ensuring no collision with declared fields or endpoint foreign-key columns.
+pub fn resolve_edge_surrogate_key_name(
+    rel: &RelationshipSchema,
+    src_key: &str,
+    dst_key: &str,
+) -> String {
+    let edge_table = pgq_edge_table_name(&rel.type_name);
+    let is_available =
+        |name: &str| !rel.fields.contains_key(name) && name != src_key && name != dst_key;
+
+    if is_available("id") {
+        return "id".to_string();
+    }
+    let candidate_table_id = format!("{edge_table}_id");
+    if is_available(&candidate_table_id) {
+        return candidate_table_id;
+    }
+    if is_available("edge_id") {
+        return "edge_id".to_string();
+    }
+    let mut counter = 1;
+    loop {
+        let candidate_n = format!("id_{counter}");
+        if is_available(&candidate_n) {
+            return candidate_n;
+        }
+        counter += 1;
+    }
+}
+
+/// Emits a `CREATE TABLE IF NOT EXISTS` statement for a single node schema.
+pub fn emit_node_table_ddl(node: &NodeSchema, dialect: &str) -> Result<String> {
+    let ddl_dialect = parse_table_ddl_dialect(dialect)?;
+    let table = pgq_vertex_table_name(node.primary_label());
+    let q_table = escape_sql_ident(&table);
+
+    let mut columns = Vec::new();
+    for field in node.fields.values() {
+        let q_col = escape_sql_ident(&field.name);
+        let sql_type = field_type_to_sql(&field.field_type, ddl_dialect, &field.name)?;
+        let nullability = if field.primary_key || !field.nullable {
+            " NOT NULL"
+        } else {
+            ""
+        };
+        columns.push(format!("{q_col} {sql_type}{nullability}"));
+    }
+
+    if let Some(ref pk) = node.primary_key {
+        columns.push(format!("PRIMARY KEY ({})", escape_sql_ident(pk)));
+    }
+
+    Ok(format!(
+        "CREATE TABLE IF NOT EXISTS {q_table} (\n  {}\n);",
+        columns.join(",\n  ")
+    ))
+}
+
+/// Emits a `CREATE TABLE IF NOT EXISTS` statement for a single relationship schema.
+pub fn emit_rel_table_ddl(
+    rel: &RelationshipSchema,
+    nodes: &[&NodeSchema],
+    dialect: &str,
+) -> Result<String> {
+    let ddl_dialect = parse_table_ddl_dialect(dialect)?;
+    let table = pgq_edge_table_name(&rel.type_name);
+    let q_table = escape_sql_ident(&table);
+
+    let src_label = rel
+        .source_labels
+        .first()
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::SchemaError(format!(
+                "Relationship '{}' is missing source_labels. SQL table DDL requires explicit vertex source endpoints.",
+                rel.name
+            ))
+        })?;
+    let tgt_label = rel
+        .target_labels
+        .first()
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::SchemaError(format!(
+                "Relationship '{}' is missing target_labels. SQL table DDL requires explicit vertex target endpoints.",
+                rel.name
+            ))
+        })?;
+
+    let src_table = pgq_vertex_table_name(src_label);
+    let tgt_table = pgq_vertex_table_name(tgt_label);
+
+    let src_node = nodes
+        .iter()
+        .find(|n| n.labels.iter().any(|l| l == src_label) || n.name == src_label);
+    let tgt_node = nodes
+        .iter()
+        .find(|n| n.labels.iter().any(|l| l == tgt_label) || n.name == tgt_label);
+
+    let src_ref_col = src_node
+        .and_then(|n| n.primary_key.as_deref())
+        .unwrap_or("id");
+    let tgt_ref_col = tgt_node
+        .and_then(|n| n.primary_key.as_deref())
+        .unwrap_or("id");
+
+    let src_col_type = if let Some(n) = src_node {
+        if let Some(f) = n.fields.get(src_ref_col) {
+            field_type_to_sql(&f.field_type, ddl_dialect, &f.name)?
+        } else {
+            "BIGINT".to_string()
+        }
+    } else {
+        "BIGINT".to_string()
+    };
+
+    let tgt_col_type = if let Some(n) = tgt_node {
+        if let Some(f) = n.fields.get(tgt_ref_col) {
+            field_type_to_sql(&f.field_type, ddl_dialect, &f.name)?
+        } else {
+            "BIGINT".to_string()
+        }
+    } else {
+        "BIGINT".to_string()
+    };
+
+    let src_key = pgq_edge_source_key(src_ref_col);
+    let tgt_key = pgq_edge_destination_key(tgt_ref_col);
+
+    let q_src_key = escape_sql_ident(&src_key);
+    let q_tgt_key = escape_sql_ident(&tgt_key);
+    let q_src_table = escape_sql_ident(&src_table);
+    let q_tgt_table = escape_sql_ident(&tgt_table);
+    let q_src_ref_col = escape_sql_ident(src_ref_col);
+    let q_tgt_ref_col = escape_sql_ident(tgt_ref_col);
+
+    let mut columns = Vec::new();
+
+    let explicit_pk = rel.derived_primary_key()?;
+    if explicit_pk.is_none() {
+        let surrogate_name = resolve_edge_surrogate_key_name(rel, &src_key, &tgt_key);
+        let q_surrogate = escape_sql_ident(&surrogate_name);
+        let surrogate_col_def = match ddl_dialect {
+            DdlDialect::DuckDb => {
+                let seq_name = pgq_edge_sequence_name(&rel.type_name, &surrogate_name);
+                format!("{q_surrogate} BIGINT DEFAULT nextval('{seq_name}') PRIMARY KEY")
+            }
+            _ => {
+                format!("{q_surrogate} BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY")
+            }
+        };
+        columns.push(surrogate_col_def);
+    }
+
+    columns.push(format!(
+        "{q_src_key} {src_col_type} NOT NULL REFERENCES {q_src_table} ({q_src_ref_col})"
+    ));
+    columns.push(format!(
+        "{q_tgt_key} {tgt_col_type} NOT NULL REFERENCES {q_tgt_table} ({q_tgt_ref_col})"
+    ));
+
+    for field in rel.fields.values() {
+        let q_col = escape_sql_ident(&field.name);
+        let sql_type = field_type_to_sql(&field.field_type, ddl_dialect, &field.name)?;
+        let nullability = if field.primary_key || !field.nullable {
+            " NOT NULL"
+        } else {
+            ""
+        };
+        columns.push(format!("{q_col} {sql_type}{nullability}"));
+    }
+
+    if let Some(ref pk_name) = explicit_pk {
+        columns.push(format!("PRIMARY KEY ({})", escape_sql_ident(pk_name)));
+    }
+
+    Ok(format!(
+        "CREATE TABLE IF NOT EXISTS {q_table} (\n  {}\n);",
+        columns.join(",\n  ")
+    ))
+}
+
+/// Emits `CREATE TABLE IF NOT EXISTS` statements for a set of nodes and relationships.
+///
+/// Node tables are emitted before edge tables so that foreign-key references succeed.
+/// For DuckDB, sequences for edge table surrogate keys are emitted before the edge tables.
+pub fn emit_table_ddl(
+    nodes: &[&NodeSchema],
+    relationships: &[&RelationshipSchema],
+    dialect: &str,
+) -> Result<Vec<String>> {
+    let ddl_dialect = parse_table_ddl_dialect(dialect)?;
+    let mut statements = Vec::new();
+    for node in nodes {
+        statements.push(emit_node_table_ddl(node, dialect)?);
+    }
+    for rel in relationships {
+        if matches!(ddl_dialect, DdlDialect::DuckDb) {
+            let explicit_pk = rel.derived_primary_key()?;
+            if explicit_pk.is_none() {
+                let src_label = rel.source_labels.first().map(|s| s.as_str()).unwrap_or("");
+                let tgt_label = rel.target_labels.first().map(|s| s.as_str()).unwrap_or("");
+                let src_node = nodes
+                    .iter()
+                    .find(|n| n.labels.iter().any(|l| l == src_label) || n.name == src_label);
+                let tgt_node = nodes
+                    .iter()
+                    .find(|n| n.labels.iter().any(|l| l == tgt_label) || n.name == tgt_label);
+                let src_ref_col = src_node
+                    .and_then(|n| n.primary_key.as_deref())
+                    .unwrap_or("id");
+                let tgt_ref_col = tgt_node
+                    .and_then(|n| n.primary_key.as_deref())
+                    .unwrap_or("id");
+                let src_key = pgq_edge_source_key(src_ref_col);
+                let tgt_key = pgq_edge_destination_key(tgt_ref_col);
+                let surrogate_name = resolve_edge_surrogate_key_name(rel, &src_key, &tgt_key);
+                let seq_name = pgq_edge_sequence_name(&rel.type_name, &surrogate_name);
+                statements.push(format!("CREATE SEQUENCE IF NOT EXISTS {seq_name};"));
+            }
+        }
+        statements.push(emit_rel_table_ddl(rel, nodes, dialect)?);
+    }
+    Ok(statements)
+}
+
 /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` DDL statement.
 ///
 /// # Endpoints and Key Convention Note
@@ -715,27 +1093,46 @@ pub fn emit_pgq_property_graph_ddl(
     nodes: &[&NodeSchema],
     relationships: &[&RelationshipSchema],
 ) -> Result<String> {
+    emit_pgq_property_graph_ddl_with_dialect(graph_name, nodes, relationships, "postgres")
+}
+
+/// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` DDL statement with explicit dialect targeting.
+pub fn emit_pgq_property_graph_ddl_with_dialect(
+    graph_name: &str,
+    nodes: &[&NodeSchema],
+    relationships: &[&RelationshipSchema],
+    dialect: &str,
+) -> Result<String> {
+    let ddl_dialect = parse_table_ddl_dialect(dialect)?;
+    let is_duckdb = matches!(ddl_dialect, DdlDialect::DuckDb);
+
     let mut v_clauses = Vec::new();
     for node in nodes {
         let primary_label = node.primary_label();
         let table_name = pgq_vertex_table_name(primary_label);
         let q_table = escape_sql_ident(&table_name);
         let q_label = escape_sql_ident(primary_label);
-        let props_clause = if node.fields.is_empty() {
-            String::new()
-        } else {
-            let field_names: Vec<String> =
-                node.fields.keys().map(|k| escape_sql_ident(k)).collect();
-            format!(" PROPERTIES ({})", field_names.join(", "))
-        };
 
-        if let Some(ref pk) = node.primary_key {
-            v_clauses.push(format!(
-                "    {q_table} KEY ({}) LABEL {q_label}{props_clause}",
-                escape_sql_ident(pk)
-            ));
+        if is_duckdb {
+            // DuckPGQ automatically exposes all columns and rejects KEY and PROPERTIES clauses.
+            v_clauses.push(format!("    {q_table} LABEL {q_label}"));
         } else {
-            v_clauses.push(format!("    {q_table} LABEL {q_label}{props_clause}"));
+            let props_clause = if node.fields.is_empty() {
+                String::new()
+            } else {
+                let field_names: Vec<String> =
+                    node.fields.keys().map(|k| escape_sql_ident(k)).collect();
+                format!(" PROPERTIES ({})", field_names.join(", "))
+            };
+
+            if let Some(ref pk) = node.primary_key {
+                v_clauses.push(format!(
+                    "    {q_table} KEY ({}) LABEL {q_label}{props_clause}",
+                    escape_sql_ident(pk)
+                ));
+            } else {
+                v_clauses.push(format!("    {q_table} LABEL {q_label}{props_clause}"));
+            }
         }
     }
 
@@ -785,22 +1182,36 @@ pub fn emit_pgq_property_graph_ddl(
         let src_key = pgq_edge_source_key(src_ref_col);
         let tgt_key = pgq_edge_destination_key(tgt_ref_col);
 
-        let props_clause = if rel.fields.is_empty() {
-            String::new()
+        if is_duckdb {
+            // DuckPGQ rejects PROPERTIES clauses on EDGE TABLES.
+            e_clauses.push(format!(
+                "    {q_table}\n      SOURCE KEY ({}) REFERENCES {} ({})\n      DESTINATION KEY ({}) REFERENCES {} ({})\n      LABEL {q_label}",
+                escape_sql_ident(&src_key),
+                escape_sql_ident(&src_table),
+                escape_sql_ident(src_ref_col),
+                escape_sql_ident(&tgt_key),
+                escape_sql_ident(&tgt_table),
+                escape_sql_ident(tgt_ref_col)
+            ));
         } else {
-            let field_names: Vec<String> = rel.fields.keys().map(|k| escape_sql_ident(k)).collect();
-            format!(" PROPERTIES ({})", field_names.join(", "))
-        };
+            let props_clause = if rel.fields.is_empty() {
+                String::new()
+            } else {
+                let field_names: Vec<String> =
+                    rel.fields.keys().map(|k| escape_sql_ident(k)).collect();
+                format!(" PROPERTIES ({})", field_names.join(", "))
+            };
 
-        e_clauses.push(format!(
-            "    {q_table}\n      SOURCE KEY ({}) REFERENCES {} ({})\n      DESTINATION KEY ({}) REFERENCES {} ({})\n      LABEL {q_label}{props_clause}",
-            escape_sql_ident(&src_key),
-            escape_sql_ident(&src_table),
-            escape_sql_ident(src_ref_col),
-            escape_sql_ident(&tgt_key),
-            escape_sql_ident(&tgt_table),
-            escape_sql_ident(tgt_ref_col)
-        ));
+            e_clauses.push(format!(
+                "    {q_table}\n      SOURCE KEY ({}) REFERENCES {} ({})\n      DESTINATION KEY ({}) REFERENCES {} ({})\n      LABEL {q_label}{props_clause}",
+                escape_sql_ident(&src_key),
+                escape_sql_ident(&src_table),
+                escape_sql_ident(src_ref_col),
+                escape_sql_ident(&tgt_key),
+                escape_sql_ident(&tgt_table),
+                escape_sql_ident(tgt_ref_col)
+            ));
+        }
     }
 
     let vertices_block = v_clauses.join(",\n");
@@ -817,18 +1228,52 @@ pub fn emit_pgq_property_graph_ddl(
     Ok(ddl)
 }
 
+/// Emits full SQL/PGQ schema DDL in the order they must be executed:
+/// 1. Vertex and edge tables (`CREATE TABLE IF NOT EXISTS`)
+/// 2. Unique constraints (`ALTER TABLE ADD CONSTRAINT` or `CREATE UNIQUE INDEX`)
+/// 3. Secondary indexes (`CREATE INDEX IF NOT EXISTS`)
+/// 4. Property graph definition (`CREATE PROPERTY GRAPH`)
+pub fn emit_pgq_schema_ddl(
+    graph_name: &str,
+    nodes: &[&NodeSchema],
+    relationships: &[&RelationshipSchema],
+    dialect: &str,
+) -> Result<Vec<String>> {
+    let mut statements = emit_table_ddl(nodes, relationships, dialect)?;
+
+    for node in nodes {
+        let mut node_constraints = emit_node_constraint_ddl(node, dialect, false)?;
+        statements.append(&mut node_constraints);
+    }
+    for rel in relationships {
+        let mut rel_constraints = emit_rel_constraint_ddl(rel, dialect, false)?;
+        statements.append(&mut rel_constraints);
+    }
+
+    for node in nodes {
+        let mut node_indexes = emit_node_index_ddl(node, dialect)?;
+        statements.append(&mut node_indexes);
+    }
+    for rel in relationships {
+        let mut rel_indexes = emit_rel_index_ddl(rel, dialect)?;
+        statements.append(&mut rel_indexes);
+    }
+
+    let pg_ddl =
+        emit_pgq_property_graph_ddl_with_dialect(graph_name, nodes, relationships, dialect)?;
+    statements.push(pg_ddl);
+
+    Ok(statements)
+}
+
 /// Emits a SQL:2023 PGQ / DuckPGQ `DROP PROPERTY GRAPH` DDL statement.
 pub fn emit_pgq_drop_property_graph_ddl(graph_name: &str) -> String {
     format!("DROP PROPERTY GRAPH IF EXISTS {graph_name};")
 }
 
 // ---------------------------------------------------------------------------
-// Multi-Dialect Pure Index & Constraint DDL Emitters (RFC-0004 §4.4)
+// Multi-Dialect Pure Index & Constraint DDL Emitters
 // ---------------------------------------------------------------------------
-
-fn escape_sql_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
 
 /// DDL operation kind for capability checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1443,7 +1888,7 @@ pub fn emit_node_constraint_ddl_with_graph(
                 }
             }
         }
-        DdlDialect::Sql | DdlDialect::DuckDb => {
+        DdlDialect::Sql => {
             let table = pgq_vertex_table_name(primary_label);
             let q_table = escape_sql_ident(&table);
             for field in node.fields.values() {
@@ -1451,6 +1896,19 @@ pub fn emit_node_constraint_ddl_with_graph(
                     let q_col = escape_sql_ident(&field.name);
                     statements.push(format!(
                         "ALTER TABLE {q_table} ADD CONSTRAINT uq_{table}_{} UNIQUE ({q_col});",
+                        field.name
+                    ));
+                }
+            }
+        }
+        DdlDialect::DuckDb => {
+            let table = pgq_vertex_table_name(primary_label);
+            let q_table = escape_sql_ident(&table);
+            for field in node.fields.values() {
+                if field.unique && !field.primary_key {
+                    let q_col = escape_sql_ident(&field.name);
+                    statements.push(format!(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_{table}_{} ON {q_table} ({q_col});",
                         field.name
                     ));
                 }
@@ -1530,7 +1988,7 @@ pub fn emit_rel_constraint_ddl_with_graph(
         DdlDialect::Memgraph => {
             // Memgraph does not support edge constraints; no-op.
         }
-        DdlDialect::Sql | DdlDialect::DuckDb => {
+        DdlDialect::Sql => {
             let table = pgq_edge_table_name(type_name);
             let q_table = escape_sql_ident(&table);
             for field in rel.fields.values() {
@@ -1538,6 +1996,19 @@ pub fn emit_rel_constraint_ddl_with_graph(
                     let q_col = escape_sql_ident(&field.name);
                     statements.push(format!(
                         "ALTER TABLE {q_table} ADD CONSTRAINT uq_{table}_{} UNIQUE ({q_col});",
+                        field.name
+                    ));
+                }
+            }
+        }
+        DdlDialect::DuckDb => {
+            let table = pgq_edge_table_name(type_name);
+            let q_table = escape_sql_ident(&table);
+            for field in rel.fields.values() {
+                if field.unique && !field.primary_key {
+                    let q_col = escape_sql_ident(&field.name);
+                    statements.push(format!(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_{table}_{} ON {q_table} ({q_col});",
                         field.name
                     ));
                 }
@@ -1937,7 +2408,7 @@ pub fn emit_node_drop_constraint_ddl_with_graph(
                 }
             }
         }
-        DdlDialect::Sql | DdlDialect::DuckDb => {
+        DdlDialect::Sql => {
             let table = pgq_vertex_table_name(primary_label);
             let q_table = escape_sql_ident(&table);
             for field in node.fields.values() {
@@ -1946,6 +2417,14 @@ pub fn emit_node_drop_constraint_ddl_with_graph(
                         "ALTER TABLE {q_table} DROP CONSTRAINT IF EXISTS uq_{table}_{};",
                         field.name
                     ));
+                }
+            }
+        }
+        DdlDialect::DuckDb => {
+            let table = pgq_vertex_table_name(primary_label);
+            for field in node.fields.values() {
+                if field.unique && !field.primary_key {
+                    statements.push(format!("DROP INDEX IF EXISTS uq_{table}_{};", field.name));
                 }
             }
         }
@@ -2015,7 +2494,7 @@ pub fn emit_rel_drop_constraint_ddl_with_graph(
         DdlDialect::Memgraph => {
             // Memgraph does not support edge constraints; no-op.
         }
-        DdlDialect::Sql | DdlDialect::DuckDb => {
+        DdlDialect::Sql => {
             let table = pgq_edge_table_name(type_name);
             let q_table = escape_sql_ident(&table);
             for field in rel.fields.values() {
@@ -2024,6 +2503,14 @@ pub fn emit_rel_drop_constraint_ddl_with_graph(
                         "ALTER TABLE {q_table} DROP CONSTRAINT IF EXISTS uq_{table}_{};",
                         field.name
                     ));
+                }
+            }
+        }
+        DdlDialect::DuckDb => {
+            let table = pgq_edge_table_name(type_name);
+            for field in rel.fields.values() {
+                if field.unique && !field.primary_key {
+                    statements.push(format!("DROP INDEX IF EXISTS uq_{table}_{};", field.name));
                 }
             }
         }

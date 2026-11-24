@@ -1630,11 +1630,18 @@ impl SchemaRegistry {
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for all registered entities.
     pub fn generate_pgq_ddl(&self, graph_name: &str) -> Result<String> {
+        self.generate_pgq_ddl_with_dialect(graph_name, "postgres")
+    }
+
+    /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for all registered entities with dialect targeting.
+    pub fn generate_pgq_ddl_with_dialect(&self, graph_name: &str, dialect: &str) -> Result<String> {
         let nodes = self.node_schemas();
         let rels = self.relationship_schemas();
         let node_refs: Vec<&NodeSchema> = nodes.iter().collect();
         let rel_refs: Vec<&RelationshipSchema> = rels.iter().collect();
-        crate::emitters::ddl::emit_pgq_property_graph_ddl(graph_name, &node_refs, &rel_refs)
+        crate::emitters::ddl::emit_pgq_property_graph_ddl_with_dialect(
+            graph_name, &node_refs, &rel_refs, dialect,
+        )
     }
 
     /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for specified model names.
@@ -1643,15 +1650,78 @@ impl SchemaRegistry {
     /// relationship, so an edge requested on its own still references each
     /// endpoint node's real key column.
     pub fn generate_pgq_ddl_for(&self, graph_name: &str, model_names: &[&str]) -> Result<String> {
+        self.generate_pgq_ddl_for_with_dialect(graph_name, model_names, "postgres")
+    }
+
+    /// Emits a SQL:2023 PGQ / DuckPGQ `CREATE PROPERTY GRAPH` statement for specified model names with dialect targeting.
+    pub fn generate_pgq_ddl_for_with_dialect(
+        &self,
+        graph_name: &str,
+        model_names: &[&str],
+        dialect: &str,
+    ) -> Result<String> {
         let all_nodes = self.node_schemas();
         let all_rels = self.relationship_schemas();
         let (mut filtered_nodes, filtered_rels) =
             Self::filter_models(&all_nodes, &all_rels, Some(model_names));
         Self::add_pgq_endpoint_nodes(&all_nodes, &filtered_rels, &mut filtered_nodes);
-        crate::emitters::ddl::emit_pgq_property_graph_ddl(
+        crate::emitters::ddl::emit_pgq_property_graph_ddl_with_dialect(
             graph_name,
             &filtered_nodes,
             &filtered_rels,
+            dialect,
+        )
+    }
+
+    /// Emits relational table DDL (`CREATE TABLE IF NOT EXISTS`) for all registered entities.
+    pub fn generate_table_ddl(&self, dialect: &str) -> Result<Vec<String>> {
+        let nodes = self.node_schemas();
+        let rels = self.relationship_schemas();
+        let node_refs: Vec<&NodeSchema> = nodes.iter().collect();
+        let rel_refs: Vec<&RelationshipSchema> = rels.iter().collect();
+        crate::emitters::ddl::emit_table_ddl(&node_refs, &rel_refs, dialect)
+    }
+
+    /// Emits relational table DDL (`CREATE TABLE IF NOT EXISTS`) for specified model names.
+    pub fn generate_table_ddl_for(
+        &self,
+        model_names: &[&str],
+        dialect: &str,
+    ) -> Result<Vec<String>> {
+        let all_nodes = self.node_schemas();
+        let all_rels = self.relationship_schemas();
+        let (mut filtered_nodes, filtered_rels) =
+            Self::filter_models(&all_nodes, &all_rels, Some(model_names));
+        Self::add_pgq_endpoint_nodes(&all_nodes, &filtered_rels, &mut filtered_nodes);
+        crate::emitters::ddl::emit_table_ddl(&filtered_nodes, &filtered_rels, dialect)
+    }
+
+    /// Emits full SQL/PGQ schema DDL in run order (tables, constraints, indexes, property graph).
+    pub fn generate_pgq_schema_ddl(&self, graph_name: &str, dialect: &str) -> Result<Vec<String>> {
+        let nodes = self.node_schemas();
+        let rels = self.relationship_schemas();
+        let node_refs: Vec<&NodeSchema> = nodes.iter().collect();
+        let rel_refs: Vec<&RelationshipSchema> = rels.iter().collect();
+        crate::emitters::ddl::emit_pgq_schema_ddl(graph_name, &node_refs, &rel_refs, dialect)
+    }
+
+    /// Emits full SQL/PGQ schema DDL for specified model names in run order.
+    pub fn generate_pgq_schema_ddl_for(
+        &self,
+        graph_name: &str,
+        model_names: &[&str],
+        dialect: &str,
+    ) -> Result<Vec<String>> {
+        let all_nodes = self.node_schemas();
+        let all_rels = self.relationship_schemas();
+        let (mut filtered_nodes, filtered_rels) =
+            Self::filter_models(&all_nodes, &all_rels, Some(model_names));
+        Self::add_pgq_endpoint_nodes(&all_nodes, &filtered_rels, &mut filtered_nodes);
+        crate::emitters::ddl::emit_pgq_schema_ddl(
+            graph_name,
+            &filtered_nodes,
+            &filtered_rels,
+            dialect,
         )
     }
 

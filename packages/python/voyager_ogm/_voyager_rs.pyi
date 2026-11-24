@@ -242,7 +242,23 @@ class NativeSchemaRegistry:
         target_label: str | None = None,
     ) -> str | None: ...
     def generate_gql_drop_graph_type_ddl(self, graph_type_name: str) -> str: ...
-    def generate_pgq_ddl(self, graph_name: str, model_names: list[str] | None = None) -> str: ...
+    def generate_pgq_ddl(
+        self,
+        graph_name: str,
+        model_names: list[str] | None = None,
+        dialect: str = "postgres",
+    ) -> str: ...
+    def generate_table_ddl(
+        self,
+        model_names: list[str] | None = None,
+        dialect: str = "postgres",
+    ) -> list[str]: ...
+    def generate_pgq_schema_ddl(
+        self,
+        graph_name: str,
+        model_names: list[str] | None = None,
+        dialect: str = "postgres",
+    ) -> list[str]: ...
     def generate_pgq_drop_ddl(self, graph_name: str) -> str: ...
     def generate_cypher25_graph_type_ddl(self, model_names: list[str] | None = None) -> str: ...
     def generate_cypher25_drop_graph_type_ddl(self) -> str: ...
@@ -504,8 +520,20 @@ def emit_pgq_property_graph_ddl(
     graph_name: str,
     nodes: list[Any] | None = None,
     rels: list[Any] | None = None,
+    dialect: str = "postgres",
 ) -> str: ...
 def emit_pgq_drop_property_graph_ddl(graph_name: str) -> str: ...
+def emit_table_ddl(
+    nodes: list[Any] | None = None,
+    rels: list[Any] | None = None,
+    dialect: str = "postgres",
+) -> list[str]: ...
+def emit_pgq_schema_ddl(
+    graph_name: str,
+    nodes: list[Any] | None = None,
+    rels: list[Any] | None = None,
+    dialect: str = "postgres",
+) -> list[str]: ...
 def emit_cypher25_graph_type_ddl(
     nodes: list[Any] | None = None,
     rels: list[Any] | None = None,
