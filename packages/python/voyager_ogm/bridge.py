@@ -2462,19 +2462,28 @@ def _adapt_falkordb_parameters(params: dict[str, Any]) -> dict[str, Any]:
 class FalkorDBBridge:
     """FalkorDB driver bridge for graph execution."""
 
-    def __init__(self, connection: Any, graph_name: str = "voyager") -> None:
+    def __init__(self, connection: Any, graph_name: str = "voyager_graph") -> None:
         """Initializes FalkorDBBridge.
+
+        A FalkorDB server holds several independent named graphs, and every query runs
+        against one of them. Without a name this bridge uses ``voyager_graph``, the same
+        default as Voyager's native FalkorDB client, so a session reads and writes the
+        same graph on either backend.
 
         Args:
             connection: FalkorDB client or Graph instance.
-            graph_name: Target graph key name if a FalkorDB instance is provided.
+            graph_name: Name of the graph to use when a FalkorDB client is provided.
+                Ignored when a Graph instance is passed; its own name is used.
         """
+        self.graph_name = graph_name
         if hasattr(connection, "select_graph"):
             self.client = connection
             self.graph = connection.select_graph(graph_name)
         elif hasattr(connection, "query"):
             self.graph = connection
             self.client = getattr(connection, "falkordb", None)
+            if hasattr(self.graph, "name"):
+                self.graph_name = self.graph.name
         else:
             self.graph = connection
             self.client = None
@@ -2626,7 +2635,7 @@ class FalkorDBBridge:
 class AsyncFalkorDBBridge:
     """Asynchronous FalkorDB driver bridge using asyncio worker threads."""
 
-    def __init__(self, connection: Any, graph_name: str = "voyager") -> None:
+    def __init__(self, connection: Any, graph_name: str = "voyager_graph") -> None:
         """Initializes AsyncFalkorDBBridge.
 
         Args:
@@ -2634,6 +2643,11 @@ class AsyncFalkorDBBridge:
             graph_name: Target graph key name if a FalkorDB instance is provided.
         """
         self.sync_bridge = FalkorDBBridge(connection, graph_name=graph_name)
+
+    @property
+    def graph_name(self) -> str:
+        """Target graph key name."""
+        return self.sync_bridge.graph_name
 
     async def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -3385,8 +3399,11 @@ def create_bridge(
             a (username, password) tuple passed as connect kwargs. For FalkorDB/Redis schemes,
             accepts a (username, password) tuple. Explicit auth overrides credentials present
             in the URI.
-        graph_name: Optional Apache AGE graph name to target when connecting to Apache AGE
-            or PostgreSQL. If specified, validated as a safe identifier.
+        graph_name: Optional graph name, validated as a safe identifier. For Apache AGE and
+            PostgreSQL it selects the AGE graph. For FalkorDB it selects one of the
+            server's named graphs; without it, the graph comes from the URI path
+            (``redis://host:6379/<graph>``) or ``?graph=``, and otherwise defaults to
+            ``voyager_graph``, the native FalkorDB client's default.
 
     Returns:
         Configured database bridge adapter.
@@ -3716,9 +3733,19 @@ def create_bridge(
                     parsed_url.fragment,
                 )
             )
+            uri_graph = qs.get("graph", qs.get("graph_name", [None]))[0]
+            if not uri_graph and parsed_url.path and parsed_url.path != "/":
+                uri_graph = parsed_url.path.lstrip("/")
+            resolved_graph = (
+                graph_name
+                if graph_name is not None
+                else (uri_graph if uri_graph else "voyager_graph")
+            )
+            if resolved_graph is not None:
+                validate_graph_name(resolved_graph)
             parsed = FalkorDB.from_url(clean_url, **falkor_kwargs)
-            f_bridge = FalkorDBBridge(parsed)
-            return AsyncFalkorDBBridge(parsed) if is_async else f_bridge
+            f_bridge = FalkorDBBridge(parsed, graph_name=resolved_graph)
+            return AsyncFalkorDBBridge(parsed, graph_name=resolved_graph) if is_async else f_bridge
         elif scheme in ("relate", "relatedb"):
             if auth is not None:
                 raise TypeError("Relate does not accept auth credentials")

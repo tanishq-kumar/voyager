@@ -435,7 +435,7 @@ fn test_format_cypher_with_params() {
     params.insert("active".to_string(), serde_json::json!(true));
 
     let query = "MATCH (n:Person {name: $name, age: $age}) RETURN n";
-    let formatted = format_cypher_with_params(query, &params);
+    let formatted = format_cypher_with_params(query, &params).unwrap();
 
     assert!(formatted.starts_with("CYPHER "));
     assert!(formatted.contains("name=\"Alice\""));
@@ -445,6 +445,109 @@ fn test_format_cypher_with_params() {
 
     // Empty params returns unchanged query
     let empty_params = HashMap::new();
-    let unchanged = format_cypher_with_params(query, &empty_params);
+    let unchanged = format_cypher_with_params(query, &empty_params).unwrap();
     assert_eq!(unchanged, query);
+}
+
+#[test]
+fn test_format_cypher_list_of_maps_and_nested() {
+    let mut params = HashMap::new();
+    params.insert(
+        "batch".to_string(),
+        serde_json::json!([
+            {"pid": 1, "name": "Alice", "tags": ["admin", "staff"]},
+            {"pid": 2, "name": "Bob", "tags": []}
+        ]),
+    );
+
+    let query = "UNWIND $batch AS row MERGE (n:Zz {pid: row.pid}) SET n.name = row.name";
+    let formatted = format_cypher_with_params(query, &params).unwrap();
+
+    assert!(formatted.starts_with("CYPHER "));
+    assert!(formatted.contains(
+        r#"batch=[{name: "Alice", pid: 1, tags: ["admin", "staff"]}, {name: "Bob", pid: 2, tags: []}]"#
+    ));
+    assert!(formatted.ends_with(query));
+}
+
+#[test]
+fn test_format_cypher_hostile_strings() {
+    let mut params = HashMap::new();
+    params.insert(
+        "hostile".to_string(),
+        serde_json::json!("hello \"world\" \\ \n \r \t 🚀 \u{2603}"),
+    );
+
+    let query = "RETURN $hostile";
+    let formatted = format_cypher_with_params(query, &params).unwrap();
+
+    assert!(formatted.contains(r#"hostile="hello \"world\" \\ \n \r \t 🚀 ☃""#));
+}
+
+#[test]
+fn test_format_cypher_non_plain_identifier_keys() {
+    let mut params = HashMap::new();
+    params.insert(
+        "data".to_string(),
+        serde_json::json!({
+            "plain_key": 1,
+            "dash-key": 2,
+            "dot.key": 3,
+            "key with space": 4,
+            "123lead_num": 5,
+        }),
+    );
+
+    let query = "RETURN $data";
+    let formatted = format_cypher_with_params(query, &params).unwrap();
+
+    assert!(formatted.contains("plain_key: 1"));
+    assert!(formatted.contains("`dash-key`: 2"));
+    assert!(formatted.contains("`dot.key`: 3"));
+    assert!(formatted.contains("`key with space`: 4"));
+    assert!(formatted.contains("`123lead_num`: 5"));
+}
+
+#[test]
+fn test_format_cypher_backtick_in_key_rejected() {
+    let mut params = HashMap::new();
+    params.insert(
+        "data".to_string(),
+        serde_json::json!({
+            "invalid`key": 42
+        }),
+    );
+
+    let res = format_cypher_with_params("RETURN $data", &params);
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("cannot contain backticks"));
+}
+
+#[test]
+fn test_format_cypher_dollar_prefix_stripped() {
+    let mut params = HashMap::new();
+    params.insert("$batch".to_string(), serde_json::json!([1, 2, 3]));
+
+    let query = "UNWIND $batch AS x RETURN x";
+    let formatted = format_cypher_with_params(query, &params).unwrap();
+
+    assert!(formatted.starts_with("CYPHER batch=[1, 2, 3] "));
+}
+
+#[test]
+fn test_format_cypher_null_and_bool_and_numbers() {
+    let mut params = HashMap::new();
+    params.insert("n".to_string(), serde_json::Value::Null);
+    params.insert("t".to_string(), serde_json::json!(true));
+    params.insert("f".to_string(), serde_json::json!(false));
+    params.insert("i".to_string(), serde_json::json!(-42));
+    params.insert("fl".to_string(), serde_json::json!(12.345));
+
+    let formatted = format_cypher_with_params("RETURN 1", &params).unwrap();
+    assert!(formatted.contains("f=false"));
+    assert!(formatted.contains("fl=12.345"));
+    assert!(formatted.contains("i=-42"));
+    assert!(formatted.contains("n=null"));
+    assert!(formatted.contains("t=true"));
 }

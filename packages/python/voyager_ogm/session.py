@@ -1638,6 +1638,48 @@ class Session(_SessionBase):
         active = self._active_transaction
         if active is not None:
             return active._execute_bulk_sync(plan)
+
+        should_try_native = (
+            self._native_client is not None
+            and self._requested_backend in ("native", "auto")
+            and self._circuit_router.should_route_native()
+        )
+
+        if should_try_native:
+            try:
+                start_time = time.perf_counter()
+                total_batches = 0
+                total_records = 0
+                statement = plan.statement
+                for batch_item in plan:
+                    total_batches += 1
+                    batch_data = batch_item.parameters.get("batch") or batch_item.parameters.get(
+                        "targets"
+                    )
+                    if isinstance(batch_data, (list, tuple)):
+                        total_records += len(batch_data)
+                    else:
+                        total_records += 1
+                    self._native_client.execute_sync(batch_item.statement, batch_item.parameters)
+                self._record_native_success()
+                return BulkExecutionResult(
+                    total_batches=total_batches,
+                    total_records=total_records,
+                    duration_seconds=time.perf_counter() - start_time,
+                    statement=statement,
+                )
+            except Exception as e:
+                if self._requested_backend == "native" or _is_query_semantic_error(e):
+                    raise
+                if (
+                    isinstance(self._bridge, (MockBridge, AsyncMockBridge))
+                    and not self._is_explicit_mock
+                ):
+                    raise RuntimeError(
+                        f"Native backend bulk execution failed: {e}. No official database driver available for fallback."
+                    ) from e
+                self._record_native_failure(e)
+
         return self._bridge.execute_bulk(plan)
 
     def ingest_parquet(
@@ -2490,6 +2532,48 @@ class AsyncSession(_SessionBase):
         active = self._active_transaction
         if active is not None:
             return await active._execute_bulk(plan)
+
+        should_try_native = (
+            self._native_client is not None
+            and self._requested_backend in ("native", "auto")
+            and self._circuit_router.should_route_native()
+        )
+
+        if should_try_native:
+            try:
+                start_time = time.perf_counter()
+                total_batches = 0
+                total_records = 0
+                statement = plan.statement
+                for batch_item in plan:
+                    total_batches += 1
+                    batch_data = batch_item.parameters.get("batch") or batch_item.parameters.get(
+                        "targets"
+                    )
+                    if isinstance(batch_data, (list, tuple)):
+                        total_records += len(batch_data)
+                    else:
+                        total_records += 1
+                    await self._native_client.execute(batch_item.statement, batch_item.parameters)
+                self._record_native_success()
+                return BulkExecutionResult(
+                    total_batches=total_batches,
+                    total_records=total_records,
+                    duration_seconds=time.perf_counter() - start_time,
+                    statement=statement,
+                )
+            except Exception as e:
+                if self._requested_backend == "native" or _is_query_semantic_error(e):
+                    raise
+                if (
+                    isinstance(self._bridge, (MockBridge, AsyncMockBridge))
+                    and not self._is_explicit_mock
+                ):
+                    raise RuntimeError(
+                        f"Native backend bulk execution failed: {e}. No official database driver available for fallback."
+                    ) from e
+                self._record_native_failure(e)
+
         return await self._bridge.execute_bulk(plan)
 
     async def ingest_parquet(

@@ -291,7 +291,7 @@ impl RedisConnection {
         query: &str,
         params: &HashMap<String, serde_json::Value>,
     ) -> Result<FalkorQueryResult> {
-        let formatted = format_cypher_with_params(query, params);
+        let formatted = format_cypher_with_params(query, params)?;
         let resp = self
             .execute_raw(&["GRAPH.QUERY", graph, &formatted])
             .await?;
@@ -305,7 +305,7 @@ impl RedisConnection {
         query: &str,
         params: &HashMap<String, serde_json::Value>,
     ) -> Result<FalkorQueryResult> {
-        let formatted = format_cypher_with_params(query, params);
+        let formatted = format_cypher_with_params(query, params)?;
         let resp = self
             .execute_raw(&["GRAPH.RO_QUERY", graph, &formatted])
             .await?;
