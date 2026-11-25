@@ -15,8 +15,7 @@
       "status": "supported"
     },
     "age": {
-      "status": "known-diff",
-      "reason": "Apache AGE returns a collected list of vertices as serialized agtype string rather than deserialized node objects."
+      "status": "supported"
     },
     "gql": {
       "status": "supported"

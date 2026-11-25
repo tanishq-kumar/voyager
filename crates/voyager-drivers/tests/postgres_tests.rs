@@ -257,6 +257,168 @@ fn test_agtype_path_parsing() {
 }
 
 #[test]
+fn test_agtype_list_of_vertices() {
+    let raw = r#"[{"id": 1, "label": "Person", "properties": {"name": "Alice"}}::vertex, {"id": 2, "label": "Person", "properties": {"name": "Bob"}}::vertex]"#;
+    let parsed = parse_agtype(raw).unwrap();
+    if let AgeValue::List(items) = parsed {
+        assert_eq!(items.len(), 2);
+        if let AgeValue::Vertex(v1) = &items[0] {
+            assert_eq!(v1.id, 1);
+            assert_eq!(v1.label, "Person");
+            assert_eq!(v1.properties.get("name").unwrap(), "Alice");
+        } else {
+            panic!("Expected AgeValue::Vertex for items[0]");
+        }
+        if let AgeValue::Vertex(v2) = &items[1] {
+            assert_eq!(v2.id, 2);
+            assert_eq!(v2.label, "Person");
+            assert_eq!(v2.properties.get("name").unwrap(), "Bob");
+        } else {
+            panic!("Expected AgeValue::Vertex for items[1]");
+        }
+    } else {
+        panic!("Expected AgeValue::List");
+    }
+}
+
+#[test]
+fn test_agtype_list_of_edges() {
+    let raw = r#"[{"id": 10, "label": "KNOWS", "start_id": 1, "end_id": 2, "properties": {"since": 2020}}::edge]"#;
+    let parsed = parse_agtype(raw).unwrap();
+    if let AgeValue::List(items) = parsed {
+        assert_eq!(items.len(), 1);
+        if let AgeValue::Edge(e) = &items[0] {
+            assert_eq!(e.id, 10);
+            assert_eq!(e.label, "KNOWS");
+            assert_eq!(e.start_id, 1);
+            assert_eq!(e.end_id, 2);
+            assert_eq!(e.properties.get("since").unwrap(), 2020);
+        } else {
+            panic!("Expected AgeValue::Edge");
+        }
+    } else {
+        panic!("Expected AgeValue::List");
+    }
+}
+
+#[test]
+fn test_agtype_path_inside_list() {
+    let raw = r#"[[{"id": 1, "label": "Person", "properties": {}}::vertex, {"id": 10, "label": "KNOWS", "start_id": 1, "end_id": 2, "properties": {}}::edge, {"id": 2, "label": "Person", "properties": {}}::vertex]::path]"#;
+    let parsed = parse_agtype(raw).unwrap();
+    if let AgeValue::List(items) = parsed {
+        assert_eq!(items.len(), 1);
+        if let AgeValue::Path(p) = &items[0] {
+            assert_eq!(p.vertices.len(), 2);
+            assert_eq!(p.edges.len(), 1);
+            assert_eq!(p.vertices[0].id, 1);
+            assert_eq!(p.edges[0].id, 10);
+            assert_eq!(p.vertices[1].id, 2);
+        } else {
+            panic!("Expected AgeValue::Path");
+        }
+    } else {
+        panic!("Expected AgeValue::List");
+    }
+}
+
+#[test]
+fn test_agtype_map_containing_vertex() {
+    let raw = r#"{"node": {"id": 1, "label": "Person", "properties": {"name": "Alice"}}::vertex, "count": 42}"#;
+    let parsed = parse_agtype(raw).unwrap();
+    if let AgeValue::Map(map) = parsed {
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("count").unwrap(), &AgeValue::Integer(42));
+        if let Some(AgeValue::Vertex(v)) = map.get("node") {
+            assert_eq!(v.id, 1);
+            assert_eq!(v.label, "Person");
+            assert_eq!(v.properties.get("name").unwrap(), "Alice");
+        } else {
+            panic!("Expected AgeValue::Vertex for key 'node'");
+        }
+    } else {
+        panic!("Expected AgeValue::Map");
+    }
+}
+
+#[test]
+fn test_agtype_nested_list() {
+    let raw = r#"[[{"id": 1, "label": "Person", "properties": {}}::vertex]]"#;
+    let parsed = parse_agtype(raw).unwrap();
+    if let AgeValue::List(outer) = parsed {
+        assert_eq!(outer.len(), 1);
+        if let AgeValue::List(inner) = &outer[0] {
+            assert_eq!(inner.len(), 1);
+            if let AgeValue::Vertex(v) = &inner[0] {
+                assert_eq!(v.id, 1);
+                assert_eq!(v.label, "Person");
+            } else {
+                panic!("Expected AgeValue::Vertex");
+            }
+        } else {
+            panic!("Expected inner AgeValue::List");
+        }
+    } else {
+        panic!("Expected outer AgeValue::List");
+    }
+}
+
+#[test]
+fn test_agtype_quoted_string_case() {
+    let raw_str = r#""foo::vertex""#;
+    let parsed = parse_agtype(raw_str).unwrap();
+    assert_eq!(parsed, AgeValue::String("foo::vertex".to_string()));
+
+    let raw_vertex_with_suffix_in_prop =
+        r#"{"id": 1, "label": "Person", "properties": {"info": "user::vertex::edge"}}::vertex"#;
+    let parsed = parse_agtype(raw_vertex_with_suffix_in_prop).unwrap();
+    if let AgeValue::Vertex(v) = parsed {
+        assert_eq!(v.properties.get("info").unwrap(), "user::vertex::edge");
+    } else {
+        panic!("Expected AgeValue::Vertex");
+    }
+}
+
+#[test]
+fn test_agtype_unannotated_map_stays_map() {
+    let raw_map = r#"{"id": 1, "label": "x", "properties": {"city": "Berlin"}}"#;
+    let parsed = parse_agtype(raw_map).unwrap();
+    if let AgeValue::Map(map) = parsed {
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get("id").unwrap(), &AgeValue::Integer(1));
+        assert_eq!(
+            map.get("label").unwrap(),
+            &AgeValue::String("x".to_string())
+        );
+        if let Some(AgeValue::Map(props)) = map.get("properties") {
+            assert_eq!(
+                props.get("city").unwrap(),
+                &AgeValue::String("Berlin".to_string())
+            );
+        } else {
+            panic!("Expected nested AgeValue::Map for 'properties'");
+        }
+    } else {
+        panic!("Expected unannotated object to decode as AgeValue::Map, not an entity");
+    }
+}
+
+#[test]
+fn test_agtype_unannotated_list_stays_list() {
+    let raw_list = r#"[{"id": 1, "label": "Person", "properties": {}}::vertex, {"id": 10, "label": "KNOWS", "start_id": 1, "end_id": 2, "properties": {}}::edge, {"id": 2, "label": "Person", "properties": {}}::vertex]"#;
+    let parsed = parse_agtype(raw_list).unwrap();
+    if let AgeValue::List(items) = parsed {
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], AgeValue::Vertex(v) if v.id == 1));
+        assert!(matches!(&items[1], AgeValue::Edge(e) if e.id == 10));
+        assert!(matches!(&items[2], AgeValue::Vertex(v) if v.id == 2));
+    } else {
+        panic!(
+            "Expected unannotated array [a, r, b] to decode as AgeValue::List of three items, not AgeValue::Path"
+        );
+    }
+}
+
+#[test]
 fn test_rows_to_arrow_record_batch() {
     let cols = vec![
         "id".to_string(),
