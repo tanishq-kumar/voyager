@@ -65,6 +65,8 @@ pub async fn connect_any_with_options(
             }
             #[cfg(not(feature = "postgres"))]
             {
+                // AGE setup only applies to PostgreSQL connections.
+                let _ = options;
                 Err(NetError::ProtocolError(
                     "voyager-drivers was built without the `postgres` feature; cannot open PostgreSQL connections"
                         .to_string(),
