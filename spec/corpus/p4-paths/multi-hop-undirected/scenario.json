@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/multi-hop-undirected",
+  "pack": "p4-paths",
+  "description": "Multi-hop pattern with undirected relationships on both hops.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match6.feature",
+    "scenario": "[11] Named path with multiple alternating directed/undirected relationships"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ uses WALK traversal semantics (allowing repeated edges) instead of openCypher trail uniqueness."
+    }
+  }
+}

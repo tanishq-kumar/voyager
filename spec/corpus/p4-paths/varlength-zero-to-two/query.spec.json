@@ -1,0 +1,59 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "a",
+            [
+              "Person"
+            ],
+            null
+          ],
+          [
+            "edge",
+            "outgoing",
+            [
+              "KNOWS"
+            ],
+            "r",
+            0,
+            2,
+            null
+          ],
+          [
+            "node",
+            "b",
+            [
+              "Person"
+            ],
+            null
+          ]
+        ]
+      ],
+      "where": [
+        "bin",
+        "eq",
+        [
+          "prop",
+          "a",
+          "name"
+        ],
+        [
+          "lit",
+          "Alice"
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "field",
+      "b",
+      "name",
+      "b_name"
+    ]
+  ]
+}

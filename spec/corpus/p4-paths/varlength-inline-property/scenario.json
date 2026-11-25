@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-inline-property",
+  "pack": "p4-paths",
+  "description": "Variable-length pattern filtering traversed relationships by an inline property map.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match4.feature",
+    "scenario": "[5] Matching variable length pattern with property predicate"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects element pattern quantifiers ('element pattern quantifier is not supported')."
+    }
+  }
+}

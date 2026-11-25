@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/relationship-uniqueness",
+  "pack": "p4-paths",
+  "description": "Relationship uniqueness within a single pattern prevents reusing the same relationship.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match3.feature",
+    "scenario": "[29] Fail when re-using a relationship in the same pattern"
+  },
+  "params": {},
+  "fixture": "path-single-edge",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ uses WALK traversal semantics and returns 2 rows because it reuses the single edge, whereas openCypher trail semantics enforces relationship uniqueness."
+    }
+  }
+}

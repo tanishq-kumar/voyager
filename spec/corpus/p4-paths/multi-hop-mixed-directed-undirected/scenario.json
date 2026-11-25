@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/multi-hop-mixed-directed-undirected",
+  "pack": "p4-paths",
+  "description": "Multi-hop pattern alternating undirected and directed relationship steps.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match6.feature",
+    "scenario": "[10] Named path with alternating directed/undirected relationships"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ uses WALK traversal semantics on undirected steps, whereas openCypher trail semantics enforces relationship uniqueness."
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "columns": [
+    "rs"
+  ],
+  "rows": [
+    [
+      [
+        {
+          "kind": "relationship",
+          "type": "KNOWS",
+          "properties": {
+            "weight": 10
+          }
+        }
+      ]
+    ]
+  ]
+}

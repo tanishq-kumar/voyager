@@ -1,0 +1,93 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "a",
+            [
+              "Person"
+            ],
+            null
+          ],
+          [
+            "edge",
+            "outgoing",
+            [
+              "KNOWS"
+            ],
+            "r1",
+            null,
+            null,
+            null
+          ],
+          [
+            "node",
+            "b",
+            [
+              "Person"
+            ],
+            null
+          ],
+          [
+            "edge",
+            "outgoing",
+            [
+              "KNOWS"
+            ],
+            "r2",
+            null,
+            null,
+            null
+          ],
+          [
+            "node",
+            "c",
+            [
+              "Person"
+            ],
+            null
+          ]
+        ]
+      ],
+      "where": [
+        "bin",
+        "eq",
+        [
+          "prop",
+          "a",
+          "name"
+        ],
+        [
+          "lit",
+          "Alice"
+        ]
+      ],
+      "path_variable": "p"
+    }
+  ],
+  "projections": [
+    [
+      "field",
+      "c",
+      "name",
+      "c_name"
+    ],
+    [
+      "expr",
+      [
+        "fn",
+        "length",
+        [
+          [
+            "ident",
+            "p"
+          ]
+        ]
+      ],
+      "len"
+    ]
+  ]
+}

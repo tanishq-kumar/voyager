@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-fixed-one",
+  "pack": "p4-paths",
+  "description": "Fixed-length variable-length pattern with exactly 1 hop (*1..1).",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match4.feature",
+    "scenario": "[1] Handling fixed-length variable length pattern"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects element pattern quantifiers ('element pattern quantifier is not supported')."
+    }
+  }
+}

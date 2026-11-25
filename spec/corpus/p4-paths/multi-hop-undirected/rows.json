@@ -1,0 +1,12 @@
+{
+  "columns": [
+    "b_name",
+    "c_name"
+  ],
+  "rows": [
+    [
+      "Charlie",
+      "Dave"
+    ]
+  ]
+}

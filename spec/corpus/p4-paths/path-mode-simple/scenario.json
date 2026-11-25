@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/path-mode-simple",
+  "pack": "p4-paths",
+  "description": "Path search mode SIMPLE explicitly declared on the MATCH clause.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p4-paths",
+    "scenario": "SIMPLE path mode"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: Dialect 'sql_pgq' does not support feature: Path search mode 'SIMPLE' - SQL:2023 PGQ GRAPH_TABLE does not support traversal search modes"
+    }
+  }
+}

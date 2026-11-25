@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-unbounded-zero",
+  "pack": "p4-paths",
+  "description": "Unbounded variable-length pattern with lower bound 0 (*0..) matching self and all reachable descendants.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match6.feature",
+    "scenario": "[15] Variable-length named path"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 does not support element pattern quantifiers such as '->{0,}' (its parser rejects the open upper bound with a syntax error, and bounded forms with 'element pattern quantifier is not supported')."
+    }
+  }
+}

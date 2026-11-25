@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/path-fn-nodes-zero-length",
+  "pack": "p4-paths",
+  "description": "nodes(p) on a zero-length path returning a single-element node list.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match6.feature",
+    "scenario": "[1] Zero-length named path"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables"
+    }
+  }
+}

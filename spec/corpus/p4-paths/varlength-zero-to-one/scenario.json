@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-zero-to-one",
+  "pack": "p4-paths",
+  "description": "Variable-length pattern with 0 or 1 hop (*0..1) matching self and immediate neighbor.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match6.feature",
+    "scenario": "[17] Return a named var length path of length zero"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects element pattern quantifiers ('element pattern quantifier is not supported')."
+    }
+  }
+}

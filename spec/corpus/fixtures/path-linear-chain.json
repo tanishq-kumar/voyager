@@ -1,0 +1,48 @@
+{
+  "description": "Linear chain: Alice -> Bob -> Charlie -> Dave with KNOWS relationships and weight properties.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": ["Person"],
+      "properties": {"name": "Alice", "age": 30}
+    },
+    {
+      "id": "b",
+      "labels": ["Person"],
+      "properties": {"name": "Bob", "age": 25}
+    },
+    {
+      "id": "c",
+      "labels": ["Person"],
+      "properties": {"name": "Charlie", "age": 35}
+    },
+    {
+      "id": "d",
+      "labels": ["Person"],
+      "properties": {"name": "Dave", "age": 40}
+    }
+  ],
+  "relationships": [
+    {
+      "id": "r1",
+      "type": "KNOWS",
+      "start": "a",
+      "end": "b",
+      "properties": {"weight": 10}
+    },
+    {
+      "id": "r2",
+      "type": "KNOWS",
+      "start": "b",
+      "end": "c",
+      "properties": {"weight": 20}
+    },
+    {
+      "id": "r3",
+      "type": "KNOWS",
+      "start": "c",
+      "end": "d",
+      "properties": {"weight": 30}
+    }
+  ]
+}

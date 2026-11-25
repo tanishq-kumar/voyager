@@ -1,0 +1,12 @@
+{
+  "columns": [
+    "a_name",
+    "len"
+  ],
+  "rows": [
+    [
+      "Alice",
+      0
+    ]
+  ]
+}

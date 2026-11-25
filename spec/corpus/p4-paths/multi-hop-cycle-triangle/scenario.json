@@ -1,0 +1,27 @@
+{
+  "id": "p4-paths/multi-hop-cycle-triangle",
+  "pack": "p4-paths",
+  "description": "Multi-hop directed pattern traversing a closed triangular cycle.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match3.feature",
+    "scenario": "[17] Handling cyclic patterns"
+  },
+  "params": {},
+  "fixture": "path-cycle-triangle",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}
