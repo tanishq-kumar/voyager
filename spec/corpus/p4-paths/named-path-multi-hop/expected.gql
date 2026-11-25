@@ -1,1 +1,1 @@
-MATCH p = (a:Person)-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(c:Person) WHERE a.name = $p0 RETURN c.name AS c_name, char_length(p) AS len
+MATCH p = (a:Person)-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(c:Person) WHERE a.name = $p0 RETURN c.name AS c_name, path_length(p) AS len
