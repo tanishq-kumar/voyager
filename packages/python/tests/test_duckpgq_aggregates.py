@@ -43,18 +43,18 @@ def test_duckpgq_compilation_aggregates():
     # Generic sql_pgq emits PostgreSQL array literal '{}'
     compiled_pg = q.compile("sql_pgq", graph_name="g")
     assert (
-        "COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), '{}') AS cities"
+        'COALESCE(ARRAY_AGG("city") FILTER (WHERE "city" IS NOT NULL), \'{}\') AS "cities"'
         in compiled_pg.statement
     )
-    assert "COALESCE(SUM(age), 0) AS total_age" in compiled_pg.statement
+    assert 'COALESCE(SUM("age"), 0) AS "total_age"' in compiled_pg.statement
 
     # duckpgq flavor emits DuckDB empty list []
     compiled_duck = q.compile("duckpgq", graph_name="g")
     assert (
-        "COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities"
+        'COALESCE(ARRAY_AGG("city") FILTER (WHERE "city" IS NOT NULL), []) AS "cities"'
         in compiled_duck.statement
     )
-    assert "COALESCE(SUM(age), 0) AS total_age" in compiled_duck.statement
+    assert 'COALESCE(SUM("age"), 0) AS "total_age"' in compiled_duck.statement
 
 
 def test_duckpgq_compilation_distinct_and_grouped():
@@ -71,11 +71,12 @@ def test_duckpgq_compilation_distinct_and_grouped():
     )
 
     compiled = q.compile("duckpgq", graph_name="corp")
-    assert "SELECT dept, COALESCE(SUM(salary), 0) AS total_salary" in compiled.statement
+    assert 'SELECT "dept", COALESCE(SUM("salary"), 0) AS "total_salary"' in compiled.statement
     assert (
-        "COALESCE(ARRAY_AGG(tag) FILTER (WHERE tag IS NOT NULL), []) AS tags" in compiled.statement
+        'COALESCE(ARRAY_AGG("tag") FILTER (WHERE "tag" IS NOT NULL), []) AS "tags"'
+        in compiled.statement
     )
-    assert "GROUP BY dept" in compiled.statement
+    assert 'GROUP BY "dept"' in compiled.statement
 
 
 def test_duckpgq_aggregates_on_in_memory_duckdb_without_duckpgq():

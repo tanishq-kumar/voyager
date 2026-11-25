@@ -1,7 +1,7 @@
 """Live Session test for SQL/PGQ column name disambiguation (#364).
 
 Verifies that unaliased projections of the same property name from different variables
-(e.g. `RETURN a.name, b.name`) emit unique column names (e.g. `COLUMNS (a.name, b.name AS name_1)`),
+(e.g. `RETURN a.name, b.name`) emit unique column names (e.g. `COLUMNS (a.name, b.name AS "name_1")`),
 so that multi-column row records in `Session.execute` preserve all projected column values
 under distinct dictionary keys instead of one overwriting the other.
 
@@ -79,7 +79,7 @@ def test_duckpgq_embedded_session_column_disambiguation():
     # 1. Two unaliased same-name properties:
     q2 = Query.match(a).to(Knows, var="r").node(b).where(a.id == 1).return_(a.name, b.name)
     compiled2 = q2.compile("duckpgq", graph_name=graph_name)
-    assert "COLUMNS (a.name, b.name AS name_1)" in compiled2.statement
+    assert 'COLUMNS (a.name, b.name AS "name_1")' in compiled2.statement
     records2 = session.execute(compiled2).all()
     assert len(records2) == 1
     assert "name" in records2[0]
@@ -98,7 +98,7 @@ def test_duckpgq_embedded_session_column_disambiguation():
         .return_(a.name, b.name, c.name)
     )
     compiled3 = q3.compile("duckpgq", graph_name=graph_name)
-    assert "COLUMNS (a.name, b.name AS name_1, c.name AS name_2)" in compiled3.statement
+    assert 'COLUMNS (a.name, b.name AS "name_1", c.name AS "name_2")' in compiled3.statement
     records3 = session.execute(compiled3).all()
     assert len(records3) == 1
     assert records3[0]["name"] == "Alice"
@@ -114,8 +114,8 @@ def test_duckpgq_embedded_session_column_disambiguation():
         .return_("a.name AS name", "b.name")
     )
     compiled_coll = q_coll.compile("duckpgq", graph_name=graph_name)
-    assert "COLUMNS (a.name AS name, c.name AS name_1)" not in compiled_coll.statement
-    assert "COLUMNS (a.name AS name, b.name AS name_1)" in compiled_coll.statement
+    assert 'COLUMNS (a.name AS "name", c.name AS "name_1")' not in compiled_coll.statement
+    assert 'COLUMNS (a.name AS "name", b.name AS "name_1")' in compiled_coll.statement
     records_coll = session.execute(compiled_coll).all()
     assert records_coll[0]["name"] == "Alice"
     assert records_coll[0]["name_1"] == "Bob"
@@ -173,7 +173,7 @@ def test_postgres19_live_session_column_disambiguation():
         q = Query.match(a).to(Knows, var="r").node(b).where(a.id == 1).return_(a.name, b.name)
         compiled = q.compile("sql_pgq", graph_name=graph_name)
 
-        assert "COLUMNS (a.name, b.name AS name_1)" in compiled.statement
+        assert 'COLUMNS (a.name, b.name AS "name_1")' in compiled.statement
 
         result = session.execute(compiled)
         records = result.all()

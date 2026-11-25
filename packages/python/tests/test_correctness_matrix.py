@@ -156,8 +156,8 @@ def test_sql_pgq_multi_hop_compilation_accuracy():
         'SELECT * FROM GRAPH_TABLE (hollywood MATCH (p IS "Person") '
         '-[r IS "PRODUCED"]->{1,4} (m IS "Movie") '
         "WHERE (p.age > $p0) AND (m.budget >= $p1) "
-        "COLUMNS (p.name, m.title, m.budget AS total_budget)) "
-        "ORDER BY name ASC NULLS LAST LIMIT 25"
+        'COLUMNS (p.name, m.title, m.budget AS "total_budget")) '
+        'ORDER BY "name" ASC NULLS LAST LIMIT 25'
     )
     assert compiled.statement == expected
     assert compiled.parameters == {"p0": 40, "p1": 1000000.0}

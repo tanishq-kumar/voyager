@@ -48,6 +48,14 @@ impl Default for AgeEmitter {
     }
 }
 
+/// Formats one entry of the `cypher(...) AS (name agtype, ...)` column list.
+///
+/// The name is double-quoted so PostgreSQL does not fold a mixed-case result
+/// column to lower case; embedded quotes are escaped by doubling them.
+fn age_column_definition(name: &str) -> String {
+    format!("{} agtype", crate::emitters::quote_sql_ident(name))
+}
+
 /// Returns `true` when Cypher text references a `$name` parameter outside
 /// string literals, backtick identifiers, and comments.
 ///
@@ -395,7 +403,7 @@ impl AstVisitor for AgeEmitter {
             if let AstNode::ReturnClause { projections, .. } = ret_node {
                 let disambiguated = super::disambiguate_projections(arena, projections)?;
                 for col in disambiguated {
-                    column_defs.push(format!("{} agtype", col.name));
+                    column_defs.push(age_column_definition(&col.name));
                 }
             }
         } else if let AstNode::QueryStatement {
@@ -413,7 +421,7 @@ impl AstVisitor for AgeEmitter {
         }
 
         let as_clause = if column_defs.is_empty() {
-            "AS (result agtype)".to_string()
+            format!("AS ({})", age_column_definition("result"))
         } else {
             format!("AS ({})", column_defs.join(", "))
         };
@@ -490,7 +498,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b $$) AS (a agtype, r agtype, b agtype)"
+            "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b $$) AS (\"a\" agtype, \"r\" agtype, \"b\" agtype)"
         );
     }
 
@@ -512,7 +520,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person) RETURN a, a.name, a, a.name $$) AS (a agtype, name agtype, a_1 agtype, name_1 agtype)"
+            "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person) RETURN a, a.name, a, a.name $$) AS (\"a\" agtype, \"name\" agtype, \"a_1\" agtype, \"name_1\" agtype)"
         );
     }
 
@@ -580,7 +588,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN coalesce(sum(n.age), 0) AS total_age $$) AS (total_age agtype)"
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN coalesce(sum(n.age), 0) AS total_age $$) AS (\"total_age\" agtype)"
         );
     }
 
@@ -602,7 +610,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN COLLECT(n.city) AS cities $$) AS (cities agtype)"
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN COLLECT(n.city) AS cities $$) AS (\"cities\" agtype)"
         );
     }
 
@@ -631,7 +639,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN n.country AS country, coalesce(sum(n.age), 0) AS total_age, COLLECT(n.city) AS cities $$) AS (country agtype, total_age agtype, cities agtype)"
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN n.country AS country, coalesce(sum(n.age), 0) AS total_age, COLLECT(n.city) AS cities $$) AS (\"country\" agtype, \"total_age\" agtype, \"cities\" agtype)"
         );
     }
 
@@ -655,7 +663,97 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) WHERE $p0 RETURN coalesce(sum(n.age), 0) AS total_age $$, %s) AS (total_age agtype)"
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) WHERE $p0 RETURN coalesce(sum(n.age), 0) AS total_age $$, %s) AS (\"total_age\" agtype)"
+        );
+    }
+
+    #[test]
+    fn age_emitter_quotes_mixed_case_alias() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("n"), vec!["Person"])
+            .r#return()
+            .field("n", "name", Some("ColumnName"));
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("age_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN n.name AS ColumnName $$) AS (\"ColumnName\" agtype)"
+        );
+    }
+
+    #[test]
+    fn age_emitter_quotes_reserved_word_alias() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("n"), vec!["Person"])
+            .r#return()
+            .field("n", "name", Some("select"))
+            .field("n", "age", Some("order"));
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("age_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN n.name AS select, n.age AS order $$) AS (\"select\" agtype, \"order\" agtype)"
+        );
+    }
+
+    #[test]
+    fn age_column_definition_escapes_embedded_double_quote() {
+        assert_eq!(
+            age_column_definition("quoted\"alias"),
+            "\"quoted\"\"alias\" agtype"
+        );
+    }
+
+    #[test]
+    fn age_emitter_order_by_alias_keeps_alias_case() {
+        let mut builder = QueryBuilder::new();
+        let alias = builder.ident("ColumnName");
+        builder
+            .r#match()
+            .node(Some("n"), vec!["Person"])
+            .r#return()
+            .field("n", "name", Some("ColumnName"))
+            .order_by(alias, true);
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("age_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN n.name AS ColumnName ORDER BY ColumnName ASC $$) AS (\"ColumnName\" agtype)"
+        );
+    }
+
+    #[test]
+    fn age_emitter_quotes_aggregate_alias() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_property_aggregate(
+                "n",
+                "age",
+                crate::ast::AggregationFunc::Sum,
+                Some("TotalAge"),
+            );
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("age_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN coalesce(sum(n.age), 0) AS TotalAge $$) AS (\"TotalAge\" agtype)"
         );
     }
 }

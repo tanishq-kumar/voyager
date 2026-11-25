@@ -26,7 +26,7 @@ fn test_age_single_node_and_projections() {
     let mut age = AgeEmitter::new("social_graph");
     let res = age.visit_query(&arena, root).unwrap();
 
-    let expected = "SELECT * FROM cypher('social_graph', $$ MATCH (p:Person) WHERE p.age > $p0 RETURN p.name, p.age $$, %s) AS (name agtype, age agtype)";
+    let expected = "SELECT * FROM cypher('social_graph', $$ MATCH (p:Person) WHERE p.age > $p0 RETURN p.name, p.age $$, %s) AS (\"name\" agtype, \"age\" agtype)";
     assert_eq!(res.statement, expected);
     assert_eq!(res.parameters.get("p0"), Some(&LiteralValue::Int64(30)));
 }
@@ -105,7 +105,7 @@ fn test_age_directed_traversal_with_aliases() {
     let mut age = AgeEmitter::new("age_graph");
     let res = age.visit_query(&arena, root).unwrap();
 
-    let expected = "SELECT * FROM cypher('age_graph', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE a.name = $p0 RETURN a.name AS source, b.name AS target $$, %s) AS (source agtype, target agtype)";
+    let expected = "SELECT * FROM cypher('age_graph', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE a.name = $p0 RETURN a.name AS source, b.name AS target $$, %s) AS (\"source\" agtype, \"target\" agtype)";
     assert_eq!(res.statement, expected);
     assert_eq!(
         res.parameters.get("p0"),
@@ -170,7 +170,7 @@ fn test_age_aggregations_and_grouping() {
     assert!(res.statement.contains("COLLECT(p.name) AS names"));
     assert!(
         res.statement
-            .contains("AS (city agtype, cnt agtype, avg_age agtype, names agtype)")
+            .contains("AS (\"city\" agtype, \"cnt\" agtype, \"avg_age\" agtype, \"names\" agtype)")
     );
 }
 
@@ -185,7 +185,7 @@ fn test_age_mutation_wrappers() {
     let res_c = age.visit_query(&a_c, r_c).unwrap();
     assert_eq!(
         res_c.statement,
-        "SELECT * FROM cypher('age_graph', $$ CREATE (p:Person) $$) AS (result agtype)"
+        "SELECT * FROM cypher('age_graph', $$ CREATE (p:Person) $$) AS (\"result\" agtype)"
     );
 
     // MERGE

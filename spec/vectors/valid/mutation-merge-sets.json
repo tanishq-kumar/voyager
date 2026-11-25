@@ -46,7 +46,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MERGE (c:Company) ON CREATE SET c.name = $p0 ON MATCH SET c.name = $p1 $$, %s) AS (result agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MERGE (c:Company) ON CREATE SET c.name = $p0 ON MATCH SET c.name = $p1 $$, %s) AS (\"result\" agtype)",
       "parameters": {
         "p0": "Acme",
         "p1": "AcmeCorp"
