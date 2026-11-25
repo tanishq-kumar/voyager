@@ -1,0 +1,28 @@
+{
+  "id": "p3-aggregation/collect-nullable-property",
+  "pack": "p3-aggregation",
+  "description": "COLLECT aggregation over a nullable property (openCypher ignores nulls; SQL/PGQ ARRAY_AGG includes them).",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p3-aggregation",
+    "scenario": "collect-nullable-property"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ ARRAY_AGG includes null values in the aggregated array, whereas openCypher/Neo4j COLLECT ignores null values."
+    }
+  }
+}

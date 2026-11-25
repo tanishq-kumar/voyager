@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/max-integer",
+  "pack": "p3-aggregation",
+  "description": "MAX aggregation over integer property values.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-orderby/ReturnOrderBy2.feature",
+    "scenario": "[3] Sort on aggregated function"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

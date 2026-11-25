@@ -15,6 +15,7 @@ data.  The marker is stripped from every result value before comparison.
 
 from __future__ import annotations
 
+import decimal
 import json
 import os
 import re
@@ -189,6 +190,8 @@ def canonicalize(value: Any, engine: str, *, parse_age: bool = True) -> Any:
     """
     if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, decimal.Decimal):
+        return int(value) if value % 1 == 0 else float(value)
     if isinstance(value, str):
         if engine == "age" and parse_age:
             return _parse_age_scalar(value)

@@ -1,0 +1,28 @@
+{
+  "id": "p3-aggregation/count-distinct-nodes",
+  "pack": "p3-aggregation",
+  "description": "COUNT(DISTINCT ...) aggregation over whole node bindings.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return4.feature",
+    "scenario": "[8] Support column renaming for aggregations"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects returning or aggregating a whole node (COLUMNS (n AS n)) with column \"n\" does not exist; see #286."
+    }
+  }
+}

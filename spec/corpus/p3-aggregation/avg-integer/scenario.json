@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/avg-integer",
+  "pack": "p3-aggregation",
+  "description": "AVG aggregation over integer property values.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return4.feature",
+    "scenario": "[8] Support column renaming for aggregations"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

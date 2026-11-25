@@ -1,0 +1,29 @@
+{
+  "id": "p3-aggregation/collect-nodes",
+  "pack": "p3-aggregation",
+  "description": "COLLECT aggregation over whole node bindings.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return6.feature",
+    "scenario": "[10] Multiple aggregates on same variable"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "known-diff",
+      "reason": "Apache AGE returns a collected list of vertices as serialized agtype string rather than deserialized node objects."
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects returning or aggregating a whole node (COLUMNS (n AS n)) with column \"n\" does not exist; see #286."
+    }
+  }
+}

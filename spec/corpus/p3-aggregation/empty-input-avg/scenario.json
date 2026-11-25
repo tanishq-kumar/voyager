@@ -1,0 +1,27 @@
+{
+  "id": "p3-aggregation/empty-input-avg",
+  "pack": "p3-aggregation",
+  "description": "AVG aggregate over an empty match produces null.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p3-aggregation",
+    "scenario": "empty-input-avg"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

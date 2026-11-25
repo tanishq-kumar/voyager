@@ -1,0 +1,73 @@
+{
+  "columns": [
+    "persons"
+  ],
+  "rows": [
+    [
+      [
+        {
+          "kind": "node",
+          "labels": [
+            "Person"
+          ],
+          "properties": {
+            "city": "London",
+            "name": "Alice",
+            "active": true,
+            "age": 30
+          }
+        },
+        {
+          "kind": "node",
+          "labels": [
+            "Person"
+          ],
+          "properties": {
+            "city": "Paris",
+            "name": "Bob",
+            "nickname": "Bobby",
+            "active": false,
+            "age": 25
+          }
+        },
+        {
+          "kind": "node",
+          "labels": [
+            "Person"
+          ],
+          "properties": {
+            "name": "Carol",
+            "nickname": "Caz",
+            "active": true,
+            "age": 40
+          }
+        },
+        {
+          "kind": "node",
+          "labels": [
+            "Person"
+          ],
+          "properties": {
+            "city": "Berlin",
+            "name": "Dave",
+            "active": true,
+            "age": 35
+          }
+        },
+        {
+          "kind": "node",
+          "labels": [
+            "Person"
+          ],
+          "properties": {
+            "city": "London",
+            "nickname": "Evie",
+            "name": "Eve",
+            "active": false,
+            "age": 20
+          }
+        }
+      ]
+    ]
+  ]
+}

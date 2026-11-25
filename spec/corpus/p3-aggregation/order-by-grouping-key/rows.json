@@ -1,0 +1,24 @@
+{
+  "columns": [
+    "city",
+    "avg_age"
+  ],
+  "rows": [
+    [
+      "Berlin",
+      35.0
+    ],
+    [
+      "London",
+      25.0
+    ],
+    [
+      "Paris",
+      25.0
+    ],
+    [
+      null,
+      40.0
+    ]
+  ]
+}
