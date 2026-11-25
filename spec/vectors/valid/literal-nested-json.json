@@ -54,7 +54,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN $p0 AS m $$, %s) AS (m agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN $p0 AS m $$, %s) AS (\"m\" agtype)",
       "parameters": {
         "p0": {
           "name": "Alice",
@@ -84,7 +84,7 @@
       }
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS ($p0 AS m))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS ($p0 AS \"m\"))",
       "parameters": {
         "p0": {
           "name": "Alice",
@@ -99,7 +99,7 @@
       }
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS ($p0 AS m))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS ($p0 AS \"m\"))",
       "parameters": {
         "p0": {
           "name": "Alice",

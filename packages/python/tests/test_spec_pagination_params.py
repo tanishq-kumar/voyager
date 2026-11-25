@@ -40,7 +40,7 @@ def _with_pagination(**pagination: Any) -> dict[str, Any]:
         (
             "age",
             "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name "
-            "SKIP $s LIMIT $l $$, %s) AS (name agtype)",
+            'SKIP $s LIMIT $l $$, %s) AS ("name" agtype)',
         ),
         ("iso_gql", "MATCH (p:Person) RETURN p.name OFFSET $s LIMIT $l"),
         (
@@ -166,7 +166,7 @@ def test_fluent_pagination_parameters_compile_in_every_dialect() -> None:
 
     assert query.compile("cypher").statement.endswith("SKIP $s LIMIT $l")
     assert query.compile("iso_gql").statement.endswith("OFFSET $s LIMIT $l")
-    assert query.compile("age").statement.endswith("SKIP $s LIMIT $l $$, %s) AS (name agtype)")
+    assert query.compile("age").statement.endswith('SKIP $s LIMIT $l $$, %s) AS ("name" agtype)')
     assert query.compile("sql_pgq").statement.endswith("LIMIT $l OFFSET $s")
     assert query.compile("duckpgq").statement.endswith("LIMIT $l OFFSET $s")
 

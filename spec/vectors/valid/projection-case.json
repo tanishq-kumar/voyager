@@ -70,7 +70,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group $$, %s) AS (age_group agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group $$, %s) AS (\"age_group\" agtype)",
       "parameters": {
         "p4": "minor",
         "p0": 18,
@@ -90,7 +90,7 @@
       }
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS \"age_group\"))",
       "parameters": {
         "p0": 18,
         "p4": "minor",
@@ -100,7 +100,7 @@
       }
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS age_group))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (CASE p.age WHEN $p0 THEN $p1 WHEN $p2 THEN $p3 ELSE $p4 END AS \"age_group\"))",
       "parameters": {
         "p1": "adult",
         "p0": 18,

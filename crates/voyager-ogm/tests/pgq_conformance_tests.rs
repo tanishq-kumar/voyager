@@ -34,9 +34,9 @@ fn test_pgq_single_node_and_where_conformance() {
     assert!(res.statement.contains("WHERE p.age > $p0"));
     assert!(
         res.statement
-            .contains("COLUMNS (p.name AS name, p.age AS age)")
+            .contains("COLUMNS (p.name AS \"name\", p.age AS \"age\")")
     );
-    assert!(res.statement.contains("ORDER BY age ASC NULLS LAST"));
+    assert!(res.statement.contains("ORDER BY \"age\" ASC NULLS LAST"));
     assert_eq!(res.parameters.get("p0"), Some(&LiteralValue::Int64(30)));
 }
 
@@ -256,22 +256,23 @@ fn test_pgq_all_aggregations_and_pagination() {
 
     assert!(
         res.statement
-            .contains("SELECT city, COUNT(name) AS total_count")
+            .contains("SELECT \"city\", COUNT(\"name\") AS \"total_count\"")
     );
-    assert!(res.statement.contains("AVG(age) AS avg_age"));
-    assert!(res.statement.contains("COALESCE(SUM(age), 0) AS total_age"));
-    assert!(res.statement.contains("MIN(age) AS min_age"));
-    assert!(res.statement.contains("MAX(age) AS max_age"));
-    assert!(
-        res.statement.contains(
-            "COALESCE(ARRAY_AGG(name) FILTER (WHERE name IS NOT NULL), '{}') AS all_names"
-        )
-    );
+    assert!(res.statement.contains("AVG(\"age\") AS \"avg_age\""));
     assert!(
         res.statement
-            .contains("COLUMNS (p.city AS city, p.name AS name, p.age AS age)")
+            .contains("COALESCE(SUM(\"age\"), 0) AS \"total_age\"")
     );
-    assert!(res.statement.contains("GROUP BY city"));
+    assert!(res.statement.contains("MIN(\"age\") AS \"min_age\""));
+    assert!(res.statement.contains("MAX(\"age\") AS \"max_age\""));
+    assert!(res.statement.contains(
+        "COALESCE(ARRAY_AGG(\"name\") FILTER (WHERE \"name\" IS NOT NULL), '{}') AS \"all_names\""
+    ));
+    assert!(
+        res.statement
+            .contains("COLUMNS (p.city AS \"city\", p.name AS \"name\", p.age AS \"age\")")
+    );
+    assert!(res.statement.contains("GROUP BY \"city\""));
     assert!(res.statement.contains("LIMIT 25 OFFSET 10"));
 }
 
@@ -522,7 +523,7 @@ fn test_duckpgq_flavor_aggregates_emission() {
 
     assert_eq!(
         res.statement,
-        "SELECT country, COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") COLUMNS (p.country AS country, p.age AS age, p.city AS city)) GROUP BY country"
+        "SELECT \"country\", COALESCE(SUM(\"age\"), 0) AS \"total_age\", COALESCE(ARRAY_AGG(\"city\") FILTER (WHERE \"city\" IS NOT NULL), []) AS \"cities\" FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") COLUMNS (p.country AS \"country\", p.age AS \"age\", p.city AS \"city\")) GROUP BY \"country\""
     );
 }
 
@@ -542,6 +543,6 @@ fn test_duckpgq_flavor_empty_input_aggregates() {
 
     assert_eq!(
         res.statement,
-        "SELECT COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") WHERE $p0 COLUMNS (p.age AS age, p.city AS city))"
+        "SELECT COALESCE(SUM(\"age\"), 0) AS \"total_age\", COALESCE(ARRAY_AGG(\"city\") FILTER (WHERE \"city\" IS NOT NULL), []) AS \"cities\" FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") WHERE $p0 COLUMNS (p.age AS \"age\", p.city AS \"city\"))"
     );
 }

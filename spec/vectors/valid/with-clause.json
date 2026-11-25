@@ -58,7 +58,7 @@
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH DISTINCT p.name AS n ORDER BY n ASC SKIP 0 LIMIT 5 RETURN n $$) AS (n agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH DISTINCT p.name AS n ORDER BY n ASC SKIP 0 LIMIT 5 RETURN n $$) AS (\"n\" agtype)",
       "parameters": {}
     },
     "iso_gql": {

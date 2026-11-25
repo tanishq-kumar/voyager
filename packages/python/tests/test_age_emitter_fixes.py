@@ -74,7 +74,7 @@ def test_age_multiple_whole_entities_emit_unique_columns() -> None:
 
     assert (
         compiled.statement
-        == "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b $$) AS (a agtype, r agtype, b agtype)"
+        == 'SELECT * FROM cypher(\'test_graph\', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b $$) AS ("a" agtype, "r" agtype, "b" agtype)'
     )
 
 
@@ -82,19 +82,19 @@ def test_age_column_clash_resolution() -> None:
     """Verifies deterministic sequential collision resolution (_1, _2, ...) for colliding columns."""
     query_same_entity = Query.match_node("a", "Person").return_("a", "a")
     c1 = query_same_entity.compile("apache_age", graph_name="test_graph")
-    assert "AS (a agtype, a_1 agtype)" in c1.statement
+    assert 'AS ("a" agtype, "a_1" agtype)' in c1.statement
 
     query_entity_and_prop = Query.match_node("a", "Person").return_("a", "a.name")
     c2 = query_entity_and_prop.compile("apache_age", graph_name="test_graph")
-    assert "AS (a agtype, name agtype)" in c2.statement
+    assert 'AS ("a" agtype, "name" agtype)' in c2.statement
 
     query_same_prop = Query.match_node("a", "Person").return_("a.name", "a.name")
     c3 = query_same_prop.compile("apache_age", graph_name="test_graph")
-    assert "AS (name agtype, name_1 agtype)" in c3.statement
+    assert 'AS ("name" agtype, "name_1" agtype)' in c3.statement
 
     query_triple_clash = Query.match_node("a", "Person").return_("a", "a", "a")
     c4 = query_triple_clash.compile("apache_age", graph_name="test_graph")
-    assert "AS (a agtype, a_1 agtype, a_2 agtype)" in c4.statement
+    assert 'AS ("a" agtype, "a_1" agtype, "a_2" agtype)' in c4.statement
 
 
 def test_age_spec_multiple_whole_entities_emit_unique_columns() -> None:
@@ -109,7 +109,7 @@ def test_age_spec_multiple_whole_entities_emit_unique_columns() -> None:
     compiled = compile_query_from_spec(spec, "apache_age", graph_name="test_graph")
     assert (
         compiled["statement"]
-        == "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b $$) AS (a agtype, r agtype, b agtype)"
+        == 'SELECT * FROM cypher(\'test_graph\', $$ MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b $$) AS ("a" agtype, "r" agtype, "b" agtype)'
     )
 
 
@@ -183,7 +183,7 @@ def test_age_spec_rejects_alternative_relationship_types() -> None:
 def test_live_age_multiple_entities_in_one_row() -> None:
     """Verifies live Apache AGE execution returning two nodes and a relationship in one row.
 
-    Confirms that unique column names AS (a agtype, r agtype, b agtype) prevent the
+    Confirms that unique column names AS ("a" agtype, "r" agtype, "b" agtype) prevent the
     PostgreSQL error 'column name \"entity\" specified more than once' and results
     are correctly mapped to Python rows.
     """
@@ -223,7 +223,7 @@ def test_live_age_multiple_entities_in_one_row() -> None:
                 )
                 compiled = query.compile("apache_age", graph_name="live_age_fix_285")
 
-                assert "AS (a agtype, r agtype, b agtype)" in compiled.statement
+                assert 'AS ("a" agtype, "r" agtype, "b" agtype)' in compiled.statement
 
                 cur.execute(compiled.statement)
                 col_names = [desc[0] for desc in cur.description]

@@ -1,1 +1,1 @@
-SELECT * FROM GRAPH_TABLE (graph_table MATCH (n) COLUMNS ($p0 AS one))
+SELECT * FROM GRAPH_TABLE (graph_table MATCH (n) COLUMNS ($p0 AS "one"))

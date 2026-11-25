@@ -28,7 +28,7 @@ fn cypher_and_age_use_angle_bracket_inequality() {
     let mut age = AgeEmitter::new("age_graph");
     assert_eq!(
         age.visit_query(&arena, root).unwrap().statement,
-        "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE p.age <> $p0 RETURN p.name $$, %s) AS (name agtype)"
+        "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE p.age <> $p0 RETURN p.name $$, %s) AS (\"name\" agtype)"
     );
 }
 
@@ -83,7 +83,7 @@ fn cypher_and_age_lower_not_in_to_a_negated_in() {
     let mut age = AgeEmitter::new("age_graph");
     assert_eq!(
         age.visit_query(&arena, root).unwrap().statement,
-        "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE NOT (p.name IN $p0) RETURN p.name $$, %s) AS (name agtype)"
+        "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE NOT (p.name IN $p0) RETURN p.name $$, %s) AS (\"name\" agtype)"
     );
 }
 

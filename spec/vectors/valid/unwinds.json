@@ -38,7 +38,7 @@
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ UNWIND $batch AS row MATCH (p:Person) RETURN p.name $$, %s) AS (name agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ UNWIND $batch AS row MATCH (p:Person) RETURN p.name $$, %s) AS (\"name\" agtype)",
       "parameters": {}
     },
     "iso_gql": {

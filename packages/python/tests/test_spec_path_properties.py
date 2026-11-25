@@ -235,7 +235,7 @@ EDGE_PROPS_HOPS_SPEC = _match_spec(
             MATCH_NODE_PROPS_SPEC,
             "age",
             "SELECT * FROM cypher('age_graph', $$ MATCH (b:Person {name: $p0}) "
-            "RETURN b.name AS n $$, %s) AS (n agtype)",
+            'RETURN b.name AS n $$, %s) AS ("n" agtype)',
         ),
         (
             MATCH_NODE_PROPS_SPEC,
@@ -246,13 +246,13 @@ EDGE_PROPS_HOPS_SPEC = _match_spec(
             MATCH_NODE_PROPS_SPEC,
             "sql_pgq",
             "SELECT * FROM GRAPH_TABLE (graph_table MATCH "
-            '(b IS "Person" WHERE b.name = $p0) COLUMNS (b.name AS n))',
+            '(b IS "Person" WHERE b.name = $p0) COLUMNS (b.name AS "n"))',
         ),
         (
             MATCH_PARAM_PROP_SPEC,
             "sql_pgq",
             "SELECT * FROM GRAPH_TABLE (graph_table MATCH "
-            '(b IS "Person" WHERE b.email = $email) COLUMNS (b.name AS n))',
+            '(b IS "Person" WHERE b.email = $email) COLUMNS (b.name AS "n"))',
         ),
         (
             MATCH_NODE_EDGE_PROPS_SPEC,
@@ -260,7 +260,7 @@ EDGE_PROPS_HOPS_SPEC = _match_spec(
             "SELECT * FROM GRAPH_TABLE (graph_table MATCH "
             '(a IS "Person" WHERE a.name = $p0) '
             '-[r IS "KNOWS" WHERE r.since = $p1]-> '
-            '(b IS "Person") COLUMNS (b.name AS n))',
+            '(b IS "Person") COLUMNS (b.name AS "n"))',
         ),
         (
             EDGE_PROPS_HOPS_SPEC,
@@ -272,7 +272,7 @@ EDGE_PROPS_HOPS_SPEC = _match_spec(
             "sql_pgq",
             'SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS "Person") '
             '-[r IS "KNOWS" WHERE r.since = $p0]->{1,3} (b IS "Person") '
-            "COLUMNS (b.name AS n))",
+            'COLUMNS (b.name AS "n"))',
         ),
         (
             json.loads(
@@ -282,7 +282,7 @@ EDGE_PROPS_HOPS_SPEC = _match_spec(
             ),
             "age",
             "SELECT * FROM cypher('age_graph', $$ CREATE (a:Person {name: $p0}) $$, "
-            "%s) AS (result agtype)",
+            '%s) AS ("result" agtype)',
         ),
         (
             json.loads(
@@ -301,7 +301,7 @@ EDGE_PROPS_HOPS_SPEC = _match_spec(
             ),
             "age",
             "SELECT * FROM cypher('age_graph', $$ MERGE (p:Person "
-            "{email: $email}) $$, %s) AS (result agtype)",
+            '{email: $email}) $$, %s) AS ("result" agtype)',
         ),
         (
             json.loads(
