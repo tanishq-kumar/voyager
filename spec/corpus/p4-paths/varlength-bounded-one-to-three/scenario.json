@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-bounded-one-to-three",
+  "pack": "p4-paths",
+  "description": "Variable-length relationship pattern bounded between 1 and 3 hops (*1..3).",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match5.feature",
+    "scenario": "[6] Handling upper and lower bounded variable length match 1"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects element pattern quantifiers ('element pattern quantifier is not supported')."
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "columns": [
+    "a_name",
+    "c_name"
+  ],
+  "rows": [
+    [
+      "Alice",
+      "Charlie"
+    ],
+    [
+      "Bob",
+      "Dave"
+    ]
+  ]
+}

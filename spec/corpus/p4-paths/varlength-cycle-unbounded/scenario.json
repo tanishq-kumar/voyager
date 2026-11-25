@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-cycle-unbounded",
+  "pack": "p4-paths",
+  "description": "Unbounded variable-length traversal on a cyclic graph terminating via relationship uniqueness.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match3.feature",
+    "scenario": "[17] Handling cyclic patterns"
+  },
+  "params": {},
+  "fixture": "path-cycle-triangle",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 does not support element pattern quantifiers such as '->{1,}' (its parser rejects the open upper bound with a syntax error, and bounded forms with 'element pattern quantifier is not supported')."
+    }
+  }
+}

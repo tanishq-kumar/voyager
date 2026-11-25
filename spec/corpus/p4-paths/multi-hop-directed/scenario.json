@@ -1,0 +1,27 @@
+{
+  "id": "p4-paths/multi-hop-directed",
+  "pack": "p4-paths",
+  "description": "Two-hop directed relationship chain matching source, intermediate, and target nodes.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match3.feature",
+    "scenario": "[9] Get related to related to"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

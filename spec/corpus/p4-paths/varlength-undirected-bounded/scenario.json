@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-undirected-bounded",
+  "pack": "p4-paths",
+  "description": "Undirected variable-length pattern with hop bounds (*1..2).",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match6.feature",
+    "scenario": "[14] Named path with undirected fixed variable length pattern"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects element pattern quantifiers ('element pattern quantifier is not supported')."
+    }
+  }
+}

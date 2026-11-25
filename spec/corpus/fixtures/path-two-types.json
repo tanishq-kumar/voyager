@@ -1,0 +1,36 @@
+{
+  "description": "Two distinct relationship types: A -> B via CONTAINS, B -> C via FRIEND.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": ["Person"],
+      "properties": {"name": "A"}
+    },
+    {
+      "id": "b",
+      "labels": ["Person"],
+      "properties": {"name": "B"}
+    },
+    {
+      "id": "c",
+      "labels": ["Person"],
+      "properties": {"name": "C"}
+    }
+  ],
+  "relationships": [
+    {
+      "id": "r1",
+      "type": "CONTAINS",
+      "start": "a",
+      "end": "b",
+      "properties": {}
+    },
+    {
+      "id": "r2",
+      "type": "FRIEND",
+      "start": "b",
+      "end": "c",
+      "properties": {}
+    }
+  ]
+}

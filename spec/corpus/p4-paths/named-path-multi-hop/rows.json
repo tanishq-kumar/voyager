@@ -1,0 +1,12 @@
+{
+  "columns": [
+    "c_name",
+    "len"
+  ],
+  "rows": [
+    [
+      "Charlie",
+      2
+    ]
+  ]
+}

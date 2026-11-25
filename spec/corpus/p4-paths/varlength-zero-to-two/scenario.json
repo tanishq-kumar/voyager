@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-zero-to-two",
+  "pack": "p4-paths",
+  "description": "Variable-length pattern with 0 to 2 hops (*0..2) matching self and up to 2 hops.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match4.feature",
+    "scenario": "[2] Simple variable length pattern"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects element pattern quantifiers ('element pattern quantifier is not supported')."
+    }
+  }
+}

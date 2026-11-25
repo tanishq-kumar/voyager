@@ -1,0 +1,71 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "a",
+            [
+              "Person"
+            ],
+            null
+          ],
+          [
+            "edge",
+            "outgoing",
+            [
+              "KNOWS"
+            ],
+            "r1",
+            null,
+            null,
+            null
+          ],
+          [
+            "node",
+            "b",
+            [
+              "Person"
+            ],
+            null
+          ],
+          [
+            "edge",
+            "incoming",
+            [
+              "KNOWS"
+            ],
+            "r2",
+            null,
+            null,
+            null
+          ],
+          [
+            "node",
+            "c",
+            [
+              "Person"
+            ],
+            null
+          ]
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "field",
+      "a",
+      "name",
+      "a_name"
+    ],
+    [
+      "field",
+      "c",
+      "name",
+      "c_name"
+    ]
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-fixed-two",
+  "pack": "p4-paths",
+  "description": "Fixed-length variable-length pattern with exactly 2 hops (*2..2).",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match5.feature",
+    "scenario": "[10] Handling symmetrically bounded variable length match, bounds are two"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects element pattern quantifiers ('element pattern quantifier is not supported')."
+    }
+  }
+}

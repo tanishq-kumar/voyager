@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/varlength-zero-middle",
+  "pack": "p4-paths",
+  "description": "Zero-length variable-length pattern between two relationships in the pattern.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match4.feature",
+    "scenario": "[3] Zero-length variable length pattern in the middle of the pattern"
+  },
+  "params": {},
+  "fixture": "path-two-types",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "known-diff",
+      "reason": "PostgreSQL 19 SQL/PGQ rejects element pattern quantifiers ('element pattern quantifier is not supported')."
+    }
+  }
+}

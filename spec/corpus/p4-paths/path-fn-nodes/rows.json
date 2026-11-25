@@ -1,0 +1,31 @@
+{
+  "columns": [
+    "ns"
+  ],
+  "rows": [
+    [
+      [
+        {
+          "kind": "node",
+          "labels": [
+            "Person"
+          ],
+          "properties": {
+            "name": "Alice",
+            "age": 30
+          }
+        },
+        {
+          "kind": "node",
+          "labels": [
+            "Person"
+          ],
+          "properties": {
+            "name": "Bob",
+            "age": 25
+          }
+        }
+      ]
+    ]
+  ]
+}
