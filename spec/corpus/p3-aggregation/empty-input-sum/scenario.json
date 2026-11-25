@@ -15,15 +15,13 @@
       "status": "supported"
     },
     "age": {
-      "status": "known-diff",
-      "reason": "Apache AGE returns null for SUM over empty input, whereas openCypher/Neo4j returns 0."
+      "status": "supported"
     },
     "gql": {
       "status": "supported"
     },
     "sqlpgq": {
-      "status": "known-diff",
-      "reason": "PostgreSQL 19 returns null for SUM over empty input, whereas openCypher/Neo4j returns 0."
+      "status": "supported"
     }
   }
 }

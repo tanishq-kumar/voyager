@@ -728,6 +728,11 @@ class _SessionBase:
         if resolved_graph is None and self._dialect in ("age", "apache_age", "postgres_age"):
             resolved_graph = "age_graph"
 
+        from voyager_ogm.bridge import AsyncDuckDbBridge, DuckDbBridge
+
+        if dialect is None and isinstance(self._bridge, (DuckDbBridge, AsyncDuckDbBridge)):
+            self._dialect = "duckpgq"
+
         if resolved_graph is not None:
             validate_graph_name(resolved_graph)
 
@@ -1099,8 +1104,17 @@ class _SessionBase:
                 if query_or_statement._optimization_level is not None
                 else self._optimization_level
             )
+            target_dialect = self._dialect
+            from voyager_ogm.bridge import AsyncDuckDbBridge, DuckDbBridge
+
+            if isinstance(self._bridge, (DuckDbBridge, AsyncDuckDbBridge)) and target_dialect in (
+                "sql_pgq",
+                "pgq",
+                "sql",
+            ):
+                target_dialect = "duckpgq"
             compiled = query_or_statement.compile(
-                dialect=self._dialect,
+                dialect=target_dialect,
                 graph_name=self._graph_name,
                 optimize=opt,
                 optimization_level=lvl,

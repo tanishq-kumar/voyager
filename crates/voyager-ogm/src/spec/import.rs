@@ -4537,12 +4537,22 @@ pub fn compile(
                 .visit_query(&arena, root)
                 .map_err(|error| map_compile_error(error).with_warnings(warnings.clone()))?
         }
-        "sql_pgq" | "pgq" | "duckpgq" | "sql" => {
+        "sql_pgq" | "pgq" | "sql" => {
             let name = options
                 .graph_name
                 .clone()
                 .unwrap_or_else(|| "graph_table".into());
             let mut emitter = SqlPgqEmitter::new(name);
+            emitter
+                .visit_query(&arena, root)
+                .map_err(|error| map_compile_error(error).with_warnings(warnings.clone()))?
+        }
+        "duckpgq" | "duck_pgq" => {
+            let name = options
+                .graph_name
+                .clone()
+                .unwrap_or_else(|| "graph_table".into());
+            let mut emitter = SqlPgqEmitter::new(name).for_duckpgq();
             emitter
                 .visit_query(&arena, root)
                 .map_err(|error| map_compile_error(error).with_warnings(warnings.clone()))?

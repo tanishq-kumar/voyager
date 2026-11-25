@@ -419,7 +419,8 @@ impl AstVisitor for AgeEmitter {
 
         let mut cypher_emitter = CypherEmitter::new()
             .without_execution_mode()
-            .with_age_label_predicates();
+            .with_age_label_predicates()
+            .with_age_aggregates();
         let cypher_compiled = cypher_emitter.visit_query(arena, root)?;
 
         let root_node = arena.get(root)?;
@@ -618,5 +619,102 @@ mod tests {
             }
             other => panic!("Expected UnsupportedFeature, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn age_emitter_sum_emits_coalesce() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_property_aggregate(
+                "n",
+                "age",
+                crate::ast::AggregationFunc::Sum,
+                Some("total_age"),
+            );
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("age_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN coalesce(sum(n.age), 0) AS total_age $$) AS (total_age agtype)"
+        );
+    }
+
+    #[test]
+    fn age_emitter_collect_preserves_opencypher_collect() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_property_aggregate(
+                "n",
+                "city",
+                crate::ast::AggregationFunc::Collect,
+                Some("cities"),
+            );
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("age_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN COLLECT(n.city) AS cities $$) AS (cities agtype)"
+        );
+    }
+
+    #[test]
+    fn age_emitter_grouped_aggregations() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .field("n", "country", Some("country"))
+            .select_property_aggregate(
+                "n",
+                "age",
+                crate::ast::AggregationFunc::Sum,
+                Some("total_age"),
+            )
+            .select_property_aggregate(
+                "n",
+                "city",
+                crate::ast::AggregationFunc::Collect,
+                Some("cities"),
+            );
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("age_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) RETURN n.country AS country, coalesce(sum(n.age), 0) AS total_age, COLLECT(n.city) AS cities $$) AS (country agtype, total_age agtype, cities agtype)"
+        );
+    }
+
+    #[test]
+    fn age_emitter_empty_input_aggregates() {
+        let mut builder = QueryBuilder::new();
+        let p0 = builder.literal(false);
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .where_expr(p0)
+            .select_property_aggregate(
+                "n",
+                "age",
+                crate::ast::AggregationFunc::Sum,
+                Some("total_age"),
+            );
+
+        let (arena, root) = builder.build();
+        let mut emitter = AgeEmitter::new("age_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM cypher('age_graph', $$ MATCH (n:Person) WHERE $p0 RETURN coalesce(sum(n.age), 0) AS total_age $$, %s) AS (total_age agtype)"
+        );
     }
 }

@@ -259,10 +259,14 @@ fn test_pgq_all_aggregations_and_pagination() {
             .contains("SELECT city, COUNT(name) AS total_count")
     );
     assert!(res.statement.contains("AVG(age) AS avg_age"));
-    assert!(res.statement.contains("SUM(age) AS total_age"));
+    assert!(res.statement.contains("COALESCE(SUM(age), 0) AS total_age"));
     assert!(res.statement.contains("MIN(age) AS min_age"));
     assert!(res.statement.contains("MAX(age) AS max_age"));
-    assert!(res.statement.contains("ARRAY_AGG(name) AS all_names"));
+    assert!(
+        res.statement.contains(
+            "COALESCE(ARRAY_AGG(name) FILTER (WHERE name IS NOT NULL), '{}') AS all_names"
+        )
+    );
     assert!(
         res.statement
             .contains("COLUMNS (p.city AS city, p.name AS name, p.age AS age)")
@@ -501,4 +505,43 @@ fn test_pgq_accepts_plain_identifier_graph_names() {
             res.statement
         );
     }
+}
+
+#[test]
+fn test_duckpgq_flavor_aggregates_emission() {
+    let mut builder = QueryBuilder::new();
+    builder
+        .match_node(Some("p"), vec!["Person"])
+        .field("p", "country", Some("country"))
+        .select_property_aggregate("p", "age", AggregationFunc::Sum, Some("total_age"))
+        .select_property_aggregate("p", "city", AggregationFunc::Collect, Some("cities"));
+    let (arena, root) = builder.build();
+
+    let mut duck_emitter = SqlPgqEmitter::new("social_graph").for_duckpgq();
+    let res = duck_emitter.visit_query(&arena, root).unwrap();
+
+    assert_eq!(
+        res.statement,
+        "SELECT country, COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") COLUMNS (p.country AS country, p.age AS age, p.city AS city)) GROUP BY country"
+    );
+}
+
+#[test]
+fn test_duckpgq_flavor_empty_input_aggregates() {
+    let mut builder = QueryBuilder::new();
+    let p0 = builder.literal(false);
+    builder
+        .match_node(Some("p"), vec!["Person"])
+        .where_expr(p0)
+        .select_property_aggregate("p", "age", AggregationFunc::Sum, Some("total_age"))
+        .select_property_aggregate("p", "city", AggregationFunc::Collect, Some("cities"));
+    let (arena, root) = builder.build();
+
+    let mut duck_emitter = SqlPgqEmitter::new("social_graph").for_duckpgq();
+    let res = duck_emitter.visit_query(&arena, root).unwrap();
+
+    assert_eq!(
+        res.statement,
+        "SELECT COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") WHERE $p0 COLUMNS (p.age AS age, p.city AS city))"
+    );
 }

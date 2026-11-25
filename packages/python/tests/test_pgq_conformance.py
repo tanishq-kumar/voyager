@@ -13,11 +13,6 @@ Ingests and validates official DuckPGQ & ISO/IEC 9075-16:2023 SQL:PGQ scenarios:
 
 from __future__ import annotations
 
-try:
-    import duckdb
-except ImportError:
-    duckdb = None
-
 import pytest
 from voyager_ogm import (
     Field,
@@ -229,14 +224,25 @@ def test_pgq_aggregations_and_projections():
 
     assert "SELECT city, COUNT(name) AS total_count" in compiled.statement
     assert "AVG(age) AS avg_age" in compiled.statement
-    assert "SUM(age) AS total_age" in compiled.statement
+    assert "COALESCE(SUM(age), 0) AS total_age" in compiled.statement
     assert "MIN(age) AS min_age" in compiled.statement
     assert "MAX(age) AS max_age" in compiled.statement
-    assert "ARRAY_AGG(name) AS all_names" in compiled.statement
+    assert (
+        "COALESCE(ARRAY_AGG(name) FILTER (WHERE name IS NOT NULL), '{}') AS all_names"
+        in compiled.statement
+    )
     assert 'FROM GRAPH_TABLE (g MATCH (p IS "Person")' in compiled.statement
     assert "COLUMNS (p.city AS city, p.name AS name, p.age AS age))" in compiled.statement
     assert "GROUP BY city" in compiled.statement
     assert "ORDER BY city ASC NULLS LAST LIMIT 10 OFFSET 5" in compiled.statement
+
+    # DuckPGQ flavor emits empty list [] instead of PostgreSQL array literal '{}'
+    compiled_duck = q.compile("duckpgq", graph_name="g")
+    assert (
+        "COALESCE(ARRAY_AGG(name) FILTER (WHERE name IS NOT NULL), []) AS all_names"
+        in compiled_duck.statement
+    )
+    assert "COALESCE(SUM(age), 0) AS total_age" in compiled_duck.statement
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +252,7 @@ def test_pgq_aggregations_and_projections():
 
 def test_live_duckdb_relational_graph_schema_and_polars():
     """Verifies live in-memory DuckDB + DuckPGQ execution and zero-copy Polars export."""
-    if duckdb is None:
-        pytest.skip("duckdb is not installed in this environment")
+    duckdb = pytest.importorskip("duckdb")
     con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     try:
         con.execute("LOAD duckpgq;")

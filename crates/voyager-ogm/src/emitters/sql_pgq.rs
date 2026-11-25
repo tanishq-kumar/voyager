@@ -47,6 +47,16 @@ fn ast_node_kind(node: &AstNode) -> &'static str {
     }
 }
 
+/// Target dialect flavor for SQL:PGQ query emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqlPgqFlavor {
+    /// PostgreSQL 19+ standard SQL:PGQ implementation (uses `'{}'` for empty array literal).
+    #[default]
+    Postgres,
+    /// DuckDB DuckPGQ implementation (uses `[]` for empty list literal).
+    DuckPgq,
+}
+
 /// Emits standardized ISO/IEC 9075-16:2023 SQL:PGQ `GRAPH_TABLE` queries.
 ///
 /// Labels in `IS` patterns are double-quoted (for example `IS "User"`), so
@@ -58,6 +68,7 @@ pub struct SqlPgqEmitter {
     param_counter: usize,
     parameters: HashMap<String, LiteralValue>,
     buffer: String,
+    flavor: SqlPgqFlavor,
 }
 
 impl Default for SqlPgqEmitter {
@@ -74,6 +85,31 @@ impl SqlPgqEmitter {
             param_counter: 0,
             parameters: HashMap::new(),
             buffer: String::with_capacity(256),
+            flavor: SqlPgqFlavor::Postgres,
+        }
+    }
+
+    /// Configures the emitter to target DuckPGQ dialect semantics (e.g. `[]` empty list literals).
+    pub fn for_duckpgq(mut self) -> Self {
+        self.flavor = SqlPgqFlavor::DuckPgq;
+        self
+    }
+
+    /// Sets the target SQL:PGQ flavor.
+    pub fn with_flavor(mut self, flavor: SqlPgqFlavor) -> Self {
+        self.flavor = flavor;
+        self
+    }
+
+    /// Returns the target SQL:PGQ flavor.
+    pub fn flavor(&self) -> SqlPgqFlavor {
+        self.flavor
+    }
+
+    fn empty_array_literal(&self) -> &'static str {
+        match self.flavor {
+            SqlPgqFlavor::Postgres => "'{}'",
+            SqlPgqFlavor::DuckPgq => "[]",
         }
     }
 
@@ -960,16 +996,44 @@ impl SqlPgqEmitter {
             }
             if let Some(func) = proj.aggregation {
                 match func {
-                    AggregationFunc::Count => self.buffer.push_str("COUNT("),
-                    AggregationFunc::CountDistinct => self.buffer.push_str("COUNT(DISTINCT "),
-                    AggregationFunc::Sum => self.buffer.push_str("SUM("),
-                    AggregationFunc::Avg => self.buffer.push_str("AVG("),
-                    AggregationFunc::Min => self.buffer.push_str("MIN("),
-                    AggregationFunc::Max => self.buffer.push_str("MAX("),
-                    AggregationFunc::Collect => self.buffer.push_str("ARRAY_AGG("),
+                    AggregationFunc::Count => {
+                        self.buffer.push_str("COUNT(");
+                        self.emit_expression(arena, proj.expression, false)?;
+                        self.buffer.push(')');
+                    }
+                    AggregationFunc::CountDistinct => {
+                        self.buffer.push_str("COUNT(DISTINCT ");
+                        self.emit_expression(arena, proj.expression, false)?;
+                        self.buffer.push(')');
+                    }
+                    AggregationFunc::Sum => {
+                        self.buffer.push_str("COALESCE(SUM(");
+                        self.emit_expression(arena, proj.expression, false)?;
+                        self.buffer.push_str("), 0)");
+                    }
+                    AggregationFunc::Avg => {
+                        self.buffer.push_str("AVG(");
+                        self.emit_expression(arena, proj.expression, false)?;
+                        self.buffer.push(')');
+                    }
+                    AggregationFunc::Min => {
+                        self.buffer.push_str("MIN(");
+                        self.emit_expression(arena, proj.expression, false)?;
+                        self.buffer.push(')');
+                    }
+                    AggregationFunc::Max => {
+                        self.buffer.push_str("MAX(");
+                        self.emit_expression(arena, proj.expression, false)?;
+                        self.buffer.push(')');
+                    }
+                    AggregationFunc::Collect => {
+                        let expr = self.render_expression_to_string(arena, proj.expression)?;
+                        let empty_arr = self.empty_array_literal();
+                        self.buffer.push_str(&format!(
+                            "COALESCE(ARRAY_AGG({expr}) FILTER (WHERE {expr} IS NOT NULL), {empty_arr})"
+                        ));
+                    }
                 }
-                self.emit_expression(arena, proj.expression, false)?;
-                self.buffer.push(')');
             } else {
                 self.emit_expression(arena, proj.expression, false)?;
             }
@@ -1195,11 +1259,16 @@ impl AstVisitor for SqlPgqEmitter {
                             AggregationFunc::CountDistinct => {
                                 format!("COUNT(DISTINCT {inner_col_name})")
                             }
-                            AggregationFunc::Sum => format!("SUM({inner_col_name})"),
+                            AggregationFunc::Sum => format!("COALESCE(SUM({inner_col_name}), 0)"),
                             AggregationFunc::Avg => format!("AVG({inner_col_name})"),
                             AggregationFunc::Min => format!("MIN({inner_col_name})"),
                             AggregationFunc::Max => format!("MAX({inner_col_name})"),
-                            AggregationFunc::Collect => format!("ARRAY_AGG({inner_col_name})"),
+                            AggregationFunc::Collect => {
+                                let empty_arr = self.empty_array_literal();
+                                format!(
+                                    "COALESCE(ARRAY_AGG({inner_col_name}) FILTER (WHERE {inner_col_name} IS NOT NULL), {empty_arr})"
+                                )
+                            }
                         };
 
                         if let Some(alias) = &proj.alias {
@@ -1876,5 +1945,192 @@ mod tests {
             }
             other => panic!("Expected UnsupportedFeature, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sql_pgq_sum_emits_coalesce() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_property_aggregate("n", "age", AggregationFunc::Sum, Some("total_age"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT COALESCE(SUM(age), 0) AS total_age FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.age AS age))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_collect_emits_coalesce_filter_where_not_null() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_property_aggregate("n", "city", AggregationFunc::Collect, Some("cities"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), '{}') AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_collect_distinct() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .distinct(true)
+            .select_property_aggregate("n", "city", AggregationFunc::Collect, Some("cities"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT DISTINCT COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), '{}') AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_grouped_aggregations() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .field("n", "country", Some("country"))
+            .select_property_aggregate("n", "age", AggregationFunc::Sum, Some("total_age"))
+            .select_property_aggregate("n", "city", AggregationFunc::Collect, Some("cities"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT country, COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), '{}') AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.country AS country, n.age AS age, n.city AS city)) GROUP BY country"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_empty_input_aggregates() {
+        let mut builder = QueryBuilder::new();
+        let p0 = builder.literal(false);
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .where_expr(p0)
+            .select_property_aggregate("n", "age", AggregationFunc::Sum, Some("total_age"))
+            .select_property_aggregate("n", "age", AggregationFunc::Collect, Some("ages"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(age) FILTER (WHERE age IS NOT NULL), '{}') AS ages FROM GRAPH_TABLE (g MATCH (n IS \"Person\") WHERE $p0 COLUMNS (n.age AS age))"
+        );
+    }
+
+    #[test]
+    fn duckpgq_sum_emits_coalesce_zero() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_property_aggregate("n", "age", AggregationFunc::Sum, Some("total_age"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g")
+            .for_duckpgq()
+            .visit_query(&arena, root)
+            .unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT COALESCE(SUM(age), 0) AS total_age FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.age AS age))"
+        );
+    }
+
+    #[test]
+    fn duckpgq_collect_emits_coalesce_filter_empty_list() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_property_aggregate("n", "city", AggregationFunc::Collect, Some("cities"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g")
+            .for_duckpgq()
+            .visit_query(&arena, root)
+            .unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city))"
+        );
+    }
+
+    #[test]
+    fn duckpgq_collect_distinct() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .distinct(true)
+            .select_property_aggregate("n", "city", AggregationFunc::Collect, Some("cities"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g")
+            .for_duckpgq()
+            .visit_query(&arena, root)
+            .unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT DISTINCT COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city))"
+        );
+    }
+
+    #[test]
+    fn duckpgq_grouped_aggregations() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .field("n", "country", Some("country"))
+            .select_property_aggregate("n", "age", AggregationFunc::Sum, Some("total_age"))
+            .select_property_aggregate("n", "city", AggregationFunc::Collect, Some("cities"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g")
+            .for_duckpgq()
+            .visit_query(&arena, root)
+            .unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT country, COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.country AS country, n.age AS age, n.city AS city)) GROUP BY country"
+        );
+    }
+
+    #[test]
+    fn duckpgq_empty_input_aggregates() {
+        let mut builder = QueryBuilder::new();
+        let p0 = builder.literal(false);
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .where_expr(p0)
+            .select_property_aggregate("n", "age", AggregationFunc::Sum, Some("total_age"))
+            .select_property_aggregate("n", "age", AggregationFunc::Collect, Some("ages"));
+
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g")
+            .for_duckpgq()
+            .visit_query(&arena, root)
+            .unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(age) FILTER (WHERE age IS NOT NULL), []) AS ages FROM GRAPH_TABLE (g MATCH (n IS \"Person\") WHERE $p0 COLUMNS (n.age AS age))"
+        );
     }
 }
