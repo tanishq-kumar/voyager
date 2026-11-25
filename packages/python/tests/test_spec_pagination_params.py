@@ -339,7 +339,7 @@ def test_live_apache_age_pagination_parameters() -> None:
 
 @pytest.mark.live
 def test_live_postgres19_pgq_pagination_parameters() -> None:
-    """PostgreSQL 19 SQL/PGQ binds LIMIT and OFFSET parameters."""
+    """PostgreSQL 19 Beta 3 SQL/PGQ binds LIMIT and OFFSET parameters."""
     port = 5456
     graph_name = "feat321_pg_pagination"
     if not _port_open(port):

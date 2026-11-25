@@ -8,7 +8,7 @@
 
 **Native asynchronous driver layer for Voyager OGM: connection pooling, wire protocols, and Arrow results.**
 
-`voyager-drivers` is the pure safe Rust driver layer for Voyager OGM. It opens asynchronous Bolt (Neo4j, Memgraph), PostgreSQL wire (Apache AGE, PostgreSQL 19) and Redis RESP (FalkorDB) connections over TCP or TLS, pools them, runs native transactions, and returns Apache Arrow record batches. It builds on [Tokio](https://tokio.rs) and contains no unsafe code.
+`voyager-drivers` is the pure safe Rust driver layer for Voyager OGM. It opens asynchronous Bolt (Neo4j, Memgraph), PostgreSQL wire (Apache AGE, PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)) and Redis RESP (FalkorDB) connections over TCP or TLS, pools them, runs native transactions, and returns Apache Arrow record batches. It builds on [Tokio](https://tokio.rs) and contains no unsafe code.
 
 ## Install
 
@@ -27,7 +27,7 @@ cargo add voyager-drivers --no-default-features --features bolt
 | Feature | Default | Enables |
 | :--- | :--- | :--- |
 | `bolt` | yes | Bolt client (Neo4j, Memgraph) |
-| `postgres` | yes | PostgreSQL wire client (Apache AGE, PostgreSQL 19) |
+| `postgres` | yes | PostgreSQL wire client (Apache AGE, PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)) |
 | `redis` | yes | Redis RESP2/RESP3 client (FalkorDB) |
 | `arrow` | yes | Arrow result batches (`rows_to_record_batch`) |
 | `tls` | yes | TLS for every protocol through [rustls](https://docs.rs/rustls) (ring provider, system root store) |

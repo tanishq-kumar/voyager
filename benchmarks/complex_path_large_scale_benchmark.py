@@ -5,7 +5,7 @@ with 2-hop / 3-hop relationship expansions across:
 1. Neo4j 5.26 (Bolt :7687)
 2. Memgraph (Bolt :7688)
 3. DuckDB (100,000 rows relational multi-hop join)
-4. PostgreSQL 19 (100,000 rows 2-hop graph join)
+4. PostgreSQL 19 Beta 3 (100,000 rows 2-hop graph join)
 5. FalkorDB (Redis Graph :6379)
 6. Apache AGE (PostgreSQL :5455)
 """

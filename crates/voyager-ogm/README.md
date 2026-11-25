@@ -160,7 +160,7 @@ More runnable examples live in [`crates/voyager-ogm/examples`](https://github.co
 | Dialect | Emitter | Targets |
 | :--- | :--- | :--- |
 | openCypher 9 / Cypher 25 | `CypherEmitter::new()` | Neo4j, Memgraph, FalkorDB |
-| SQL:2023 PGQ (`GRAPH_TABLE`) | `SqlPgqEmitter::new("graph_name")` | DuckDB/DuckPGQ, PostgreSQL 19+ |
+| SQL:2023 PGQ (`GRAPH_TABLE`) | `SqlPgqEmitter::new("graph_name")` | DuckDB/DuckPGQ, PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) |
 | ISO GQL (ISO/IEC 39075:2024) | `IsoGqlEmitter::new()` | Standard GQL engines |
 | Apache AGE | `AgeEmitter::new("age_graph")` | Cypher-in-SQL on PostgreSQL |
 

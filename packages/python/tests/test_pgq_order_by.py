@@ -313,7 +313,7 @@ def test_duckpgq_order_by_multiple_mixed_keys_and_pagination(duckpgq_bridge) -> 
 
 @pytest.mark.live
 class TestLivePostgres19AndNeo4jParity:
-    """Live verification of SQL/PGQ #319 and #320 against PostgreSQL 19 and Neo4j."""
+    """Live verification of SQL/PGQ #319 and #320 against PostgreSQL 19 Beta 3 and Neo4j."""
 
     @pytest.fixture(autouse=True)
     def setup_and_teardown(self):

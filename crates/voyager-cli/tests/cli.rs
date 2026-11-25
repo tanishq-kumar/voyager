@@ -374,3 +374,128 @@ fn voy_alias_is_installed_with_the_same_version() {
         stdout(&output)
     );
 }
+
+#[cfg(feature = "postgres")]
+mod pg_stub_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    fn pg_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(msg_type);
+        out.extend_from_slice(&(4 + payload.len() as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn pg_param_status(name: &str, value: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(value.as_bytes());
+        payload.push(0);
+        pg_frame(b'S', &payload)
+    }
+
+    fn pg_single_text_row(col: &str, val: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut row_desc = Vec::new();
+        row_desc.extend_from_slice(&1i16.to_be_bytes());
+        row_desc.extend_from_slice(col.as_bytes());
+        row_desc.push(0);
+        row_desc.extend_from_slice(&0i32.to_be_bytes());
+        row_desc.extend_from_slice(&0i16.to_be_bytes());
+        row_desc.extend_from_slice(&25i32.to_be_bytes());
+        row_desc.extend_from_slice(&(-1i16).to_be_bytes());
+        row_desc.extend_from_slice(&(-1i32).to_be_bytes());
+        row_desc.extend_from_slice(&0i16.to_be_bytes());
+        out.extend_from_slice(&pg_frame(b'T', &row_desc));
+
+        let mut data_row = Vec::new();
+        data_row.extend_from_slice(&1i16.to_be_bytes());
+        data_row.extend_from_slice(&(val.len() as i32).to_be_bytes());
+        data_row.extend_from_slice(val.as_bytes());
+        out.extend_from_slice(&pg_frame(b'D', &data_row));
+        out.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+        out.extend_from_slice(&pg_frame(b'Z', b"I"));
+        out
+    }
+
+    fn spawn_pg_without_pgq(
+        server_version: &'static str,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let mut startup = Vec::new();
+            startup.extend_from_slice(&pg_frame(b'R', &0i32.to_be_bytes()));
+            startup.extend_from_slice(&pg_param_status("server_version", server_version));
+            startup.extend_from_slice(&pg_frame(b'Z', b"I"));
+            if stream.write_all(&startup).is_err() {
+                return;
+            }
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 || buf[0] == b'X' {
+                    break;
+                }
+                let query = String::from_utf8_lossy(&buf[5..n]);
+                let reply = if query.contains("SHOW server_version") {
+                    pg_single_text_row("server_version", server_version)
+                } else if query.contains("pg_propgraph_element") {
+                    pg_single_text_row("json_build_object", r#"{"pgq": false, "age": false}"#)
+                } else {
+                    pg_single_text_row("?column?", "1")
+                };
+                if stream.write_all(&reply).is_err() {
+                    break;
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn doctor_and_introspect_report_clear_error_when_postgres_lacks_pgq() {
+        let (addr, handle) = spawn_pg_without_pgq("19.0");
+        let doctor = run(&[
+            "doctor",
+            "--uri",
+            &format!("postgresql://postgres:zz@{addr}/voyager_graph"),
+        ]);
+        let _ = handle.join();
+        assert_eq!(doctor.status.code(), Some(3), "{}", stderr(&doctor));
+        let err = stderr(&doctor);
+        assert!(
+            err.contains("doctor: PostgreSQL 19.0 does not support SQL/PGQ"),
+            "{err}"
+        );
+        assert!(
+            err.contains("experimental: PostgreSQL 19 Beta 1-3 and 20 development builds"),
+            "{err}"
+        );
+
+        let (addr, handle) = spawn_pg_without_pgq("19.0");
+        let introspect = run(&[
+            "introspect",
+            "--uri",
+            &format!("postgresql://postgres:zz@{addr}/voyager_graph?graph=g"),
+        ]);
+        let _ = handle.join();
+        assert_eq!(introspect.status.code(), Some(5), "{}", stderr(&introspect));
+        let err = stderr(&introspect);
+        assert!(
+            err.contains("PostgreSQL 19.0 does not support SQL/PGQ"),
+            "{err}"
+        );
+        assert!(
+            err.contains("experimental: PostgreSQL 19 Beta 1-3 and 20 development builds"),
+            "{err}"
+        );
+    }
+}

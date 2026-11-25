@@ -464,7 +464,7 @@ def test_sql_pgq_rejects_edge_relationship_type_expression_negation() -> None:
 
 @pytest.mark.live
 def test_live_postgres19_supported_forms() -> None:
-    """Verifies live PostgreSQL 19 execution with supported single-label, label disjunction, and alternative edge types."""
+    """Verifies live PostgreSQL 19 Beta 3 execution with supported single-label, label disjunction, and alternative edge types."""
     if psycopg is None:
         pytest.skip("psycopg is not installed in this environment")
     if not _is_port_open("127.0.0.1", 5456):

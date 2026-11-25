@@ -51,7 +51,7 @@ fn ast_node_kind(node: &AstNode) -> &'static str {
 /// Target dialect flavor for SQL:PGQ query emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SqlPgqFlavor {
-    /// PostgreSQL 19+ standard SQL:PGQ implementation (uses `'{}'` for empty array literal).
+    /// PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds; uses `'{}'` for empty array literal).
     #[default]
     Postgres,
     /// DuckDB DuckPGQ implementation (uses `[]` for empty list literal).
@@ -61,7 +61,7 @@ pub enum SqlPgqFlavor {
 /// Emits standardized ISO/IEC 9075-16:2023 SQL:PGQ `GRAPH_TABLE` queries.
 ///
 /// Labels in `IS` patterns are double-quoted (for example `IS "User"`), so
-/// PostgreSQL 19 matches the declared label spelling exactly, the same
+/// PostgreSQL SQL/PGQ matches the declared label spelling exactly, the same
 /// case-exact rule Cypher uses.
 #[derive(Debug)]
 pub struct SqlPgqEmitter {

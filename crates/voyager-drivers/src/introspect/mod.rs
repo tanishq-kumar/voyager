@@ -47,7 +47,7 @@
 //!   (Memgraph); property types through `valueType()`.
 //! - FalkorDB: `db.labels()`, `db.relationshipTypes()`, `db.indexes()` and
 //!   `db.constraints()`; property types through `typeOf()`.
-//! - PostgreSQL 19 SQL/PGQ property graphs: the `pg_propgraph_*` catalogs,
+//! - PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) property graphs: the `pg_propgraph_*` catalogs,
 //!   with types, keys, `NOT NULL`, unique constraints and indexes read from the
 //!   element tables. Requires the graph name (`?graph=` in the URI).
 //! - Apache AGE and DuckDB return an `UNSUPPORTED_FEATURE` error.
@@ -57,6 +57,8 @@ mod cypher;
 pub mod parse;
 #[cfg(feature = "postgres")]
 mod pgq;
+#[cfg(feature = "postgres")]
+pub use pgq::{PgqSupport, no_pgq_support_message, probe_pgq_support};
 
 use std::collections::{BTreeMap, BTreeSet};
 

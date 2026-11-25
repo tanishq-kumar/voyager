@@ -141,7 +141,7 @@ uv run --no-sync pytest -m live packages/python/tests/test_native_tls.py
 | Memgraph 7690 | TLS only (plain Memgraph stays on 7688) |
 | FalkorDB 6380 | TLS only (plain FalkorDB stays on 6379) |
 | FalkorDB 6381 | mutual TLS: clients present `client.crt` / `client.key` |
-| Apache AGE 5455, PostgreSQL 19 5456 | `ssl=on`: the client chooses with `sslmode` |
+| Apache AGE 5455, PostgreSQL 19 Beta 3 5456 | `ssl=on`: the client chooses with `sslmode` |
 
 The tests read the host from `VOYAGER_TEST_HOST` (default `127.0.0.1`) and the CA from `VOYAGER_TEST_TLS_CA` (default `containers/tls/certs/ca.crt`; the client certificate is read from the same directory), and skip an endpoint that is unreachable. TLS behaviour that needs no database (certificate and hostname checks, mutual TLS, every PostgreSQL `sslmode`, the server's `N` reply) is covered by `crates/voyager-drivers/tests/tls_tests.rs`, which generates its own certificates.
 
@@ -187,7 +187,7 @@ just ci
 Voyager is structured as a monorepo:
 
 * `crates/voyager-ogm`: Core query compiler — fluent builder, AST arena, optimizer, multi-dialect emitters (openCypher, SQL:2023 PGQ, ISO GQL, Apache AGE), schema registry, Arrow bridge.
-* `crates/voyager-drivers`: Native async driver layer — Bolt (Neo4j, Memgraph), PostgreSQL wire (Apache AGE, PostgreSQL 19), Redis RESP (FalkorDB), connection pooling, native transactions.
+* `crates/voyager-drivers`: Native async driver layer — Bolt (Neo4j, Memgraph), PostgreSQL wire (Apache AGE, PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)), Redis RESP (FalkorDB), connection pooling, native transactions.
 * `crates/voyager-cli`: The `voyager` binary — diagnostics (`doctor`), plus early `compile`/`bench` placeholders (planned short alias: `voy`).
 * `crates/voyager-pyo3`: PyO3 native extension for the Python package (not published to crates.io; built into the wheel by maturin).
 * `packages/python/voyager_ogm`: Python SDK — sessions, models, bridges, Polars streaming, graph viewer.

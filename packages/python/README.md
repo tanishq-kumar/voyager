@@ -7,7 +7,7 @@
 [![CI](https://github.com/tanishq-kumar/voyager/actions/workflows/ci.yml/badge.svg)](https://github.com/tanishq-kumar/voyager/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/tanishq-kumar/voyager/blob/main/LICENSE)
 
-Voyager OGM lets you define graph models with Python type annotations and build a query once as an abstract syntax tree, then compile it to the dialect your database speaks: openCypher (Neo4j, Memgraph, FalkorDB), SQL:2023 PGQ `GRAPH_TABLE` (DuckDB/DuckPGQ, PostgreSQL), ISO GQL, or Apache AGE. Results stream into Polars DataFrames through the Apache Arrow C Data Interface, and optional extras add Bolt, PostgreSQL, embedded DuckDB and Relate, SQLAlchemy, NetworkX, and notebook integrations.
+Voyager OGM lets you define graph models with Python type annotations and build a query once as an abstract syntax tree, then compile it to the dialect your database speaks: openCypher (Neo4j, Memgraph, FalkorDB), SQL:2023 PGQ `GRAPH_TABLE` (DuckDB/DuckPGQ; PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)), ISO GQL, or Apache AGE. Results stream into Polars DataFrames through the Apache Arrow C Data Interface, and optional extras add Bolt, PostgreSQL, embedded DuckDB and Relate, SQLAlchemy, NetworkX, and notebook integrations.
 
 ## Installation
 
@@ -126,7 +126,7 @@ print(cypher.statement)
 # RETURN _person_0.name, _person_0.age, _company_0.name AS company_name
 # ORDER BY _person_0.name ASC LIMIT 10
 
-# 2. Compile to SQL:2023 PGQ (DuckDB, PostgreSQL)
+# 2. Compile to SQL:2023 PGQ (DuckDB/DuckPGQ; PostgreSQL SQL/PGQ experimental on 19 Beta 1-3 / 20 dev)
 pgq = query.compile("sql_pgq", graph_name="corp_graph")
 print(pgq.statement)
 
