@@ -107,6 +107,12 @@ def test_scenario_metadata_and_spec_schema(scenario_id: str, scenario_dir: Path)
 
     # Validate against scenario.schema.json
     Draft202012Validator(SCENARIO_SCHEMA).validate(scenario_doc)
+    if "reference_cypher" in scenario_doc:
+        cypher_status = scenario_doc["targets"]["cypher"]["status"]
+        assert cypher_status != "supported", (
+            f"{scenario_id}: reference_cypher is only allowed when targets.cypher.status "
+            f"is not 'supported' (got {cypher_status!r})"
+        )
 
     # Validate scenario.json ID consistency with directory structure
     pack_name, scenario_name = scenario_id.split("/", 1)
