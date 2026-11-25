@@ -18,8 +18,7 @@
       "status": "supported"
     },
     "gql": {
-      "status": "known-diff",
-      "reason": "ISO GQL emitter maps 'length' to 'char_length' instead of 'path_length' for path variables (#362)."
+      "status": "supported"
     },
     "sqlpgq": {
       "status": "unsupported",

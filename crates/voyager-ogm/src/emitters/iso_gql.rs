@@ -6,7 +6,7 @@ use crate::ast::{
 };
 use crate::error::{Error, Result};
 use crate::visitor::{AstVisitor, ColumnMeta, CompiledQuery};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Detects whether an expression is likely to produce a string value.
 ///
@@ -61,6 +61,7 @@ pub struct IsoGqlEmitter {
     buffer: String,
     ignore_execution_mode: bool,
     node_params: HashMap<NodeHandle, String>,
+    path_variables: HashSet<String>,
 }
 
 impl IsoGqlEmitter {
@@ -72,6 +73,7 @@ impl IsoGqlEmitter {
             buffer: String::with_capacity(256),
             ignore_execution_mode: false,
             node_params: HashMap::new(),
+            path_variables: HashSet::new(),
         }
     }
 
@@ -229,6 +231,7 @@ impl IsoGqlEmitter {
                 edges,
             } => {
                 if let Some(var) = path_variable {
+                    self.path_variables.insert(var.clone());
                     self.buffer.push_str(var);
                     self.buffer.push_str(" = ");
                 }
@@ -415,9 +418,24 @@ impl IsoGqlEmitter {
                 }
             },
             AstNode::FunctionCall { name, arguments } => {
-                let gql_func = match name.to_ascii_lowercase().as_str() {
+                let lower_name = name.to_ascii_lowercase();
+                // openCypher's `length` is overloaded: it returns the number of relationships in
+                // a path, and in older Cypher it also returned the number of characters in a
+                // string. ISO GQL separates those functions, so only a value known to be a path
+                // can become `path_length`; every other argument keeps the string meaning that
+                // was emitted before path variables were tracked.
+                let is_path_length = if lower_name == "length" && arguments.len() == 1 {
+                    match arena.get(arguments[0])? {
+                        AstNode::Identifier(id) => self.path_variables.contains(id),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                let gql_func = match lower_name.as_str() {
                     "tolower" | "lower" => "lower",
                     "toupper" | "upper" => "upper",
+                    "length" if is_path_length => "path_length",
                     "length" | "char_length" | "character_length" => "char_length",
                     "size" | "cardinality" => "cardinality",
                     "path_length" => "path_length",
@@ -626,6 +644,14 @@ impl IsoGqlEmitter {
         }
 
         if let Some(alias) = &proj.alias {
+            // `WITH p AS q` keeps a path binding under its new name, so a later `length(q)`
+            // is still a path length.
+            if proj.aggregation.is_none()
+                && let Ok(AstNode::Identifier(id)) = arena.get(proj.expression)
+                && self.path_variables.contains(id)
+            {
+                self.path_variables.insert(alias.clone());
+            }
             self.buffer.push_str(" AS ");
             self.buffer.push_str(alias);
         }
@@ -648,6 +674,7 @@ impl IsoGqlEmitter {
                 self.buffer.push_str("DISTINCT ");
             }
 
+            let path_variables_before = self.path_variables.clone();
             for (i, proj) in projections.iter().enumerate() {
                 if i > 0 {
                     self.buffer.push_str(", ");
@@ -681,6 +708,22 @@ impl IsoGqlEmitter {
             if let Some(l) = limit {
                 self.buffer.push_str(&format!(" LIMIT {l}"));
             }
+
+            // A WITH replaces the names in scope: keep the path kind only for names the
+            // clause still projects from a known path, and drop it when an alias shadows
+            // a path variable with a non-path value such as a string property.
+            let mut path_variables_after = HashSet::new();
+            for proj in projections {
+                if proj.aggregation.is_some() {
+                    continue;
+                }
+                if let Ok(AstNode::Identifier(id)) = arena.get(proj.expression)
+                    && path_variables_before.contains(id)
+                {
+                    path_variables_after.insert(proj.alias.clone().unwrap_or_else(|| id.clone()));
+                }
+            }
+            self.path_variables = path_variables_after;
 
             Ok(())
         } else {
@@ -936,6 +979,7 @@ impl AstVisitor for IsoGqlEmitter {
         self.buffer.clear();
         self.parameters.clear();
         self.node_params.clear();
+        self.path_variables.clear();
         self.param_counter = 0;
 
         let root_node = arena.get(root)?;
@@ -1156,5 +1200,159 @@ impl AstVisitor for IsoGqlEmitter {
                 "Invalid root AST node for ISO GQL: {root_node:?}"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::QueryBuilder;
+
+    fn named_path_builder() -> (QueryAstArena, NodeHandle) {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .path_variable("p")
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("b"), vec!["Person"]);
+        let p_ident = builder.ident("p");
+        let len = builder.function("length", vec![p_ident]);
+        builder.r#return().custom_expr(len, Some("len"));
+        builder.build()
+    }
+
+    #[test]
+    fn length_on_named_path_emits_path_length() {
+        let (arena, root) = named_path_builder();
+        let mut emitter = IsoGqlEmitter::new();
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+        assert_eq!(
+            compiled.statement,
+            "MATCH p = (a:Person)-[r:KNOWS]->(b:Person) RETURN path_length(p) AS len"
+        );
+    }
+
+    #[test]
+    fn path_length_function_emits_path_length() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .path_variable("p")
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("b"), vec!["Person"]);
+        let p_ident = builder.ident("p");
+        let len = builder.function("path_length", vec![p_ident]);
+        builder.r#return().custom_expr(len, Some("len"));
+        let (arena, root) = builder.build();
+
+        let mut emitter = IsoGqlEmitter::new();
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+        assert_eq!(
+            compiled.statement,
+            "MATCH p = (a:Person)-[r:KNOWS]->(b:Person) RETURN path_length(p) AS len"
+        );
+    }
+
+    #[test]
+    fn length_on_string_property_emits_char_length() {
+        let mut builder = QueryBuilder::new();
+        builder.match_node(Some("p"), vec!["Person"]);
+        let name = builder.prop("p", "name");
+        let len = builder.function("length", vec![name]);
+        builder.r#return().custom_expr(len, Some("len"));
+        let (arena, root) = builder.build();
+
+        let mut emitter = IsoGqlEmitter::new();
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+        assert_eq!(
+            compiled.statement,
+            "MATCH (p:Person) RETURN char_length(p.name) AS len"
+        );
+    }
+
+    #[test]
+    fn size_on_list_and_string_emit_cardinality() {
+        let mut builder = QueryBuilder::new();
+        builder.match_node(Some("p"), vec!["Person"]);
+        let skills = builder.prop("p", "skills");
+        let name = builder.prop("p", "name");
+        let list_size = builder.function("size", vec![skills]);
+        let string_size = builder.function("size", vec![name]);
+        builder
+            .r#return()
+            .custom_expr(list_size, Some("list_size"))
+            .custom_expr(string_size, Some("string_size"));
+        let (arena, root) = builder.build();
+
+        let mut emitter = IsoGqlEmitter::new();
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+        assert_eq!(
+            compiled.statement,
+            "MATCH (p:Person) RETURN cardinality(p.skills) AS list_size, cardinality(p.name) AS string_size"
+        );
+    }
+
+    #[test]
+    fn with_alias_keeps_path_kind_for_length() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .path_variable("p")
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("b"), vec!["Person"]);
+        let p_ident = builder.ident("p");
+        builder.with_clause(
+            false,
+            vec![ProjectionItem::aliased(p_ident, "q")],
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let q_ident = builder.ident("q");
+        let len = builder.function("length", vec![q_ident]);
+        builder.r#return().custom_expr(len, Some("len"));
+        let (arena, root) = builder.build();
+
+        let mut emitter = IsoGqlEmitter::new();
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+        assert_eq!(
+            compiled.statement,
+            "MATCH p = (a:Person)-[r:KNOWS]->(b:Person) WITH p AS q RETURN path_length(q) AS len"
+        );
+    }
+
+    #[test]
+    fn with_string_alias_shadows_path_name() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .path_variable("p")
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("b"), vec!["Person"]);
+        let name = builder.prop("a", "name");
+        builder.with_clause(
+            false,
+            vec![ProjectionItem::aliased(name, "p")],
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let p_ident = builder.ident("p");
+        let len = builder.function("length", vec![p_ident]);
+        builder.r#return().custom_expr(len, Some("len"));
+        let (arena, root) = builder.build();
+
+        let mut emitter = IsoGqlEmitter::new();
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+        assert_eq!(
+            compiled.statement,
+            "MATCH p = (a:Person)-[r:KNOWS]->(b:Person) WITH a.name AS p RETURN char_length(p) AS len"
+        );
     }
 }
