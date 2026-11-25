@@ -22,6 +22,7 @@ from typing import Any, Literal, Protocol, overload, runtime_checkable
 
 import polars as pl
 
+from voyager_ogm.agtype import decode_agtype
 from voyager_ogm.ingestion import BulkIngestionPlan
 from voyager_ogm.types import unwrap_spatial_param
 
@@ -1881,6 +1882,41 @@ def mask_uri_password(uri: str) -> str:
     return uri
 
 
+def _description_type_oid(description: Any) -> int | None:
+    """Returns the PostgreSQL type OID from a cursor description entry."""
+    type_code = getattr(description, "type_code", None)
+    if isinstance(type_code, int):
+        return type_code
+    oid = getattr(type_code, "oid", None)
+    if isinstance(oid, int):
+        return oid
+    if isinstance(description, (list, tuple)) and len(description) > 1:
+        value = description[1]
+        if isinstance(value, int):
+            return value
+        oid = getattr(value, "oid", None)
+        if isinstance(oid, int):
+            return oid
+    return None
+
+
+def _postgres_agtype_oid(conn: Any) -> int | None:
+    """Returns the server's ``agtype`` type OID, or None when AGE is not installed."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT oid FROM pg_catalog.pg_type "
+                "WHERE typname = 'agtype' AND typnamespace = 'ag_catalog'::regnamespace"
+            )
+            row = cur.fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    oid = row[0]
+    return oid if isinstance(oid, int) else None
+
+
 def setup_postgres_age(conn: Any, force: bool = False) -> None:
     """Configures a PostgreSQL connection for Apache AGE if required or installed.
 
@@ -1933,6 +1969,28 @@ class PostgresBridge:
         self._conn = connection
         self.graph_name = graph_name
         setup_postgres_age(self.conn, force=False)
+        self._agtype_oid = (
+            _postgres_agtype_oid(self.conn)
+            if getattr(self.conn, "_voyager_age_initialized", False) is True
+            else None
+        )
+
+    def _decode_row(self, cursor: Any, row: Sequence[Any]) -> tuple[Any, ...]:
+        """Decodes only values from PostgreSQL columns whose type is ``agtype``."""
+        if self._agtype_oid is None or not cursor.description:
+            return tuple(row)
+        agtype_indices = [
+            index
+            for index, description in enumerate(cursor.description)
+            if _description_type_oid(description) == self._agtype_oid
+        ]
+        if not agtype_indices:
+            return tuple(row)
+        decoded = list(row)
+        for index in agtype_indices:
+            if index < len(decoded) and decoded[index] is not None:
+                decoded[index] = decode_agtype(decoded[index])
+        return tuple(decoded)
 
     @property
     def connection(self) -> Any:
@@ -1988,7 +2046,8 @@ class PostgresBridge:
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
-                return [dict(zip(cols, row, strict=False)) for row in rows]
+                decoded = [self._decode_row(cur, row) for row in rows]
+                return [dict(zip(cols, row, strict=False)) for row in decoded]
             return []
 
     def execute_to_polars(
@@ -2009,7 +2068,8 @@ class PostgresBridge:
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
-                return pl.DataFrame(rows, schema=cols, orient="row")
+                decoded = [self._decode_row(cur, row) for row in rows]
+                return pl.DataFrame(decoded, schema=cols, orient="row")
             return pl.DataFrame()
 
     def execute_bulk(
@@ -2166,7 +2226,8 @@ class PostgresBridgeTransaction:
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
-                    return [dict(zip(cols, row, strict=False)) for row in rows]
+                    decoded = [self._bridge._decode_row(cur, row) for row in rows]
+                    return [dict(zip(cols, row, strict=False)) for row in decoded]
                 return []
         except BaseException:
             self._mark_failed()
@@ -2184,7 +2245,8 @@ class PostgresBridgeTransaction:
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
-                    return pl.DataFrame(rows, schema=cols, orient="row")
+                    decoded = [self._bridge._decode_row(cur, row) for row in rows]
+                    return pl.DataFrame(decoded, schema=cols, orient="row")
                 return pl.DataFrame()
         except BaseException:
             self._mark_failed()

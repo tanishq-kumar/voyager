@@ -210,25 +210,110 @@ pub fn clean_agtype_string(s: &str) -> String {
     String::from_utf8_lossy(&out).trim().to_string()
 }
 
-fn age_value_to_json(val: AgeValue) -> serde_json::Value {
+/// Converts a parsed agtype value into the canonical Python-facing shape.
+///
+/// Vertices become `{"kind": "node", "id", "labels", "properties"}`, edges
+/// become `{"kind": "relationship", "id", "type", "start_id", "end_id",
+/// "properties"}` and paths become `{"kind": "path", "nodes", "relationships",
+/// "sequence"}`. Lists and maps recurse, so a `collect(n)` list contains node
+/// maps and a plain map without an AGE annotation stays a map.
+pub fn age_value_to_canonical_json(val: &AgeValue) -> serde_json::Value {
     match val {
         AgeValue::Null => serde_json::Value::Null,
-        AgeValue::Boolean(b) => serde_json::Value::Bool(b),
-        AgeValue::Integer(i) => serde_json::Value::Number(i.into()),
-        AgeValue::Float(f) => serde_json::Number::from_f64(f)
+        AgeValue::Boolean(b) => serde_json::Value::Bool(*b),
+        AgeValue::Integer(i) => serde_json::Value::Number((*i).into()),
+        AgeValue::Float(f) => serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
-        AgeValue::String(s) => serde_json::Value::String(s),
-        AgeValue::Vertex(v) => serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
-        AgeValue::Edge(e) => serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
-        AgeValue::Path(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+        AgeValue::String(s) => serde_json::Value::String(s.clone()),
+        AgeValue::Vertex(v) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String("node".to_string()),
+            );
+            obj.insert("id".to_string(), serde_json::Value::Number(v.id.into()));
+            let labels = if v.label.is_empty() {
+                Vec::new()
+            } else {
+                vec![serde_json::Value::String(v.label.clone())]
+            };
+            obj.insert("labels".to_string(), serde_json::Value::Array(labels));
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(
+                    v.properties
+                        .iter()
+                        .map(|(k, value)| (k.clone(), value.clone()))
+                        .collect(),
+                ),
+            );
+            serde_json::Value::Object(obj)
+        }
+        AgeValue::Edge(e) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String("relationship".to_string()),
+            );
+            obj.insert("id".to_string(), serde_json::Value::Number(e.id.into()));
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(e.label.clone()),
+            );
+            obj.insert(
+                "start_id".to_string(),
+                serde_json::Value::Number(e.start_id.into()),
+            );
+            obj.insert(
+                "end_id".to_string(),
+                serde_json::Value::Number(e.end_id.into()),
+            );
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(
+                    e.properties
+                        .iter()
+                        .map(|(k, value)| (k.clone(), value.clone()))
+                        .collect(),
+                ),
+            );
+            serde_json::Value::Object(obj)
+        }
+        AgeValue::Path(p) => {
+            let nodes: Vec<serde_json::Value> = p
+                .vertices
+                .iter()
+                .map(|v| age_value_to_canonical_json(&AgeValue::Vertex(v.clone())))
+                .collect();
+            let relationships: Vec<serde_json::Value> = p
+                .edges
+                .iter()
+                .map(|e| age_value_to_canonical_json(&AgeValue::Edge(e.clone())))
+                .collect();
+            let sequence: Vec<serde_json::Value> = (1..=p.edges.len() as i64)
+                .map(|i| serde_json::Value::Number(i.into()))
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String("path".to_string()),
+            );
+            obj.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+            obj.insert(
+                "relationships".to_string(),
+                serde_json::Value::Array(relationships),
+            );
+            obj.insert("sequence".to_string(), serde_json::Value::Array(sequence));
+            serde_json::Value::Object(obj)
+        }
         AgeValue::List(list) => {
-            serde_json::Value::Array(list.into_iter().map(age_value_to_json).collect())
+            serde_json::Value::Array(list.iter().map(age_value_to_canonical_json).collect())
         }
         AgeValue::Map(map) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in map {
-                obj.insert(k, age_value_to_json(v));
+                obj.insert(k.clone(), age_value_to_canonical_json(v));
             }
             serde_json::Value::Object(obj)
         }
@@ -238,7 +323,7 @@ fn age_value_to_json(val: AgeValue) -> serde_json::Value {
 fn age_map_to_json_map(map: HashMap<String, AgeValue>) -> HashMap<String, serde_json::Value> {
     let mut out = HashMap::with_capacity(map.len());
     for (k, v) in map {
-        out.insert(k, age_value_to_json(v));
+        out.insert(k, age_value_to_canonical_json(&v));
     }
     out
 }

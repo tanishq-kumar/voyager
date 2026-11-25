@@ -4,9 +4,10 @@ use bytes::BytesMut;
 use std::collections::HashMap;
 use voyager_drivers::postgres::{
     AgeValue, AuthenticationRequest, BackendMessage, FrontendMessage, PG_PROTOCOL_V3, ScramClient,
-    StartupMessage, TransactionStatus, clean_agtype_string, compute_md5_password, parse_agtype,
-    prepare_postgres_statement, rows_to_record_batch,
+    StartupMessage, TransactionStatus, age_value_to_canonical_json, clean_agtype_string,
+    compute_md5_password, parse_agtype, prepare_postgres_statement, rows_to_record_batch,
 };
+use voyager_drivers::{ConnectOptions, QueryResult, QuerySummary};
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
@@ -553,4 +554,58 @@ fn test_prepared_sql_statement_parse_and_bind_encoding() {
     bind.encode(&mut buf);
     assert_eq!(buf[0], b'B');
     assert!(contains_bytes(&buf, b"x' OR 1=1 --"));
+}
+
+#[test]
+fn test_age_value_to_canonical_json_shapes() {
+    let vertex =
+        parse_agtype(r#"{"id": 1, "label": "P", "properties": {"name": "A"}}::vertex"#).unwrap();
+    let canonical = age_value_to_canonical_json(&vertex);
+    assert_eq!(canonical["kind"], "node");
+    assert_eq!(canonical["id"], 1);
+    assert_eq!(canonical["labels"][0], "P");
+    assert_eq!(canonical["properties"]["name"], "A");
+
+    let edge = parse_agtype(
+        r#"{"id": 2, "label": "K", "start_id": 1, "end_id": 3, "properties": {}}::edge"#,
+    )
+    .unwrap();
+    let canonical = age_value_to_canonical_json(&edge);
+    assert_eq!(canonical["kind"], "relationship");
+    assert_eq!(canonical["type"], "K");
+    assert_eq!(canonical["start_id"], 1);
+    assert_eq!(canonical["end_id"], 3);
+
+    let path = parse_agtype(
+        r#"[{"id": 1, "label": "P", "properties": {}}::vertex,
+            {"id": 2, "label": "K", "start_id": 1, "end_id": 3, "properties": {}}::edge,
+            {"id": 3, "label": "P", "properties": {}}::vertex]::path"#,
+    )
+    .unwrap();
+    let canonical = age_value_to_canonical_json(&path);
+    assert_eq!(canonical["kind"], "path");
+    assert_eq!(canonical["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(canonical["relationships"].as_array().unwrap().len(), 1);
+    assert_eq!(canonical["sequence"], serde_json::json!([1]));
+
+    let list = parse_agtype(r#"[{"id": 1, "label": "P", "properties": {}}::vertex]"#).unwrap();
+    let canonical = age_value_to_canonical_json(&list);
+    assert_eq!(canonical[0]["kind"], "node");
+
+    let plain_map = parse_agtype(r#"{"id": 1, "label": "x", "properties": {}}"#).unwrap();
+    let canonical = age_value_to_canonical_json(&plain_map);
+    assert_eq!(canonical["id"], 1);
+    assert!(canonical.get("kind").is_none());
+}
+
+#[test]
+fn test_connect_options_default_is_not_age() {
+    assert!(!ConnectOptions::default().age);
+    assert!(ConnectOptions { age: true }.age);
+}
+
+#[test]
+fn test_query_result_defaults_to_no_age_columns() {
+    let result = QueryResult::new(vec!["n".to_string()], Vec::new(), QuerySummary::empty());
+    assert!(result.age_columns.is_empty());
 }

@@ -40,7 +40,7 @@ pub use circuit::{
     BackendRoute, CircuitConfig, CircuitRouter, CircuitSnapshot, CircuitState, ErrorClassification,
     classify_error, classify_net_error, is_semantic_error,
 };
-pub use client::{NativeClient, connect_any};
+pub use client::{ConnectOptions, NativeClient, connect_any, connect_any_with_options};
 pub use config::{Auth, ConnectionConfig, PoolConfig, TlsMode};
 pub use engine::{
     AsyncConnection, AsyncEngine, AsyncTransaction, ConnectionFactory, FnConnectionFactory,
@@ -56,8 +56,8 @@ pub use pool::{ConnectionPool, PoolMetricsSnapshot, PooledConnection};
 pub use postgres::{
     AgeEdge, AgePath, AgeValue, AgeVertex, AuthenticationRequest, BackendMessage, FieldDescription,
     FrontendMessage, PgDiagnostic, PostgresConnection, PostgresTransaction, ScramClient,
-    StartupMessage, TransactionStatus, clean_agtype_string, compute_md5_password, parse_agtype,
-    rows_to_record_batch,
+    StartupMessage, TransactionStatus, age_value_to_canonical_json, clean_agtype_string,
+    compute_md5_password, parse_agtype, rows_to_record_batch,
 };
 #[cfg(feature = "redis")]
 pub use redis::{

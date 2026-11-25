@@ -1,9 +1,10 @@
 """Live Apache AGE test for COLLECT(n) and COLLECT(r) decoding (#350).
 
 Runs COLLECT over vertices and relationships, a list literal and a map literal
-through Voyager's Session API on Apache AGE. The Session returns AGE values as
-agtype text, so the results are decoded with the corpus harness decoder, which
-must recognise entities only by their ::vertex / ::edge / ::path annotations.
+through Voyager's Session API on Apache AGE. Session now returns decoded values;
+the corpus harness decoder is applied only to keep its idempotent fallback
+covered, and entities must still be recognised by their ::vertex / ::edge /
+::path annotations.
 """
 
 from __future__ import annotations
