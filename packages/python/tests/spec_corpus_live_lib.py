@@ -243,45 +243,150 @@ def canonicalize(value: Any, engine: str, *, parse_age: bool = True) -> Any:
     return str(value)
 
 
+class _AgtypeParser:
+    def __init__(self, s: str) -> None:
+        self.s = s
+        self.pos = 0
+        self.len = len(s)
+
+    def skip_ws(self) -> None:
+        while self.pos < self.len and self.s[self.pos] in " \t\r\n":
+            self.pos += 1
+
+    def parse_value(self) -> Any:
+        self.skip_ws()
+        if self.pos >= self.len:
+            return None
+        c = self.s[self.pos]
+        if c == '"':
+            val, self.pos = json.decoder.scanstring(self.s, self.pos + 1)
+            return val
+        if c == "{":
+            return self.parse_object()
+        if c == "[":
+            return self.parse_array()
+        if c == "t" and self.s.startswith("true", self.pos):
+            next_pos = self.pos + 4
+            if next_pos >= self.len or not (self.s[next_pos].isalnum() or self.s[next_pos] == "_"):
+                self.pos = next_pos
+                return True
+        if c == "f" and self.s.startswith("false", self.pos):
+            next_pos = self.pos + 5
+            if next_pos >= self.len or not (self.s[next_pos].isalnum() or self.s[next_pos] == "_"):
+                self.pos = next_pos
+                return False
+        if c == "n" and self.s.startswith("null", self.pos):
+            next_pos = self.pos + 4
+            if next_pos >= self.len or not (self.s[next_pos].isalnum() or self.s[next_pos] == "_"):
+                self.pos = next_pos
+                return None
+        if c in "-+0123456789":
+            return self.parse_number()
+        return self.s[self.pos :]
+
+    def parse_object(self) -> Any:
+        self.pos += 1
+        self.skip_ws()
+        obj: dict[str, Any] = {}
+        if self.pos < self.len and self.s[self.pos] == "}":
+            self.pos += 1
+        else:
+            while self.pos < self.len:
+                self.skip_ws()
+                if self.pos >= self.len or self.s[self.pos] != '"':
+                    break
+                key, self.pos = json.decoder.scanstring(self.s, self.pos + 1)
+                self.skip_ws()
+                if self.pos < self.len and self.s[self.pos] == ":":
+                    self.pos += 1
+                val = self.parse_value()
+                obj[key] = val
+                self.skip_ws()
+                if self.pos < self.len and self.s[self.pos] == ",":
+                    self.pos += 1
+                    continue
+                if self.pos < self.len and self.s[self.pos] == "}":
+                    self.pos += 1
+                    break
+        self.skip_ws()
+        if self.s.startswith("::vertex", self.pos):
+            self.pos += len("::vertex")
+            label = obj.get("label")
+            labels = sorted([str(label)] if label else [])
+            return {
+                "kind": "node",
+                "labels": labels,
+                "properties": _strip_markers(
+                    {
+                        str(k): canonicalize(v, "age", parse_age=False)
+                        for k, v in dict(obj.get("properties") or {}).items()
+                    }
+                ),
+            }
+        if self.s.startswith("::edge", self.pos):
+            self.pos += len("::edge")
+            return {
+                "kind": "relationship",
+                "type": str(obj.get("label", "")),
+                "properties": _strip_markers(
+                    {
+                        str(k): canonicalize(v, "age", parse_age=False)
+                        for k, v in dict(obj.get("properties") or {}).items()
+                    }
+                ),
+            }
+        return {str(k): canonicalize(v, "age", parse_age=False) for k, v in obj.items()}
+
+    def parse_array(self) -> Any:
+        self.pos += 1
+        self.skip_ws()
+        arr: list[Any] = []
+        if self.pos < self.len and self.s[self.pos] == "]":
+            self.pos += 1
+        else:
+            while self.pos < self.len:
+                val = self.parse_value()
+                arr.append(val)
+                self.skip_ws()
+                if self.pos < self.len and self.s[self.pos] == ",":
+                    self.pos += 1
+                    continue
+                if self.pos < self.len and self.s[self.pos] == "]":
+                    self.pos += 1
+                    break
+        self.skip_ws()
+        if self.s.startswith("::path", self.pos):
+            self.pos += len("::path")
+            return [canonicalize(item, "age", parse_age=False) for item in arr]
+        return [canonicalize(item, "age", parse_age=False) for item in arr]
+
+    def parse_number(self) -> Any:
+        start = self.pos
+        while self.pos < self.len and self.s[self.pos] in "-+0123456789.eE":
+            self.pos += 1
+        num_str = self.s[start : self.pos]
+        self.skip_ws()
+        if self.s.startswith("::numeric", self.pos):
+            self.pos += len("::numeric")
+        try:
+            if "." in num_str or "e" in num_str.lower():
+                return float(num_str)
+            return int(num_str)
+        except ValueError:
+            return num_str
+
+
 def _parse_age_scalar(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     text = value.strip()
-    suffix = ""
-    for candidate in ("::vertex", "::edge", "::path"):
-        if text.endswith(candidate):
-            suffix = candidate
-            text = text[: -len(candidate)]
-            break
-    try:
-        parsed = json.loads(text)
-    except (TypeError, ValueError):
+    if not text:
         return value
-    if suffix == "::vertex":
-        label = parsed.get("label")
-        labels = [str(label)] if label else []
-        return {
-            "kind": "node",
-            "labels": labels,
-            "properties": _strip_markers(
-                {
-                    str(k): canonicalize(v, "age", parse_age=False)
-                    for k, v in dict(parsed.get("properties") or {}).items()
-                }
-            ),
-        }
-    if suffix == "::edge":
-        return {
-            "kind": "relationship",
-            "type": str(parsed.get("label", "")),
-            "properties": _strip_markers(
-                {
-                    str(k): canonicalize(v, "age", parse_age=False)
-                    for k, v in dict(parsed.get("properties") or {}).items()
-                }
-            ),
-        }
-    return parsed
+    try:
+        parser = _AgtypeParser(text)
+        return parser.parse_value()
+    except Exception:
+        return value
 
 
 def _is_number(value: Any) -> bool:

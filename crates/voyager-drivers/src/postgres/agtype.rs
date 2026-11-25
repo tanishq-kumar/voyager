@@ -210,6 +210,347 @@ pub fn clean_agtype_string(s: &str) -> String {
     String::from_utf8_lossy(&out).trim().to_string()
 }
 
+fn age_value_to_json(val: AgeValue) -> serde_json::Value {
+    match val {
+        AgeValue::Null => serde_json::Value::Null,
+        AgeValue::Boolean(b) => serde_json::Value::Bool(b),
+        AgeValue::Integer(i) => serde_json::Value::Number(i.into()),
+        AgeValue::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        AgeValue::String(s) => serde_json::Value::String(s),
+        AgeValue::Vertex(v) => serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
+        AgeValue::Edge(e) => serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+        AgeValue::Path(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+        AgeValue::List(list) => {
+            serde_json::Value::Array(list.into_iter().map(age_value_to_json).collect())
+        }
+        AgeValue::Map(map) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in map {
+                obj.insert(k, age_value_to_json(v));
+            }
+            serde_json::Value::Object(obj)
+        }
+    }
+}
+
+fn age_map_to_json_map(map: HashMap<String, AgeValue>) -> HashMap<String, serde_json::Value> {
+    let mut out = HashMap::with_capacity(map.len());
+    for (k, v) in map {
+        out.insert(k, age_value_to_json(v));
+    }
+    out
+}
+
+struct AgtypeParser<'a> {
+    input: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> AgtypeParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            bytes: input.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.pos < self.bytes.len()
+            && matches!(self.bytes[self.pos], b' ' | b'\t' | b'\n' | b'\r')
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn consume(&mut self, prefix: &str) -> bool {
+        if self.bytes[self.pos..].starts_with(prefix.as_bytes()) {
+            self.pos += prefix.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_keyword(&mut self, kw: &str) -> bool {
+        if self.bytes[self.pos..].starts_with(kw.as_bytes()) {
+            let next_pos = self.pos + kw.len();
+            if next_pos < self.bytes.len()
+                && (self.bytes[next_pos].is_ascii_alphanumeric() || self.bytes[next_pos] == b'_')
+            {
+                return false;
+            }
+            self.pos = next_pos;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String> {
+        if self.pos >= self.bytes.len() || self.bytes[self.pos] != b'"' {
+            return Err(NetError::ProtocolError(format!(
+                "Expected '\"' at position {}",
+                self.pos
+            )));
+        }
+        let start = self.pos;
+        self.pos += 1;
+        let mut escaped = false;
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            self.pos += 1;
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                break;
+            }
+        }
+        serde_json::from_str::<String>(&self.input[start..self.pos]).map_err(|e| {
+            NetError::ProtocolError(format!(
+                "Failed to parse string starting at {}: {}",
+                start, e
+            ))
+        })
+    }
+
+    fn parse_number(&mut self) -> Result<AgeValue> {
+        let start = self.pos;
+        while self.pos < self.bytes.len()
+            && matches!(
+                self.bytes[self.pos],
+                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'
+            )
+        {
+            self.pos += 1;
+        }
+        let num_str = &self.input[start..self.pos];
+        self.skip_whitespace();
+        let _ = self.consume("::numeric");
+        if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
+            num_str.parse::<f64>().map(AgeValue::Float).map_err(|e| {
+                NetError::ProtocolError(format!("Failed to parse float '{}': {}", num_str, e))
+            })
+        } else {
+            num_str.parse::<i64>().map(AgeValue::Integer).map_err(|e| {
+                NetError::ProtocolError(format!("Failed to parse integer '{}': {}", num_str, e))
+            })
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<AgeValue> {
+        self.pos += 1; // skip '{'
+        self.skip_whitespace();
+        let mut map = HashMap::new();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+        } else {
+            loop {
+                self.skip_whitespace();
+                if self.peek() != Some(b'"') {
+                    return Err(NetError::ProtocolError(format!(
+                        "Expected object string key at pos {}",
+                        self.pos
+                    )));
+                }
+                let key = self.parse_string()?;
+                self.skip_whitespace();
+                if !self.consume(":") {
+                    return Err(NetError::ProtocolError(format!(
+                        "Expected ':' after object key '{}' at pos {}",
+                        key, self.pos
+                    )));
+                }
+                self.skip_whitespace();
+                let val = self.parse_value()?;
+                map.insert(key, val);
+                self.skip_whitespace();
+                if self.consume(",") {
+                    continue;
+                }
+                if self.consume("}") {
+                    break;
+                }
+                return Err(NetError::ProtocolError(format!(
+                    "Expected ',' or '}}' at pos {}",
+                    self.pos
+                )));
+            }
+        }
+
+        self.skip_whitespace();
+        if self.consume("::vertex") {
+            let id = match map.get("id") {
+                Some(AgeValue::Integer(i)) => *i,
+                Some(AgeValue::Float(f)) => *f as i64,
+                _ => {
+                    return Err(NetError::ProtocolError(
+                        "Missing or invalid 'id' in vertex".to_string(),
+                    ));
+                }
+            };
+            let label = match map.get("label") {
+                Some(AgeValue::String(s)) => s.clone(),
+                _ => {
+                    return Err(NetError::ProtocolError(
+                        "Missing or invalid 'label' in vertex".to_string(),
+                    ));
+                }
+            };
+            let properties = match map.remove("properties") {
+                Some(AgeValue::Map(props)) => age_map_to_json_map(props),
+                _ => HashMap::new(),
+            };
+            Ok(AgeValue::Vertex(AgeVertex {
+                id,
+                label,
+                properties,
+            }))
+        } else if self.consume("::edge") {
+            let id = match map.get("id") {
+                Some(AgeValue::Integer(i)) => *i,
+                Some(AgeValue::Float(f)) => *f as i64,
+                _ => {
+                    return Err(NetError::ProtocolError(
+                        "Missing or invalid 'id' in edge".to_string(),
+                    ));
+                }
+            };
+            let label = match map.get("label") {
+                Some(AgeValue::String(s)) => s.clone(),
+                _ => {
+                    return Err(NetError::ProtocolError(
+                        "Missing or invalid 'label' in edge".to_string(),
+                    ));
+                }
+            };
+            let start_id = match map.get("start_id") {
+                Some(AgeValue::Integer(i)) => *i,
+                Some(AgeValue::Float(f)) => *f as i64,
+                _ => {
+                    return Err(NetError::ProtocolError(
+                        "Missing or invalid 'start_id' in edge".to_string(),
+                    ));
+                }
+            };
+            let end_id = match map.get("end_id") {
+                Some(AgeValue::Integer(i)) => *i,
+                Some(AgeValue::Float(f)) => *f as i64,
+                _ => {
+                    return Err(NetError::ProtocolError(
+                        "Missing or invalid 'end_id' in edge".to_string(),
+                    ));
+                }
+            };
+            let properties = match map.remove("properties") {
+                Some(AgeValue::Map(props)) => age_map_to_json_map(props),
+                _ => HashMap::new(),
+            };
+            Ok(AgeValue::Edge(AgeEdge {
+                id,
+                label,
+                start_id,
+                end_id,
+                properties,
+            }))
+        } else {
+            Ok(AgeValue::Map(map))
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<AgeValue> {
+        self.pos += 1; // skip '['
+        self.skip_whitespace();
+        let mut items = Vec::new();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+        } else {
+            loop {
+                let val = self.parse_value()?;
+                items.push(val);
+                self.skip_whitespace();
+                if self.consume(",") {
+                    continue;
+                }
+                if self.consume("]") {
+                    break;
+                }
+                return Err(NetError::ProtocolError(format!(
+                    "Expected ',' or ']' at pos {}",
+                    self.pos
+                )));
+            }
+        }
+
+        self.skip_whitespace();
+        if self.consume("::path") {
+            if items.len() < 3 || items.len().is_multiple_of(2) {
+                return Err(NetError::ProtocolError(
+                    "Invalid path length in agtype".to_string(),
+                ));
+            }
+            let mut vertices = Vec::with_capacity(items.len() / 2 + 1);
+            let mut edges = Vec::with_capacity(items.len() / 2);
+
+            for (idx, item) in items.into_iter().enumerate() {
+                if idx % 2 == 0 {
+                    if let AgeValue::Vertex(v) = item {
+                        vertices.push(v);
+                    } else {
+                        return Err(NetError::ProtocolError(format!(
+                            "Expected vertex in path at index {}",
+                            idx
+                        )));
+                    }
+                } else if let AgeValue::Edge(e) = item {
+                    edges.push(e);
+                } else {
+                    return Err(NetError::ProtocolError(format!(
+                        "Expected edge in path at index {}",
+                        idx
+                    )));
+                }
+            }
+
+            Ok(AgeValue::Path(AgePath { vertices, edges }))
+        } else {
+            Ok(AgeValue::List(items))
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<AgeValue> {
+        self.skip_whitespace();
+        if self.pos >= self.bytes.len() {
+            return Ok(AgeValue::Null);
+        }
+
+        let b = self.bytes[self.pos];
+        match b {
+            b'"' => self.parse_string().map(AgeValue::String),
+            b'{' => self.parse_object(),
+            b'[' => self.parse_array(),
+            b't' if self.consume_keyword("true") => Ok(AgeValue::Boolean(true)),
+            b'f' if self.consume_keyword("false") => Ok(AgeValue::Boolean(false)),
+            b'n' if self.consume_keyword("null") => Ok(AgeValue::Null),
+            b'-' | b'+' | b'0'..=b'9' => self.parse_number(),
+            _ => {
+                let s = self.input[self.pos..].trim().to_string();
+                self.pos = self.bytes.len();
+                Ok(AgeValue::String(s))
+            }
+        }
+    }
+}
+
 /// Parses an Apache AGE `agtype` text string into an [`AgeValue`].
 pub fn parse_agtype(raw: &str) -> Result<AgeValue> {
     let trimmed = raw.trim();
@@ -217,120 +558,10 @@ pub fn parse_agtype(raw: &str) -> Result<AgeValue> {
         return Ok(AgeValue::Null);
     }
 
-    let is_vertex = trimmed.ends_with("::vertex");
-    let is_edge = trimmed.ends_with("::edge");
-    let is_path = trimmed.ends_with("::path");
-
-    let cleaned = clean_agtype_string(trimmed);
-
-    if is_vertex {
-        let vertex: AgeVertex = serde_json::from_str(&cleaned).map_err(|e| {
-            NetError::ProtocolError(format!("Failed to parse AGE vertex: {}: {}", e, trimmed))
-        })?;
-        return Ok(AgeValue::Vertex(vertex));
-    }
-
-    if is_edge {
-        let edge: AgeEdge = serde_json::from_str(&cleaned).map_err(|e| {
-            NetError::ProtocolError(format!("Failed to parse AGE edge: {}: {}", e, trimmed))
-        })?;
-        return Ok(AgeValue::Edge(edge));
-    }
-
-    if is_path {
-        let raw_val: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
-            NetError::ProtocolError(format!("Failed to parse AGE path: {}: {}", e, trimmed))
-        })?;
-
-        if let serde_json::Value::Array(arr) = raw_val {
-            let mut vertices = Vec::new();
-            let mut edges = Vec::new();
-            for (idx, item) in arr.into_iter().enumerate() {
-                if idx % 2 == 0 {
-                    let v: AgeVertex = serde_json::from_value(item).map_err(|e| {
-                        NetError::ProtocolError(format!("Invalid vertex in path at {}: {}", idx, e))
-                    })?;
-                    vertices.push(v);
-                } else {
-                    let e: AgeEdge = serde_json::from_value(item).map_err(|e| {
-                        NetError::ProtocolError(format!("Invalid edge in path at {}: {}", idx, e))
-                    })?;
-                    edges.push(e);
-                }
-            }
-            return Ok(AgeValue::Path(AgePath { vertices, edges }));
-        }
-    }
-
-    // Try parsing as standard JSON
-    match serde_json::from_str::<serde_json::Value>(&cleaned) {
-        Ok(serde_json::Value::Null) => Ok(AgeValue::Null),
-        Ok(serde_json::Value::Bool(b)) => Ok(AgeValue::Boolean(b)),
-        Ok(serde_json::Value::Number(n)) => {
-            if let Some(i) = n.as_i64() {
-                Ok(AgeValue::Integer(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(AgeValue::Float(f))
-            } else {
-                Ok(AgeValue::String(n.to_string()))
-            }
-        }
-        Ok(serde_json::Value::String(s)) => Ok(AgeValue::String(s)),
-        Ok(serde_json::Value::Object(obj)) => {
-            // Check if object has vertex or edge fields
-            if obj.contains_key("id") && obj.contains_key("label") && obj.contains_key("properties")
-            {
-                if obj.contains_key("start_id") && obj.contains_key("end_id") {
-                    if let Ok(edge) =
-                        serde_json::from_value::<AgeEdge>(serde_json::Value::Object(obj.clone()))
-                    {
-                        return Ok(AgeValue::Edge(edge));
-                    }
-                } else if let Ok(vertex) =
-                    serde_json::from_value::<AgeVertex>(serde_json::Value::Object(obj.clone()))
-                {
-                    return Ok(AgeValue::Vertex(vertex));
-                }
-            }
-            let mut map = HashMap::new();
-            for (k, v) in obj {
-                map.insert(k, parse_json_value(v));
-            }
-            Ok(AgeValue::Map(map))
-        }
-        Ok(serde_json::Value::Array(arr)) => {
-            let list = arr.into_iter().map(parse_json_value).collect();
-            Ok(AgeValue::List(list))
-        }
-        Err(_) => Ok(AgeValue::String(trimmed.to_string())),
-    }
-}
-
-fn parse_json_value(val: serde_json::Value) -> AgeValue {
-    match val {
-        serde_json::Value::Null => AgeValue::Null,
-        serde_json::Value::Bool(b) => AgeValue::Boolean(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                AgeValue::Integer(i)
-            } else if let Some(f) = n.as_f64() {
-                AgeValue::Float(f)
-            } else {
-                AgeValue::String(n.to_string())
-            }
-        }
-        serde_json::Value::String(s) => AgeValue::String(s),
-        serde_json::Value::Array(arr) => {
-            AgeValue::List(arr.into_iter().map(parse_json_value).collect())
-        }
-        serde_json::Value::Object(obj) => {
-            let mut map = HashMap::new();
-            for (k, v) in obj {
-                map.insert(k, parse_json_value(v));
-            }
-            AgeValue::Map(map)
-        }
-    }
+    let mut parser = AgtypeParser::new(trimmed);
+    let val = parser.parse_value()?;
+    parser.skip_whitespace();
+    Ok(val)
 }
 
 /// Dynamically transforms tabular row values into an Apache Arrow [`RecordBatch`].
