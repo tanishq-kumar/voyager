@@ -1,0 +1,29 @@
+{
+  "id": "p4-paths/named-path-multi-hop",
+  "pack": "p4-paths",
+  "description": "Named path variable binding a two-hop relationship pattern.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match6.feature",
+    "scenario": "[3] Return a three node path"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "known-diff",
+      "reason": "ISO GQL emitter maps 'length' to 'char_length' instead of 'path_length' for path variables (#362)."
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables"
+    }
+  }
+}

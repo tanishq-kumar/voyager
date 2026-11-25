@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/path-fn-relationships",
+  "pack": "p4-paths",
+  "description": "relationships(p) function returning the list of edges along a path.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match9.feature",
+    "scenario": "[1] Variable length relationship variables are lists of relationships"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "p4-paths/multi-hop-three-hops",
+  "pack": "p4-paths",
+  "description": "Three-hop directed relationship chain across four nodes.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match6.feature",
+    "scenario": "[3] Return a three node path"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

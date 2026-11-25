@@ -1,0 +1,1 @@
+SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS "Person") -[r1 IS "KNOWS"]-> (b IS "Person") -[r2 IS "KNOWS"]-> (c IS "Person") -[r3 IS "KNOWS"]-> (a IS "Person") WHERE a.name = $p0 COLUMNS (a.name AS a_name, b.name AS b_name, c.name AS c_name))

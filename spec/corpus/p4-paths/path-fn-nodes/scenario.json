@@ -1,0 +1,28 @@
+{
+  "id": "p4-paths/path-fn-nodes",
+  "pack": "p4-paths",
+  "description": "nodes(p) function returning the list of vertices along a path.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-orderby/ReturnOrderBy2.feature",
+    "scenario": "[12] Sort on path length and sort on path nodes"
+  },
+  "params": {},
+  "fixture": "path-linear-chain",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables"
+    }
+  }
+}
