@@ -2879,8 +2879,46 @@ impl PyQueryBuilder {
     }
 }
 
+/// Converts a decoded Apache AGE value to Python objects.
+fn json_value_to_py<'py>(
+    py: Python<'py>,
+    value: &serde_json::Value,
+) -> PyResult<Bound<'py, PyAny>> {
+    match value {
+        serde_json::Value::Null => Ok(py.None().into_bound(py)),
+        serde_json::Value::Bool(value) => Ok(value.into_pyobject(py)?.to_owned().into_any()),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Ok(integer.into_pyobject(py)?.to_owned().into_any())
+            } else {
+                Ok(value
+                    .as_f64()
+                    .unwrap_or(f64::NAN)
+                    .into_pyobject(py)?
+                    .into_any())
+            }
+        }
+        serde_json::Value::String(value) => Ok(value.into_pyobject(py)?.into_any()),
+        serde_json::Value::Array(values) => {
+            let list = PyList::empty(py);
+            for value in values {
+                list.append(json_value_to_py(py, value)?)?;
+            }
+            Ok(list.into_any())
+        }
+        serde_json::Value::Object(values) => {
+            let dict = PyDict::new(py);
+            for (key, value) in values {
+                dict.set_item(key, json_value_to_py(py, value)?)?;
+            }
+            Ok(dict.into_any())
+        }
+    }
+}
+
 fn record_batch_to_py_dicts<'py>(
     batch: &arrow_array::RecordBatch,
+    age_columns: &[bool],
     py: Python<'py>,
 ) -> PyResult<Bound<'py, PyList>> {
     use arrow_array::*;
@@ -2924,11 +2962,27 @@ fn record_batch_to_py_dicts<'py>(
                 }
                 DataType::Utf8 => {
                     let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                    dict.set_item(field_name, arr.value(row))?;
+                    let value = arr.value(row);
+                    if age_columns.get(col_idx).copied().unwrap_or(false) {
+                        let decoded = voyager_drivers::parse_agtype(value)
+                            .map(|value| voyager_drivers::age_value_to_canonical_json(&value))
+                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                        dict.set_item(field_name, json_value_to_py(py, &decoded)?)?;
+                    } else {
+                        dict.set_item(field_name, value)?;
+                    }
                 }
                 DataType::LargeUtf8 => {
                     let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                    dict.set_item(field_name, arr.value(row))?;
+                    let value = arr.value(row);
+                    if age_columns.get(col_idx).copied().unwrap_or(false) {
+                        let decoded = voyager_drivers::parse_agtype(value)
+                            .map(|value| voyager_drivers::age_value_to_canonical_json(&value))
+                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                        dict.set_item(field_name, json_value_to_py(py, &decoded)?)?;
+                    } else {
+                        dict.set_item(field_name, value)?;
+                    }
                 }
                 _ => {
                     dict.set_item(field_name, py.None())?;
@@ -2997,7 +3051,7 @@ impl PyArrowStream {
 
     /// Exports rows as a list of Python dictionaries.
     fn to_dicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        record_batch_to_py_dicts(&self.batch, py)
+        record_batch_to_py_dicts(&self.batch, &[], py)
     }
 
     /// Slices the record batch into chunked batches of `batch_size` rows each, returning PyArrowStreams.
@@ -3520,6 +3574,7 @@ pub struct PyNativeQueryResult {
     stream: PyArrowStream,
     columns: Vec<String>,
     summary: voyager_drivers::QuerySummary,
+    age_columns: Vec<bool>,
 }
 
 #[pymethods]
@@ -3584,6 +3639,12 @@ impl PyNativeQueryResult {
         self.summary.execution_time_ms
     }
 
+    /// Whether any projected column is Apache AGE `agtype` and needs decoding.
+    #[getter]
+    fn has_age_columns(&self) -> bool {
+        self.age_columns.iter().any(|is_age| *is_age)
+    }
+
     /// Access to the underlying ArrowStream.
     #[getter]
     fn stream(&self) -> PyArrowStream {
@@ -3602,13 +3663,13 @@ impl PyNativeQueryResult {
 
     /// Exports rows as a list of Python dictionaries.
     fn to_dicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        self.stream.to_dicts(py)
+        record_batch_to_py_dicts(&self.stream.batch, &self.age_columns, py)
     }
 
     /// Access to result records as a list of Python dictionaries.
     #[getter]
     fn records<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        self.stream.to_dicts(py)
+        self.to_dicts(py)
     }
 
     /// Access to this result's execution summary metrics.
@@ -3621,6 +3682,7 @@ impl PyNativeQueryResult {
 fn query_result_to_py(query_result: voyager_drivers::QueryResult) -> PyResult<PyNativeQueryResult> {
     let columns = query_result.columns.clone();
     let summary = query_result.summary.clone();
+    let age_columns = query_result.age_columns.clone();
     let batch = query_result
         .into_single_batch()
         .map_err(|e| PyValueError::new_err(e.to_string()))?
@@ -3632,6 +3694,7 @@ fn query_result_to_py(query_result: voyager_drivers::QueryResult) -> PyResult<Py
         stream: PyArrowStream::from_batch(batch),
         columns,
         summary,
+        age_columns,
     })
 }
 
@@ -3699,16 +3762,23 @@ impl PyNativeClient {
     /// TLS is chosen by the URI: `bolt+s://`, `rediss://`, PostgreSQL `?sslmode=...`, with
     /// `tls_ca_file` / `sslrootcert`, `tls_cert_file` / `sslcert`, `tls_key_file` / `sslkey`
     /// and `tls_server_name` parameters.
+    ///
+    /// `age=True` runs Apache AGE setup on every PostgreSQL connection even when the URI
+    /// does not name AGE, so a Session can select AGE through its dialect or graph name.
     #[new]
-    #[pyo3(signature = (uri, min_idle=1, max_size=10))]
-    fn new(uri: &str, min_idle: usize, max_size: usize) -> PyResult<Self> {
+    #[pyo3(signature = (uri, min_idle=1, max_size=10, age=false))]
+    fn new(uri: &str, min_idle: usize, max_size: usize, age: bool) -> PyResult<Self> {
         let pool_config = voyager_drivers::PoolConfig {
             min_idle,
             max_size,
             ..Default::default()
         };
-        let client = voyager_drivers::NativeClient::new(uri, Some(pool_config))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let client = voyager_drivers::NativeClient::new_with_options(
+            uri,
+            Some(pool_config),
+            voyager_drivers::ConnectOptions { age },
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { client })
     }
 
@@ -3743,6 +3813,7 @@ impl PyNativeClient {
 
         let columns = query_result.columns.clone();
         let summary = query_result.summary.clone();
+        let age_columns = query_result.age_columns.clone();
         let batch = query_result
             .into_single_batch()
             .map_err(|e| PyValueError::new_err(e.to_string()))?
@@ -3756,6 +3827,7 @@ impl PyNativeClient {
             stream: PyArrowStream::from_batch(batch),
             columns,
             summary,
+            age_columns,
         })
     }
 
@@ -3778,6 +3850,7 @@ impl PyNativeClient {
 
             let columns = query_result.columns.clone();
             let summary = query_result.summary.clone();
+            let age_columns = query_result.age_columns.clone();
             let batch = query_result
                 .into_single_batch()
                 .map_err(|e| PyValueError::new_err(e.to_string()))?
@@ -3791,6 +3864,7 @@ impl PyNativeClient {
                 stream: PyArrowStream::from_batch(batch),
                 columns,
                 summary,
+                age_columns,
             })
         })
     }
@@ -6681,4 +6755,33 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("__version__", voyager_ogm::VERSION)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_query_result_reports_age_columns() {
+        let batch = arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
+        let result = PyNativeQueryResult {
+            stream: PyArrowStream::from_batch(batch),
+            columns: vec!["n".to_string(), "age".to_string()],
+            summary: voyager_drivers::QuerySummary::empty(),
+            age_columns: vec![false, true],
+        };
+        assert!(result.has_age_columns());
+    }
+
+    #[test]
+    fn native_query_result_without_age_columns_is_plain_arrow() {
+        let batch = arrow_array::RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
+        let result = PyNativeQueryResult {
+            stream: PyArrowStream::from_batch(batch),
+            columns: vec!["n".to_string()],
+            summary: voyager_drivers::QuerySummary::empty(),
+            age_columns: Vec::new(),
+        };
+        assert!(!result.has_age_columns());
+    }
 }

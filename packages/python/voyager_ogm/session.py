@@ -672,7 +672,12 @@ class _SessionBase:
                 try:
                     from voyager_ogm._voyager_rs import NativeClient
 
-                    self._native_client = NativeClient(bridge, min_idle=1, max_size=pool_size)
+                    self._native_client = NativeClient(
+                        bridge,
+                        min_idle=1,
+                        max_size=pool_size,
+                        age=self._wants_apache_age(graph_name),
+                    )
                 except Exception:
                     pass
                 self._bridge = AsyncMockBridge() if is_async else MockBridge()
@@ -680,7 +685,12 @@ class _SessionBase:
                 try:
                     from voyager_ogm._voyager_rs import NativeClient
 
-                    self._native_client = NativeClient(bridge, min_idle=1, max_size=pool_size)
+                    self._native_client = NativeClient(
+                        bridge,
+                        min_idle=1,
+                        max_size=pool_size,
+                        age=self._wants_apache_age(graph_name),
+                    )
                     self._bridge = create_bridge(bridge, is_async=is_async, graph_name=graph_name)
                 except Exception as e:
                     if self._requested_backend == "native":
@@ -742,6 +752,38 @@ class _SessionBase:
     def graph_name(self) -> str | None:
         """The active graph name configured for this session (single source of truth)."""
         return self._graph_name
+
+    def _wants_apache_age(self, graph_name: str | None = None) -> bool:
+        """Returns whether the native PostgreSQL connection must run Apache AGE setup."""
+        dialect = (self._dialect or "").lower()
+        if dialect in ("age", "apache_age", "postgres_age"):
+            return True
+        if graph_name is None:
+            return False
+        return dialect not in ("sql_pgq", "duckpgq", "iso_gql")
+
+    def _native_execution_result(
+        self,
+        result: Any,
+        statement: str,
+        query: Query | CompiledQuery | None,
+    ) -> ExecutionResult:
+        """Builds an ExecutionResult from a native result, decoding AGE values."""
+        if bool(getattr(result, "has_age_columns", False)):
+            return ExecutionResult(
+                records=result.to_dicts(),
+                statement=statement,
+                query=query,
+                dialect=self._dialect,
+            )
+        return ExecutionResult(
+            records=None,
+            statement=statement,
+            query=query,
+            dialect=self._dialect,
+            stream=result.stream,
+            summary=result.summary,
+        )
 
     @property
     def circuit_router(self) -> Any:
@@ -1434,14 +1476,7 @@ class Session(_SessionBase):
         if active is not None:
             tx_result = active._execute_sync(stmt, params)
             if active.backend == "native":
-                return ExecutionResult(
-                    records=None,
-                    statement=stmt,
-                    query=q_obj,
-                    dialect=self._dialect,
-                    stream=tx_result.stream,
-                    summary=tx_result.summary,
-                )
+                return self._native_execution_result(tx_result, stmt, q_obj)
             return ExecutionResult(
                 records=tx_result,
                 statement=stmt,
@@ -1459,14 +1494,7 @@ class Session(_SessionBase):
             try:
                 native_res = self._native_client.execute_sync(stmt, params)
                 self._record_native_success()
-                return ExecutionResult(
-                    records=None,
-                    statement=stmt,
-                    query=q_obj,
-                    dialect=self._dialect,
-                    stream=native_res.stream,
-                    summary=native_res.summary,
-                )
+                return self._native_execution_result(native_res, stmt, q_obj)
             except Exception as e:
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
@@ -2330,14 +2358,7 @@ class AsyncSession(_SessionBase):
         if active is not None:
             tx_result = await active._execute(stmt, params)
             if active.backend == "native":
-                return ExecutionResult(
-                    records=None,
-                    statement=stmt,
-                    query=q_obj,
-                    dialect=self._dialect,
-                    stream=tx_result.stream,
-                    summary=tx_result.summary,
-                )
+                return self._native_execution_result(tx_result, stmt, q_obj)
             return ExecutionResult(
                 records=tx_result,
                 statement=stmt,
@@ -2355,14 +2376,7 @@ class AsyncSession(_SessionBase):
             try:
                 native_res = await self._native_client.execute(stmt, params)
                 self._record_native_success()
-                return ExecutionResult(
-                    records=None,
-                    statement=stmt,
-                    query=q_obj,
-                    dialect=self._dialect,
-                    stream=native_res.stream,
-                    summary=native_res.summary,
-                )
+                return self._native_execution_result(native_res, stmt, q_obj)
             except Exception as e:
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise

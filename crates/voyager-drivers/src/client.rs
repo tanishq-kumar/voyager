@@ -17,11 +17,27 @@ use crate::postgres::PostgresConnection;
 use crate::redis::RedisConnection;
 use crate::uri::{DatabaseProtocol, ParsedUri};
 
+/// Extra connection intent that is not encoded in the URI.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectOptions {
+    /// Run Apache AGE setup (`LOAD 'age'; SET search_path = ...`) on every
+    /// PostgreSQL connection, even when the URI has no AGE scheme or parameters.
+    pub age: bool,
+}
+
 /// Asynchronously connects to any supported database protocol based on the URI scheme.
 ///
 /// TLS URIs (`bolt+s`, `rediss`, `?sslmode=...`, ...) connect over TLS when the `tls`
 /// feature is enabled and fail with [`NetError::TlsError`] naming the feature otherwise.
 pub async fn connect_any(uri: &str) -> Result<Box<dyn AsyncConnection>> {
+    connect_any_with_options(uri, ConnectOptions::default()).await
+}
+
+/// Like [`connect_any`], with extra connection intent carried separately from the URI.
+pub async fn connect_any_with_options(
+    uri: &str,
+    options: ConnectOptions,
+) -> Result<Box<dyn AsyncConnection>> {
     // Parsing already rejects protocols whose Cargo feature is disabled, with an
     // error that names the missing feature.
     let parsed = ParsedUri::parse(uri)?;
@@ -44,7 +60,7 @@ pub async fn connect_any(uri: &str) -> Result<Box<dyn AsyncConnection>> {
         DatabaseProtocol::Postgres => {
             #[cfg(feature = "postgres")]
             {
-                let conn = PostgresConnection::connect(&parsed).await?;
+                let conn = PostgresConnection::connect_with_age(&parsed, options.age).await?;
                 Ok(Box::new(conn))
             }
             #[cfg(not(feature = "postgres"))]
@@ -87,6 +103,16 @@ pub struct NativeClient {
 impl NativeClient {
     /// Creates a new `NativeClient` connecting to the given URI.
     pub fn new(uri: &str, pool_config: Option<PoolConfig>) -> Result<Self> {
+        Self::new_with_options(uri, pool_config, ConnectOptions::default())
+    }
+
+    /// Creates a new `NativeClient` with extra connection intent carried separately
+    /// from the URI. Every pooled or reconnected connection receives the same intent.
+    pub fn new_with_options(
+        uri: &str,
+        pool_config: Option<PoolConfig>,
+        options: ConnectOptions,
+    ) -> Result<Self> {
         let parsed = ParsedUri::parse(uri)?;
         let protocol = parsed.protocol;
         let uri_owned = uri.to_string();
@@ -95,7 +121,7 @@ impl NativeClient {
 
         let pool = ConnectionPool::from_fn(config, move || {
             let u = uri_factory.clone();
-            async move { connect_any(&u).await }
+            async move { connect_any_with_options(&u, options).await }
         });
 
         Ok(Self {

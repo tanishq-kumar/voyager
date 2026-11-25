@@ -63,6 +63,9 @@ pub struct QueryResult {
     pub batches: Vec<RecordBatch>,
     /// Server-side execution statistics and mutation counters.
     pub summary: QuerySummary,
+    /// Per-column flags marking Apache AGE `agtype` columns whose text values
+    /// still need decoding before they reach Python.
+    pub age_columns: Vec<bool>,
 }
 
 impl QueryResult {
@@ -72,6 +75,7 @@ impl QueryResult {
             columns,
             batches,
             summary,
+            age_columns: Vec::new(),
         }
     }
 
@@ -81,6 +85,7 @@ impl QueryResult {
             columns: Vec::new(),
             batches: Vec::new(),
             summary,
+            age_columns: Vec::new(),
         }
     }
 

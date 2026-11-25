@@ -1,5 +1,6 @@
 //! PostgreSQL physical asynchronous connection engine implementing [`AsyncConnection`].
 
+use arrow_array::Array;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -31,6 +32,7 @@ pub struct PostgresConnection {
     secret_key: i32,
     transaction_status: TransactionStatus,
     is_age_initialized: bool,
+    agtype_oid: Option<i32>,
     query_timeout: Option<std::time::Duration>,
     last_command_tag: Option<String>,
 }
@@ -74,8 +76,24 @@ impl PostgresConnection {
         Self::connect_with_tls(uri, &TlsOptions::new()).await
     }
 
+    /// Like [`connect`](Self::connect), with explicit Apache AGE intent carried
+    /// separately from the URI.
+    pub async fn connect_with_age(uri: &ParsedUri, age: bool) -> Result<Self> {
+        Self::connect_with_tls_and_age(uri, &TlsOptions::new(), age).await
+    }
+
     /// Like [`connect`](Self::connect), with TLS options that win over the URI parameters.
     pub async fn connect_with_tls(uri: &ParsedUri, tls_options: &TlsOptions) -> Result<Self> {
+        Self::connect_with_tls_and_age(uri, tls_options, false).await
+    }
+
+    /// Like [`connect_with_tls`](Self::connect_with_tls), with explicit Apache AGE intent
+    /// carried separately from the URI.
+    pub async fn connect_with_tls_and_age(
+        uri: &ParsedUri,
+        tls_options: &TlsOptions,
+        age: bool,
+    ) -> Result<Self> {
         let ssl_mode = SslMode::from_uri(uri)?;
         let negotiation = SslNegotiation::from_uri(uri, ssl_mode)?;
         if ssl_mode.may_use_tls() && !crate::tls::TLS_AVAILABLE {
@@ -90,7 +108,7 @@ impl PostgresConnection {
         let timeout_dur = std::time::Duration::from_secs(timeout_secs);
         match tokio::time::timeout(
             timeout_dur,
-            Self::connect_raw(uri, ssl_mode, negotiation, &tls_options),
+            Self::connect_raw(uri, ssl_mode, negotiation, &tls_options, age),
         )
         .await
         {
@@ -113,16 +131,17 @@ impl PostgresConnection {
         ssl_mode: SslMode,
         negotiation: SslNegotiation,
         tls: &TlsOptions,
+        age: bool,
     ) -> Result<Self> {
         if ssl_mode == SslMode::Allow {
             // libpq `allow`: plaintext first; any failure of that attempt (rejected
             // startup, closed or reset connection, ...) retries with TLS.
-            return match Self::connect_once(uri, ssl_mode, negotiation, tls, false).await {
+            return match Self::connect_once(uri, ssl_mode, negotiation, tls, false, age).await {
                 Err(plaintext_error) => {
                     debug!(
                         "plaintext attempt failed ({plaintext_error}); retrying with TLS (sslmode=allow)"
                     );
-                    Self::connect_once(uri, ssl_mode, negotiation, tls, true)
+                    Self::connect_once(uri, ssl_mode, negotiation, tls, true, age)
                         .await
                         .map_err(|tls_error| {
                             append_detail(
@@ -142,6 +161,7 @@ impl PostgresConnection {
             negotiation,
             tls,
             ssl_mode.requests_tls_first(),
+            age,
         )
         .await
     }
@@ -236,6 +256,7 @@ impl PostgresConnection {
         negotiation: SslNegotiation,
         tls: &TlsOptions,
         use_tls: bool,
+        age: bool,
     ) -> Result<Self> {
         let socket_addr = uri.socket_addr();
         let stream = TcpStream::connect(&socket_addr).await.map_err(|e| {
@@ -271,6 +292,7 @@ impl PostgresConnection {
             secret_key: 0,
             transaction_status: TransactionStatus::Idle,
             is_age_initialized: false,
+            agtype_oid: None,
             query_timeout,
             last_command_tag: None,
         };
@@ -278,8 +300,9 @@ impl PostgresConnection {
         // Perform protocol handshake & authentication
         conn.handshake().await?;
 
-        // If target protocol or parameters indicate Apache AGE, initialize AGE extension
-        if uri.raw.starts_with("age:")
+        // If the caller, target protocol or parameters indicate Apache AGE, initialize AGE extension
+        if age
+            || uri.raw.starts_with("age:")
             || uri.params.contains_key("graph")
             || uri.params.contains_key("graph_name")
             || uri.params.contains_key("age")
@@ -420,7 +443,43 @@ impl PostgresConnection {
         self.execute_simple("LOAD 'age'; SET search_path = ag_catalog, \"$user\", public;")
             .await?;
         self.is_age_initialized = true;
+        self.agtype_oid = self.resolve_agtype_oid().await?;
         Ok(())
+    }
+
+    /// Looks up the Apache AGE `agtype` type OID on this server.
+    ///
+    /// The OID is installation-specific, so it is read from the catalog instead
+    /// of hard-coded. Failure to resolve it leaves decoding disabled rather than
+    /// failing the connection.
+    async fn resolve_agtype_oid(&mut self) -> Result<Option<i32>> {
+        let result = self
+            .execute_simple_inner(
+                "SELECT oid FROM pg_catalog.pg_type                  WHERE typname = 'agtype' AND typnamespace = 'ag_catalog'::regnamespace;",
+            )
+            .await?;
+        let Some(batch) = result.batches.first() else {
+            return Ok(None);
+        };
+        let Some(array) = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+        else {
+            return Ok(None);
+        };
+        if array.is_empty() || array.is_null(0) {
+            return Ok(None);
+        }
+        Ok(Some(array.value(0) as i32))
+    }
+
+    /// Marks result columns whose PostgreSQL type is `agtype`.
+    fn age_columns(&self, field_types: &[i32]) -> Vec<bool> {
+        match self.agtype_oid {
+            Some(oid) => field_types.iter().map(|oid_i| *oid_i == oid).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Executes a simple query string via PostgreSQL Simple Query Protocol (`'Q'`).
@@ -447,6 +506,7 @@ impl PostgresConnection {
             .await?;
 
         let mut columns = Vec::new();
+        let mut field_types: Vec<i32> = Vec::new();
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         let mut summary = QuerySummary::empty();
         let mut query_error = None;
@@ -455,6 +515,7 @@ impl PostgresConnection {
             let msg = read_backend_message(&mut self.stream).await?;
             match msg {
                 BackendMessage::RowDescription(fields) => {
+                    field_types = fields.iter().map(|f| f.type_oid).collect();
                     columns = fields.into_iter().map(|f| f.name).collect();
                 }
                 BackendMessage::DataRow(vals) => {
@@ -505,7 +566,9 @@ impl PostgresConnection {
             Vec::new()
         };
 
-        Ok(QueryResult::new(columns, batches, summary))
+        let mut result = QueryResult::new(columns, batches, summary);
+        result.age_columns = self.age_columns(&field_types);
+        Ok(result)
     }
 
     /// Executes a parameterized statement via the PostgreSQL extended query protocol.
@@ -569,7 +632,9 @@ impl PostgresConnection {
             Vec::new()
         };
 
-        Ok(QueryResult::new(response.columns, batches, summary))
+        let mut result = QueryResult::new(response.columns, batches, summary);
+        result.age_columns = self.age_columns(&response.field_types);
+        Ok(result)
     }
 
     /// Executes a prepared statement with the configured query timeout.
@@ -747,6 +812,7 @@ pub(crate) fn validate_savepoint_name(name: &str) -> Result<()> {
 /// Fully drained response to an extended-query cycle.
 struct ExtendedResponse {
     columns: Vec<String>,
+    field_types: Vec<i32>,
     rows: Vec<Vec<Option<String>>>,
     summary: QuerySummary,
     command_tag: Option<String>,
@@ -762,6 +828,7 @@ where
 {
     let mut response = ExtendedResponse {
         columns: Vec::new(),
+        field_types: Vec::new(),
         rows: Vec::new(),
         summary: QuerySummary::empty(),
         command_tag: None,
@@ -779,6 +846,7 @@ where
             | BackendMessage::NoData
             | BackendMessage::EmptyQueryResponse => {}
             BackendMessage::RowDescription(fields) => {
+                response.field_types = fields.iter().map(|f| f.type_oid).collect();
                 response.columns = fields.into_iter().map(|f| f.name).collect();
             }
             BackendMessage::DataRow(vals) => {
