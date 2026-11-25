@@ -6,7 +6,7 @@
 #
 # Plaintext ports keep working, so the rest of the test suite is unaffected:
 # - Neo4j 7687: Bolt TLS is OPTIONAL, so the same port accepts plain and TLS (bolt+s / bolt+ssc).
-# - Apache AGE 5455 and PostgreSQL 19 5456: ssl=on; the client chooses (sslmode=require / verify-full).
+# - Apache AGE 5455 and PostgreSQL 19 Beta 3 5456: ssl=on; the client chooses (sslmode=require / verify-full).
 # - Memgraph and FalkorDB cannot mix plain and TLS on one port, so each gets a TLS-only instance:
 #   Memgraph Bolt+TLS on 7690, FalkorDB Redis+TLS on 6380. Both start empty (no data volume).
 # - FalkorDB with mutual TLS on 6381 (falkordb-mtls): clients must present a certificate
@@ -40,6 +40,7 @@ services:
     volumes:
       - ./tls/certs:/tls:ro,z
 
+  # Inherits postgres:19beta3-alpine from compose.yaml; must stay on 19beta3 because 19.0 has no SQL/PGQ.
   postgres19:
     entrypoint: *pg-tls-entrypoint
     volumes:

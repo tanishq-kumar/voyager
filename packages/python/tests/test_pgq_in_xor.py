@@ -1,9 +1,9 @@
 """Regression tests for SQL/PGQ ``IN`` lists (#303) and ``XOR`` (#304).
 
 SQL:2023 PGQ emitted `x IN [$p0, $p1]` for a literal list, `x IN $p0` for a
-list parameter and `a XOR b` for XOR. PostgreSQL 19 rejects all three. These
+list parameter and `a XOR b` for XOR. PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) rejects all three. These
 tests cover the emitted SQL on SQL/PGQ and DuckPGQ, DuckPGQ execution, and live
-PostgreSQL 19 execution for the literal, parameter, negated, empty and NULL
+PostgreSQL 19 Beta 3 execution for the literal, parameter, negated, empty and NULL
 cases, plus the XOR three-valued result.
 """
 

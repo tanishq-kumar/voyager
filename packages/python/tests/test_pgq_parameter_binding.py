@@ -9,7 +9,7 @@ Verifies:
    and safely encodes all supported Python types (str with quote-doubling, int, float
    incl. nan/inf, bool, None, date/datetime/time, list, dict/map) as SQL literals,
    raising TypeError for unsupported types.
-3. Live execution parity on PostgreSQL 19 and DuckPGQ.
+3. Live execution parity on PostgreSQL 19 Beta 3 (experimental SQL/PGQ) and DuckPGQ.
 """
 
 from __future__ import annotations

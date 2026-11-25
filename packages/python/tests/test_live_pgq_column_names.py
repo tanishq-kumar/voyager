@@ -6,7 +6,7 @@ so that multi-column row records in `Session.execute` preserve all projected col
 under distinct dictionary keys instead of one overwriting the other.
 
 Tested on:
-- PostgreSQL 19 (if reachable on VOYAGER_TEST_HOST:5456)
+- PostgreSQL 19 Beta 3 (if reachable on VOYAGER_TEST_HOST:5456)
 - DuckDB / DuckPGQ (embedded in-memory)
 """
 

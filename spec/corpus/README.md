@@ -64,7 +64,7 @@ Live engine coverage per target:
 | --- | --- | --- |
 | `cypher` | `cypher` | Neo4j (reference), Memgraph, FalkorDB |
 | `age` | `age` | Apache AGE |
-| `sqlpgq` | `sql_pgq` | PostgreSQL 19 |
+| `sqlpgq` | `sql_pgq` | PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) |
 | `gql` | `iso_gql` | Compile check only; no GQL engine is available |
 
 ## Fixtures
@@ -103,7 +103,7 @@ and leaves the engine clean:
 | Memgraph | `neo4j` Python driver, same statements as Neo4j | Same marker namespace and cleanup as Neo4j. | Same as Neo4j. |
 | FalkorDB | `falkordb` Python client (`GRAPH.QUERY`) | A dedicated graph key `voyager_corpus_<token>`; the graph is deleted after the scenario. | One node per fixture node; labels are kept; unlabeled nodes report an empty label set. |
 | Apache AGE | SQL `cypher('<graph>', $$ ... $$)` in a dedicated AGE graph | A dedicated graph `voyager_corpus_<token>` created with `create_graph` and dropped with `drop_graph(..., true)`. | AGE stores at most one label per vertex, so the loader rejects multi-label fixture nodes (those targets are `unsupported`). Property maps are inlined into the `CREATE` statement because AGE does not accept a parameter as a `CREATE` property map; the marker is stripped from results. |
-| PostgreSQL 19 | Plain tables in a dedicated schema plus `CREATE PROPERTY GRAPH` | A dedicated schema `voyager_corpus_<token>` (and property graph in it) created for each scenario and dropped with `DROP SCHEMA ... CASCADE`. | One vertex table per label, plus one unlabeled vertex table; one edge table per (type, start table, end table). `PROPERTIES` exposes the fixture property names. Node properties become typed columns (booleans, integers, floats, text, arrays). Multi-label nodes and duplicate labels across tables cannot be represented, so the loader rejects them (those targets are `unsupported`). SQL/PGQ labels and relationship types are double-quoted so their declared case is preserved; property names stay unquoted and PostgreSQL folds them to lower case. |
+| PostgreSQL 19 Beta 3 (experimental SQL/PGQ) | Plain tables in a dedicated schema plus `CREATE PROPERTY GRAPH` | A dedicated schema `voyager_corpus_<token>` (and property graph in it) created for each scenario and dropped with `DROP SCHEMA ... CASCADE`. | One vertex table per label, plus one unlabeled vertex table; one edge table per (type, start table, end table). `PROPERTIES` exposes the fixture property names. Node properties become typed columns (booleans, integers, floats, text, arrays). Multi-label nodes and duplicate labels across tables cannot be represented, so the loader rejects them (those targets are `unsupported`). SQL/PGQ labels and relationship types are double-quoted so their declared case is preserved; property names stay unquoted and PostgreSQL folds them to lower case. |
 
 Batches of live tests are short and each scenario cleans up in a `finally`
 block. If a process dies mid-run, only namespace names carrying the
@@ -122,7 +122,7 @@ against every engine whose target status is `supported`. For each case it:
    name for SQL/PGQ and AGE, so the checked-in `expected.*` files are untouched);
 3. merges compiler-extracted parameters with `scenario.json` `params`;
 4. executes the compiled statement through Voyager's execution path (the
-   `Session`/`PostgresBridge` path for Apache AGE and PostgreSQL 19) or the
+   `Session`/`PostgresBridge` path for Apache AGE and PostgreSQL 19 Beta 3) or the
    engine's own client where entity labels/types must survive (Neo4j, Memgraph,
    FalkorDB, whose Voyager bridge normalizes entities to property maps);
 5. canonicalizes the rows and compares them with `rows.json` under the rules
@@ -236,6 +236,6 @@ This runs `scripts/update_corpus.py` to re-emit all `expected.*` files for `supp
 ## Roadmap & Milestone Checks
 
 - **#253**: Scenario format, JSON Schema, compilation runner (`just corpus`), update tool (`just corpus-update`), and Pack P0 (MATCH / RETURN basics).
-- **#254 (Current)**: Engine-neutral fixtures (`spec/corpus/fixtures`, `fixture.schema.json`), per-engine loaders, live execution checks against `rows.json`, `just corpus-live`, `just corpus-record-rows`, and Pack P0 live evidence on Neo4j, Memgraph, FalkorDB, Apache AGE and PostgreSQL 19.
+- **#254 (Current)**: Engine-neutral fixtures (`spec/corpus/fixtures`, `fixture.schema.json`), per-engine loaders, live execution checks against `rows.json`, `just corpus-live`, `just corpus-record-rows`, and Pack P0 live evidence on Neo4j, Memgraph, FalkorDB, Apache AGE and PostgreSQL 19 Beta 3.
 - **#234**: Fluent code generation from Query Spec for Python (`expected.py`) and Rust (`expected.rs`).
 - **Packs P1–P7**: Filtering (P1, #255), Ordering & Pagination (P2, #256), Aggregation (P3, #257), Paths & Variable-Length (P4, #258), Optional Match & UNWIND (P5, #259), Writes & DML (P6, #260), Subqueries & CALL (P7, #261).

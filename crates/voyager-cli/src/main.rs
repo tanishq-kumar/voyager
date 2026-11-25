@@ -40,7 +40,7 @@ Exit codes:
   2  usage error
   3  connection, check or catalog query failure (doctor, introspect)
   4  input/output error (cannot read the spec file or stdin)
-  5  engine not supported by introspect (Apache AGE, DuckDB)";
+  5  engine not supported by introspect (Apache AGE, DuckDB, PostgreSQL without SQL/PGQ)";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -99,8 +99,10 @@ enum Commands {
                       a sample of at most --sample-size entities per label or relationship type, \
                       unless the engine declares them (PostgreSQL).\n\n\
                       Supported: Neo4j 5.13+ and Memgraph (bolt://), FalkorDB (redis:// or \
-                      falkordb://, graph from the URI), PostgreSQL 19 SQL/PGQ property graphs \
-                      (postgresql://...?graph=<name>). Apache AGE and DuckDB exit with code 5.\n\n\
+                      falkordb://, graph from the URI), PostgreSQL SQL/PGQ (experimental: \
+                      PostgreSQL 19 Beta 1-3 and 20 development builds) property graphs \
+                      (postgresql://...?graph=<name>). Apache AGE, DuckDB, and PostgreSQL servers \
+                      without SQL/PGQ exit with code 5.\n\n\
                       Credentials work as for doctor: URI userinfo or --username, and \
                       --password-env for the password.",
         after_help = EXIT_HELP
@@ -177,7 +179,7 @@ enum Dialect {
     /// ISO GQL
     #[value(name = "iso_gql")]
     IsoGql,
-    /// SQL:2023 PGQ (PostgreSQL 19)
+    /// SQL:2023 PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)
     #[value(name = "sql_pgq")]
     SqlPgq,
     /// DuckPGQ (DuckDB)
@@ -777,13 +779,28 @@ async fn probe_postgres(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         .cloned();
     let tls = tls_label(connection.is_tls());
     let latency = measure_ping(&mut connection).await?;
-    let _ = connection.close().await;
 
     let uses_age = parsed.raw.starts_with("age:")
+        || voyager_drivers::introspect::uses_age(parsed)
         || parsed.params.contains_key("graph")
         || parsed.params.contains_key("graph_name")
         || parsed.params.contains_key("age")
         || parsed.params.get("dialect").map(String::as_str) == Some("age");
+
+    if !uses_age {
+        match voyager_drivers::introspect::probe_pgq_support(&mut connection).await {
+            Ok(voyager_drivers::introspect::PgqSupport::Supported) => {}
+            Ok(voyager_drivers::introspect::PgqSupport::Unsupported { message, .. }) => {
+                let _ = connection.close().await;
+                return Err(Failure::check(format!("doctor: {message}")));
+            }
+            Err(error) => {
+                let _ = connection.close().await;
+                return Err(Failure::check(format!("doctor: {error}")));
+            }
+        }
+    }
+    let _ = connection.close().await;
 
     Ok(ProbeReport {
         protocol: format!("PostgreSQL wire{tls}"),

@@ -1,4 +1,4 @@
-//! Introspection of PostgreSQL 19 SQL/PGQ property graphs.
+//! Introspection of PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) property graphs.
 //!
 //! Labels, properties and their declared types, and edge endpoints come from
 //! the `pg_propgraph_*` catalogs. Constraint and index facts come from the
@@ -338,6 +338,122 @@ pub(crate) fn build(
     }
 }
 
+/// Result of probing a PostgreSQL connection for SQL/PGQ property graph support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgqSupport {
+    /// Server exposes the SQL/PGQ `pg_propgraph_*` catalogs.
+    Supported,
+    /// Server lacks SQL/PGQ support; `message` names the server version when available.
+    Unsupported {
+        /// Server version reported by `SHOW server_version` (or startup parameters).
+        server_version: Option<String>,
+        /// Human-readable message explaining why SQL/PGQ is unavailable.
+        message: String,
+    },
+}
+
+/// Formats the error message for a PostgreSQL server without SQL/PGQ support.
+pub fn no_pgq_support_message(server_version: Option<&str>) -> String {
+    match server_version.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(version) => format!(
+            "PostgreSQL {version} does not support SQL/PGQ \
+             (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)"
+        ),
+        None => "this PostgreSQL server does not support SQL/PGQ \
+                 (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)"
+            .to_string(),
+    }
+}
+
+/// Returns `true` when `error` is a PostgreSQL `undefined_table` (`42P01`) or
+/// `syntax_error` (`42601`) from probing SQL/PGQ catalogs or syntax.
+pub(crate) fn is_missing_pgq_error(error: &NetError) -> bool {
+    let msg = match error {
+        NetError::ProtocolError(msg) | NetError::ExecutionError(msg) => msg,
+        _ => return false,
+    };
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("sqlstate 42p01")
+        || lower.contains("sqlstate 42601")
+        || lower.contains("undefined_table")
+        || lower.contains("does not exist")
+        || lower.contains("syntax error")
+}
+
+/// Queries `SHOW server_version`, falling back to handshake `ParameterStatus`.
+async fn query_server_version(connection: &mut PostgresConnection) -> Option<String> {
+    if let Ok(result) = connection
+        .execute("SHOW server_version", &HashMap::new())
+        .await
+    {
+        if let Some(version) = result
+            .batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .and_then(|b| {
+                let col = b.column(0).as_any().downcast_ref::<StringArray>()?;
+                (!col.is_null(0)).then(|| col.value(0).trim().to_string())
+            })
+            && !version.is_empty()
+        {
+            return Some(version);
+        }
+    }
+    connection
+        .server_parameters()
+        .get("server_version")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+struct CatalogProbe {
+    has_pgq: bool,
+    has_age: bool,
+}
+
+async fn probe_catalogs(connection: &mut PostgresConnection) -> Result<CatalogProbe> {
+    match json_rows(
+        connection,
+        "SELECT json_build_object(\
+           'pgq', to_regclass('pg_catalog.pg_propgraph_element') IS NOT NULL, \
+           'age', to_regclass('ag_catalog.ag_graph') IS NOT NULL)::text",
+    )
+    .await
+    {
+        Ok(rows) => {
+            let has = |key: &str| {
+                rows.first()
+                    .and_then(|row| row.get(key))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            };
+            Ok(CatalogProbe {
+                has_pgq: has("pgq"),
+                has_age: has("age"),
+            })
+        }
+        Err(error) if is_missing_pgq_error(&error) => Ok(CatalogProbe {
+            has_pgq: false,
+            has_age: false,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+/// Probes whether the connected PostgreSQL server exposes SQL/PGQ property graph catalogs.
+pub async fn probe_pgq_support(connection: &mut PostgresConnection) -> Result<PgqSupport> {
+    let probe = probe_catalogs(connection).await?;
+    if probe.has_pgq {
+        return Ok(PgqSupport::Supported);
+    }
+    let server_version = query_server_version(connection).await;
+    let message = no_pgq_support_message(server_version.as_deref());
+    Ok(PgqSupport::Unsupported {
+        server_version,
+        message,
+    })
+}
+
 /// Introspects the SQL/PGQ property graph named by the URI's `graph` (or
 /// `graph_name`) parameter.
 pub(crate) async fn introspect_pgq(
@@ -360,22 +476,9 @@ async fn read(
     uri: &ParsedUri,
     options: &IntrospectOptions,
 ) -> Result<GraphSchema> {
-    let probe = json_rows(
-        connection,
-        "SELECT json_build_object(\
-           'pgq', to_regclass('pg_catalog.pg_propgraph_element') IS NOT NULL, \
-           'age', to_regclass('ag_catalog.ag_graph') IS NOT NULL)::text",
-    )
-    .await?;
-    let has = |key: &str| {
-        probe
-            .first()
-            .and_then(|row| row.get(key))
-            .and_then(Value::as_bool)
-            == Some(true)
-    };
-    if !has("pgq") {
-        return Err(if has("age") {
+    let probe = probe_catalogs(connection).await?;
+    if !probe.has_pgq {
+        return Err(if probe.has_age {
             unsupported(
                 "Apache AGE",
                 "AGE stores properties as untyped agtype and reports indexes only as \
@@ -383,10 +486,10 @@ async fn read(
                  cannot be read without guessing",
             )
         } else {
+            let server_version = query_server_version(connection).await;
             unsupported(
                 "PostgreSQL",
-                "this server has no SQL/PGQ property graph catalogs (PostgreSQL 19 or later is \
-                 required)",
+                &no_pgq_support_message(server_version.as_deref()),
             )
         });
     }
@@ -396,13 +499,24 @@ async fn read(
         .get("graph")
         .or_else(|| uri.params.get("graph_name"))
         .cloned();
-    let available = json_rows(
+    let available = match json_rows(
         connection,
         &wrap(
             "SELECT DISTINCT pgepgid::regclass::text AS graph FROM pg_propgraph_element ORDER BY 1",
         ),
     )
-    .await?;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) if is_missing_pgq_error(&error) => {
+            let server_version = query_server_version(connection).await;
+            return Err(unsupported(
+                "PostgreSQL",
+                &no_pgq_support_message(server_version.as_deref()),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let available: Vec<String> = available
         .iter()
         .filter_map(|row| parse::string(row, "graph"))
@@ -437,10 +551,18 @@ async fn read(
         )));
     }
 
-    let properties = json_rows(connection, &properties_query(&graph)).await?;
-    let endpoints = json_rows(connection, &endpoints_query(&graph)).await?;
-    let constraints = json_rows(connection, &constraints_query(&graph)).await?;
-    let indexes = json_rows(connection, &indexes_query(&graph)).await?;
+    let (properties, endpoints, constraints, indexes) =
+        match fetch_pgq_catalogs(connection, &graph).await {
+            Ok(catalogs) => catalogs,
+            Err(error) if is_missing_pgq_error(&error) => {
+                let server_version = query_server_version(connection).await;
+                return Err(unsupported(
+                    "PostgreSQL",
+                    &no_pgq_support_message(server_version.as_deref()),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
 
     let mut builder = SchemaBuilder::new();
     build(
@@ -460,6 +582,17 @@ async fn read(
         database: Some(graph),
         sample_size: options.sample_size,
     }))
+}
+
+async fn fetch_pgq_catalogs(
+    connection: &mut PostgresConnection,
+    graph: &str,
+) -> Result<(Vec<Row>, Vec<Row>, Vec<Row>, Vec<Row>)> {
+    let properties = json_rows(connection, &properties_query(graph)).await?;
+    let endpoints = json_rows(connection, &endpoints_query(graph)).await?;
+    let constraints = json_rows(connection, &constraints_query(graph)).await?;
+    let indexes = json_rows(connection, &indexes_query(graph)).await?;
+    Ok((properties, endpoints, constraints, indexes))
 }
 
 #[cfg(test)]
@@ -562,5 +695,216 @@ mod tests {
         // The edge key covers columns that are not properties: not mapped.
         assert!(knows.properties["since"].primary_key.is_none());
         assert_eq!(schema.indexes.len(), 2);
+    }
+
+    #[test]
+    fn no_pgq_support_message_names_server_version() {
+        assert_eq!(
+            no_pgq_support_message(Some("19.0")),
+            "PostgreSQL 19.0 does not support SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)"
+        );
+        assert_eq!(
+            no_pgq_support_message(Some("18.3 (Debian 18.3-1)")),
+            "PostgreSQL 18.3 (Debian 18.3-1) does not support SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)"
+        );
+        assert_eq!(
+            no_pgq_support_message(None),
+            "this PostgreSQL server does not support SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)"
+        );
+        assert_eq!(
+            no_pgq_support_message(Some("   ")),
+            "this PostgreSQL server does not support SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)"
+        );
+    }
+
+    #[test]
+    fn detects_missing_pgq_catalog_and_syntax_errors() {
+        assert!(is_missing_pgq_error(&NetError::ProtocolError(
+            "ERROR: relation \"pg_propgraph_element\" does not exist (SQLSTATE 42P01)".to_string(),
+        )));
+        assert!(is_missing_pgq_error(&NetError::ProtocolError(
+            "ERROR: syntax error at or near \"(\" (SQLSTATE 42601)".to_string(),
+        )));
+        assert!(!is_missing_pgq_error(&NetError::ProtocolError(
+            "ERROR: permission denied for table users (SQLSTATE 42501)".to_string(),
+        )));
+        assert!(!is_missing_pgq_error(&NetError::ConnectionFailed(
+            "connection refused".to_string(),
+        )));
+    }
+
+    fn pg_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(msg_type);
+        out.extend_from_slice(&(4 + payload.len() as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn pg_param_status(name: &str, value: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(value.as_bytes());
+        payload.push(0);
+        pg_frame(b'S', &payload)
+    }
+
+    fn pg_single_text_row(col: &str, val: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut row_desc = Vec::new();
+        row_desc.extend_from_slice(&1i16.to_be_bytes());
+        row_desc.extend_from_slice(col.as_bytes());
+        row_desc.push(0);
+        row_desc.extend_from_slice(&0i32.to_be_bytes());
+        row_desc.extend_from_slice(&0i16.to_be_bytes());
+        row_desc.extend_from_slice(&25i32.to_be_bytes()); // text OID
+        row_desc.extend_from_slice(&(-1i16).to_be_bytes());
+        row_desc.extend_from_slice(&(-1i32).to_be_bytes());
+        row_desc.extend_from_slice(&0i16.to_be_bytes());
+        out.extend_from_slice(&pg_frame(b'T', &row_desc));
+
+        let mut data_row = Vec::new();
+        data_row.extend_from_slice(&1i16.to_be_bytes());
+        data_row.extend_from_slice(&(val.len() as i32).to_be_bytes());
+        data_row.extend_from_slice(val.as_bytes());
+        out.extend_from_slice(&pg_frame(b'D', &data_row));
+        out.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+        out.extend_from_slice(&pg_frame(b'Z', b"I"));
+        out
+    }
+
+    fn pg_error_reply(sqlstate: &str, message: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"SERROR\0");
+        payload.push(b'C');
+        payload.extend_from_slice(sqlstate.as_bytes());
+        payload.push(0);
+        payload.push(b'M');
+        payload.extend_from_slice(message.as_bytes());
+        payload.push(0);
+        payload.push(0);
+        let mut out = pg_frame(b'E', &payload);
+        out.extend_from_slice(&pg_frame(b'Z', b"I"));
+        out
+    }
+
+    async fn spawn_pg_stub(
+        server_version: &'static str,
+        probe_reply: Vec<u8>,
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            // Read StartupMessage
+            let _ = stream.read(&mut buf).await;
+            let mut startup_reply = Vec::new();
+            startup_reply.extend_from_slice(&pg_frame(b'R', &0i32.to_be_bytes()));
+            startup_reply.extend_from_slice(&pg_param_status("server_version", server_version));
+            startup_reply.extend_from_slice(&pg_frame(b'Z', b"I"));
+            if stream.write_all(&startup_reply).await.is_err() {
+                return;
+            }
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 || buf[0] == b'X' {
+                    break;
+                }
+                let query = String::from_utf8_lossy(&buf[5..n]);
+                let reply = if query.contains("SHOW server_version") {
+                    pg_single_text_row("server_version", server_version)
+                } else {
+                    probe_reply.clone()
+                };
+                if stream.write_all(&reply).await.is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn introspect_without_pgq_catalogs_names_server_version() {
+        let addr = spawn_pg_stub(
+            "19.0",
+            pg_single_text_row("json_build_object", r#"{"pgq": false, "age": false}"#),
+        )
+        .await;
+        let uri =
+            ParsedUri::parse(&format!("postgresql://postgres:pw@{addr}/db?graph=g")).expect("uri");
+        let err = crate::introspect(&uri, &IntrospectOptions::default())
+            .await
+            .expect_err("expected unsupported error");
+        assert_eq!(err.code(), voyager_ogm::ErrorCode::UnsupportedFeature);
+        let msg = crate::introspect::describe_error(&err);
+        assert!(
+            msg.contains("PostgreSQL 19.0 does not support SQL/PGQ"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("experimental: PostgreSQL 19 Beta 1-3 and 20 development builds"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn introspect_with_age_catalogs_keeps_age_error() {
+        let addr = spawn_pg_stub(
+            "18.3",
+            pg_single_text_row("json_build_object", r#"{"pgq": false, "age": true}"#),
+        )
+        .await;
+        let uri =
+            ParsedUri::parse(&format!("postgresql://postgres:pw@{addr}/db?graph=g")).expect("uri");
+        let err = crate::introspect(&uri, &IntrospectOptions::default())
+            .await
+            .expect_err("expected unsupported error");
+        assert_eq!(err.code(), voyager_ogm::ErrorCode::UnsupportedFeature);
+        let msg = crate::introspect::describe_error(&err);
+        assert!(msg.contains("Dialect 'Apache AGE'"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn probe_pgq_support_handles_undefined_table_and_syntax_errors() {
+        let addr_42p01 = spawn_pg_stub(
+            "18.4",
+            pg_error_reply("42P01", "relation \"pg_propgraph_element\" does not exist"),
+        )
+        .await;
+        let uri =
+            ParsedUri::parse(&format!("postgresql://postgres:pw@{addr_42p01}/db")).expect("uri");
+        let mut conn = PostgresConnection::connect(&uri).await.expect("connect");
+        let support = probe_pgq_support(&mut conn).await.expect("probe");
+        assert_eq!(
+            support,
+            PgqSupport::Unsupported {
+                server_version: Some("18.4".to_string()),
+                message: "PostgreSQL 18.4 does not support SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)".to_string(),
+            }
+        );
+
+        let addr_42601 = spawn_pg_stub(
+            "19.0",
+            pg_error_reply("42601", "syntax error at or near \"GRAPH_TABLE\""),
+        )
+        .await;
+        let uri =
+            ParsedUri::parse(&format!("postgresql://postgres:pw@{addr_42601}/db")).expect("uri");
+        let mut conn = PostgresConnection::connect(&uri).await.expect("connect");
+        let support = probe_pgq_support(&mut conn).await.expect("probe");
+        assert_eq!(
+            support,
+            PgqSupport::Unsupported {
+                server_version: Some("19.0".to_string()),
+                message: "PostgreSQL 19.0 does not support SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)".to_string(),
+            }
+        );
     }
 }

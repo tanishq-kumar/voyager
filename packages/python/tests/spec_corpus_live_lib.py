@@ -778,7 +778,7 @@ class AgeEngine(BaseEngine):
 
 
 class PG19Engine(BaseEngine):
-    """PostgreSQL 19 SQL/PGQ loaded into plain tables in a dedicated schema."""
+    """PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) loaded into plain tables in a dedicated schema."""
 
     name = "pg19"
 

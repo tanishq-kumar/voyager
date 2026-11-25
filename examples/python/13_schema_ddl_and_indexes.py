@@ -102,7 +102,7 @@ def main() -> None:
     print()
 
     # -----------------------------------------------------------------------
-    # Part 4: SQL:2023 PGQ (PostgreSQL 19+ / DuckDB DuckPGQ)
+    # Part 4: SQL:2023 PGQ (DuckDB DuckPGQ; PostgreSQL SQL/PGQ experimental on 19 Beta 1-3 / 20 dev)
     # -----------------------------------------------------------------------
     print("[4] SQL:2023 PGQ Property Graph Catalog DDL:")
     print("-" * 50)

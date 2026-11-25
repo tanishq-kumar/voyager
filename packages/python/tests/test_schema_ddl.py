@@ -286,7 +286,7 @@ def test_live_neo4j_enterprise_cypher25_graph_type():
 
 @pytest.mark.live
 def test_live_postgres19_pgq_ddl_execution():
-    """Verifies applying generated SQL:2023 PGQ DDL directly to PostgreSQL 19."""
+    """Verifies applying generated SQL:2023 PGQ DDL directly to PostgreSQL 19 Beta 3."""
     uri = os.getenv("PG19_URI", "postgresql://postgres:voyagerpass123@127.0.0.1:5456/postgres")
     try:
         import psycopg

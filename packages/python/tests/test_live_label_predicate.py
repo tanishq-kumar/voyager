@@ -201,7 +201,7 @@ def test_live_apache_age_label_predicate() -> None:
 
 
 def test_live_postgres19_rejects_label_predicate_in_where() -> None:
-    """PostgreSQL 19 has no label test in GRAPH_TABLE WHERE, so we raise."""
+    """PostgreSQL SQL/PGQ (19 Beta 3) has no label test in GRAPH_TABLE WHERE, so we raise."""
     if not _is_open(5456):
         pytest.skip("PostgreSQL 19 container not reachable")
 

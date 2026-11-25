@@ -1,14 +1,14 @@
 """Live tests: relational table DDL, constraints, indexes and SQL/PGQ property graph (#327).
 
 Verifies that the full ordered schema DDL emitted by `generate_pgq_schema_ddl`:
-1. Executes on PostgreSQL 19 in one pass (tables + constraints + indexes + CREATE PROPERTY GRAPH).
+1. Executes on PostgreSQL 19 Beta 3 in one pass (tables + constraints + indexes + CREATE PROPERTY GRAPH).
 2. Supports self-relationships, labels differing from class names, and reserved-word labels ("User", "Order").
 3. Enables SQL/PGQ queries via `GRAPH_TABLE` matching the model schema.
 4. Matches `introspect_schema` with `export_schema` for the same models.
 5. Executes end-to-end on embedded DuckPGQ.
 
 Databases:
-- PostgreSQL 19 on VOYAGER_TEST_HOST:5456 (default 127.0.0.1)
+- PostgreSQL 19 Beta 3 on VOYAGER_TEST_HOST:5456 (default 127.0.0.1)
 - DuckDB / DuckPGQ embedded
 """
 
