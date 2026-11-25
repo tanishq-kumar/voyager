@@ -25,7 +25,7 @@ pub use ddl::{
     resolve_edge_surrogate_key_name,
 };
 pub use iso_gql::IsoGqlEmitter;
-pub use sql_pgq::SqlPgqEmitter;
+pub use sql_pgq::{SqlPgqEmitter, SqlPgqFlavor};
 
 use crate::ast::{AstNode, LabelExpression, NodeHandle, QueryAstArena};
 use crate::error::{Error, Result};

@@ -21,8 +21,7 @@
       "status": "supported"
     },
     "sqlpgq": {
-      "status": "known-diff",
-      "reason": "PostgreSQL 19 SQL/PGQ ARRAY_AGG includes null values in the aggregated array, whereas openCypher/Neo4j COLLECT ignores null values."
+      "status": "supported"
     }
   }
 }

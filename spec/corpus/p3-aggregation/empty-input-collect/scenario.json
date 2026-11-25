@@ -21,8 +21,7 @@
       "status": "supported"
     },
     "sqlpgq": {
-      "status": "known-diff",
-      "reason": "PostgreSQL 19 SQL/PGQ ARRAY_AGG returns null for empty input, whereas openCypher/Neo4j returns an empty list []."
+      "status": "supported"
     }
   }
 }

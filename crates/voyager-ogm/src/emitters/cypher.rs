@@ -17,6 +17,7 @@ pub struct CypherEmitter {
     ignore_execution_mode: bool,
     node_params: HashMap<NodeHandle, String>,
     age_label_predicates: bool,
+    age_aggregates: bool,
 }
 
 impl CypherEmitter {
@@ -29,6 +30,7 @@ impl CypherEmitter {
             ignore_execution_mode: false,
             node_params: HashMap::new(),
             age_label_predicates: false,
+            age_aggregates: false,
         }
     }
 
@@ -44,6 +46,12 @@ impl CypherEmitter {
     /// `label(i) = 'TextNode'` for both nodes and relationships.
     pub fn with_age_label_predicates(mut self) -> Self {
         self.age_label_predicates = true;
+        self
+    }
+
+    /// Enables Apache AGE aggregate null parity (emits `coalesce(sum(...), 0)` for SUM).
+    pub fn with_age_aggregates(mut self) -> Self {
+        self.age_aggregates = true;
         self
     }
 
@@ -505,6 +513,8 @@ impl CypherEmitter {
             }
             AstNode::QueryStatement { .. } => {
                 let mut nested_emitter = CypherEmitter::new().without_execution_mode();
+                nested_emitter.age_label_predicates = self.age_label_predicates;
+                nested_emitter.age_aggregates = self.age_aggregates;
                 nested_emitter.param_counter = self.param_counter;
                 let compiled = nested_emitter.visit_query(arena, handle)?;
                 self.buffer.push_str(&compiled.statement);
@@ -539,14 +549,24 @@ impl CypherEmitter {
             match func {
                 AggregationFunc::Count => self.buffer.push_str("COUNT("),
                 AggregationFunc::CountDistinct => self.buffer.push_str("COUNT(DISTINCT "),
-                AggregationFunc::Sum => self.buffer.push_str("SUM("),
+                AggregationFunc::Sum => {
+                    if self.age_aggregates {
+                        self.buffer.push_str("coalesce(sum(");
+                    } else {
+                        self.buffer.push_str("SUM(");
+                    }
+                }
                 AggregationFunc::Avg => self.buffer.push_str("AVG("),
                 AggregationFunc::Min => self.buffer.push_str("MIN("),
                 AggregationFunc::Max => self.buffer.push_str("MAX("),
                 AggregationFunc::Collect => self.buffer.push_str("COLLECT("),
             }
             self.emit_expression(arena, proj.expression, false)?;
-            self.buffer.push(')');
+            if self.age_aggregates && func == AggregationFunc::Sum {
+                self.buffer.push_str("), 0)");
+            } else {
+                self.buffer.push(')');
+            }
         } else {
             self.emit_expression(arena, proj.expression, false)?;
         }

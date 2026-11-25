@@ -207,7 +207,7 @@ def test_age_aggregations_and_grouping():
 
     assert "COUNT(p.name) AS total_count" in compiled.statement
     assert "AVG(p.age) AS avg_age" in compiled.statement
-    assert "SUM(p.age) AS total_age" in compiled.statement
+    assert "coalesce(sum(p.age), 0) AS total_age" in compiled.statement
     assert "MIN(p.age) AS min_age" in compiled.statement
     assert "MAX(p.age) AS max_age" in compiled.statement
     assert "COLLECT(p.name) AS all_names" in compiled.statement
