@@ -1,0 +1,32 @@
+{
+  "id": "p1-filtering/where-not-in-operator",
+  "pack": "p1-filtering",
+  "description": "Infix NOT IN against a list parameter. The equivalent NOT over IN is covered by where-not-over-in.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "Infix NOT IN boolean predicate"
+  },
+  "params": {
+    "names": [
+      "Bob",
+      "Carol"
+    ]
+  },
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

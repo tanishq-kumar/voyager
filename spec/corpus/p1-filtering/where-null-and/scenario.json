@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-null-and",
+  "pack": "p1-filtering",
+  "description": "Three-valued AND: a null comparison AND a true predicate is null and filters the row.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match-where/MatchWhere5.feature",
+    "scenario": "[3] Filter out on null if the AND'd predicate evaluates to true"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

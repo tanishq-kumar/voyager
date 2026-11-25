@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-ends-with",
+  "pack": "p1-filtering",
+  "description": "ENDS WITH string predicate.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "ENDS WITH suffix predicate"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

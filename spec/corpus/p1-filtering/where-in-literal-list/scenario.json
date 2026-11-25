@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-in-literal-list",
+  "pack": "p1-filtering",
+  "description": "IN against a literal list of strings. The shipped TCK subset only uses IN inside OPTIONAL MATCH, so this is a plain-MATCH Voyager scenario.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "IN with a literal list"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

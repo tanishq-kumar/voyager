@@ -1,0 +1,29 @@
+{
+  "id": "p1-filtering/where-parameter-gt",
+  "pack": "p1-filtering",
+  "description": "Greater-than against an integer parameter.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p1-filtering",
+    "scenario": "Comparison against an integer parameter"
+  },
+  "params": {
+    "age": 30
+  },
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

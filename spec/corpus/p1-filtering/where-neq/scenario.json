@@ -1,0 +1,27 @@
+{
+  "id": "p1-filtering/where-neq",
+  "pack": "p1-filtering",
+  "description": "Inequality comparison (<>) on a node property. Adapted from the TCK's node-identity inequality to a property comparison and a simpler Person fixture.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match-where/MatchWhere4.feature",
+    "scenario": "[1] Join nodes on inequality"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}
