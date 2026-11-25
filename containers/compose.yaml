@@ -90,7 +90,9 @@ services:
       timeout: 3s
       retries: 5
 
-  # PostgreSQL 19 Beta 3 (Relational & Recursive SQL Engine)
+  # PostgreSQL 19 Beta 3 (Relational, Recursive SQL, and experimental SQL/PGQ).
+  # Must stay pinned on 19beta3-alpine: SQL/PGQ was reverted in 19 Beta 4, so
+  # PostgreSQL 19.0 GA has no SQL/PGQ support.
   postgres19:
     image: docker.io/library/postgres:19beta3-alpine
     container_name: voyager-postgres19

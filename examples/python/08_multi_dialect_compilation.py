@@ -3,7 +3,7 @@
 Teaches:
     - Compiling a single graph AST into multiple target graph query languages
     - openCypher 9 / Cypher 25 for Neo4j and Memgraph
-    - SQL:2023 PGQ (`GRAPH_TABLE`) for DuckDB and PostgreSQL
+    - SQL:2023 PGQ (`GRAPH_TABLE`) for DuckDB/DuckPGQ (and experimental PostgreSQL SQL/PGQ on 19 Beta 1-3 / 20 dev builds)
     - ISO/IEC 39075:2024 GQL standard syntax
     - Parameter mapping and variable-length traversal conversion across dialects
 
@@ -64,7 +64,7 @@ def main() -> None:
     print(f"    {cypher.statement}")
     print(f"    Params: {cypher.parameters}\n")
 
-    # 2. SQL:2023 PGQ (DuckDB, PostgreSQL)
+    # 2. SQL:2023 PGQ (DuckDB/DuckPGQ; PostgreSQL SQL/PGQ experimental on 19 Beta 1-3 / 20 dev)
     pgq = query.compile("sql_pgq", graph_name="movie_network")
     print("[2] SQL:2023 PGQ (GRAPH_TABLE):")
     print(f"    {pgq.statement}")

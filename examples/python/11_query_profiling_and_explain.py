@@ -6,7 +6,7 @@ Teaches:
     - Multi-dialect keyword translation:
         * openCypher (Neo4j / Memgraph): `EXPLAIN` and `PROFILE`
         * ISO/IEC 39075:2024 GQL: `EXPLAIN` and `PROFILE`
-        * SQL:2023 PGQ (DuckDB / PostgreSQL): `EXPLAIN` and `EXPLAIN ANALYZE`
+        * SQL:2023 PGQ (DuckDB/DuckPGQ; PostgreSQL SQL/PGQ experimental on 19 Beta 1-3 / 20 dev): `EXPLAIN` and `EXPLAIN ANALYZE`
         * Apache AGE: `EXPLAIN SELECT ...` and `EXPLAIN ANALYZE SELECT ...`
     - MockBridge execution and live engine profiling when Neo4j is available
 
@@ -122,7 +122,7 @@ def main():
     dialects = [
         ("cypher", "openCypher (Neo4j / Memgraph)"),
         ("iso_gql", "ISO/IEC GQL"),
-        ("sql_pgq", "SQL:2023 PGQ (PostgreSQL / DuckDB)"),
+        ("sql_pgq", "SQL:2023 PGQ (DuckDB/DuckPGQ; experimental PostgreSQL SQL/PGQ)"),
         ("age", "Apache AGE (PostgreSQL Extension)"),
     ]
 

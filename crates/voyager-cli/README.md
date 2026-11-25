@@ -41,7 +41,7 @@ Every subcommand documents the same exit codes in `--help`:
 | `2` | Usage error, including unknown flags, a missing input, or an unknown dialect or format |
 | `3` | Connection, check or catalog query failure in `doctor` or `introspect` (invalid URI, unsupported protocol, connect/auth/ping failure, missing property graph) |
 | `4` | Input/output error, such as an unreadable spec file |
-| `5` | `introspect` does not support the engine (Apache AGE, DuckDB) |
+| `5` | `introspect` does not support the engine (Apache AGE, DuckDB, PostgreSQL without SQL/PGQ) |
 
 `validate` succeeds silently and exits `0`, so it can run in CI pipelines
 without extra output. A validation failure prints one line to stderr in the
@@ -184,10 +184,12 @@ that do require authentication, keep the credentials in the URI or pass
 `--username` plus `--password-env`.
 
 DuckDB is embedded and has no network endpoint, so `doctor --uri duckdb://...`
-reports that it cannot be checked. SQL/PGQ itself is checked only through
-compilation; `doctor` connects to PostgreSQL and reports `age` for `age://`
-URIs or PostgreSQL URIs carrying an AGE graph parameter, and `sql_pgq`
-otherwise.
+reports that it cannot be checked. For PostgreSQL URIs, `doctor` reports
+`age` for `age://` URIs or PostgreSQL URIs carrying an AGE graph parameter;
+otherwise it checks whether the server exposes SQL/PGQ property graph catalogs
+and reports `sql_pgq` when present, or fails with a version-specific error if
+SQL/PGQ is unavailable (experimental: PostgreSQL 19 Beta 1-3 and 20
+development builds).
 
 ## `voyager introspect`
 
@@ -230,7 +232,7 @@ How properties are filled in:
 | Neo4j 5.13+ | `db.labels()`, `db.relationshipTypes()`, `SHOW CONSTRAINTS`, `SHOW INDEXES`, `valueType()` |
 | Memgraph | `SHOW CONSTRAINT INFO`, `SHOW INDEX INFO`, `valueType()`; labels from `SHOW NODE_LABELS INFO` when schema metadata is enabled, else a label scan |
 | FalkorDB | `db.labels()`, `db.relationshipTypes()`, `db.indexes()`, `db.constraints()`, `typeOf()` for the URI's graph |
-| PostgreSQL 19 | `pg_propgraph_*` catalogs plus the element tables' keys, `NOT NULL`, unique constraints and indexes; needs `?graph=<name>` |
+| PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) | `pg_propgraph_*` catalogs plus the element tables' keys, `NOT NULL`, unique constraints and indexes; needs `?graph=<name>` |
 | Apache AGE, DuckDB | not supported (exit `5`) |
 
 Neo4j Community Edition has no existence or key constraints, so every property

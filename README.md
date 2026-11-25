@@ -135,7 +135,7 @@ The default features are `bolt`, `postgres`, `redis`, and `arrow`:
 | Feature | Default | Enables |
 | :--- | :--- | :--- |
 | `bolt` | yes | Bolt client (Neo4j, Memgraph) |
-| `postgres` | yes | PostgreSQL wire client (Apache AGE, PostgreSQL 19) |
+| `postgres` | yes | PostgreSQL wire client (Apache AGE, PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)) |
 | `redis` | yes | Redis RESP2/RESP3 client (FalkorDB) |
 | `arrow` | yes | Arrow result batches (`rows_to_record_batch`) |
 | `testkit` | no | Mock engine and `BoltStubServer` for tests |
@@ -203,7 +203,7 @@ server version, matching dialect and ping round-trip latency. Passwords come
 from `--password-env` or the URI userinfo, never from the command line.
 
 `introspect` prints a live database's graph schema (Neo4j, Memgraph, FalkorDB
-and PostgreSQL 19 property graphs) as text, or with `--format json` in the shape
+and PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) property graphs) as text, or with `--format json` in the shape
 of `export_schema`:
 
 ```bash
@@ -226,7 +226,7 @@ For local development setup (building the Python extension from source, test dat
 Define models with Python type annotations and build queries once. Voyager compiles the abstract syntax tree (AST) into the exact dialect required by your database:
 
 - **openCypher**: Neo4j, Memgraph, FalkorDB, AWS Neptune.
-- **SQL:2023 PGQ (`GRAPH_TABLE`)**: DuckDB DuckPGQ, PostgreSQL (19+).
+- **SQL:2023 PGQ (`GRAPH_TABLE`)**: DuckDB DuckPGQ; PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds).
 - **ISO GQL (ISO/IEC 39075:2024)**: The official international graph query standard.
 
 **Example:** [Multi-dialect compilation](https://github.com/tanishq-kumar/voyager/blob/main/examples/python/08_multi_dialect_compilation.py) and [enterprise dialects & multi-label DDL](https://github.com/tanishq-kumar/voyager/blob/main/examples/python/09_enterprise_dialects.py).
@@ -274,7 +274,7 @@ print(cypher.statement)
 # RETURN _person_0.name, _person_0.age, _company_0.name AS company_name
 # ORDER BY _person_0.name ASC LIMIT 10
 
-# 2. Compile to SQL:2023 PGQ (DuckDB, PostgreSQL)
+# 2. Compile to SQL:2023 PGQ (DuckDB DuckPGQ; PostgreSQL SQL/PGQ experimental on 19 Beta 1-3 / 20 dev)
 pgq = query.compile("sql_pgq", graph_name="corp_graph")
 print(pgq.statement)
 
@@ -433,7 +433,7 @@ Models are registered under a module-qualified identity (`package.module.Model`)
 
 `Field(description="...")` and a model-level `__description__` record documentation on schema entities. They are metadata only: generated DDL and compiled queries are unchanged, and `NativeSchemaRegistry.to_json()` snapshots include a `description` key only where one was set (fields and models without one have no `description` key). A subclass does not inherit its parent's `__description__` (field descriptions travel with the inherited `Field` objects). `examples/python/13_schema_ddl_and_indexes.py` prints a snapshot showing both cases.
 
-`export_schema([Person, Movie, ActedIn])` returns the declared models as a JSON-serialisable dict (labels, relationship types and endpoints, property types, flags, defaults, descriptions and `Field` value constraints), and `Person.to_json_schema()` emits a JSON Schema draft 2020-12 document for one model. `introspect_schema("bolt://localhost:7687")` reads the same structure from a live database (Neo4j, Memgraph, FalkorDB, PostgreSQL 19 property graphs), so the two can be compared.
+`export_schema([Person, Movie, ActedIn])` returns the declared models as a JSON-serialisable dict (labels, relationship types and endpoints, property types, flags, defaults, descriptions and `Field` value constraints), and `Person.to_json_schema()` emits a JSON Schema draft 2020-12 document for one model. `introspect_schema("bolt://localhost:7687")` reads the same structure from a live database (Neo4j, Memgraph, FalkorDB, PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) property graphs), so the two can be compared.
 
 ---
 
@@ -448,7 +448,7 @@ Voyager is verified against 6 database backends:
 | **Apache AGE**       | Cypher-in-SQL                                           | PostgreSQL Wire Protocol |
 | **DuckDB & DuckPGQ** | SQL:2023 PGQ (`GRAPH_TABLE`)                            | In-Memory / Arrow FFI    |
 | **FalkorDB**         | openCypher                                              | Redis RESP / Bolt        |
-| **PostgreSQL**       | Relational / Recursive SQL (14–18)<br>SQL:2023 PGQ (19+) | PostgreSQL Wire Protocol |
+| **PostgreSQL**       | Relational / Recursive SQL (14–19)<br>SQL:2023 PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) | PostgreSQL Wire Protocol |
 
 > **FalkorDB graph names:** one FalkorDB server holds several independent named graphs, and Voyager runs every query against one of them. Name it in the URI path (`redis://localhost:6379/social`), with `?graph=social`, or with `graph_name="social"`. Without a name, both the native client and the `falkordb` driver bridge use `voyager_graph`.
 

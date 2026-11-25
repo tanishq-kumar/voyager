@@ -4,7 +4,7 @@ Teaches:
     - Multi-label node entity definitions (`@node(label=["Person", "Engineer"])`)
     - Dialect name cheat-sheet:
         * `"cypher"`: openCypher 9 / Cypher 25 (Neo4j, Memgraph, FalkorDB)
-        * `"sql_pgq"`: SQL:2023 Property Graph Queries (`GRAPH_TABLE`) (DuckDB, PostgreSQL)
+        * `"sql_pgq"`: SQL:2023 Property Graph Queries (`GRAPH_TABLE`) (DuckDB/DuckPGQ; PostgreSQL SQL/PGQ experimental on 19 Beta 1-3 / 20 dev)
         * `"iso_gql"`: ISO/IEC 39075:2024 Graph Query Language (ISO GQL standard)
         * `"age"`: Apache AGE Cypher-in-SQL extension for PostgreSQL
     - How multi-labels compile differently: `:Person:Engineer` (Cypher) vs `IS Person IS Engineer` (PGQ) vs `Person&Engineer` (GQL)
@@ -70,9 +70,9 @@ def main() -> None:
     print(f"    {cypher.statement}")
     print(f"    Parameters: {cypher.parameters}\n")
 
-    # 2. Compile to SQL:2023 PGQ (for DuckDB / PostgreSQL)
+    # 2. Compile to SQL:2023 PGQ (DuckDB/DuckPGQ; PostgreSQL SQL/PGQ experimental on 19 Beta 1-3 / 20 dev)
     pgq = query.compile("sql_pgq", graph_name="infra_graph")
-    print("[2] SQL:2023 PGQ GRAPH_TABLE (for DuckDB / PostgreSQL):")
+    print("[2] SQL:2023 PGQ GRAPH_TABLE (DuckDB/DuckPGQ; PostgreSQL SQL/PGQ experimental):")
     print(f"    {pgq.statement}")
     print(f"    Parameters: {pgq.parameters}\n")
 

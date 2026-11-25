@@ -269,7 +269,7 @@ def introspect_schema(source: Any, *, sample_size: int = DEFAULT_SAMPLE_SIZE) ->
     as ``voyager introspect --format json``, on its own short-lived connection;
     the GIL is released while it runs. Supported engines: Neo4j 5.13+ and
     Memgraph (``bolt://``), FalkorDB (``redis://`` / ``falkordb://``, the graph
-    named in the URI) and PostgreSQL 19 SQL/PGQ property graphs
+    named in the URI) and PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) property graphs
     (``postgresql://...?graph=<name>``).
 
     ``nodes`` and ``relationships`` have the keys of ``export_schema``, so the

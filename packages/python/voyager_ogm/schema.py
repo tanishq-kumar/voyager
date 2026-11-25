@@ -1194,7 +1194,7 @@ class SchemaManager:
         """Applies SQL:2023 PGQ `CREATE PROPERTY GRAPH` DDL to the active session.
 
         Args:
-            session: Active database session (PostgreSQL 19 / DuckPGQ).
+            session: Active database session (DuckPGQ, or PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)).
             graph_name: Identifier name for the property graph.
             *models: Model classes to register.
 

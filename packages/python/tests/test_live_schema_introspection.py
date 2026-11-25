@@ -3,7 +3,7 @@
 Each test creates the schema of the models below, inserts a few nodes and
 relationships, introspects the database, compares every fact the engine reports
 with ``export_schema`` for the same models, and drops everything afterwards.
-The PostgreSQL 19 case builds its tables with the generated naming rule and
+The PostgreSQL 19 Beta 3 case builds its tables with the generated naming rule and
 creates the property graph from the generated DDL, then queries it with the
 SQL/PGQ emitter.
 

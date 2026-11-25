@@ -1,4 +1,4 @@
-"""Live PostgreSQL 19 test: reserved words as SQL/PGQ labels.
+"""Live PostgreSQL 19 Beta 3 test: reserved words as SQL/PGQ labels.
 
 The node labels are ``User`` and ``Order``, which are reserved SQL words, so the
 whole path has to be quoted: the vertex and edge tables, the ``CREATE PROPERTY

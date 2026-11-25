@@ -481,7 +481,7 @@ pub(crate) fn emit_gql_edge_labels(buffer: &mut String, expr: Option<&LabelExpre
 /// Writes a SQL identifier double-quoted, escaping embedded quotes.
 ///
 /// SQL:2023 PGQ labels and table names are identifiers. Quoting them keeps the
-/// declared case, which is what PostgreSQL 19 stores and what `IS "Label"`
+/// declared case, which is what PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) stores and what `IS "Label"`
 /// matches.
 pub(crate) fn push_pgq_quoted_ident(buffer: &mut String, ident: &str) {
     buffer.push('"');

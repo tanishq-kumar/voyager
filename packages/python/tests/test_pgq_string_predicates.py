@@ -138,7 +138,7 @@ def test_duckpgq_null_search_value_excludes_every_row(duckpgq_bridge, method: st
 
 @pytest.mark.live
 class TestPostgres19StringPredicates:
-    """PostgreSQL 19 GRAPH_TABLE execution of #318 through both backends."""
+    """PostgreSQL 19 Beta 3 GRAPH_TABLE execution of #318 through both backends."""
 
     @pytest.fixture
     def pg19(self):
