@@ -155,8 +155,8 @@ git config core.hooksPath .githooks
 
 `just setup` does not set this for you. The hooks delegate to `just`:
 
-- `pre-commit` runs `just pre-commit` (format check, lint, and Python type checks) — fast enough for every commit.
-- `pre-push` currently runs `just pre-push`, which is the full `just test` suite plus a benchmark capture (`just bench-save`). That is slow; use `git push --no-verify` when you only need to push, until the pre-push hook is made fast (tracked separately).
+- `pre-commit` runs `just pre-commit` (`fmt-check`, `lint`, and `typecheck` — Rust/Python formatting, Clippy/Ruff lints, and `ty`/`mypy` type checks), typically taking a few seconds when the Rust build cache is warm.
+- `pre-push` runs `just pre-push` with the same fast, side-effect-free checks (`fmt-check`, `lint`, and `typecheck`, also a few seconds when warm) and skips tag-only pushes and ref deletions. CI remains the full gate (running the complete Rust, Python, feature-combination, supply-chain, and packaging suites), and benchmarks are captured deliberately with `just bench-save` or `just bench-all` rather than inside git hooks.
 
 ---
 

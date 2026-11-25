@@ -1,5 +1,25 @@
 #!/usr/bin/env sh
-set -e
+set -eu
 
-echo "[pre-push] Delegating to 'just pre-push' (test suite + benchmark capture)..."
+if [ ! -t 0 ]; then
+    should_run=0
+    while IFS=' ' read -r local_ref local_sha _remote_ref _remote_sha || [ -n "${local_ref:-}" ]; do
+        [ -n "$local_ref" ] || [ -n "$local_sha" ] || continue
+        case "$local_sha" in
+            *[!0]*) ;;
+            *) continue ;;
+        esac
+        case "$local_ref" in
+            refs/tags/*) continue ;;
+        esac
+        should_run=1
+        break
+    done
+    if [ "$should_run" -eq 0 ]; then
+        echo "[pre-push] Only tag pushes or ref deletions; skipping checks."
+        exit 0
+    fi
+fi
+
+echo "[pre-push] Delegating to 'just pre-push'..."
 just pre-push
