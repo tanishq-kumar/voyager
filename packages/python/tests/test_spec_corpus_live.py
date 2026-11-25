@@ -52,13 +52,20 @@ def test_live_corpus_scenario(scenario_id: str, engine: str, scenario_dir: Path)
     except corpus.FixtureUnsupportedError as err:
         pytest.fail(f"{scenario_id} cannot be loaded on {engine}: {err}")
 
-    diffs = corpus.compare_rows(
+    col_diffs = corpus.compare_columns(
+        expected_doc.get("columns"),
+        execution.columns,
+        engine=engine,
+        aliases=corpus.spec_projection_aliases(spec),
+    )
+    row_diffs = corpus.compare_rows(
         expected_doc["rows"],
         execution.rows,
         ordered=scenario.get("rows") == "ordered",
         scenario_id=scenario_id,
         engine=engine,
     )
+    diffs = [*col_diffs, *row_diffs]
     if diffs:
         detail = "\n".join(f"  {line}" for line in diffs)
         pytest.fail(

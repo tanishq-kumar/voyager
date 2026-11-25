@@ -99,19 +99,258 @@ def test_scenario_fixture_and_rows(scenario_id: str, scenario_dir: Path) -> None
     assert rows_path.is_file(), f"{scenario_id} is missing rows.json"
     rows_doc = load_json(rows_path)
     assert isinstance(rows_doc.get("rows"), list), f"{scenario_id} rows.json needs a rows list"
+    spec = load_json(scenario_dir / "query.spec.json")
     columns = rows_doc.get("columns")
-    if columns is not None:
-        assert isinstance(columns, list)
-        assert all(isinstance(name, str) for name in columns)
+    assert isinstance(columns, list), f"{scenario_id} rows.json needs a columns list"
+    assert all(isinstance(name, str) for name in columns), (
+        f"{scenario_id} rows.json columns must all be strings"
+    )
+    projections = spec.get("projections", [])
+    assert len(columns) == len(projections), (
+        f"{scenario_id} rows.json has {len(columns)} column(s) for {len(projections)} projection(s)"
+    )
     for index, row in enumerate(rows_doc["rows"]):
         assert isinstance(row, list), f"{scenario_id} row {index} is not a list"
-        if columns is not None:
-            assert len(row) == len(columns), (
-                f"{scenario_id} row {index} has {len(row)} values for {len(columns)} columns"
-            )
+        assert len(row) == len(columns), (
+            f"{scenario_id} row {index} has {len(row)} values for {len(columns)} columns"
+        )
         for value in row:
             _check_canonical_value(value, scenario_id, index)
     assert scenario["rows"] in ("ordered", "unordered")
+
+
+def test_spec_projection_aliases_extracts_all_projection_forms() -> None:
+    """Aliases are read from Query Spec projection items without parsing query text."""
+    spec = {
+        "projections": [
+            ["field", "n", "name", None],
+            ["field", "n", "age", "person_age"],
+            ["expr", ["prop", "a", ""], "ColumnName"],
+            ["expr", ["lit", 1], None],
+            ["agg", "n", "age", "count", "cnt"],
+            ["agg", "n", "*", "count", None],
+        ]
+    }
+    assert corpus.spec_projection_aliases(spec) == [
+        None,
+        "person_age",
+        "ColumnName",
+        None,
+        "cnt",
+        None,
+    ]
+
+
+def test_column_comparison_alias_mismatch_fails_and_names_column() -> None:
+    """Dropped or renamed aliases fail on every engine and report position and column name."""
+    for engine in corpus.ENGINES:
+        diffs = corpus.compare_columns(
+            ["n.name", "person_age"],
+            ["n.name", "wrong_alias"],
+            engine=engine,
+            aliases=[None, "person_age"],
+        )
+        assert diffs, f"Expected mismatch on {engine}"
+        assert "column 1" in diffs[0]
+        assert "'person_age'" in diffs[0]
+        assert "'wrong_alias'" in diffs[0]
+
+        dropped = corpus.compare_columns(
+            ["person_age"],
+            ["n.age"],
+            engine=engine,
+            aliases=["person_age"],
+        )
+        assert dropped, f"Expected dropped alias mismatch on {engine}"
+        assert "column 0" in dropped[0]
+        assert "'person_age'" in dropped[0]
+        assert "'n.age'" in dropped[0]
+
+
+def test_column_comparison_unaliased_rules_per_engine() -> None:
+    """Cypher engines check all columns; AGE and SQL/PGQ ignore unaliased column names."""
+    for engine in ("age", "pg19"):
+        # Unaliased columns differ (e.g. 'name' vs 'n.name', 'entity' vs 'a'), which must pass.
+        assert (
+            corpus.compare_columns(
+                ["n.name", "a", "person_age"],
+                ["name", "entity", "person_age"],
+                engine=engine,
+                aliases=[None, None, "person_age"],
+            )
+            == []
+        )
+        # PostgreSQL folds unquoted SQL column aliases to lowercase.
+        assert (
+            corpus.compare_columns(
+                ["ColumnName"],
+                ["columnname"],
+                engine=engine,
+                aliases=["ColumnName"],
+            )
+            == []
+        )
+
+    for engine in ("neo4j", "memgraph", "falkordb"):
+        diffs = corpus.compare_columns(
+            ["n.name"],
+            ["name"],
+            engine=engine,
+            aliases=[None],
+        )
+        assert diffs
+        assert "column 0" in diffs[0]
+        assert "'n.name'" in diffs[0]
+        assert "'name'" in diffs[0]
+
+
+def test_column_comparison_backward_compatible_without_columns() -> None:
+    """Legacy rows.json documents omitting 'columns' skip column-name checks."""
+    for engine in corpus.ENGINES:
+        assert corpus.compare_columns(None, ["anything"], engine=engine, aliases=["alias"]) == []
+
+
+def test_column_comparison_reports_column_count_mismatch() -> None:
+    """Mismatched column count is reported clearly."""
+    diffs = corpus.compare_columns(
+        ["a", "b"],
+        ["a"],
+        engine="neo4j",
+        aliases=["a", "b"],
+    )
+    assert any("column count" in d for d in diffs)
+    assert any("column 1" in d for d in diffs) or len(diffs) == 1
+
+
+def test_recorder_reference_statement_selection() -> None:
+    """Recorder selects compiled Cypher when supported and reference_cypher when known-diff."""
+    supported_scenario = {
+        "params": {},
+        "fixture": None,
+        "rows": "unordered",
+        "targets": {"cypher": {"status": "supported"}},
+    }
+    spec = {
+        "spec_version": 1,
+        "matches": [{"paths": [[["node", "n", ["Person"]]]]}],
+        "projections": [["field", "n", "name", None]],
+    }
+    resolved = corpus.resolve_reference_query(supported_scenario, spec)
+    assert resolved == ("MATCH (n:Person) RETURN n.name", {})
+
+    # Stray reference_cypher on a supported cypher target is rejected.
+    with pytest.raises(ValueError, match="supported"):
+        corpus.resolve_reference_query(
+            {
+                **supported_scenario,
+                "reference_cypher": {"statement": "RETURN 1", "reason": "invalid"},
+            },
+            spec,
+        )
+
+    # known-diff without reference_cypher must never silently use the compiled statement.
+    known_diff_no_ref = {
+        "params": {},
+        "fixture": None,
+        "rows": "unordered",
+        "targets": {"cypher": {"status": "known-diff", "reason": "compiler bug"}},
+    }
+    assert corpus.resolve_reference_query(known_diff_no_ref, spec) is None
+    with pytest.raises(ValueError, match="no reference_cypher"):
+        corpus.record_scenario_rows("pack/s", known_diff_no_ref, spec, "tok")
+
+    # known-diff with reference_cypher executes the corrected statement, not the compiled one.
+    known_diff_with_ref = {
+        **known_diff_no_ref,
+        "reference_cypher": {
+            "statement": "MATCH (n:Person) WHERE n.age <> $min_age RETURN n.name",
+            "reason": "current compiler emits != instead of <>",
+            "params": {"min_age": 30},
+        },
+    }
+    ref_stmt, ref_params = corpus.resolve_reference_query(known_diff_with_ref, spec)
+    assert ref_stmt == "MATCH (n:Person) WHERE n.age <> $min_age RETURN n.name"
+    assert ref_params["min_age"] == 30
+
+    # unsupported cypher target with reference_cypher also works without compiling Cypher.
+    unsupported_with_ref = {
+        "params": {"limit": 5},
+        "fixture": None,
+        "rows": "ordered",
+        "targets": {"cypher": {"status": "unsupported", "reason": "UNSUPPORTED_FEATURE: x"}},
+        "reference_cypher": {
+            "statement": "MATCH (n:Person) RETURN n.name LIMIT $limit",
+            "reason": "manual reference Cypher",
+        },
+    }
+    unsup_stmt, unsup_params = corpus.resolve_reference_query(unsupported_with_ref, spec)
+    assert unsup_stmt == "MATCH (n:Person) RETURN n.name LIMIT $limit"
+    assert unsup_params == {"limit": 5}
+
+    # Verify record_scenario_rows passes the resolved statement to the engine adapter.
+    class StubAdapter(corpus.BaseEngine):
+        name = "neo4j"
+
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, dict[str, Any]]] = []
+
+        def load(self, fixture: dict[str, Any], token: str) -> corpus.LoadResult:
+            return corpus.LoadResult(engine="neo4j", namespace=token)
+
+        def cleanup(self, result: corpus.LoadResult) -> None:
+            pass
+
+        def execute(
+            self, statement: str, parameters: dict[str, Any]
+        ) -> tuple[list[str], list[list[Any]]]:
+            self.executed.append((statement, parameters))
+            return ["n.name"], [["Alice"]]
+
+    stub = StubAdapter()
+    recorded = corpus.record_scenario_rows("pack/s", known_diff_with_ref, spec, "tok", adapter=stub)
+    assert stub.executed == [
+        ("MATCH (n:Person) WHERE n.age <> $min_age RETURN n.name", {"min_age": 30})
+    ]
+    assert recorded == {"columns": ["n.name"], "rows": [["Alice"]]}
+
+
+def test_scenario_schema_validates_reference_cypher() -> None:
+    """scenario.schema.json accepts valid reference_cypher on non-supported cypher targets only."""
+    schema = load_json(corpus.CORPUS_DIR / "scenario.schema.json")
+    validator = Draft202012Validator(schema)
+    base = {
+        "id": "p0-match-return/sample",
+        "pack": "p0-match-return",
+        "description": "Sample scenario",
+        "source": {"kind": "voyager", "feature": "", "scenario": "sample"},
+        "params": {},
+        "fixture": "match-all",
+        "rows": "unordered",
+        "targets": {
+            "cypher": {"status": "known-diff", "reason": "diff"},
+            "age": {"status": "supported"},
+            "gql": {"status": "supported"},
+            "sqlpgq": {"status": "supported"},
+        },
+        "reference_cypher": {
+            "statement": "MATCH (n) RETURN n",
+            "reason": "Use reference Cypher syntax",
+        },
+    }
+    validator.validate(base)
+
+    # Reject when targets.cypher.status is supported.
+    bad_supported = {
+        **base,
+        "targets": {**base["targets"], "cypher": {"status": "supported"}},
+    }
+    assert list(validator.iter_errors(bad_supported))
+
+    # Reject empty statement or missing reason.
+    bad_empty = {**base, "reference_cypher": {"statement": "", "reason": "x"}}
+    assert list(validator.iter_errors(bad_empty))
+    bad_no_reason = {**base, "reference_cypher": {"statement": "RETURN 1"}}
+    assert list(validator.iter_errors(bad_no_reason))
 
 
 def _check_canonical_value(value: Any, scenario_id: str, row_index: int) -> None:
