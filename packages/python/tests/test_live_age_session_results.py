@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 from spec_corpus_live_lib import canonicalize
-from voyager_ogm import Field, Node, Query, Session
+from voyager_ogm import Field, GraphNode, GraphPath, GraphRelationship, Node, Query, Session
 
 pytestmark = pytest.mark.live
 
@@ -125,44 +125,45 @@ def test_live_age_results_decode_on_both_backends(age_graph: Any, backend: str) 
     try:
         node_query = _cypher_query(f"MATCH (a:{LABEL} {{name: 'A'}}) RETURN a", {"a": "agtype"})
         node = session.execute(node_query)[0]["a"]
-        assert node["kind"] == "node"
-        assert node["labels"] == [LABEL]
-        assert node["properties"]["name"] == "A"
-        assert node["properties"]["score"] == 10
+        assert isinstance(node, GraphNode)
+        assert node.labels == frozenset({LABEL})
+        assert node["name"] == "A"
+        assert node["score"] == 10
+        assert node.to_dict()["kind"] == "node"
 
         rel_query = _cypher_query(
             f"MATCH (a:{LABEL} {{name: 'A'}})-[r:{REL_TYPE}]->(b) RETURN r",
             {"r": "agtype"},
         )
         relationship = session.execute(rel_query)[0]["r"]
-        assert relationship["kind"] == "relationship"
-        assert relationship["type"] == REL_TYPE
-        assert relationship["properties"]["since"] == 2020
-        assert relationship["start_id"] == node["id"]
+        assert isinstance(relationship, GraphRelationship)
+        assert relationship.type == REL_TYPE
+        assert relationship["since"] == 2020
+        assert relationship.start_id == node.id
 
         path_query = _cypher_query(
             f"MATCH p=(a:{LABEL} {{name: 'A'}})-[r:{REL_TYPE}]->(b) RETURN p",
             {"p": "agtype"},
         )
         path = session.execute(path_query)[0]["p"]
-        assert path["kind"] == "path"
-        assert [item["properties"]["name"] for item in path["nodes"]] == ["A", "B"]
-        assert [item["type"] for item in path["relationships"]] == [REL_TYPE]
+        assert isinstance(path, GraphPath)
+        assert [item["name"] for item in path.nodes] == ["A", "B"]
+        assert [item.type for item in path.relationships] == [REL_TYPE]
 
         collect_query = _cypher_query(
             f"MATCH (n:{LABEL}) RETURN collect(n) AS nodes", {"nodes": "agtype"}
         )
         nodes = session.execute(collect_query)[0]["nodes"]
-        assert [item["kind"] for item in nodes] == ["node", "node"]
-        assert sorted(item["properties"]["name"] for item in nodes) == ["A", "B"]
+        assert [type(item) for item in nodes] == [GraphNode, GraphNode]
+        assert sorted(item["name"] for item in nodes) == ["A", "B"]
 
         collect_rel_query = _cypher_query(
             f"MATCH ()-[r:{REL_TYPE}]->() RETURN collect(r) AS rels",
             {"rels": "agtype"},
         )
         relationships = session.execute(collect_rel_query)[0]["rels"]
-        assert [item["kind"] for item in relationships] == ["relationship"]
-        assert relationships[0]["type"] == REL_TYPE
+        assert [type(item) for item in relationships] == [GraphRelationship]
+        assert relationships[0].type == REL_TYPE
 
         nested_query = _cypher_query(
             f"MATCH (a:{LABEL} {{name: 'A'}})-[r:{REL_TYPE}]->(b:{LABEL}) "
@@ -170,13 +171,14 @@ def test_live_age_results_decode_on_both_backends(age_graph: Any, backend: str) 
             {"triple": "agtype", "nested": "agtype"},
         )
         nested_row = session.execute(nested_query)[0]
-        assert [item["kind"] for item in nested_row["triple"]] == [
-            "node",
-            "relationship",
-            "node",
+        assert [type(item) for item in nested_row["triple"]] == [
+            GraphNode,
+            GraphRelationship,
+            GraphNode,
         ]
-        assert nested_row["nested"][0][0]["kind"] == "node"
-        assert nested_row["nested"][1]["node"]["properties"]["name"] == "B"
+        assert isinstance(nested_row["nested"][0][0], GraphNode)
+        assert isinstance(nested_row["nested"][1]["node"], GraphNode)
+        assert nested_row["nested"][1]["node"]["name"] == "B"
 
         scalar_query = _cypher_query(
             "RETURN 'A' AS s, 30 AS i, 1.5 AS f, 30::numeric AS num, true AS b, null AS nul",
@@ -269,14 +271,14 @@ def test_live_age_native_setup_without_uri_parameters(age_graph: Any) -> None:
     session = Session(AGE_URI, dialect="age", graph_name=GRAPH, backend="native")
     try:
         raw = _cypher_query(f"MATCH (a:{LABEL} {{name: 'A'}}) RETURN a", {"a": "agtype"})
-        assert session.execute(raw)[0]["a"]["properties"]["name"] == "A"
+        assert session.execute(raw)[0]["a"]["name"] == "A"
 
         person = AgeBuilderPerson("p")
         compiled = Query.match(person).where(person.name == "A").return_(person.name)
         assert session.execute(compiled)[0]["name"] == "A"
 
         with session.transaction():
-            assert session.execute(raw)[0]["a"]["properties"]["name"] == "A"
+            assert session.execute(raw)[0]["a"]["name"] == "A"
             assert session.execute(compiled)[0]["name"] == "A"
     finally:
         session.close()

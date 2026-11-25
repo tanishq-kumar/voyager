@@ -8,7 +8,7 @@ use voyager_drivers::bolt::{
     BoltConnection, BoltDate, BoltDateTime, BoltDateTimeZoneId, BoltDuration, BoltLocalDateTime,
     BoltLocalTime, BoltNode, BoltPath, BoltPoint2D, BoltPoint3D, BoltRelationship, BoltRequest,
     BoltResponse, BoltStubServer, BoltTime, BoltUnboundRelationship, BoltValue, PackStream,
-    encode_chunks, read_message_frame, srid,
+    bolt_value_to_canonical_json, build_bolt_record_batch, encode_chunks, read_message_frame, srid,
 };
 use voyager_drivers::config::{ConnectionConfig, PoolConfig};
 use voyager_drivers::engine::{AsyncConnection, ConnectionFactory};
@@ -531,4 +531,133 @@ fn test_packstream_temporal_types_roundtrip() {
     // Zero duration
     let dur_zero = BoltValue::Duration(BoltDuration::new(0, 0, 0, 0));
     assert_eq!(dur_zero.as_duration().unwrap().to_iso_string(), "PT0S");
+}
+
+#[test]
+fn test_bolt_canonical_json_entities_and_paths() {
+    let mut props_a = HashMap::new();
+    props_a.insert("name".to_string(), BoltValue::String("A".to_string()));
+    props_a.insert(
+        "tags".to_string(),
+        BoltValue::List(vec![BoltValue::Integer(1), BoltValue::Boolean(true)]),
+    );
+    let node_a = BoltNode {
+        id: 10,
+        labels: vec!["ZzB".to_string(), "ZzA".to_string()],
+        properties: props_a,
+        element_id: Some("4:db:10".to_string()),
+    };
+
+    let mut props_b = HashMap::new();
+    props_b.insert("name".to_string(), BoltValue::String("B".to_string()));
+    let node_b = BoltNode {
+        id: 20,
+        labels: vec!["ZzB".to_string()],
+        properties: props_b,
+        element_id: Some("4:db:20".to_string()),
+    };
+
+    let mut rel_props = HashMap::new();
+    rel_props.insert("w".to_string(), BoltValue::Integer(1));
+    let rel_forward = BoltRelationship {
+        id: 30,
+        start_node_id: 10,
+        end_node_id: 20,
+        rel_type: "ZK".to_string(),
+        properties: rel_props.clone(),
+        element_id: Some("5:db:30".to_string()),
+        start_element_id: Some("4:db:10".to_string()),
+        end_element_id: Some("4:db:20".to_string()),
+    };
+
+    let node_json = bolt_value_to_canonical_json(&BoltValue::Node(node_a.clone()));
+    assert_eq!(node_json["kind"], "node");
+    assert_eq!(node_json["id"], 10);
+    assert_eq!(node_json["element_id"], "4:db:10");
+    assert_eq!(node_json["labels"], serde_json::json!(["ZzA", "ZzB"]));
+    assert_eq!(node_json["properties"]["name"], "A");
+    assert_eq!(
+        node_json["properties"]["tags"],
+        serde_json::json!([1, true])
+    );
+
+    let rel_json = bolt_value_to_canonical_json(&BoltValue::Relationship(rel_forward));
+    assert_eq!(rel_json["kind"], "relationship");
+    assert_eq!(rel_json["type"], "ZK");
+    assert_eq!(rel_json["start_id"], 10);
+    assert_eq!(rel_json["end_id"], 20);
+    assert_eq!(rel_json["start_element_id"], "4:db:10");
+    assert_eq!(rel_json["end_element_id"], "4:db:20");
+    assert_eq!(rel_json["properties"], serde_json::json!({"w": 1}));
+
+    // Cycle path: node_a (0) -[rel0 +]-> node_b (1) <-[rel0 -]- node_a (0)
+    let unbound = BoltUnboundRelationship {
+        id: 31,
+        rel_type: "ZK".to_string(),
+        properties: rel_props,
+        element_id: Some("5:db:31".to_string()),
+    };
+    let cycle_path = BoltPath {
+        nodes: vec![node_a.clone(), node_b.clone()],
+        relationships: vec![unbound],
+        sequence: vec![1, 1, -1, 0],
+    };
+    let path_json = bolt_value_to_canonical_json(&BoltValue::Path(cycle_path));
+    assert_eq!(path_json["kind"], "path");
+    let path_nodes = path_json["nodes"].as_array().unwrap();
+    assert_eq!(path_nodes.len(), 3);
+    assert_eq!(path_nodes[0]["id"], 10);
+    assert_eq!(path_nodes[1]["id"], 20);
+    assert_eq!(path_nodes[2]["id"], 10);
+    let path_rels = path_json["relationships"].as_array().unwrap();
+    assert_eq!(path_rels.len(), 2);
+    assert_eq!(path_rels[0]["start_id"], 10);
+    assert_eq!(path_rels[0]["end_id"], 20);
+    assert_eq!(path_rels[1]["start_id"], 10);
+    assert_eq!(path_rels[1]["end_id"], 20);
+}
+
+#[test]
+fn test_build_bolt_record_batch_entity_metadata_and_json() {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+
+    let mut props = HashMap::new();
+    props.insert("name".to_string(), BoltValue::String("A".to_string()));
+    let node = BoltNode {
+        id: 1,
+        labels: vec!["ZzS".to_string()],
+        properties: props,
+        element_id: None,
+    };
+
+    let cols = vec!["n".to_string(), "count".to_string()];
+    let rows = vec![vec![BoltValue::Node(node), BoltValue::Integer(42)]];
+    let batch = build_bolt_record_batch(&cols, &rows).unwrap();
+
+    let schema = batch.schema();
+    let n_field = schema.field(0);
+    assert_eq!(n_field.data_type(), &DataType::Utf8);
+    assert_eq!(
+        n_field
+            .metadata()
+            .get("voyager.encoding")
+            .map(String::as_str),
+        Some("json")
+    );
+    assert_eq!(
+        n_field.metadata().get("voyager.kind").map(String::as_str),
+        Some("node")
+    );
+
+    let count_field = schema.field(1);
+    assert_eq!(count_field.data_type(), &DataType::Int64);
+    assert!(!count_field.metadata().contains_key("voyager.encoding"));
+
+    let raw_json = batch.column(0).as_string::<i32>().value(0);
+    let parsed: serde_json::Value = serde_json::from_str(raw_json).unwrap();
+    assert_eq!(parsed["kind"], "node");
+    assert_eq!(parsed["element_id"], serde_json::Value::Null);
+    assert_eq!(parsed["labels"], serde_json::json!(["ZzS"]));
+    assert_eq!(parsed["properties"], serde_json::json!({"name": "A"}));
 }

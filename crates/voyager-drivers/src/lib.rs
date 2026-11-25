@@ -35,6 +35,8 @@ pub use bolt::BoltStubServer;
 pub use bolt::{BoltConnection, BoltRequest, BoltResponse, BoltVersion};
 pub use bolt::{
     BoltNode, BoltPath, BoltRelationship, BoltUnboundRelationship, BoltValue, PackStream,
+    bolt_node_to_canonical_json, bolt_path_to_canonical_json, bolt_relationship_to_canonical_json,
+    bolt_value_to_canonical_json, build_bolt_record_batch,
 };
 pub use circuit::{
     BackendRoute, CircuitConfig, CircuitRouter, CircuitSnapshot, CircuitState, ErrorClassification,
@@ -56,8 +58,9 @@ pub use pool::{ConnectionPool, PoolMetricsSnapshot, PooledConnection};
 pub use postgres::{
     AgeEdge, AgePath, AgeValue, AgeVertex, AuthenticationRequest, BackendMessage, FieldDescription,
     FrontendMessage, PgDiagnostic, PostgresConnection, PostgresTransaction, ScramClient,
-    StartupMessage, TransactionStatus, age_value_to_canonical_json, clean_agtype_string,
-    compute_md5_password, parse_agtype, rows_to_record_batch,
+    StartupMessage, TransactionStatus, age_value_to_arrow_json, age_value_to_canonical_json,
+    clean_agtype_string, compute_md5_password, parse_agtype, rows_to_record_batch,
+    rows_to_record_batch_with_age_columns,
 };
 #[cfg(feature = "redis")]
 pub use redis::{
