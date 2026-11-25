@@ -364,49 +364,6 @@ fn validate_age_node(
     Ok(())
 }
 
-fn resolve_age_column_base_name(arena: &QueryAstArena, handle: NodeHandle) -> Result<String> {
-    match arena.get(handle)? {
-        AstNode::PropertyAccess { target, property } => {
-            if property.is_empty() {
-                match arena.get(*target)? {
-                    AstNode::Identifier(id) => Ok(id.clone()),
-                    AstNode::NodePattern {
-                        variable: Some(var),
-                        ..
-                    } => Ok(var.clone()),
-                    AstNode::EdgePattern {
-                        variable: Some(var),
-                        ..
-                    } => Ok(var.clone()),
-                    _ => Ok("entity".to_string()),
-                }
-            } else {
-                Ok(property.clone())
-            }
-        }
-        AstNode::Identifier(id) => {
-            if let Some((_, prop)) = id.rsplit_once('.') {
-                if !prop.is_empty() {
-                    Ok(prop.to_string())
-                } else {
-                    Ok(id.clone())
-                }
-            } else {
-                Ok(id.clone())
-            }
-        }
-        AstNode::NodePattern {
-            variable: Some(var),
-            ..
-        } => Ok(var.clone()),
-        AstNode::EdgePattern {
-            variable: Some(var),
-            ..
-        } => Ok(var.clone()),
-        _ => Ok("col".to_string()),
-    }
-}
-
 impl AstVisitor for AgeEmitter {
     fn visit_query(&mut self, arena: &QueryAstArena, root: NodeHandle) -> Result<CompiledQuery> {
         if !is_valid_age_graph_name(&self.graph_name) {
@@ -436,25 +393,9 @@ impl AstVisitor for AgeEmitter {
             execution_mode = *mode;
             let ret_node = arena.get(*ret_handle)?;
             if let AstNode::ReturnClause { projections, .. } = ret_node {
-                let mut used_names = std::collections::HashSet::new();
-                for proj in projections {
-                    let base_name = if let Some(alias) = &proj.alias {
-                        alias.clone()
-                    } else {
-                        resolve_age_column_base_name(arena, proj.expression)?
-                    };
-                    let base_name = if base_name.is_empty() {
-                        "col".to_string()
-                    } else {
-                        base_name
-                    };
-                    let mut col_name = base_name.clone();
-                    let mut counter = 1usize;
-                    while !used_names.insert(col_name.clone()) {
-                        col_name = format!("{base_name}_{counter}");
-                        counter += 1;
-                    }
-                    column_defs.push(format!("{col_name} agtype"));
+                let disambiguated = super::disambiguate_projections(arena, projections)?;
+                for col in disambiguated {
+                    column_defs.push(format!("{} agtype", col.name));
                 }
             }
         } else if let AstNode::QueryStatement {

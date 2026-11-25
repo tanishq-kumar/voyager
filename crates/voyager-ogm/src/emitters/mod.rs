@@ -610,6 +610,115 @@ fn format_pgq_label_expr(buffer: &mut String, expr: &LabelExpression) {
     }
 }
 
+/// Describes the disambiguated column name and any required emitted alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DisambiguatedColumn {
+    /// Final unique column name (e.g. "name", "name_1", "actor").
+    pub name: String,
+    /// Explicit alias that must be emitted in SQL (`AS <emitted_alias>`),
+    /// or `None` if the unaliased expression already has this default name without collision.
+    pub emitted_alias: Option<String>,
+}
+
+/// Resolves the default base name of an expression handle for column projection.
+pub(crate) fn resolve_projection_base_name(
+    arena: &QueryAstArena,
+    handle: NodeHandle,
+) -> Result<String> {
+    match arena.get(handle)? {
+        AstNode::PropertyAccess { target, property } => {
+            if property.is_empty() {
+                match arena.get(*target)? {
+                    AstNode::Identifier(id) => Ok(id.clone()),
+                    AstNode::NodePattern {
+                        variable: Some(var),
+                        ..
+                    } => Ok(var.clone()),
+                    AstNode::EdgePattern {
+                        variable: Some(var),
+                        ..
+                    } => Ok(var.clone()),
+                    _ => Ok("entity".to_string()),
+                }
+            } else {
+                Ok(property.clone())
+            }
+        }
+        AstNode::Identifier(id) => {
+            if let Some((_, prop)) = id.rsplit_once('.') {
+                if !prop.is_empty() {
+                    Ok(prop.to_string())
+                } else {
+                    Ok(id.clone())
+                }
+            } else {
+                Ok(id.clone())
+            }
+        }
+        AstNode::NodePattern {
+            variable: Some(var),
+            ..
+        } => Ok(var.clone()),
+        AstNode::EdgePattern {
+            variable: Some(var),
+            ..
+        } => Ok(var.clone()),
+        _ => Ok("col".to_string()),
+    }
+}
+
+/// Disambiguates output column names for a slice of projections.
+///
+/// Follows the same deterministic scheme used across Voyager's PostgreSQL targets (AGE and SQL/PGQ):
+/// the first occurrence of a column name keeps its natural/user name (e.g. `name`).
+/// Subsequent columns with a colliding default name or alias are disambiguated as
+/// `{base_name}_{counter}` (e.g. `name_1`, `name_2`).
+///
+/// If an expression had no explicit alias and did not collide, `emitted_alias` is `None`
+/// so emitters avoid unnecessary `AS` clauses. If it collided, `emitted_alias` is `Some(col_name)`.
+/// If it had an explicit alias originally, `emitted_alias` is `Some(col_name)`.
+pub(crate) fn disambiguate_projections(
+    arena: &QueryAstArena,
+    projections: &[crate::ast::ProjectionItem],
+) -> Result<Vec<DisambiguatedColumn>> {
+    let mut used_names = HashSet::new();
+    let mut result = Vec::with_capacity(projections.len());
+
+    for (idx, proj) in projections.iter().enumerate() {
+        let (base_name, had_explicit_alias) = if let Some(alias) = &proj.alias {
+            (alias.clone(), true)
+        } else {
+            let name = resolve_projection_base_name(arena, proj.expression)?;
+            let name = if name.is_empty() {
+                format!("col_{idx}")
+            } else {
+                name
+            };
+            (name, false)
+        };
+
+        let mut col_name = base_name.clone();
+        let mut counter = 1usize;
+        while !used_names.insert(col_name.clone()) {
+            col_name = format!("{base_name}_{counter}");
+            counter += 1;
+        }
+
+        let emitted_alias = if had_explicit_alias || col_name != base_name {
+            Some(col_name.clone())
+        } else {
+            None
+        };
+
+        result.push(DisambiguatedColumn {
+            name: col_name,
+            emitted_alias,
+        });
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod identifier_validation_tests {
     use super::{
