@@ -43,6 +43,7 @@ Every scenario is described by a `scenario.json` file conforming to `scenario.sc
 | `fixture` | `string` | Base name of the engine-neutral setup graph under `spec/corpus/fixtures/`; never `null` for a live scenario. |
 | `rows` | `"ordered"` or `"unordered"` | Expected row ordering semantics for result comparison. |
 | `targets` | `object` | Compilation targets: `cypher`, `age`, `gql`, `sqlpgq`. |
+| `reference_cypher` | `object` (optional) | Corrected reference Cypher `{statement, reason, params?}` used by `just corpus-record-rows` when `targets.cypher.status` is not `"supported"`. Forbidden when `targets.cypher.status` is `"supported"`. |
 
 ### Target Statuses
 
@@ -166,8 +167,22 @@ be overridden with `VOYAGER_TEST_NEO4J_PORT`, `VOYAGER_TEST_MEMGRAPH_PORT`,
 - **Ordering**: `rows: "ordered"` compares rows position by position;
   `rows: "unordered"` compares them as a multiset, so duplicate rows are
   significant but their order is not.
-- **Columns**: column names are informational. Values are compared by position;
-  AGE names whole-entity columns `entity`, and SQL/PGQ may name them differently.
+- **Columns**: `rows.json` records `columns`, the expected column names from
+  Neo4j in projection order (legacy files omitting `columns` skip name checking).
+  Whether a column name is checked depends on whether `query.spec.json` sets an
+  explicit projection alias (`AS name`) and on the engine:
+  - **Neo4j, Memgraph, FalkorDB**: every column (both aliased and unaliased) is
+    checked verbatim by position. All three engines name unaliased columns after
+    the emitted expression text verbatim (`n.name`, `COUNT(*)`, `1 + 2`).
+  - **Apache AGE, PostgreSQL 19 (SQL/PGQ)**: explicit projection aliases
+    (`AS name` in `query.spec.json`) are checked by position, allowing
+    PostgreSQL's unquoted SQL identifier lowercase folding (so `AS ColumnName`
+    matches `'ColumnName'` or `'columnname'`). Unaliased columns are
+    informational only, because AGE's `AS (...)` column list and SQL/PGQ's
+    `COLUMNS (...)` clause name unaliased columns from the SQL identifiers
+    (e.g. `name` instead of `a.name`).
+  - Any mismatch fails the live test with a column diff naming the column
+    position, expected name, and actual name.
 - **Numbers**: integers and floats compare numerically, so `1` equals `1.0`.
   Booleans are not numbers.
 - **Nulls**: `null` equals only `null`.
@@ -191,13 +206,34 @@ VOYAGER_TEST_HOST=192.168.1.12 just corpus-record-rows
 VOYAGER_TEST_HOST=192.168.1.12 just corpus-record-rows p0-match-return/match-all-nodes
 ```
 
-The recorder compiles and executes the `cypher` target only, sorts rows for
-`unordered` scenarios, strips loader markers, and writes `rows.json`. A target
-may only be marked `supported` after its live check passes on every engine the
-dialect covers; otherwise use `known-diff` (compiles but differs or is rejected
-live) or `unsupported` (does not compile) with a reason that names the cause and
-starts with the error code for `unsupported` targets. Cite an issue number only
-while that issue is still open.
+The recorder executes on Neo4j, sorts rows for `unordered` scenarios, strips
+loader markers, and writes `rows.json` (including `columns`). For scenarios
+whose `cypher` target is `supported`, it compiles `query.spec.json` for `cypher`
+and runs the compiled statement. When `targets.cypher.status` is `known-diff`
+or `unsupported`, the recorder never silently executes the known-diff compiled
+statement; instead, the scenario may supply an optional `reference_cypher`
+object in `scenario.json`:
+
+```json
+"reference_cypher": {
+  "statement": "MATCH (n:Person) WHERE n.age <> $p0 RETURN n.name",
+  "reason": "Current Cypher emitter writes != instead of <> (#...)",
+  "params": {}
+}
+```
+
+When `reference_cypher` is present on a non-`supported` `cypher` scenario, the
+recorder runs `reference_cypher.statement` with merged parameters (`params` and,
+for `known-diff`, any compiler-extracted parameters, overridden by
+`reference_cypher.params`). Non-`supported` `cypher` scenarios without
+`reference_cypher` are skipped rather than recorded from a broken statement.
+`reference_cypher` is forbidden when `targets.cypher.status` is `supported`.
+
+A target may only be marked `supported` after its live check passes on every
+engine the dialect covers; otherwise use `known-diff` (compiles but differs or
+is rejected live) or `unsupported` (does not compile) with a reason that names
+the cause and starts with the error code for `unsupported` targets. Cite an
+issue number only while that issue is still open.
 
 ## Adding a Scenario
 

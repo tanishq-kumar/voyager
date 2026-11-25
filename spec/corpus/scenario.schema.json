@@ -73,8 +73,49 @@
         "gql": { "$ref": "#/$defs/Target" },
         "sqlpgq": { "$ref": "#/$defs/Target" }
       }
+    },
+    "reference_cypher": {
+      "description": "Optional corrected openCypher statement used by the row recorder when targets.cypher.status is not 'supported'.",
+      "type": "object",
+      "required": ["statement", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "statement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "params": {
+          "type": "object"
+        }
+      }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "required": ["reference_cypher"]
+      },
+      "then": {
+        "properties": {
+          "targets": {
+            "properties": {
+              "cypher": {
+                "properties": {
+                  "status": {
+                    "enum": ["known-diff", "unsupported"]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "Target": {
       "type": "object",

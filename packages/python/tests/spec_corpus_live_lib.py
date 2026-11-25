@@ -61,6 +61,12 @@ ENGINE_TARGET: dict[str, str] = {
 
 ENGINES: tuple[str, ...] = ("neo4j", "memgraph", "falkordb", "age", "pg19")
 
+#: Engines that name unaliased columns after the Cypher expression text verbatim.
+CYPHER_COLUMN_ENGINES: frozenset[str] = frozenset({"neo4j", "memgraph", "falkordb"})
+
+#: PostgreSQL-backed engines that fold unquoted SQL column identifiers to lower case.
+SQL_FOLDING_ENGINES: frozenset[str] = frozenset({"age", "pg19"})
+
 
 class EngineUnavailableError(RuntimeError):
     """Raised when a live engine or one of its Python clients is unavailable."""
@@ -94,7 +100,7 @@ def engine_endpoint(engine: str) -> tuple[str, int]:
     return host, _env_int(env_names[engine], defaults[engine])
 
 
-def is_port_open(host: str, port: int, timeout: float = 0.7) -> bool:
+def is_port_open(host: str, port: int, timeout: float = 2.0) -> bool:
     """Return whether a TCP port accepts connections."""
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -165,6 +171,64 @@ def supported_engines(scenario: dict[str, Any]) -> list[str]:
 def scenario_parameters(scenario: dict[str, Any], compiled: dict[str, Any]) -> dict[str, Any]:
     """Merge compiler-extracted parameters with the scenario's user parameters."""
     return {**compiled.get("parameters", {}), **scenario.get("params", {})}
+
+
+def spec_projection_aliases(spec: dict[str, Any]) -> list[str | None]:
+    """Extract explicit projection aliases in column order from a Query Spec document."""
+    aliases: list[str | None] = []
+    for item in spec.get("projections", []):
+        if not isinstance(item, list) or not item:
+            aliases.append(None)
+            continue
+        tag = item[0]
+        if tag == "field" and len(item) >= 4:
+            alias = item[3]
+        elif tag == "expr" and len(item) >= 3:
+            alias = item[2]
+        elif tag == "agg" and len(item) >= 5:
+            alias = item[4]
+        else:
+            alias = None
+        aliases.append(alias if isinstance(alias, str) else None)
+    return aliases
+
+
+def compare_columns(
+    expected: Sequence[str] | None,
+    actual: Sequence[str],
+    *,
+    engine: str,
+    aliases: Sequence[str | None] | None = None,
+) -> list[str]:
+    """Compare returned column names against ``rows.json`` according to per-engine rules.
+
+    - When ``expected`` is ``None``, column checking is skipped for backward
+      compatibility with legacy ``rows.json`` files without a ``columns`` key.
+    - Explicit aliases (from ``aliases``) are checked on every engine; PostgreSQL-backed
+      engines (``age``, ``pg19``) fold unquoted SQL identifiers to lower case.
+    - Unaliased columns are checked verbatim on Cypher engines (``neo4j``, ``memgraph``,
+      ``falkordb``) and treated as informational on ``age`` and ``pg19``.
+    """
+    if expected is None:
+        return []
+
+    diffs: list[str] = []
+    if len(expected) != len(actual):
+        diffs.append(
+            f"column count: expected {len(expected)} ({list(expected)}), "
+            f"got {len(actual)} ({list(actual)})"
+        )
+
+    check_all = engine in CYPHER_COLUMN_ENGINES
+    fold_case = engine in SQL_FOLDING_ENGINES
+    for index, (exp_col, act_col) in enumerate(zip(expected, actual, strict=False)):
+        alias = aliases[index] if aliases is not None and index < len(aliases) else None
+        if not check_all and alias is None:
+            continue
+        matched = act_col in (exp_col, exp_col.lower()) if fold_case else act_col == exp_col
+        if not matched:
+            diffs.append(f"column {index}: expected {exp_col!r}, got {act_col!r}")
+    return diffs
 
 
 # ---------------------------------------------------------------------------
@@ -554,8 +618,9 @@ class BoltEngine(BaseEngine):
         self, statement: str, parameters: dict[str, Any]
     ) -> tuple[list[str], list[list[Any]]]:
         with self.driver.session() as session:
-            records = list(session.run(statement, parameters))
-        columns = list(records[0].keys()) if records else []
+            result = session.run(statement, parameters)
+            columns = list(result.keys())
+            records = list(result)
         rows = [[canonicalize(value, self.name) for value in record.values()] for record in records]
         return columns, rows
 
@@ -758,20 +823,15 @@ class AgeEngine(BaseEngine):
     def execute(
         self, statement: str, parameters: dict[str, Any]
     ) -> tuple[list[str], list[list[Any]]]:
-        from voyager_ogm import Session
-        from voyager_ogm.bridge import PostgresBridge
-
-        session = Session(
-            bridge=PostgresBridge(self.conn, graph_name=self.graph_name), dialect="age"
+        return _postgres_session_execute(
+            self.conn,
+            statement,
+            parameters,
+            dialect="age",
+            graph_name=self.graph_name,
+            engine=self.name,
+            parse_age=False,
         )
-        result = session.execute(statement, parameters)
-        records = result.all()
-        columns = list(records[0].keys()) if records else []
-        rows = [
-            [canonicalize(value, self.name, parse_age=False) for value in record.values()]
-            for record in records
-        ]
-        return columns, rows
 
     def close(self) -> None:
         self.conn.close()
@@ -951,15 +1011,56 @@ class PG19Engine(BaseEngine):
     def execute(
         self, statement: str, parameters: dict[str, Any]
     ) -> tuple[list[str], list[list[Any]]]:
-        from voyager_ogm import Session
-        from voyager_ogm.bridge import PostgresBridge
+        return _postgres_session_execute(
+            self.conn,
+            statement,
+            parameters,
+            dialect="sql_pgq",
+            graph_name=None,
+            engine=self.name,
+            parse_age=True,
+        )
 
-        session = Session(bridge=PostgresBridge(self.conn), dialect="sql_pgq")
-        result = session.execute(statement, parameters)
-        records = result.all()
-        columns = list(records[0].keys()) if records else []
-        rows = [[canonicalize(value, self.name) for value in record.values()] for record in records]
-        return columns, rows
+
+_MUTATION_KEYWORDS = re.compile(
+    r"\b(CREATE|MERGE|SET|DELETE|REMOVE|INSERT|UPDATE)\b", re.IGNORECASE
+)
+
+
+def _postgres_session_execute(
+    conn: Any,
+    statement: str,
+    parameters: dict[str, Any],
+    *,
+    dialect: str,
+    graph_name: str | None,
+    engine: str,
+    parse_age: bool,
+) -> tuple[list[str], list[list[Any]]]:
+    """Execute via Session/PostgresBridge and fall back to cursor metadata when 0 rows return."""
+    from voyager_ogm import Session
+    from voyager_ogm.bridge import PostgresBridge
+
+    bridge = PostgresBridge(conn, graph_name=graph_name)
+    session = Session(bridge=bridge, dialect=dialect)
+    result = session.execute(statement, parameters)
+    records = result.all()
+    if records:
+        columns = list(records[0].keys())
+    elif _MUTATION_KEYWORDS.search(statement):
+        # Session results carry no column names when they are empty, and running a
+        # write a second time to read cursor metadata would apply it twice.
+        columns = []
+    else:
+        stmt, params = bridge._format_pgq_statement(statement, parameters)
+        with conn.cursor() as cur:
+            cur.execute(stmt, params or None)
+            columns = [d[0] for d in cur.description] if cur.description else []
+    rows = [
+        [canonicalize(value, engine, parse_age=parse_age) for value in record.values()]
+        for record in records
+    ]
+    return columns, rows
 
     def close(self) -> None:
         self.conn.close()
@@ -1033,28 +1134,57 @@ def new_token() -> str:
 # ---------------------------------------------------------------------------
 
 
+def execute_statement(
+    engine: str,
+    statement: str,
+    parameters: dict[str, Any],
+    fixture: dict[str, Any],
+    token: str,
+    *,
+    adapter: BaseEngine | None = None,
+) -> Execution:
+    """Load the fixture, execute a statement on ``engine``, and canonicalize rows."""
+    owned = adapter is None
+    active_adapter = make_engine(engine) if adapter is None else adapter
+    load_result: LoadResult | None = None
+    try:
+        load_result = active_adapter.load(fixture, token)
+        columns, rows = active_adapter.execute(statement, parameters)
+        return Execution(
+            statement=statement,
+            parameters=parameters,
+            columns=columns,
+            rows=rows,
+            engine=engine,
+        )
+    finally:
+        if load_result is not None:
+            active_adapter.cleanup(load_result)
+        if owned:
+            active_adapter.close()
+
+
 def execute_scenario(
     engine: str,
     scenario: dict[str, Any],
     spec: dict[str, Any],
     fixture: dict[str, Any],
     token: str,
+    *,
+    adapter: BaseEngine | None = None,
 ) -> Execution:
     """Load the fixture, compile for the engine's dialect, execute and canonicalize rows."""
-    adapter = make_engine(engine)
+    owned = adapter is None
+    active_adapter = make_engine(engine) if adapter is None else adapter
     load_result: LoadResult | None = None
     try:
-        load_result = adapter.load(fixture, token)
-        graph_name = getattr(adapter, "graph_name", None) or None
+        load_result = active_adapter.load(fixture, token)
+        graph_name = getattr(active_adapter, "graph_name", None) or None
         from voyager_ogm._voyager_rs import compile_query_from_spec
 
         compiled = compile_query_from_spec(spec, ENGINE_DIALECT[engine], graph_name=graph_name)
         parameters = scenario_parameters(scenario, compiled)
-        columns, rows = adapter.execute(compiled["statement"], parameters)
-        if not columns:
-            columns = [
-                item.get("alias") or item.get("name", "") for item in compiled.get("columns", [])
-            ]
+        columns, rows = active_adapter.execute(compiled["statement"], parameters)
         return Execution(
             statement=compiled["statement"],
             parameters=parameters,
@@ -1064,16 +1194,72 @@ def execute_scenario(
         )
     finally:
         if load_result is not None:
-            adapter.cleanup(load_result)
-        adapter.close()
+            active_adapter.cleanup(load_result)
+        if owned:
+            active_adapter.close()
+
+
+def resolve_reference_query(
+    scenario: dict[str, Any], spec: dict[str, Any]
+) -> tuple[str, dict[str, Any]] | None:
+    """Select the openCypher reference statement and parameters for recording ``rows.json``.
+
+    - When ``targets.cypher.status`` is ``"supported"``, compiles ``spec`` for
+      ``cypher`` (rejecting a stray ``reference_cypher`` override).
+    - When ``targets.cypher.status`` is ``"known-diff"`` or ``"unsupported"``,
+      returns the scenario's ``reference_cypher`` statement if present, or
+      ``None`` so the recorder never silently uses a known-diff compiled query.
+    """
+    cypher_status = scenario["targets"]["cypher"]["status"]
+    reference = scenario.get("reference_cypher")
+    if cypher_status == "supported":
+        if reference is not None:
+            raise ValueError(
+                "reference_cypher must not be set when targets.cypher.status is 'supported'"
+            )
+        from voyager_ogm._voyager_rs import compile_query_from_spec
+
+        compiled = compile_query_from_spec(spec, "cypher")
+        return compiled["statement"], scenario_parameters(scenario, compiled)
+
+    if reference is None:
+        return None
+    if not isinstance(reference, dict) or not isinstance(reference.get("statement"), str):
+        raise ValueError("reference_cypher must be an object with a string 'statement'")
+    statement = reference["statement"].strip()
+    if not statement:
+        raise ValueError("reference_cypher.statement must be non-empty")
+
+    extracted: dict[str, Any] = {}
+    if cypher_status == "known-diff":
+        from voyager_ogm._voyager_rs import compile_query_from_spec
+
+        try:
+            extracted = compile_query_from_spec(spec, "cypher").get("parameters", {})
+        except Exception:
+            extracted = {}
+    params = {**extracted, **scenario.get("params", {}), **(reference.get("params") or {})}
+    return statement, params
 
 
 def record_scenario_rows(
-    scenario_id: str, scenario: dict[str, Any], spec: dict[str, Any], token: str
+    scenario_id: str,
+    scenario: dict[str, Any],
+    spec: dict[str, Any],
+    token: str,
+    *,
+    adapter: BaseEngine | None = None,
 ) -> dict[str, Any]:
     """Execute one scenario on the reference engine (Neo4j) and return rows.json content."""
+    resolved = resolve_reference_query(scenario, spec)
+    if resolved is None:
+        cypher_status = scenario["targets"]["cypher"]["status"]
+        raise ValueError(
+            f"{scenario_id}: cypher target is {cypher_status!r} and no reference_cypher is configured"
+        )
+    statement, parameters = resolved
     fixture = load_fixture(scenario.get("fixture"))
-    execution = execute_scenario("neo4j", scenario, spec, fixture, token)
+    execution = execute_statement("neo4j", statement, parameters, fixture, token, adapter=adapter)
     rows = execution.rows
     if scenario.get("rows") != "ordered":
         rows = sorted(rows, key=_render_row)

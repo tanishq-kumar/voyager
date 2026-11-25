@@ -44,11 +44,15 @@ def main(argv: list[str]) -> int:
     try:
         for scenario_id, scenario_dir in scenarios:
             scenario = corpus.load_json(scenario_dir / "scenario.json")
-            if scenario["targets"]["cypher"]["status"] != "supported":
-                print(f"[SKIP] {scenario_id}: cypher target is not supported")
-                continue
             spec = corpus.load_json(scenario_dir / "query.spec.json")
-            rows_doc = corpus.record_scenario_rows(scenario_id, scenario, spec, corpus.new_token())
+            resolved = corpus.resolve_reference_query(scenario, spec)
+            if resolved is None:
+                status = scenario["targets"]["cypher"]["status"]
+                print(f"[SKIP] {scenario_id}: cypher target is {status} without reference_cypher")
+                continue
+            rows_doc = corpus.record_scenario_rows(
+                scenario_id, scenario, spec, corpus.new_token(), adapter=engine
+            )
             output = scenario_dir / "rows.json"
             output.write_text(
                 json.dumps(rows_doc, indent=2, ensure_ascii=False) + "\n",
@@ -56,8 +60,10 @@ def main(argv: list[str]) -> int:
                 newline="\n",
             )
             written += 1
+            via = " (via reference_cypher)" if scenario.get("reference_cypher") else ""
             print(
-                f"[OK] {scenario_id}: {len(rows_doc['rows'])} row(s) -> {output.relative_to(REPO_ROOT)}"
+                f"[OK] {scenario_id}: {len(rows_doc['rows'])} row(s){via} -> "
+                f"{output.relative_to(REPO_ROOT)}"
             )
     except corpus.EngineUnavailableError as err:
         print(f"[ERROR] Neo4j reference engine is unavailable: {err}")
