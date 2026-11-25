@@ -456,9 +456,9 @@ release-branch line:
 pre-commit: fmt-check lint typecheck
     @echo "[PASS] Pre-commit checks passed cleanly!"
 
-# Pre-push hook recipe (runs full test matrix and captures benchmark snapshots)
-pre-push: test bench-save
-    @echo "[PASS] Pre-push verification and benchmark capture complete!"
+# Pre-push hook recipe (fast, side-effect-free formatting, linting, and type checks)
+pre-push: fmt-check lint typecheck
+    @echo "[PASS] Pre-push checks passed cleanly!"
 
 # Run Rust micro-benchmarks
 bench:

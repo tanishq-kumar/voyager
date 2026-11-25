@@ -6,15 +6,18 @@ automatic descriptor binding, base class injection, and type reflection.
 
 from __future__ import annotations
 
+import builtins
 import copy
 import datetime
 import difflib
 import inspect
 import logging
 import re
+import sys
 import threading
 import types
 import typing
+import warnings
 import weakref
 from collections import defaultdict
 from collections.abc import Sequence
@@ -1435,31 +1438,92 @@ def _native_merge_key_fields(
     return list(key_fields)
 
 
-def _evaluate_annotation(cls: Any, annotation: Any) -> Any:
-    """Resolves one string annotation in the class's module without failing its siblings.
+def _annotation_namespaces(cls: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Builds the globals and locals namespaces used to evaluate annotations on ``cls``."""
+    module_name = getattr(cls, "__module__", None)
+    module = sys.modules.get(module_name) if module_name else None
+    globals_ns: dict[str, Any] = (
+        getattr(module, "__dict__", {"__builtins__": builtins})
+        if module is not None
+        else {"__builtins__": builtins}
+    )
+
+    locals_ns: dict[str, Any] = {}
+    for param in getattr(cls, "__type_params__", ()):
+        locals_ns[param.__name__] = param
+    for key, value in vars(cls).items():
+        if not (key.startswith("__") and key.endswith("__")) and not isinstance(
+            value, (Field, RelationshipDescriptor)
+        ):
+            locals_ns[key] = value
+    cls_name = getattr(cls, "__name__", None)
+    if isinstance(cls_name, str) and cls_name and cls_name not in locals_ns:
+        locals_ns[cls_name] = cls
+    return globals_ns, locals_ns
+
+
+def _eval_annotation_str(
+    text: str,
+    globals_ns: dict[str, Any],
+    locals_ns: dict[str, Any],
+) -> Any:
+    """Evaluates a single string annotation, unwrapping one quoted forward reference."""
+    evaluated = eval(text, globals_ns, locals_ns)
+    if isinstance(evaluated, str):
+        if evaluated in _BUILTIN_TYPES:
+            return _BUILTIN_TYPES[evaluated]
+        return eval(evaluated, globals_ns, locals_ns)
+    return evaluated
+
+
+def _evaluate_annotation(
+    cls: Any,
+    annotation: Any,
+    *,
+    attr_name: str | None = None,
+    globals_ns: dict[str, Any] | None = None,
+    locals_ns: dict[str, Any] | None = None,
+) -> Any:
+    """Resolves one annotation in the class's module and class namespace without failing its siblings.
 
     ``inspect.get_annotations(..., eval_str=True)`` evaluates a whole class at once, so a
     single unimported name leaves every annotation as a raw string. Each annotation is
-    evaluated here independently and an unresolvable one is returned unchanged.
+    evaluated here independently using the model's module globals and class namespace.
+    When an annotation cannot be resolved, a ``UserWarning`` naming the class and field is
+    emitted and ``typing.Any`` is returned as the fallback type.
 
     Args:
         cls: Class whose module and class namespace are used for name resolution.
         annotation: Raw annotation, usually a string under ``from __future__ import annotations``.
+        attr_name: Optional field attribute name included in the warning message.
+        globals_ns: Optional precomputed module globals mapping for ``cls``.
+        locals_ns: Optional precomputed class locals mapping for ``cls``.
 
     Returns:
-        The evaluated annotation, or the original string when it cannot be resolved.
+        The evaluated annotation, or ``typing.Any`` when it cannot be resolved.
     """
     if not isinstance(annotation, str):
         return annotation
-    holder = type("_AnnotationHolder", (), {"__module__": getattr(cls, "__module__", "")})
-    for key, value in vars(cls).items():
-        if not (key.startswith("__") and key.endswith("__")):
-            setattr(holder, key, value)
-    holder.__annotations__ = {"value": annotation}
+    if globals_ns is None or locals_ns is None:
+        computed_globals, computed_locals = _annotation_namespaces(cls)
+        if globals_ns is None:
+            globals_ns = computed_globals
+        if locals_ns is None:
+            locals_ns = computed_locals
+
     try:
-        return inspect.get_annotations(holder, eval_str=True)["value"]
-    except Exception:
-        return annotation
+        return _eval_annotation_str(annotation, globals_ns, locals_ns)
+    except Exception as exc:
+        if annotation in _BUILTIN_TYPES:
+            return _BUILTIN_TYPES[annotation]
+        target = f"{cls.__name__}.{attr_name}" if attr_name else cls.__name__
+        warnings.warn(
+            f"Could not resolve type annotation {annotation!r} for {target}; "
+            f"falling back to Any ({exc}).",
+            UserWarning,
+            stacklevel=4,
+        )
+        return Any
 
 
 def _string_annotation_is_nullable(annotation: str) -> bool:
@@ -1538,12 +1602,20 @@ def _resolve_field_nullability(field: Field[Any]) -> None:
 def _process_type_annotations(cls: Any) -> dict[str, Field]:
     """Extracts type annotations and injects Field descriptors automatically.
 
+    Each field annotation is evaluated independently in the model's module and
+    class namespaces. Any annotation that cannot be evaluated emits a
+    ``UserWarning`` naming the class and field (once per class/field) and falls
+    back to ``typing.Any``.
+
     Args:
         cls: Class to inspect.
 
     Returns:
         Dictionary mapping field attribute names to Field descriptors.
     """
+    if "_annotations_processed" in cls.__dict__:
+        return cast(dict[str, Field], cls.__dict__.get("_schema_fields", {}))
+
     fields_map: dict[str, Field] = {}
 
     # Inherit schema fields from base classes in MRO
@@ -1551,21 +1623,30 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
         if hasattr(base, "_schema_fields") and isinstance(base._schema_fields, dict):
             fields_map.update(base._schema_fields)
 
-    annotations = {
-        attr_name: _evaluate_annotation(cls, type_hint)
-        for attr_name, type_hint in inspect.get_annotations(cls, eval_str=False).items()
-    }
+    globals_ns, locals_ns = _annotation_namespaces(cls)
+    raw_annotations = inspect.get_annotations(cls, eval_str=False)
 
-    for attr_name, type_hint in annotations.items():
+    for attr_name, raw_hint in raw_annotations.items():
         if attr_name.startswith("_"):
             continue
-        if isinstance(type_hint, str) and type_hint in _BUILTIN_TYPES:
-            type_hint = _BUILTIN_TYPES[type_hint]
 
         existing_val = getattr(cls, attr_name, _MISSING_CLASS_ATTR)
         if isinstance(existing_val, RelationshipDescriptor):
             existing_val._set_owner(cls, attr_name)
             continue
+        if not isinstance(existing_val, Field) and inspect.isroutine(existing_val):
+            continue
+
+        type_hint = _evaluate_annotation(
+            cls,
+            raw_hint,
+            attr_name=attr_name,
+            globals_ns=globals_ns,
+            locals_ns=locals_ns,
+        )
+        if isinstance(type_hint, str) and type_hint in _BUILTIN_TYPES:
+            type_hint = _BUILTIN_TYPES[type_hint]
+
         if isinstance(existing_val, Field):
             if attr_name not in cls.__dict__:
                 # The annotation overrides an inherited descriptor for this
@@ -1576,7 +1657,7 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
             if existing_val.name is None:
                 existing_val.name = attr_name
             fields_map[attr_name] = existing_val
-        elif not inspect.isroutine(existing_val):
+        else:
             field_desc: Field[Any] = Field(
                 default=... if existing_val is _MISSING_CLASS_ATTR else existing_val,
                 name=attr_name,
@@ -1603,6 +1684,7 @@ def _process_type_annotations(cls: Any) -> dict[str, Field]:
         _validate_field_declaration(cls, attr_name, field_desc)
 
     cls._schema_fields = fields_map
+    cls._annotations_processed = True
     return fields_map
 
 
