@@ -1,0 +1,29 @@
+{
+  "id": "p0-match-return/match-relationship-types",
+  "pack": "p0-match-return",
+  "description": "Match relationship with multiple alternative types (type disjunction).",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/match/Match2.feature",
+    "scenario": "[6] Match relationships with multiple types"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: Apache AGE does not support relationship type alternation ('|')."
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

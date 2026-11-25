@@ -1,0 +1,48 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "a",
+            []
+          ],
+          [
+            "edge",
+            "outgoing",
+            [
+              "KNOWS"
+            ],
+            "r",
+            null,
+            null,
+            {
+              "since": [
+                "param",
+                "since"
+              ]
+            }
+          ],
+          [
+            "node",
+            "b",
+            []
+          ]
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "expr",
+      [
+        "prop",
+        "r",
+        ""
+      ],
+      null
+    ]
+  ]
+}

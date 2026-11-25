@@ -1,0 +1,27 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "n",
+            []
+          ]
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "expr",
+      [
+        "prop",
+        "n",
+        ""
+      ],
+      null
+    ]
+  ]
+}

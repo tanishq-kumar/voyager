@@ -1,0 +1,30 @@
+{
+  "id": "p0-match-return/match-relationship-property-parameter",
+  "pack": "p0-match-return",
+  "description": "Match relationship pattern with a parameter expression in the property map.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p0-match-return",
+    "scenario": "Relationship pattern with parameterized property in inline map"
+  },
+  "params": {
+    "since": 2020
+  },
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

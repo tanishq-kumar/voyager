@@ -118,6 +118,15 @@ test-python:
 spec-check:
     uv run --no-sync pytest packages/python/tests/test_spec_vectors.py -v
 
+# Run Query Spec conformance corpus compile checks
+corpus:
+    uv run --no-sync pytest packages/python/tests/test_spec_corpus.py -v
+
+# Rewrite expected files in spec/corpus from the current compiler for supported and known-diff targets
+corpus-update:
+    uv run python scripts/update_corpus.py
+    git diff --stat spec/corpus
+
 # Run Relate embedded database integration tests
 test-relate:
     uv run --no-sync pytest packages/python/tests/test_relate_compatibility.py -v

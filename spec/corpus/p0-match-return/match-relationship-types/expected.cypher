@@ -1,0 +1,1 @@
+MATCH (n)-[r:KNOWS|HATES]->(x) RETURN r

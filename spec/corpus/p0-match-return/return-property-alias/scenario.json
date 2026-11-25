@@ -1,0 +1,27 @@
+{
+  "id": "p0-match-return/return-property-alias",
+  "pack": "p0-match-return",
+  "description": "Project a node property with an explicit column alias.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return4.feature",
+    "scenario": "[3] Aliasing expressions"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

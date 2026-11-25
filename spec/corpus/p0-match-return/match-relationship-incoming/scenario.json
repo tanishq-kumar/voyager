@@ -1,0 +1,28 @@
+{
+  "id": "p0-match-return/match-relationship-incoming",
+  "pack": "p0-match-return",
+  "description": "Match single-hop incoming directed relationship with edge type.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p0-match-return",
+    "scenario": "Incoming single-hop directed relationship with edge type"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

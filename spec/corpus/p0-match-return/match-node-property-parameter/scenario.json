@@ -1,0 +1,30 @@
+{
+  "id": "p0-match-return/match-node-property-parameter",
+  "pack": "p0-match-return",
+  "description": "Match node with a parameter expression in the inline property map.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p0-match-return",
+    "scenario": "Node pattern with parameterized property in inline map"
+  },
+  "params": {
+    "name": "Alice"
+  },
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ GRAPH_TABLE COLUMNS only supports scalar expressions and properties, not whole node or relationship variables."
+    }
+  }
+}

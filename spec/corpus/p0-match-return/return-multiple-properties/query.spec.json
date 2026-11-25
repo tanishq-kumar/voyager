@@ -1,0 +1,36 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "a",
+            []
+          ]
+        ]
+      ]
+    }
+  ],
+  "projections": [
+    [
+      "field",
+      "a",
+      "name",
+      null
+    ],
+    [
+      "field",
+      "a",
+      "age",
+      null
+    ],
+    [
+      "field",
+      "a",
+      "seasons",
+      null
+    ]
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "p0-match-return/return-node-property",
+  "pack": "p0-match-return",
+  "description": "Project a single node property value.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return2.feature",
+    "scenario": "[2] Returning a node property value"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

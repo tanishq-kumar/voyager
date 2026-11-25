@@ -1,0 +1,27 @@
+{
+  "id": "p0-match-return/return-literal-string",
+  "pack": "p0-match-return",
+  "description": "Project a string literal expression in RETURN with an alias.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p0-match-return",
+    "scenario": "RETURN string literal with column alias"
+  },
+  "params": {},
+  "fixture": null,
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}
