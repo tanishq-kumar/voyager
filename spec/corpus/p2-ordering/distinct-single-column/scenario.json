@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/distinct-single-column",
+  "pack": "p2-ordering",
+  "description": "DISTINCT deduplication on a single nullable property.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return/Return5.feature",
+    "scenario": "[2] DISTINCT on nullable values"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "unordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

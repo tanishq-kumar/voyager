@@ -1,0 +1,28 @@
+{
+  "columns": [
+    "n.name",
+    "n.city"
+  ],
+  "rows": [
+    [
+      "Carol",
+      null
+    ],
+    [
+      "Bob",
+      "Paris"
+    ],
+    [
+      "Alice",
+      "London"
+    ],
+    [
+      "Eve",
+      "London"
+    ],
+    [
+      "Dave",
+      "Berlin"
+    ]
+  ]
+}

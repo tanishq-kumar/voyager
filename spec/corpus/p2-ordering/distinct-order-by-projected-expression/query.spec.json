@@ -1,0 +1,34 @@
+{
+  "spec_version": 1,
+  "matches": [
+    {
+      "paths": [
+        [
+          [
+            "node",
+            "n",
+            [
+              "Person"
+            ]
+          ]
+        ]
+      ]
+    }
+  ],
+  "distinct": true,
+  "projections": [
+    [
+      "field",
+      "n",
+      "city",
+      null
+    ]
+  ],
+  "order_by": [
+    [
+      "n",
+      "city",
+      "ASC"
+    ]
+  ]
+}

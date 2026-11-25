@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/order-by-null-asc",
+  "pack": "p2-ordering",
+  "description": "ORDER BY ascending on a nullable property; null sorts last.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-orderby/ReturnOrderBy1.feature",
+    "scenario": "[11] ORDER BY should order distinct types in the expected order"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

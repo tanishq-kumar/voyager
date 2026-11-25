@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/pagination-past-end",
+  "pack": "p2-ordering",
+  "description": "Page beyond end of result set in deterministic pagination over a stable unique key order.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p2-ordering",
+    "scenario": "Deterministic pagination beyond end"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

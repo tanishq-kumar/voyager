@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/limit-zero",
+  "pack": "p2-ordering",
+  "description": "Pagination using literal LIMIT 0 returning zero rows.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-skip-limit/ReturnSkipLimit2.feature",
+    "scenario": "[3] LIMIT 0 should return an empty result"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

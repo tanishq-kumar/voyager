@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/limit-larger-than-result",
+  "pack": "p2-ordering",
+  "description": "Pagination using LIMIT larger than the available result count.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-skip-limit/ReturnSkipLimit3.feature",
+    "scenario": "[3] Limiting amount of rows when there are fewer left than the LIMIT argument"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

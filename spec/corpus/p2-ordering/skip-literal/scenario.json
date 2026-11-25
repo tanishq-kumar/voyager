@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/skip-literal",
+  "pack": "p2-ordering",
+  "description": "Pagination using literal integer SKIP alone.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-skip-limit/ReturnSkipLimit1.feature",
+    "scenario": "[1] Start the result from the second row"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

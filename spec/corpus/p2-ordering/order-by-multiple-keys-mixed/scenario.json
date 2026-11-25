@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/order-by-multiple-keys-mixed",
+  "pack": "p2-ordering",
+  "description": "ORDER BY on multiple properties with mixed ascending and descending directions.",
+  "source": {
+    "kind": "voyager",
+    "feature": "spec/corpus/p2-ordering",
+    "scenario": "ORDER BY multiple keys with mixed directions"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "columns": [
+    "n.name",
+    "n.age"
+  ],
+  "rows": [
+    [
+      "Eve",
+      20
+    ]
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/distinct-order-by-alias-asc",
+  "pack": "p2-ordering",
+  "description": "DISTINCT combined with ORDER BY on projected column alias ascending.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-orderby/ReturnOrderBy2.feature",
+    "scenario": "[9] Using aliased DISTINCT expression in ORDER BY"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

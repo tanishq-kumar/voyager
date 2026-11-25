@@ -1,0 +1,1 @@
+SELECT * FROM GRAPH_TABLE (graph_table MATCH (n IS "Person") COLUMNS (n.name)) ORDER BY name ASC NULLS LAST LIMIT 10

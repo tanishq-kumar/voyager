@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/skip-limit",
+  "pack": "p2-ordering",
+  "description": "Pagination specifying both literal SKIP and literal LIMIT together.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-skip-limit/ReturnSkipLimit3.feature",
+    "scenario": "[1] Get rows in the middle"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

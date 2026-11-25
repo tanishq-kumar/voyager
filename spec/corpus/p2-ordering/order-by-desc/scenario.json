@@ -1,0 +1,27 @@
+{
+  "id": "p2-ordering/order-by-desc",
+  "pack": "p2-ordering",
+  "description": "ORDER BY descending on a single node property.",
+  "source": {
+    "kind": "opencypher-tck",
+    "feature": "clauses/return-orderby/ReturnOrderBy2.feature",
+    "scenario": "[2] ORDER BY DESC should return results in descending order"
+  },
+  "params": {},
+  "fixture": "filter-persons",
+  "rows": "ordered",
+  "targets": {
+    "cypher": {
+      "status": "supported"
+    },
+    "age": {
+      "status": "supported"
+    },
+    "gql": {
+      "status": "supported"
+    },
+    "sqlpgq": {
+      "status": "supported"
+    }
+  }
+}

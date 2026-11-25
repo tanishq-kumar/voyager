@@ -1,0 +1,28 @@
+{
+  "columns": [
+    "n.active",
+    "n.age"
+  ],
+  "rows": [
+    [
+      false,
+      20
+    ],
+    [
+      false,
+      25
+    ],
+    [
+      true,
+      30
+    ],
+    [
+      true,
+      35
+    ],
+    [
+      true,
+      40
+    ]
+  ]
+}

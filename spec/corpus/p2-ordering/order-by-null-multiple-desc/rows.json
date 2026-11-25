@@ -1,0 +1,28 @@
+{
+  "columns": [
+    "n.name",
+    "n.nickname"
+  ],
+  "rows": [
+    [
+      "Alice",
+      null
+    ],
+    [
+      "Dave",
+      null
+    ],
+    [
+      "Eve",
+      "Evie"
+    ],
+    [
+      "Carol",
+      "Caz"
+    ],
+    [
+      "Bob",
+      "Bobby"
+    ]
+  ]
+}
