@@ -23,6 +23,11 @@ from typing import Any, Literal, Protocol, overload, runtime_checkable
 import polars as pl
 
 from voyager_ogm.agtype import decode_agtype
+from voyager_ogm.entities import (
+    convert_driver_value,
+    serialize_records_for_arrow,
+    serialize_value_for_arrow,
+)
 from voyager_ogm.ingestion import BulkIngestionPlan
 from voyager_ogm.types import unwrap_spatial_param
 
@@ -702,16 +707,14 @@ def _adapt_bolt_parameters(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_bolt_record(record: Any) -> dict[str, Any]:
-    """Extracts record dictionary from Bolt Record, ensuring relationship entities retain properties."""
+    """Extracts record dictionary from Bolt Record, converting entities to GraphNode/GraphRelationship/GraphPath."""
     if isinstance(record, dict):
-        return record
-    row = dict(record.data()) if hasattr(record, "data") else dict(record)
+        return {k: convert_driver_value(v) for k, v in record.items()}
     items_fn = getattr(record, "items", None)
     if callable(items_fn):
-        for k, v in items_fn():
-            if hasattr(v, "start_node") and hasattr(v, "type"):
-                row[k] = dict(v)
-    return row
+        return {k: convert_driver_value(v) for k, v in items_fn()}
+    raw = dict(record.data()) if hasattr(record, "data") else dict(record)
+    return {k: convert_driver_value(v) for k, v in raw.items()}
 
 
 class Neo4jBoltBridge:
@@ -758,7 +761,7 @@ class Neo4jBoltBridge:
         Returns:
             Polars DataFrame.
         """
-        records = self.execute(statement, parameters)
+        records = serialize_records_for_arrow(self.execute(statement, parameters))
         return pl.DataFrame(records) if records else pl.DataFrame()
 
     def execute_bulk(
@@ -907,7 +910,7 @@ class Neo4jBoltTransaction:
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
         """Runs a Cypher statement and returns a Polars DataFrame."""
-        records = self.execute(statement, parameters)
+        records = serialize_records_for_arrow(self.execute(statement, parameters))
         return pl.DataFrame(records) if records else pl.DataFrame()
 
     def execute_bulk(
@@ -1052,7 +1055,7 @@ class AsyncNeo4jBoltBridge:
         Returns:
             Polars DataFrame.
         """
-        records = await self.execute(statement, parameters)
+        records = serialize_records_for_arrow(await self.execute(statement, parameters))
         return pl.DataFrame(records) if records else pl.DataFrame()
 
     async def execute_bulk(
@@ -1214,7 +1217,7 @@ class AsyncNeo4jBoltTransaction:
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
         """Runs a Cypher statement and returns a Polars DataFrame."""
-        records = await self.execute(statement, parameters)
+        records = serialize_records_for_arrow(await self.execute(statement, parameters))
         return pl.DataFrame(records) if records else pl.DataFrame()
 
     async def execute_bulk(
@@ -2068,7 +2071,10 @@ class PostgresBridge:
             if cur.description:
                 cols = [d[0] for d in cur.description]
                 rows = cur.fetchall()
-                decoded = [self._decode_row(cur, row) for row in rows]
+                decoded = [
+                    tuple(serialize_value_for_arrow(v) for v in self._decode_row(cur, row))
+                    for row in rows
+                ]
                 return pl.DataFrame(decoded, schema=cols, orient="row")
             return pl.DataFrame()
 
@@ -2245,7 +2251,12 @@ class PostgresBridgeTransaction:
                 if cur.description:
                     cols = [d[0] for d in cur.description]
                     rows = cur.fetchall()
-                    decoded = [self._bridge._decode_row(cur, row) for row in rows]
+                    decoded = [
+                        tuple(
+                            serialize_value_for_arrow(v) for v in self._bridge._decode_row(cur, row)
+                        )
+                        for row in rows
+                    ]
                     return pl.DataFrame(decoded, schema=cols, orient="row")
                 return pl.DataFrame()
         except BaseException:
@@ -2599,10 +2610,7 @@ class FalkorDBBridge:
         for row in res.result_set:
             rec: dict[str, Any] = {}
             for col, val in zip(col_names, row, strict=False):
-                if hasattr(val, "properties"):
-                    rec[col] = val.properties
-                else:
-                    rec[col] = val
+                rec[col] = convert_driver_value(val)
             records.append(rec)
         return records
 
@@ -2618,7 +2626,7 @@ class FalkorDBBridge:
         Returns:
             Polars DataFrame.
         """
-        records = self.execute(statement, parameters)
+        records = serialize_records_for_arrow(self.execute(statement, parameters))
         return pl.DataFrame(records) if records else pl.DataFrame()
 
     def execute_bulk(
@@ -2748,40 +2756,8 @@ class AsyncFalkorDBBridge:
 
 
 def _normalize_relate_value(val: Any) -> Any:
-    """Normalizes Relate native objects (Node, Relationship, Point, Duration) to standard Python dicts and types."""
-    if hasattr(val, "properties") and hasattr(val, "labels"):
-        d = dict(val.properties)
-        d.setdefault("id", val.id)
-        d.setdefault("labels", list(val.labels))
-        d.setdefault("element_id", val.element_id)
-        return d
-    elif hasattr(val, "type") and hasattr(val, "start_node"):
-        d = dict(val.properties)
-        d.setdefault("type", val.type)
-        d.setdefault("id", val.id)
-        d.setdefault("start", val.start_node)
-        d.setdefault("end", val.end_node)
-        d.setdefault("element_id", val.element_id)
-        return d
-    elif hasattr(val, "srid") and hasattr(val, "x") and hasattr(val, "y"):
-        from voyager_ogm.types import Point
-
-        return Point(
-            x=val.x,
-            y=val.y,
-            z=getattr(val, "z", None),
-            srid=val.srid,
-        )
-    elif hasattr(val, "months") and hasattr(val, "seconds") and hasattr(val, "nanoseconds"):
-        try:
-            return val.to_timedelta()
-        except Exception:
-            return str(val)
-    elif isinstance(val, dict):
-        return {k: _normalize_relate_value(v) for k, v in val.items()}
-    elif isinstance(val, (list, tuple)):
-        return [_normalize_relate_value(x) for x in val]
-    return val
+    """Normalizes Relate native objects (Node, Relationship, Path, Point, Duration) via the shared converter."""
+    return convert_driver_value(val)
 
 
 def _normalize_relate_record(record: Any) -> dict[str, Any]:
@@ -2910,7 +2886,7 @@ class RelateBridge:
                 except Exception:
                     pass
             records = getattr(res, "fetchall", lambda: getattr(res, "data", []))()
-            normalized = [_normalize_relate_record(r) for r in records]
+            normalized = serialize_records_for_arrow([_normalize_relate_record(r) for r in records])
             return pl.DataFrame(normalized) if normalized else pl.DataFrame()
         return pl.DataFrame()
 

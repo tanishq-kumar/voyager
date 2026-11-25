@@ -609,3 +609,77 @@ fn test_query_result_defaults_to_no_age_columns() {
     let result = QueryResult::new(vec!["n".to_string()], Vec::new(), QuerySummary::empty());
     assert!(result.age_columns.is_empty());
 }
+
+#[test]
+fn test_rows_to_record_batch_with_age_columns_decodes_entities_and_scalars() {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+    use voyager_drivers::postgres::rows_to_record_batch_with_age_columns;
+
+    let v_a = r#"{"id": 1, "label": "ZzS", "properties": {"name": "A"}}::vertex"#;
+    let e_k =
+        r#"{"id": 2, "label": "ZK", "start_id": 1, "end_id": 3, "properties": {"w": 1}}::edge"#;
+    let v_b = r#"{"id": 3, "label": "ZzS", "properties": {"name": "B"}}::vertex"#;
+    let path = format!("[{v_a}, {e_k}, {v_b}]::path");
+
+    let cols = vec![
+        "a".to_string(),
+        "k".to_string(),
+        "p".to_string(),
+        "score".to_string(),
+        "plain".to_string(),
+    ];
+    let rows = vec![vec![
+        Some(v_a.to_string()),
+        Some(e_k.to_string()),
+        Some(path),
+        Some("42".to_string()),
+        Some("raw_text".to_string()),
+    ]];
+    let age_columns = vec![true, true, true, true, false];
+
+    let batch = rows_to_record_batch_with_age_columns(&cols, &rows, &age_columns).unwrap();
+    let schema = batch.schema();
+
+    assert_eq!(
+        schema
+            .field(0)
+            .metadata()
+            .get("voyager.encoding")
+            .map(String::as_str),
+        Some("json")
+    );
+    assert_eq!(
+        schema
+            .field(0)
+            .metadata()
+            .get("voyager.kind")
+            .map(String::as_str),
+        Some("node")
+    );
+    assert_eq!(
+        schema
+            .field(1)
+            .metadata()
+            .get("voyager.kind")
+            .map(String::as_str),
+        Some("relationship")
+    );
+    assert_eq!(
+        schema
+            .field(2)
+            .metadata()
+            .get("voyager.kind")
+            .map(String::as_str),
+        Some("path")
+    );
+    assert_eq!(schema.field(3).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(4).data_type(), &DataType::Utf8);
+    assert!(!schema.field(4).metadata().contains_key("voyager.encoding"));
+
+    let path_val: serde_json::Value =
+        serde_json::from_str(batch.column(2).as_string::<i32>().value(0)).unwrap();
+    assert_eq!(path_val["kind"], "path");
+    assert!(path_val.get("sequence").is_none());
+    assert_eq!(path_val["nodes"][0]["element_id"], serde_json::Value::Null);
+}

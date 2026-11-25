@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::config::Auth;
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
-use crate::postgres::agtype::rows_to_record_batch;
+use crate::postgres::agtype::rows_to_record_batch_with_age_columns;
 use crate::postgres::auth::{ScramClient, compute_md5_password};
 use crate::postgres::codec::{
     read_backend_message, write_frontend_message, write_frontend_messages, write_startup_message,
@@ -559,16 +559,15 @@ impl PostgresConnection {
 
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
-        let batch = rows_to_record_batch(&columns, &rows)?;
+        let age_cols = self.age_columns(&field_types);
+        let batch = rows_to_record_batch_with_age_columns(&columns, &rows, &age_cols)?;
         let batches = if batch.num_rows() > 0 || !columns.is_empty() {
             vec![batch]
         } else {
             Vec::new()
         };
 
-        let mut result = QueryResult::new(columns, batches, summary);
-        result.age_columns = self.age_columns(&field_types);
-        Ok(result)
+        Ok(QueryResult::new(columns, batches, summary))
     }
 
     /// Executes a parameterized statement via the PostgreSQL extended query protocol.
@@ -625,16 +624,16 @@ impl PostgresConnection {
         let mut summary = response.summary;
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
-        let batch = rows_to_record_batch(&response.columns, &response.rows)?;
+        let age_cols = self.age_columns(&response.field_types);
+        let batch =
+            rows_to_record_batch_with_age_columns(&response.columns, &response.rows, &age_cols)?;
         let batches = if batch.num_rows() > 0 || !response.columns.is_empty() {
             vec![batch]
         } else {
             Vec::new()
         };
 
-        let mut result = QueryResult::new(response.columns, batches, summary);
-        result.age_columns = self.age_columns(&response.field_types);
-        Ok(result)
+        Ok(QueryResult::new(response.columns, batches, summary))
     }
 
     /// Executes a prepared statement with the configured query timeout.

@@ -6,6 +6,8 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
+from voyager_ogm.entities import GraphNode, GraphPath, GraphRelationship
+
 
 def extract_graph_pattern_from_cypher(
     stmt: str,
@@ -66,59 +68,162 @@ def extract_graph_entities_from_records(
 
     nodes_dict: dict[str, dict[str, Any]] = {}
     edges_list: list[dict[str, Any]] = []
+    seen_edge_ids: set[str] = set()
+
+    def _add_graph_node(node: GraphNode, fallback_key: str) -> None:
+        n_id = str(
+            node.element_id
+            if node.element_id is not None
+            else (node.id if node.id is not None else fallback_key)
+        )
+        lbl = sorted(node.labels)[0] if node.labels else "Node"
+        props = dict(node.properties)
+        if "id" not in props and node.id is not None:
+            props["id"] = node.id
+        nodes_dict[n_id] = {
+            "id": n_id,
+            "label": lbl,
+            "group": lbl,
+            "size": 11,
+            "data": props,
+        }
+
+    def _add_graph_rel(rel: GraphRelationship) -> None:
+        src = str(
+            rel.start_element_id
+            if rel.start_element_id is not None
+            else (rel.start_id if rel.start_id is not None else "")
+        )
+        tgt = str(
+            rel.end_element_id
+            if rel.end_element_id is not None
+            else (rel.end_id if rel.end_id is not None else "")
+        )
+        if not (src and tgt):
+            return
+        r_id = str(
+            rel.element_id
+            if rel.element_id is not None
+            else (rel.id if rel.id is not None else f"rel_{len(edges_list)}")
+        )
+        if r_id in seen_edge_ids:
+            return
+        seen_edge_ids.add(r_id)
+        edges_list.append(
+            {
+                "id": r_id,
+                "source": src,
+                "target": tgt,
+                "label": rel.type or "CONNECTED_TO",
+                "color": "#64748b",
+                "data": dict(rel.properties),
+            }
+        )
+
+    def _collect_entities(val: Any, fallback_key: str) -> bool:
+        if isinstance(val, GraphNode):
+            _add_graph_node(val, fallback_key)
+            return True
+        if isinstance(val, GraphRelationship):
+            _add_graph_rel(val)
+            return True
+        if isinstance(val, GraphPath):
+            for n in val.nodes:
+                _add_graph_node(n, fallback_key)
+            for rel in val.relationships:
+                _add_graph_rel(rel)
+            return True
+        if isinstance(val, list):
+            found = False
+            for idx, item in enumerate(val):
+                if _collect_entities(item, f"{fallback_key}_{idx}"):
+                    found = True
+            return found
+        if isinstance(val, dict):
+            if "labels" in val or "_labels" in val or "label" in val:
+                n_id = str(val.get("id", val.get("_id", fallback_key)))
+                lbls = val.get("labels", val.get("_labels", [val.get("label", "Node")]))
+                lbl = lbls[0] if isinstance(lbls, list) and lbls else str(lbls)
+                props = dict(
+                    val.get(
+                        "properties",
+                        {
+                            pk: pv
+                            for pk, pv in val.items()
+                            if pk not in ("labels", "_labels", "label", "_id")
+                        },
+                    )
+                )
+                if "id" not in props and val.get("id") is not None:
+                    props["id"] = val.get("id")
+                nodes_dict[n_id] = {
+                    "id": n_id,
+                    "label": lbl,
+                    "group": lbl,
+                    "size": 11,
+                    "data": props,
+                }
+                return True
+            if "type" in val or "_type" in val:
+                e_type = str(val.get("type", val.get("_type", "CONNECTED_TO")))
+                src = str(
+                    val.get(
+                        "start",
+                        val.get("source", val.get("start_node_id", val.get("start_id", ""))),
+                    )
+                )
+                tgt = str(
+                    val.get(
+                        "end",
+                        val.get("target", val.get("end_node_id", val.get("end_id", ""))),
+                    )
+                )
+                if src and tgt:
+                    props = dict(
+                        val.get(
+                            "properties",
+                            {
+                                pk: pv
+                                for pk, pv in val.items()
+                                if pk
+                                not in (
+                                    "type",
+                                    "_type",
+                                    "start",
+                                    "source",
+                                    "end",
+                                    "target",
+                                    "start_id",
+                                    "end_id",
+                                )
+                            },
+                        )
+                    )
+                    edges_list.append(
+                        {
+                            "id": f"rel_{len(edges_list)}",
+                            "source": src,
+                            "target": tgt,
+                            "label": e_type,
+                            "color": "#64748b",
+                            "data": props,
+                        }
+                    )
+                    return True
+            found = False
+            for sub_k, sub_v in val.items():
+                if _collect_entities(sub_v, f"{fallback_key}_{sub_k}"):
+                    found = True
+            return found
+        return False
 
     has_entity_objects = False
     for r in records:
         if not isinstance(r, dict):
             continue
         for k, v in r.items():
-            if isinstance(v, dict):
-                if "labels" in v or "_labels" in v or "label" in v:
-                    n_id = str(v.get("id", v.get("_id", k)))
-                    lbls = v.get("labels", v.get("_labels", [v.get("label", "Node")]))
-                    lbl = lbls[0] if isinstance(lbls, list) and lbls else str(lbls)
-                    props = v.get(
-                        "properties",
-                        {
-                            pk: pv
-                            for pk, pv in v.items()
-                            if pk not in ("labels", "_labels", "label", "_id")
-                        },
-                    )
-                    if "id" not in props and v.get("id") is not None:
-                        props["id"] = v.get("id")
-                    nodes_dict[n_id] = {
-                        "id": n_id,
-                        "label": lbl,
-                        "group": lbl,
-                        "size": 11,
-                        "data": props,
-                    }
-                    has_entity_objects = True
-                elif "type" in v or "_type" in v:
-                    e_type = str(v.get("type", v.get("_type", "CONNECTED_TO")))
-                    src = str(v.get("start", v.get("source", v.get("start_node_id", ""))))
-                    tgt = str(v.get("end", v.get("target", v.get("end_node_id", ""))))
-                    if src and tgt:
-                        props = v.get(
-                            "properties",
-                            {
-                                pk: pv
-                                for pk, pv in v.items()
-                                if pk not in ("type", "_type", "start", "source", "end", "target")
-                            },
-                        )
-                        edges_list.append(
-                            {
-                                "id": f"rel_{len(edges_list)}",
-                                "source": src,
-                                "target": tgt,
-                                "label": e_type,
-                                "color": "#64748b",
-                                "data": props,
-                            }
-                        )
-                        has_entity_objects = True
+            if _collect_entities(v, k):
+                has_entity_objects = True
 
     if has_entity_objects and (nodes_dict or edges_list):
         return list(nodes_dict.values()), edges_list
