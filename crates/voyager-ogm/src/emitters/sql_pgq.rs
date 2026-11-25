@@ -4,6 +4,7 @@ use crate::ast::{
     AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LabelExpression, LiteralValue,
     NodeHandle, ProjectionItem, QueryAstArena, UnaryOp,
 };
+use crate::emitters::DisambiguatedColumn;
 use crate::error::{Error, Result};
 use crate::visitor::{AstVisitor, ColumnMeta, CompiledQuery};
 use std::collections::HashMap;
@@ -688,21 +689,14 @@ impl SqlPgqEmitter {
         arena: &QueryAstArena,
         expr_handle: NodeHandle,
         projections: &[ProjectionItem],
+        disambiguated: &[DisambiguatedColumn],
     ) -> Option<String> {
-        for proj in projections {
+        for (idx, proj) in projections.iter().enumerate() {
             if self.expressions_match(arena, proj.expression, expr_handle) {
-                if let Some(alias) = &proj.alias {
-                    return Some(alias.clone());
-                } else if let Ok(AstNode::PropertyAccess { property, .. }) =
-                    arena.get(proj.expression)
-                {
-                    return Some(property.clone());
-                } else if let Ok(AstNode::Identifier(id)) = arena.get(proj.expression) {
-                    return Some(id.clone());
-                }
+                return Some(disambiguated[idx].name.clone());
             }
         }
-        for proj in projections {
+        for (idx, proj) in projections.iter().enumerate() {
             if let Some(func) = proj.aggregation {
                 if let Ok(AstNode::FunctionCall { name, arguments }) = arena.get(expr_handle) {
                     let func_name_matches = match func {
@@ -718,67 +712,43 @@ impl SqlPgqEmitter {
                         && func_name_matches
                         && self.expressions_match(arena, proj.expression, arguments[0])
                     {
-                        if let Some(alias) = &proj.alias {
-                            return Some(alias.clone());
-                        } else {
-                            let base = self.get_expr_leaf_name(arena, proj.expression);
-                            return Some(format!("{func:?}({base})").to_ascii_lowercase());
-                        }
+                        return Some(disambiguated[idx].name.clone());
                     }
                 }
             }
         }
         if let Ok(AstNode::Identifier(id)) = arena.get(expr_handle) {
-            for proj in projections {
+            for (idx, proj) in projections.iter().enumerate() {
+                if disambiguated[idx].name == *id {
+                    return Some(disambiguated[idx].name.clone());
+                }
                 if let Some(alias) = &proj.alias {
                     if alias == id {
-                        return Some(alias.clone());
+                        return Some(disambiguated[idx].name.clone());
                     }
                 } else if let Ok(AstNode::PropertyAccess { property, .. }) =
                     arena.get(proj.expression)
                 {
                     if property == id {
-                        return Some(property.clone());
+                        return Some(disambiguated[idx].name.clone());
                     }
                 } else if let Ok(AstNode::Identifier(proj_id)) = arena.get(proj.expression) {
                     if proj_id == id {
-                        return Some(proj_id.clone());
+                        return Some(disambiguated[idx].name.clone());
                     }
                 }
             }
         }
         if let Ok(AstNode::PropertyAccess { property, .. }) = arena.get(expr_handle) {
-            for proj in projections {
+            for (idx, proj) in projections.iter().enumerate() {
                 if let Some(alias) = &proj.alias {
                     if alias == property {
-                        return Some(alias.clone());
+                        return Some(disambiguated[idx].name.clone());
                     }
                 }
             }
         }
         None
-    }
-
-    fn get_projection_column_name(
-        &self,
-        arena: &QueryAstArena,
-        proj: &ProjectionItem,
-        idx: usize,
-    ) -> String {
-        if let Some(alias) = &proj.alias {
-            alias.clone()
-        } else if let Ok(AstNode::PropertyAccess { property, .. }) = arena.get(proj.expression) {
-            property.clone()
-        } else if let Ok(AstNode::Identifier(id)) = arena.get(proj.expression) {
-            id.clone()
-        } else {
-            let leaf = self.get_expr_leaf_name(arena, proj.expression);
-            if !leaf.is_empty() {
-                leaf
-            } else {
-                format!("col_{idx}")
-            }
-        }
     }
 
     fn get_expr_leaf_name(&self, arena: &QueryAstArena, expr_handle: NodeHandle) -> String {
@@ -988,6 +958,7 @@ impl SqlPgqEmitter {
         &mut self,
         arena: &QueryAstArena,
         projections: &[ProjectionItem],
+        disambiguated: &[DisambiguatedColumn],
     ) -> Result<()> {
         self.buffer.push_str(" COLUMNS (");
         for (i, proj) in projections.iter().enumerate() {
@@ -1038,7 +1009,7 @@ impl SqlPgqEmitter {
                 self.emit_expression(arena, proj.expression, false)?;
             }
 
-            if let Some(alias) = &proj.alias {
+            if let Some(alias) = &disambiguated[i].emitted_alias {
                 self.buffer.push_str(" AS ");
                 self.buffer.push_str(alias);
             }
@@ -1162,6 +1133,9 @@ impl AstVisitor for SqlPgqEmitter {
                 }
             }
 
+            let disambiguated =
+                crate::emitters::disambiguate_projections(arena, &projections_list)?;
+
             let has_aggregates = projections_list.iter().any(|p| p.aggregation.is_some());
 
             let mut hidden_columns: Vec<(NodeHandle, String)> = Vec::new();
@@ -1170,17 +1144,17 @@ impl AstVisitor for SqlPgqEmitter {
             if let Some(order_by) = order_by_clause
                 && !order_by.is_empty()
             {
-                let mut returned_names: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for (idx, proj) in projections_list.iter().enumerate() {
-                    returned_names.insert(self.get_projection_column_name(arena, proj, idx));
-                }
+                let returned_names: std::collections::HashSet<String> =
+                    disambiguated.iter().map(|d| d.name.clone()).collect();
 
                 let mut alias_counter = 0;
                 for (order_expr, is_asc) in order_by {
-                    if let Some(col_name) =
-                        self.resolve_returned_column_name(arena, *order_expr, &projections_list)
-                    {
+                    if let Some(col_name) = self.resolve_returned_column_name(
+                        arena,
+                        *order_expr,
+                        &projections_list,
+                        &disambiguated,
+                    ) {
                         order_by_compiled.push((col_name, *is_asc));
                     } else {
                         if let Some(var) = self.is_whole_entity_expression(arena, *order_expr)? {
@@ -1245,11 +1219,12 @@ impl AstVisitor for SqlPgqEmitter {
                             } else {
                                 format!("col_{idx}")
                             };
-                            let col_alias = if inner_columns.iter().any(|(_, a)| a == &base_name) {
-                                format!("{base_name}_{idx}")
-                            } else {
-                                base_name
-                            };
+                            let mut col_alias = base_name.clone();
+                            let mut counter = 1usize;
+                            while inner_columns.iter().any(|(_, a)| a == &col_alias) {
+                                col_alias = format!("{base_name}_{counter}");
+                                counter += 1;
+                            }
                             inner_columns.push((expr_sql, col_alias.clone()));
                             col_alias
                         };
@@ -1271,29 +1246,37 @@ impl AstVisitor for SqlPgqEmitter {
                             }
                         };
 
-                        if let Some(alias) = &proj.alias {
+                        if let Some(alias) = &disambiguated[idx].emitted_alias {
                             outer_select_items.push(format!("{func_call} AS {alias}"));
                         } else {
                             outer_select_items.push(func_call);
                         }
                     } else {
-                        let col_alias = proj.alias.clone().unwrap_or_else(|| {
-                            if !fallback_name.is_empty() {
-                                fallback_name
-                            } else {
-                                format!("col_{idx}")
-                            }
-                        });
+                        let target_col_name = &disambiguated[idx].name;
 
-                        if let Some((_, existing_alias)) =
+                        let inner_alias = if let Some((_, existing_alias)) =
                             inner_columns.iter().find(|(e, _)| e == &expr_sql)
                         {
-                            outer_select_items.push(existing_alias.clone());
-                            group_by_keys.push(existing_alias.clone());
+                            existing_alias.clone()
                         } else {
+                            let mut col_alias = target_col_name.clone();
+                            let mut counter = 1usize;
+                            while inner_columns.iter().any(|(_, a)| a == &col_alias) {
+                                col_alias = format!("{target_col_name}_{counter}");
+                                counter += 1;
+                            }
                             inner_columns.push((expr_sql, col_alias.clone()));
-                            outer_select_items.push(col_alias.clone());
-                            group_by_keys.push(col_alias);
+                            col_alias
+                        };
+
+                        if inner_alias != *target_col_name {
+                            outer_select_items.push(format!("{inner_alias} AS {target_col_name}"));
+                        } else {
+                            outer_select_items.push(inner_alias.clone());
+                        }
+
+                        if !group_by_keys.contains(&inner_alias) {
+                            group_by_keys.push(inner_alias);
                         }
                     }
                 }
@@ -1339,12 +1322,11 @@ impl AstVisitor for SqlPgqEmitter {
             } else if !hidden_columns.is_empty() {
                 self.buffer.push_str(prefix);
                 self.buffer.push_str("SELECT ");
-                for (i, proj) in projections_list.iter().enumerate() {
+                for (i, d) in disambiguated.iter().enumerate() {
                     if i > 0 {
                         self.buffer.push_str(", ");
                     }
-                    self.buffer
-                        .push_str(&self.get_projection_column_name(arena, proj, i));
+                    self.buffer.push_str(&d.name);
                 }
                 self.buffer.push_str(" FROM GRAPH_TABLE (");
                 self.buffer.push_str(&self.graph_name);
@@ -1358,7 +1340,7 @@ impl AstVisitor for SqlPgqEmitter {
                         self.buffer.push_str(", ");
                     }
                     self.emit_expression(arena, proj.expression, false)?;
-                    if let Some(alias) = &proj.alias {
+                    if let Some(alias) = &disambiguated[i].emitted_alias {
                         self.buffer.push_str(" AS ");
                         self.buffer.push_str(alias);
                     }
@@ -1382,7 +1364,7 @@ impl AstVisitor for SqlPgqEmitter {
 
                 self.emit_matches_and_where(arena, matches)?;
 
-                self.emit_columns(arena, &projections_list)?;
+                self.emit_columns(arena, &projections_list, &disambiguated)?;
                 self.buffer.push(')');
             }
 
@@ -1540,7 +1522,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\" | \"HATES\"]-> (b IS \"Person\") COLUMNS (a.name, b.name))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\" | \"HATES\"]-> (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))"
         );
     }
 
@@ -2131,6 +2113,142 @@ mod tests {
         assert_eq!(
             compiled.statement,
             "SELECT COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(age) FILTER (WHERE age IS NOT NULL), []) AS ages FROM GRAPH_TABLE (g MATCH (n IS \"Person\") WHERE $p0 COLUMNS (n.age AS age))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_emitter_two_unaliased_same_name_properties() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("c"), vec!["Person"])
+            .r#return()
+            .field("a", "name", None::<String>)
+            .field("c", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, c.name AS name_1))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_emitter_three_unaliased_same_name_properties() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r1"))
+            .node(Some("b"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r2"))
+            .node(Some("c"), vec!["Person"])
+            .r#return()
+            .field("a", "name", None::<String>)
+            .field("b", "name", None::<String>)
+            .field("c", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") -[r2 IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, b.name AS name_1, c.name AS name_2))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_emitter_explicit_alias_colliding_with_default_name() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("c"), vec!["Person"])
+            .r#return()
+            .field("a", "name", Some("name"))
+            .field("c", "name", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name AS name, c.name AS name_1))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_emitter_aggregate_path_with_clashing_names() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("b"), vec!["Person"])
+            .field("a", "name", None::<String>)
+            .field("b", "name", None::<String>)
+            .select_property_aggregate("b", "age", AggregationFunc::Count, Some("cnt"));
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT name, name_1, COUNT(age) AS cnt FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (b IS \"Person\") COLUMNS (a.name AS name, b.name AS name_1, b.age AS age)) GROUP BY name, name_1"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_emitter_no_clash_output_unchanged() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("b"), vec!["Person"])
+            .r#return()
+            .field("a", "name", None::<String>)
+            .field("b", "age", None::<String>);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (b IS \"Person\") COLUMNS (a.name, b.age))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_emitter_order_by_disambiguated_column() {
+        let mut builder = QueryBuilder::new();
+        let c_name = builder.prop("c", "name");
+        builder
+            .r#match()
+            .node(Some("a"), vec!["Person"])
+            .to(vec!["KNOWS"], Some("r"))
+            .node(Some("c"), vec!["Person"])
+            .r#return()
+            .field("a", "name", None::<String>)
+            .field("c", "name", None::<String>)
+            .order_by(c_name, false);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, c.name AS name_1)) ORDER BY name_1 DESC NULLS FIRST"
         );
     }
 }

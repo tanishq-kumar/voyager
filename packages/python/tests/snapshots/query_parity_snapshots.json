@@ -35,7 +35,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[]-> (b IS \"Person\") COLUMNS (a.name, b.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[]-> (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
       "status": "ok"
     }
   },
@@ -84,7 +84,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") <-[w IS \"WORKS_AT\"]- (c IS \"Company\") COLUMNS (a.name, c.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") <-[w IS \"WORKS_AT\"]- (c IS \"Company\") COLUMNS (a.name, c.name AS name_1))",
       "status": "ok"
     }
   },
@@ -104,7 +104,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (b IS \"Person\") COLUMNS (a.name, b.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
       "status": "ok"
     }
   },
@@ -415,7 +415,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\"), (b IS \"Person\") -[r2 IS \"WORKS_AT\"]-> (c IS \"Company\") COLUMNS (a.name, b.name, c.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\"), (b IS \"Person\") -[r2 IS \"WORKS_AT\"]-> (c IS \"Company\") COLUMNS (a.name, b.name AS name_1, c.name AS name_2))",
       "status": "ok"
     }
   },
@@ -607,7 +607,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -626,7 +626,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -645,7 +645,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -664,7 +664,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -683,7 +683,7 @@
       "status": "ok"
     },
     "sql_pgq": {
-      "error_message": "Dialect 'sql_pgq' does not support feature: Whole entity column projection ('p') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables",
+      "error_message": "Dialect 'sql_pgq' does not support feature: Path variable assignment ('p = ...') - SQL:2023 PGQ GRAPH_TABLE does not support path variables",
       "error_type": "ValueError",
       "status": "unsupported"
     }
@@ -704,7 +704,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]->{2,2} (b IS \"Person\") COLUMNS (a.name, b.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]->{2,2} (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
       "status": "ok"
     }
   },
@@ -724,7 +724,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]->{1,3} (b IS \"Person\") COLUMNS (a.name, b.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]->{1,3} (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
       "status": "ok"
     }
   },
@@ -870,7 +870,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]- (b IS \"Person\") COLUMNS (a.name, b.name))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]- (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
       "status": "ok"
     }
   },

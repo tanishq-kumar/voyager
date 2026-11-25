@@ -375,7 +375,7 @@ def test_sql_pgq_accepts_alternative_relationship_types() -> None:
     compiled = query.compile("sql_pgq", graph_name="g")
     assert (
         compiled.statement
-        == 'SELECT * FROM GRAPH_TABLE (g MATCH (a IS "Person") -[r IS "KNOWS" | "HATES"]-> (b IS "Person") COLUMNS (a.name, b.name))'
+        == 'SELECT * FROM GRAPH_TABLE (g MATCH (a IS "Person") -[r IS "KNOWS" | "HATES"]-> (b IS "Person") COLUMNS (a.name, b.name AS name_1))'
     )
 
 
