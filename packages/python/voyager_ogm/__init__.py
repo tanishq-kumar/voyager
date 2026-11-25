@@ -39,6 +39,7 @@ from voyager_ogm.bridge import (
     validate_graph_name,
 )
 from voyager_ogm.config import VoyagerConfig, configure, get_config, reset_config
+from voyager_ogm.entities import GraphNode, GraphPath, GraphRelationship, json_default
 from voyager_ogm.expressions import (
     AliasedExpr,
     BinaryExpr,
@@ -245,7 +246,10 @@ __all__ = [
     "FieldConstraintError",
     "FullTextIndex",
     "FunctionExpr",
+    "GraphNode",
+    "GraphPath",
     "GraphQuery",
+    "GraphRelationship",
     "GraphViewer",
     "HybridQuery",
     "HybridSession",
@@ -313,6 +317,7 @@ __all__ = [
     "ingest_csv_relationships",
     "ingest_parquet",
     "ingest_parquet_relationships",
+    "json_default",
     "explain",
     "explore",
     "export_schema",

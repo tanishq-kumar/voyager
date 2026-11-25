@@ -685,6 +685,8 @@ struct ProbeReport {
     server_version: Option<String>,
     latency: Duration,
     dialect: &'static str,
+    /// Non-fatal findings printed as `warning:` lines; the connection itself is healthy.
+    warnings: Vec<String>,
 }
 
 async fn probe_connection(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
@@ -763,6 +765,7 @@ async fn probe_bolt(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         server_version,
         latency,
         dialect: "cypher",
+        warnings: Vec::new(),
     })
 }
 
@@ -787,16 +790,19 @@ async fn probe_postgres(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         || parsed.params.contains_key("age")
         || parsed.params.get("dialect").map(String::as_str) == Some("age");
 
+    // The connection is healthy either way: a server without SQL/PGQ is reported
+    // as a warning, since a plain postgresql:// URI does not say SQL/PGQ is wanted.
+    let mut warnings = Vec::new();
     if !uses_age {
         match voyager_drivers::introspect::probe_pgq_support(&mut connection).await {
             Ok(voyager_drivers::introspect::PgqSupport::Supported) => {}
             Ok(voyager_drivers::introspect::PgqSupport::Unsupported { message, .. }) => {
-                let _ = connection.close().await;
-                return Err(Failure::check(format!("doctor: {message}")));
+                warnings.push(format!(
+                    "{message}; SQL/PGQ queries will fail on this server"
+                ));
             }
             Err(error) => {
-                let _ = connection.close().await;
-                return Err(Failure::check(format!("doctor: {error}")));
+                warnings.push(format!("could not check SQL/PGQ support: {error}"));
             }
         }
     }
@@ -807,6 +813,7 @@ async fn probe_postgres(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         server_version,
         latency,
         dialect: if uses_age { "age" } else { "sql_pgq" },
+        warnings,
     })
 }
 
@@ -832,6 +839,7 @@ async fn probe_redis(parsed: &ParsedUri) -> Result<ProbeReport, Failure> {
         server_version,
         latency,
         dialect: "cypher",
+        warnings: Vec::new(),
     })
 }
 
@@ -885,6 +893,9 @@ fn print_connection_report(parsed: &ParsedUri, report: &ProbeReport) {
         "latency: {} (ping round trip)",
         format_latency(report.latency)
     );
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
     println!("status: ok");
 }
 

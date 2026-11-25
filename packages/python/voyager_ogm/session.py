@@ -22,6 +22,7 @@ from voyager_ogm.bridge import (
     validate_pagination_parameters,
 )
 from voyager_ogm.config import get_config
+from voyager_ogm.entities import serialize_records_for_arrow
 from voyager_ogm.expressions import ParamExpr
 from voyager_ogm.ingestion import (
     BulkIngestionPlan,
@@ -326,7 +327,7 @@ class ExecutionResult(list[dict[str, Any]]):
             except Exception:
                 pass
 
-        records = self._ensure_records()
+        records = serialize_records_for_arrow(self._ensure_records())
         df = pl.DataFrame(records) if records else pl.DataFrame()
         self._cached_df = df
         return df
@@ -355,7 +356,7 @@ class ExecutionResult(list[dict[str, Any]]):
             except Exception:
                 pass
 
-        records = self._ensure_records()
+        records = serialize_records_for_arrow(self._ensure_records())
         tbl = pa.Table.from_pylist(records) if records else pa.Table.from_pylist([])
         self._cached_table = tbl
         return tbl
@@ -469,15 +470,26 @@ class ExecutionResult(list[dict[str, Any]]):
             elif as_format == "polars":
                 import polars as pl
 
-                yield pl.DataFrame(chunk) if chunk else pl.DataFrame()
+                serialized_chunk = serialize_records_for_arrow(chunk)
+                yield pl.DataFrame(serialized_chunk) if serialized_chunk else pl.DataFrame()
             elif as_format == "arrow":
                 import pyarrow as pa
 
-                yield pa.Table.from_pylist(chunk) if chunk else pa.Table.from_pylist([])
+                serialized_chunk = serialize_records_for_arrow(chunk)
+                yield (
+                    pa.Table.from_pylist(serialized_chunk)
+                    if serialized_chunk
+                    else pa.Table.from_pylist([])
+                )
             elif as_format == "stream":
                 import pyarrow as pa
 
-                yield pa.Table.from_pylist(chunk) if chunk else pa.Table.from_pylist([])
+                serialized_chunk = serialize_records_for_arrow(chunk)
+                yield (
+                    pa.Table.from_pylist(serialized_chunk)
+                    if serialized_chunk
+                    else pa.Table.from_pylist([])
+                )
             else:
                 raise ValueError(f"Unsupported batch format: '{as_format}'")
 

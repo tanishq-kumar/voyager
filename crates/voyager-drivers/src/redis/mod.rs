@@ -19,7 +19,8 @@ pub use codec::{
 };
 pub use connection::RedisConnection;
 pub use graph::{
-    FalkorNode, FalkorQueryResult, FalkorRelationship, FalkorStatistics, resp_to_bolt_value,
+    FalkorCompactResult, FalkorGraphSchema, FalkorNode, FalkorQueryResult, FalkorRelationship,
+    FalkorStatistics, decode_compact_cell, resp_to_bolt_value,
 };
 pub use resp::{MAX_RESP_DEPTH, RespValue};
 pub use transaction::{RedisTransaction, format_cypher_with_params};

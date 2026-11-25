@@ -461,7 +461,7 @@ mod pg_stub_tests {
     }
 
     #[test]
-    fn doctor_and_introspect_report_clear_error_when_postgres_lacks_pgq() {
+    fn doctor_warns_and_introspect_fails_when_postgres_lacks_pgq() {
         let (addr, handle) = spawn_pg_without_pgq("19.0");
         let doctor = run(&[
             "doctor",
@@ -469,10 +469,19 @@ mod pg_stub_tests {
             &format!("postgresql://postgres:zz@{addr}/voyager_graph"),
         ]);
         let _ = handle.join();
-        assert_eq!(doctor.status.code(), Some(3), "{}", stderr(&doctor));
+        assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
+        assert!(
+            stdout(&doctor).contains("status: ok"),
+            "{}",
+            stdout(&doctor)
+        );
         let err = stderr(&doctor);
         assert!(
-            err.contains("doctor: PostgreSQL 19.0 does not support SQL/PGQ"),
+            err.contains("warning: PostgreSQL 19.0 does not support SQL/PGQ"),
+            "{err}"
+        );
+        assert!(
+            err.contains("SQL/PGQ queries will fail on this server"),
             "{err}"
         );
         assert!(
