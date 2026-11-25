@@ -14,8 +14,7 @@ import socket
 import uuid
 
 import pytest
-from spec_corpus_live_lib import _parse_age_scalar
-from voyager_ogm import Session, create_bridge
+from voyager_ogm import GraphNode, GraphRelationship, Session, create_bridge
 
 pytestmark = pytest.mark.live
 
@@ -68,16 +67,16 @@ def test_live_age_collect_nodes_and_relationships() -> None:
             )
             res_nodes = session.execute(query_nodes)
             assert len(res_nodes) == 1
-            raw_persons = res_nodes[0]["persons"]
-            decoded_persons = _parse_age_scalar(raw_persons)
+            decoded_persons = res_nodes[0]["persons"]
 
             assert isinstance(decoded_persons, list)
             assert len(decoded_persons) == 2
-            names = sorted(p["properties"]["name"] for p in decoded_persons)
+            assert all(isinstance(p, GraphNode) for p in decoded_persons)
+            names = sorted(p["name"] for p in decoded_persons)
             assert names == ["Alice", "Bob"]
             for p in decoded_persons:
-                assert p["kind"] == "node"
-                assert p["labels"] == [node_label]
+                assert p.labels == frozenset({node_label})
+                assert p.to_dict()["kind"] == "node"
 
             # 2. COLLECT(r)
             query_rels = (
@@ -87,15 +86,15 @@ def test_live_age_collect_nodes_and_relationships() -> None:
             )
             res_rels = session.execute(query_rels)
             assert len(res_rels) == 1
-            raw_rels = res_rels[0]["rels"]
-            decoded_rels = _parse_age_scalar(raw_rels)
+            decoded_rels = res_rels[0]["rels"]
 
             assert isinstance(decoded_rels, list)
             assert len(decoded_rels) == 1
             rel = decoded_rels[0]
-            assert rel["kind"] == "relationship"
-            assert rel["type"] == rel_type
-            assert rel["properties"]["since"] == 2021
+            assert isinstance(rel, GraphRelationship)
+            assert rel.type == rel_type
+            assert rel["since"] == 2021
+            assert rel.to_dict()["kind"] == "relationship"
 
             # 3. List literal [a, r, b] (stays a list of three, NOT a path)
             query_triple = (
@@ -106,17 +105,16 @@ def test_live_age_collect_nodes_and_relationships() -> None:
             )
             res_triple = session.execute(query_triple)
             assert len(res_triple) == 1
-            raw_triple = res_triple[0]["triple"]
-            decoded_triple = _parse_age_scalar(raw_triple)
+            decoded_triple = res_triple[0]["triple"]
 
             assert isinstance(decoded_triple, list)
             assert len(decoded_triple) == 3
-            assert decoded_triple[0]["kind"] == "node"
-            assert decoded_triple[0]["properties"]["name"] == "Alice"
-            assert decoded_triple[1]["kind"] == "relationship"
-            assert decoded_triple[1]["type"] == rel_type
-            assert decoded_triple[2]["kind"] == "node"
-            assert decoded_triple[2]["properties"]["name"] == "Bob"
+            assert isinstance(decoded_triple[0], GraphNode)
+            assert decoded_triple[0]["name"] == "Alice"
+            assert isinstance(decoded_triple[1], GraphRelationship)
+            assert decoded_triple[1].type == rel_type
+            assert isinstance(decoded_triple[2], GraphNode)
+            assert decoded_triple[2]["name"] == "Bob"
 
             # 4. Map literal with id/label/properties keys (stays a map, NOT a node)
             query_map = (
@@ -126,8 +124,7 @@ def test_live_age_collect_nodes_and_relationships() -> None:
             )
             res_map = session.execute(query_map)
             assert len(res_map) == 1
-            raw_map = res_map[0]["m"]
-            decoded_map = _parse_age_scalar(raw_map)
+            decoded_map = res_map[0]["m"]
 
             assert isinstance(decoded_map, dict)
             assert "kind" not in decoded_map

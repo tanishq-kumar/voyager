@@ -8,7 +8,8 @@ use pyo3::exceptions::{
     PyNotImplementedError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyString, PyTuple};
 
 pyo3::create_exception!(
     voyager_ogm._voyager_rs,
@@ -2879,7 +2880,78 @@ impl PyQueryBuilder {
     }
 }
 
-/// Converts a decoded Apache AGE value to Python objects.
+struct EntityConstructors {
+    node_from_trusted: Py<PyAny>,
+    rel_from_trusted: Py<PyAny>,
+    path_from_trusted: Py<PyAny>,
+}
+
+static ENTITY_CONSTRUCTORS: PyOnceLock<EntityConstructors> = PyOnceLock::new();
+
+fn entity_constructors<'py>(py: Python<'py>) -> PyResult<&'py EntityConstructors> {
+    ENTITY_CONSTRUCTORS.get_or_try_init(py, || {
+        let mod_entities = py.import("voyager_ogm.entities")?;
+        let node_cls = mod_entities.getattr("GraphNode")?;
+        let rel_cls = mod_entities.getattr("GraphRelationship")?;
+        let path_cls = mod_entities.getattr("GraphPath")?;
+        Ok(EntityConstructors {
+            node_from_trusted: node_cls.getattr("_from_trusted")?.unbind(),
+            rel_from_trusted: rel_cls.getattr("_from_trusted")?.unbind(),
+            path_from_trusted: path_cls.getattr("_from_trusted")?.unbind(),
+        })
+    })
+}
+
+fn is_entity_node_obj(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.get("kind").and_then(|v| v.as_str()) == Some("node")
+        && map.contains_key("id")
+        && map.get("labels").and_then(|v| v.as_array()).is_some()
+        && map.get("properties").and_then(|v| v.as_object()).is_some()
+        && map.keys().all(|k| {
+            matches!(
+                k.as_str(),
+                "kind" | "id" | "element_id" | "labels" | "properties"
+            )
+        })
+}
+
+fn is_entity_rel_obj(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.get("kind").and_then(|v| v.as_str()) == Some("relationship")
+        && map.contains_key("id")
+        && map.contains_key("start_id")
+        && map.contains_key("end_id")
+        && map.get("type").and_then(|v| v.as_str()).is_some()
+        && map.get("properties").and_then(|v| v.as_object()).is_some()
+        && map.keys().all(|k| {
+            matches!(
+                k.as_str(),
+                "kind"
+                    | "id"
+                    | "element_id"
+                    | "type"
+                    | "start_id"
+                    | "end_id"
+                    | "start_element_id"
+                    | "end_element_id"
+                    | "properties"
+            )
+        })
+}
+
+fn is_entity_path_obj(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.get("kind").and_then(|v| v.as_str()) == Some("path")
+        && map.get("nodes").and_then(|v| v.as_array()).is_some()
+        && map
+            .get("relationships")
+            .and_then(|v| v.as_array())
+            .is_some()
+        && map
+            .keys()
+            .all(|k| matches!(k.as_str(), "kind" | "nodes" | "relationships" | "sequence"))
+}
+
+/// Converts a canonical JSON value to Python objects, hydrating entity objects
+/// into `GraphNode`, `GraphRelationship`, and `GraphPath` instances.
 fn json_value_to_py<'py>(
     py: Python<'py>,
     value: &serde_json::Value,
@@ -2907,6 +2979,95 @@ fn json_value_to_py<'py>(
             Ok(list.into_any())
         }
         serde_json::Value::Object(values) => {
+            if is_entity_node_obj(values) {
+                let ctors = entity_constructors(py)?;
+                let id_py = values
+                    .get("id")
+                    .map(|v| json_value_to_py(py, v))
+                    .transpose()?
+                    .unwrap_or_else(|| py.None().into_bound(py));
+                let eid_py = values
+                    .get("element_id")
+                    .map(|v| json_value_to_py(py, v))
+                    .transpose()?
+                    .unwrap_or_else(|| py.None().into_bound(py));
+                let labels_arr = values["labels"].as_array().expect("checked");
+                let mut label_objs = Vec::with_capacity(labels_arr.len());
+                for lbl in labels_arr {
+                    if let Some(s) = lbl.as_str() {
+                        label_objs.push(s.into_pyobject(py)?.into_any());
+                    } else {
+                        label_objs.push(json_value_to_py(py, lbl)?);
+                    }
+                }
+                let labels_fs = PyFrozenSet::new(py, &label_objs)?;
+                let props_dict = PyDict::new(py);
+                for (pk, pv) in values["properties"].as_object().expect("checked") {
+                    props_dict.set_item(pk, json_value_to_py(py, pv)?)?;
+                }
+                return ctors
+                    .node_from_trusted
+                    .bind(py)
+                    .call1((id_py, eid_py, labels_fs, props_dict));
+            }
+
+            if is_entity_rel_obj(values) {
+                let ctors = entity_constructors(py)?;
+                let id_py = json_value_to_py(py, &values["id"])?;
+                let eid_py = values
+                    .get("element_id")
+                    .map(|v| json_value_to_py(py, v))
+                    .transpose()?
+                    .unwrap_or_else(|| py.None().into_bound(py));
+                let rel_type = values["type"].as_str().expect("checked");
+                let start_id_py = json_value_to_py(py, &values["start_id"])?;
+                let end_id_py = json_value_to_py(py, &values["end_id"])?;
+                let start_eid_py = values
+                    .get("start_element_id")
+                    .map(|v| json_value_to_py(py, v))
+                    .transpose()?
+                    .unwrap_or_else(|| py.None().into_bound(py));
+                let end_eid_py = values
+                    .get("end_element_id")
+                    .map(|v| json_value_to_py(py, v))
+                    .transpose()?
+                    .unwrap_or_else(|| py.None().into_bound(py));
+                let props_dict = PyDict::new(py);
+                for (pk, pv) in values["properties"].as_object().expect("checked") {
+                    props_dict.set_item(pk, json_value_to_py(py, pv)?)?;
+                }
+                return ctors.rel_from_trusted.bind(py).call1((
+                    id_py,
+                    eid_py,
+                    rel_type,
+                    start_id_py,
+                    end_id_py,
+                    props_dict,
+                    start_eid_py,
+                    end_eid_py,
+                ));
+            }
+
+            if is_entity_path_obj(values) {
+                let ctors = entity_constructors(py)?;
+                let nodes_arr = values["nodes"].as_array().expect("checked");
+                let rels_arr = values["relationships"].as_array().expect("checked");
+                let mut node_objs = Vec::with_capacity(nodes_arr.len());
+                for n in nodes_arr {
+                    node_objs.push(json_value_to_py(py, n)?);
+                }
+                let mut rel_objs = Vec::with_capacity(rels_arr.len());
+                for r in rels_arr {
+                    rel_objs.push(json_value_to_py(py, r)?);
+                }
+                let nodes_tuple = PyTuple::new(py, &node_objs)?;
+                let rels_tuple = PyTuple::new(py, &rel_objs)?;
+                return ctors
+                    .path_from_trusted
+                    .bind(py)
+                    .call1((nodes_tuple, rels_tuple));
+            }
+
             let dict = PyDict::new(py);
             for (key, value) in values {
                 dict.set_item(key, json_value_to_py(py, value)?)?;
@@ -2914,6 +3075,13 @@ fn json_value_to_py<'py>(
             Ok(dict.into_any())
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum Utf8ColMode {
+    Plain,
+    JsonEntities,
+    AgeAgtype,
 }
 
 fn record_batch_to_py_dicts<'py>(
@@ -2928,13 +3096,31 @@ fn record_batch_to_py_dicts<'py>(
     let num_cols = batch.num_columns();
     let schema = batch.schema();
     let fields = schema.fields();
+
+    let mut col_names = Vec::with_capacity(num_cols);
+    let mut utf8_modes = Vec::with_capacity(num_cols);
+    for (col_idx, field) in fields.iter().enumerate() {
+        col_names.push(PyString::intern(py, field.name().as_str()));
+        let meta = field.metadata();
+        let is_json = meta.get("voyager.encoding").is_some_and(|v| v == "json")
+            || meta.contains_key("voyager.kind");
+        let mode = if is_json {
+            Utf8ColMode::JsonEntities
+        } else if age_columns.get(col_idx).copied().unwrap_or(false) {
+            Utf8ColMode::AgeAgtype
+        } else {
+            Utf8ColMode::Plain
+        };
+        utf8_modes.push(mode);
+    }
+
     let list = PyList::empty(py);
 
     for row in 0..num_rows {
         let dict = PyDict::new(py);
         for col_idx in 0..num_cols {
             let col = batch.column(col_idx);
-            let field_name = fields[col_idx].name().as_str();
+            let field_name = &col_names[col_idx];
             if col.is_null(row) {
                 dict.set_item(field_name, py.None())?;
                 continue;
@@ -2963,25 +3149,41 @@ fn record_batch_to_py_dicts<'py>(
                 DataType::Utf8 => {
                     let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
                     let value = arr.value(row);
-                    if age_columns.get(col_idx).copied().unwrap_or(false) {
-                        let decoded = voyager_drivers::parse_agtype(value)
-                            .map(|value| voyager_drivers::age_value_to_canonical_json(&value))
-                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                        dict.set_item(field_name, json_value_to_py(py, &decoded)?)?;
-                    } else {
-                        dict.set_item(field_name, value)?;
+                    match utf8_modes[col_idx] {
+                        Utf8ColMode::JsonEntities => {
+                            let parsed: serde_json::Value = serde_json::from_str(value)
+                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                            dict.set_item(field_name, json_value_to_py(py, &parsed)?)?;
+                        }
+                        Utf8ColMode::AgeAgtype => {
+                            let decoded = voyager_drivers::parse_agtype(value)
+                                .map(|val| voyager_drivers::age_value_to_arrow_json(&val))
+                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                            dict.set_item(field_name, json_value_to_py(py, &decoded)?)?;
+                        }
+                        Utf8ColMode::Plain => {
+                            dict.set_item(field_name, value)?;
+                        }
                     }
                 }
                 DataType::LargeUtf8 => {
                     let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
                     let value = arr.value(row);
-                    if age_columns.get(col_idx).copied().unwrap_or(false) {
-                        let decoded = voyager_drivers::parse_agtype(value)
-                            .map(|value| voyager_drivers::age_value_to_canonical_json(&value))
-                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                        dict.set_item(field_name, json_value_to_py(py, &decoded)?)?;
-                    } else {
-                        dict.set_item(field_name, value)?;
+                    match utf8_modes[col_idx] {
+                        Utf8ColMode::JsonEntities => {
+                            let parsed: serde_json::Value = serde_json::from_str(value)
+                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                            dict.set_item(field_name, json_value_to_py(py, &parsed)?)?;
+                        }
+                        Utf8ColMode::AgeAgtype => {
+                            let decoded = voyager_drivers::parse_agtype(value)
+                                .map(|val| voyager_drivers::age_value_to_arrow_json(&val))
+                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                            dict.set_item(field_name, json_value_to_py(py, &decoded)?)?;
+                        }
+                        Utf8ColMode::Plain => {
+                            dict.set_item(field_name, value)?;
+                        }
                     }
                 }
                 _ => {

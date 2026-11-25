@@ -11,7 +11,10 @@ use arrow_schema::{DataType, Field, Schema};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::bolt::{BoltNode, BoltRelationship, BoltValue};
+use crate::bolt::{
+    BoltNode, BoltPath, BoltPoint2D, BoltRelationship, BoltUnboundRelationship, BoltValue,
+    build_bolt_record_batch,
+};
 use crate::engine::{QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
 use crate::redis::resp::RespValue;
@@ -601,5 +604,507 @@ impl FalkorQueryResult {
 
         let batch = self.to_arrow_record_batch()?;
         Ok(QueryResult::new(self.columns.clone(), vec![batch], summary))
+    }
+}
+
+/// Cached label, relationship type, and property key index tables for one FalkorDB graph.
+#[derive(Debug, Clone, Default)]
+pub struct FalkorGraphSchema {
+    /// Graph version reported in query statistics.
+    pub version: Option<i64>,
+    /// Label names indexed by compact label ID.
+    pub labels: Vec<String>,
+    /// Relationship type names indexed by compact type ID.
+    pub relationships: Vec<String>,
+    /// Property key names indexed by compact property ID.
+    pub properties: Vec<String>,
+}
+
+/// Parsed `--compact` query response from FalkorDB before schema resolution.
+#[derive(Debug, Clone)]
+pub struct FalkorCompactResult {
+    /// Column names from the `RETURN` projection.
+    pub columns: Vec<String>,
+    /// Raw compact cell values (`[scalar_type, raw_value]`) per row.
+    pub rows: Vec<Vec<RespValue>>,
+    /// Parsed query execution statistics.
+    pub statistics: FalkorStatistics,
+    /// Graph schema version reported in statistics (`Graph version: N`).
+    pub graph_version: Option<i64>,
+}
+
+/// Extracts `Graph version: N` from a FalkorDB statistics array.
+fn parse_graph_version(stats_array: &[RespValue]) -> Option<i64> {
+    for item in stats_array {
+        let line = item.to_string_lossy();
+        if let Some((key, val)) = line.split_once(':')
+            && key.trim() == "Graph version"
+        {
+            return val.trim().parse::<i64>().ok();
+        }
+    }
+    None
+}
+
+impl FalkorCompactResult {
+    /// Parses a complete `--compact` FalkorDB `GRAPH.QUERY` response.
+    pub fn parse(resp: RespValue) -> Result<Self> {
+        let items = match resp {
+            RespValue::Array(Some(arr)) => arr,
+            RespValue::Error(err) => {
+                return Err(NetError::ExecutionError(format!(
+                    "FalkorDB query error: {}",
+                    err
+                )));
+            }
+            other => {
+                return Err(NetError::ProtocolError(format!(
+                    "Expected RESP array from FalkorDB query, got {:?}",
+                    other
+                )));
+            }
+        };
+
+        if items.len() == 3 {
+            let columns = match &items[0] {
+                RespValue::Array(Some(cols)) => cols
+                    .iter()
+                    .map(|c| {
+                        if let Some(pair) = c.as_array()
+                            && pair.len() >= 2
+                        {
+                            pair[1].to_string_lossy()
+                        } else {
+                            c.to_string_lossy()
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            let mut rows = Vec::new();
+            if let RespValue::Array(Some(raw_rows)) = &items[1] {
+                for raw_row in raw_rows {
+                    if let RespValue::Array(Some(cells)) = raw_row {
+                        rows.push(cells.clone());
+                    }
+                }
+            }
+
+            let (statistics, graph_version) = match &items[2] {
+                RespValue::Array(Some(stats_arr)) => (
+                    FalkorStatistics::parse(stats_arr),
+                    parse_graph_version(stats_arr),
+                ),
+                _ => (FalkorStatistics::default(), None),
+            };
+
+            Ok(Self {
+                columns,
+                rows,
+                statistics,
+                graph_version,
+            })
+        } else if items.len() == 1 {
+            let (statistics, graph_version) = match &items[0] {
+                RespValue::Array(Some(stats_arr)) => (
+                    FalkorStatistics::parse(stats_arr),
+                    parse_graph_version(stats_arr),
+                ),
+                _ => (FalkorStatistics::default(), None),
+            };
+            Ok(Self {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                statistics,
+                graph_version,
+            })
+        } else {
+            Err(NetError::ProtocolError(format!(
+                "Unexpected FalkorDB query response array length: {} (expected 1 or 3)",
+                items.len()
+            )))
+        }
+    }
+
+    /// Returns `true` when decoding these rows requires schema lookups or refreshes.
+    pub fn needs_schema_refresh(&self, schema: Option<&FalkorGraphSchema>) -> bool {
+        let mut max_label = None;
+        let mut max_rel = None;
+        let mut max_prop = None;
+        for row in &self.rows {
+            for cell in row {
+                collect_compact_schema_indices(cell, &mut max_label, &mut max_rel, &mut max_prop);
+            }
+        }
+        if max_label.is_none() && max_rel.is_none() && max_prop.is_none() {
+            return false;
+        }
+        let Some(cached) = schema else {
+            return true;
+        };
+        if self.graph_version.is_some() && cached.version != self.graph_version {
+            return true;
+        }
+        if let Some(idx) = max_label
+            && idx >= cached.labels.len()
+        {
+            return true;
+        }
+        if let Some(idx) = max_rel
+            && idx >= cached.relationships.len()
+        {
+            return true;
+        }
+        if let Some(idx) = max_prop
+            && idx >= cached.properties.len()
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Converts compact rows into unified [`BoltValue`]s and builds an Arrow [`QueryResult`].
+    pub fn to_query_result(&self, schema: &FalkorGraphSchema) -> Result<QueryResult> {
+        let summary = self.statistics.to_query_summary();
+        if self.columns.is_empty() {
+            return Ok(QueryResult::empty(summary));
+        }
+
+        let mut bolt_rows = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let mut bolt_row = Vec::with_capacity(row.len());
+            for cell in row {
+                bolt_row.push(decode_compact_cell(cell, schema)?);
+            }
+            bolt_rows.push(bolt_row);
+        }
+
+        let batch = build_bolt_record_batch(&self.columns, &bolt_rows)?;
+        Ok(QueryResult::new(self.columns.clone(), vec![batch], summary))
+    }
+}
+
+fn update_max(slot: &mut Option<usize>, candidate: i64) {
+    if let Ok(idx) = usize::try_from(candidate) {
+        *slot = Some(slot.map_or(idx, |cur| cur.max(idx)));
+    }
+}
+
+fn collect_compact_schema_indices(
+    cell: &RespValue,
+    max_label: &mut Option<usize>,
+    max_rel: &mut Option<usize>,
+    max_prop: &mut Option<usize>,
+) {
+    let Some(pair) = cell.as_array() else {
+        return;
+    };
+    if pair.len() < 2 {
+        return;
+    }
+    let Some(scalar_type) = pair[0].as_i64() else {
+        return;
+    };
+    let val = &pair[1];
+    match scalar_type {
+        6 => {
+            if let Some(items) = val.as_array() {
+                for item in items {
+                    collect_compact_schema_indices(item, max_label, max_rel, max_prop);
+                }
+            }
+        }
+        7 => {
+            if let Some(fields) = val.as_array()
+                && fields.len() >= 5
+            {
+                if let Some(rel_id) = fields[1].as_i64() {
+                    update_max(max_rel, rel_id);
+                }
+                if let Some(props) = fields[4].as_array() {
+                    for prop in props {
+                        if let Some(p_arr) = prop.as_array()
+                            && p_arr.len() >= 3
+                        {
+                            if let Some(prop_id) = p_arr[0].as_i64() {
+                                update_max(max_prop, prop_id);
+                            }
+                            let nested = RespValue::Array(Some(p_arr[1..3].to_vec()));
+                            collect_compact_schema_indices(&nested, max_label, max_rel, max_prop);
+                        }
+                    }
+                }
+            }
+        }
+        8 => {
+            if let Some(fields) = val.as_array()
+                && fields.len() >= 3
+            {
+                if let Some(lbls) = fields[1].as_array() {
+                    for lbl in lbls {
+                        if let Some(lbl_id) = lbl.as_i64() {
+                            update_max(max_label, lbl_id);
+                        }
+                    }
+                }
+                if let Some(props) = fields[2].as_array() {
+                    for prop in props {
+                        if let Some(p_arr) = prop.as_array()
+                            && p_arr.len() >= 3
+                        {
+                            if let Some(prop_id) = p_arr[0].as_i64() {
+                                update_max(max_prop, prop_id);
+                            }
+                            let nested = RespValue::Array(Some(p_arr[1..3].to_vec()));
+                            collect_compact_schema_indices(&nested, max_label, max_rel, max_prop);
+                        }
+                    }
+                }
+            }
+        }
+        9 => {
+            if let Some(path_parts) = val.as_array()
+                && path_parts.len() >= 2
+            {
+                collect_compact_schema_indices(&path_parts[0], max_label, max_rel, max_prop);
+                collect_compact_schema_indices(&path_parts[1], max_label, max_rel, max_prop);
+            }
+        }
+        10 => {
+            if let Some(items) = val.as_array() {
+                let mut i = 1;
+                while i < items.len() {
+                    collect_compact_schema_indices(&items[i], max_label, max_rel, max_prop);
+                    i += 2;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn decode_compact_properties(
+    props_val: &RespValue,
+    schema: &FalkorGraphSchema,
+) -> Result<HashMap<String, BoltValue>> {
+    let mut map = HashMap::new();
+    let Some(items) = props_val.as_array() else {
+        return Ok(map);
+    };
+    for prop in items {
+        if let Some(parts) = prop.as_array()
+            && parts.len() >= 3
+        {
+            let prop_idx = parts[0].as_i64().unwrap_or(-1);
+            let key = usize::try_from(prop_idx)
+                .ok()
+                .and_then(|idx| schema.properties.get(idx))
+                .cloned()
+                .unwrap_or_else(|| format!("prop_{}", prop_idx));
+            let cell = RespValue::Array(Some(vec![parts[1].clone(), parts[2].clone()]));
+            map.insert(key, decode_compact_cell(&cell, schema)?);
+        }
+    }
+    Ok(map)
+}
+
+fn decode_compact_node(val: &RespValue, schema: &FalkorGraphSchema) -> Result<BoltNode> {
+    let fields = val.as_array().ok_or_else(|| {
+        NetError::ProtocolError(format!(
+            "Expected compact FalkorDB node array, got {:?}",
+            val
+        ))
+    })?;
+    if fields.len() < 3 {
+        return Err(NetError::ProtocolError(format!(
+            "Compact FalkorDB node array too short: {:?}",
+            fields
+        )));
+    }
+    let id = fields[0].as_i64().unwrap_or(0);
+    let mut labels = Vec::new();
+    if let Some(lbl_ids) = fields[1].as_array() {
+        for lbl_id_val in lbl_ids {
+            if let Some(lbl_id) = lbl_id_val.as_i64()
+                && let Ok(idx) = usize::try_from(lbl_id)
+                && let Some(name) = schema.labels.get(idx)
+            {
+                labels.push(name.clone());
+            }
+        }
+    }
+    let properties = decode_compact_properties(&fields[2], schema)?;
+    Ok(BoltNode {
+        id,
+        labels,
+        properties,
+        element_id: None,
+    })
+}
+
+fn decode_compact_edge(val: &RespValue, schema: &FalkorGraphSchema) -> Result<BoltRelationship> {
+    let fields = val.as_array().ok_or_else(|| {
+        NetError::ProtocolError(format!(
+            "Expected compact FalkorDB edge array, got {:?}",
+            val
+        ))
+    })?;
+    if fields.len() < 5 {
+        return Err(NetError::ProtocolError(format!(
+            "Compact FalkorDB edge array too short: {:?}",
+            fields
+        )));
+    }
+    let id = fields[0].as_i64().unwrap_or(0);
+    let rel_idx = fields[1].as_i64().unwrap_or(-1);
+    let rel_type = usize::try_from(rel_idx)
+        .ok()
+        .and_then(|idx| schema.relationships.get(idx))
+        .cloned()
+        .unwrap_or_default();
+    let start_node_id = fields[2].as_i64().unwrap_or(0);
+    let end_node_id = fields[3].as_i64().unwrap_or(0);
+    let properties = decode_compact_properties(&fields[4], schema)?;
+    Ok(BoltRelationship {
+        id,
+        start_node_id,
+        end_node_id,
+        rel_type,
+        properties,
+        element_id: None,
+        start_element_id: None,
+        end_element_id: None,
+    })
+}
+
+/// Decodes one compact FalkorDB `[scalar_type, value]` cell into a [`BoltValue`].
+pub fn decode_compact_cell(cell: &RespValue, schema: &FalkorGraphSchema) -> Result<BoltValue> {
+    let Some(pair) = cell.as_array() else {
+        return Ok(resp_to_bolt_value(cell));
+    };
+    if pair.len() < 2 {
+        return Ok(resp_to_bolt_value(cell));
+    }
+    let Some(scalar_type) = pair[0].as_i64() else {
+        return Ok(resp_to_bolt_value(cell));
+    };
+    let val = &pair[1];
+    match scalar_type {
+        0 | 1 => Ok(BoltValue::Null),
+        2 => Ok(BoltValue::String(val.to_string_lossy())),
+        3 => Ok(BoltValue::Integer(val.as_i64().unwrap_or(0))),
+        4 => Ok(BoltValue::Boolean(val.as_bool().unwrap_or(false))),
+        5 => Ok(BoltValue::Float(val.as_f64().unwrap_or(0.0))),
+        6 => {
+            let mut out = Vec::new();
+            if let Some(items) = val.as_array() {
+                out.reserve(items.len());
+                for item in items {
+                    out.push(decode_compact_cell(item, schema)?);
+                }
+            }
+            Ok(BoltValue::List(out))
+        }
+        7 => Ok(BoltValue::Relationship(decode_compact_edge(val, schema)?)),
+        8 => Ok(BoltValue::Node(decode_compact_node(val, schema)?)),
+        9 => {
+            let parts = val.as_array().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected compact FalkorDB path array, got {:?}",
+                    val
+                ))
+            })?;
+            if parts.len() < 2 {
+                return Err(NetError::ProtocolError(
+                    "Compact FalkorDB path array missing nodes or edges".to_string(),
+                ));
+            }
+            let raw_nodes = match decode_compact_cell(&parts[0], schema)? {
+                BoltValue::List(items) => items,
+                _ => Vec::new(),
+            };
+            let raw_edges = match decode_compact_cell(&parts[1], schema)? {
+                BoltValue::List(items) => items,
+                _ => Vec::new(),
+            };
+            let mut nodes = Vec::with_capacity(raw_nodes.len());
+            for n in raw_nodes {
+                if let BoltValue::Node(node) = n {
+                    nodes.push(node);
+                }
+            }
+            let mut rels = Vec::with_capacity(raw_edges.len());
+            let mut sequence = Vec::with_capacity(raw_edges.len() * 2);
+            for (idx, edge_val) in raw_edges.into_iter().enumerate() {
+                if let BoltValue::Relationship(rel) = edge_val {
+                    let forward = nodes
+                        .get(idx)
+                        .zip(nodes.get(idx + 1))
+                        .map(|(prev, next)| {
+                            rel.start_node_id == prev.id && rel.end_node_id == next.id
+                        })
+                        .unwrap_or(true);
+                    let rel_code = if forward {
+                        (idx + 1) as i64
+                    } else {
+                        -((idx + 1) as i64)
+                    };
+                    sequence.push(rel_code);
+                    sequence.push((idx + 1) as i64);
+                    rels.push(BoltUnboundRelationship {
+                        id: rel.id,
+                        rel_type: rel.rel_type,
+                        properties: rel.properties,
+                        element_id: None,
+                    });
+                }
+            }
+            Ok(BoltValue::Path(BoltPath {
+                nodes,
+                relationships: rels,
+                sequence,
+            }))
+        }
+        10 => {
+            let mut map = HashMap::new();
+            if let Some(items) = val.as_array() {
+                let mut i = 0;
+                while i + 1 < items.len() {
+                    let key = items[i].to_string_lossy();
+                    let v = decode_compact_cell(&items[i + 1], schema)?;
+                    map.insert(key, v);
+                    i += 2;
+                }
+            }
+            Ok(BoltValue::Map(map))
+        }
+        11 => {
+            if let Some(coords) = val.as_array()
+                && coords.len() >= 2
+            {
+                let lat = coords[0].as_f64().unwrap_or(0.0);
+                let lon = coords[1].as_f64().unwrap_or(0.0);
+                Ok(BoltValue::Point2D(BoltPoint2D {
+                    srid: 4326,
+                    x: lon,
+                    y: lat,
+                }))
+            } else {
+                Ok(resp_to_bolt_value(val))
+            }
+        }
+        12 => {
+            let mut floats = Vec::new();
+            if let Some(items) = val.as_array() {
+                for item in items {
+                    if let Some(f) = item.as_f64() {
+                        floats.push(BoltValue::Float(f));
+                    }
+                }
+            }
+            Ok(BoltValue::List(floats))
+        }
+        _ => Ok(resp_to_bolt_value(val)),
     }
 }

@@ -1,12 +1,9 @@
 //! Bolt asynchronous connection implementation over TCP or TLS streams.
 
-use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -349,127 +346,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         columns: &[String],
         records: &[Vec<BoltValue>],
     ) -> Result<RecordBatch> {
-        if columns.is_empty() {
-            let schema = Arc::new(Schema::empty());
-            return Ok(RecordBatch::new_empty(schema));
-        }
-
-        let num_rows = records.len();
-        let mut fields = Vec::with_capacity(columns.len());
-        let mut arrow_arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
-
-        for (col_idx, col_name) in columns.iter().enumerate() {
-            let mut int_count = 0usize;
-            let mut float_count = 0usize;
-            let mut bool_count = 0usize;
-            let mut non_null_count = 0usize;
-
-            for row in records {
-                match row.get(col_idx) {
-                    Some(BoltValue::Integer(_)) => {
-                        int_count += 1;
-                        non_null_count += 1;
-                    }
-                    Some(BoltValue::Float(_)) => {
-                        float_count += 1;
-                        non_null_count += 1;
-                    }
-                    Some(BoltValue::Boolean(_)) => {
-                        bool_count += 1;
-                        non_null_count += 1;
-                    }
-                    Some(BoltValue::Null) | None => {}
-                    Some(_) => {
-                        non_null_count += 1;
-                    }
-                }
-            }
-
-            if non_null_count > 0 && int_count == non_null_count {
-                // Pure homogeneous 64-bit integer column
-                let mut builder = Int64Builder::with_capacity(num_rows);
-                for row in records {
-                    match row.get(col_idx) {
-                        Some(BoltValue::Integer(i)) => builder.append_value(*i),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(col_name, DataType::Int64, true));
-                arrow_arrays.push(Arc::new(builder.finish()));
-            } else if non_null_count > 0 && float_count == non_null_count {
-                // Pure homogeneous 64-bit floating point column
-                let mut builder = Float64Builder::with_capacity(num_rows);
-                for row in records {
-                    match row.get(col_idx) {
-                        Some(BoltValue::Float(f)) => builder.append_value(*f),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(col_name, DataType::Float64, true));
-                arrow_arrays.push(Arc::new(builder.finish()));
-            } else if non_null_count > 0
-                && (int_count + float_count) == non_null_count
-                && int_count > 0
-                && float_count > 0
-            {
-                // Mixed numeric column (Integers + Floats) -> Safely promote to Float64
-                let mut builder = Float64Builder::with_capacity(num_rows);
-                for row in records {
-                    match row.get(col_idx) {
-                        Some(BoltValue::Float(f)) => builder.append_value(*f),
-                        Some(BoltValue::Integer(i)) => builder.append_value(*i as f64),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(col_name, DataType::Float64, true));
-                arrow_arrays.push(Arc::new(builder.finish()));
-            } else if non_null_count > 0 && bool_count == non_null_count {
-                // Pure homogeneous boolean column
-                let mut builder = BooleanBuilder::with_capacity(num_rows);
-                for row in records {
-                    match row.get(col_idx) {
-                        Some(BoltValue::Boolean(b)) => builder.append_value(*b),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(col_name, DataType::Boolean, true));
-                arrow_arrays.push(Arc::new(builder.finish()));
-            } else {
-                // Heterogeneous / variant column, pure string, or complex graph structures
-                // Safely format as UTF-8 string to guarantee ZERO SILENT DATA LOSS
-                let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
-                for row in records {
-                    match row.get(col_idx) {
-                        Some(BoltValue::String(s)) => builder.append_value(s),
-                        Some(BoltValue::Integer(i)) => builder.append_value(i.to_string()),
-                        Some(BoltValue::Float(f)) => builder.append_value(f.to_string()),
-                        Some(BoltValue::Boolean(b)) => builder.append_value(b.to_string()),
-                        Some(BoltValue::Date(d)) => builder.append_value(d.to_iso_string()),
-                        Some(BoltValue::Time(t)) => builder.append_value(t.to_iso_string()),
-                        Some(BoltValue::LocalTime(lt)) => builder.append_value(lt.to_iso_string()),
-                        Some(BoltValue::DateTime(dt)) => builder.append_value(dt.to_iso_string()),
-                        Some(BoltValue::LocalDateTime(ldt)) => {
-                            builder.append_value(ldt.to_iso_string())
-                        }
-                        Some(BoltValue::DateTimeZoneId(dtz)) => {
-                            builder.append_value(dtz.to_iso_string())
-                        }
-                        Some(BoltValue::Duration(dur)) => builder.append_value(dur.to_iso_string()),
-                        Some(BoltValue::Null) | None => builder.append_null(),
-                        Some(other) => {
-                            let json_str = serde_json::to_string(other)
-                                .unwrap_or_else(|_| format!("{:?}", other));
-                            builder.append_value(&json_str);
-                        }
-                    }
-                }
-                fields.push(Field::new(col_name, DataType::Utf8, true));
-                arrow_arrays.push(Arc::new(builder.finish()));
-            }
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, arrow_arrays).map_err(NetError::ArrowError)
+        crate::bolt::canonical::build_bolt_record_batch(columns, records)
     }
 
     /// Parses execution mutation metrics from a `SUCCESS` response metadata map.

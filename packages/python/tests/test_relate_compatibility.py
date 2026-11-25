@@ -19,6 +19,8 @@ from voyager_ogm import (
     AsyncRelateBridge,
     AsyncSession,
     Field,
+    GraphNode,
+    GraphRelationship,
     Node,
     Point,
     Query,
@@ -172,12 +174,15 @@ def test_relate_entity_return_and_graph_extraction(relate_conn):
     row = records[0]
 
     # Verify node extraction retains properties and labels
+    assert isinstance(row["p"], GraphNode)
     assert row["p"]["name"] == "Alice"
-    assert "RelatePerson" in row["p"]["labels"]
+    assert "RelatePerson" in row["p"].labels
+    assert isinstance(row["c"], GraphNode)
     assert row["c"]["name"] == "Paris"
-    assert "RelateCity" in row["c"]["labels"]
+    assert "RelateCity" in row["c"].labels
+    assert isinstance(row["r"], GraphRelationship)
     assert row["r"]["since"] == 2020
-    assert row["r"]["type"] == "LIVES_IN"
+    assert row["r"].type == "LIVES_IN"
 
     # Verify GraphViewer / NetworkX extractor extracts entities
     assert len(records.nodes) == 2

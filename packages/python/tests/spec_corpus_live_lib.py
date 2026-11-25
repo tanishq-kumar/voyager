@@ -29,6 +29,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 from voyager_ogm.agtype import decode_agtype
+from voyager_ogm.entities import GraphNode, GraphPath, GraphRelationship
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CORPUS_DIR = REPO_ROOT / "spec" / "corpus"
@@ -263,6 +264,36 @@ def canonicalize(value: Any, engine: str, *, parse_age: bool = True) -> Any:
         return value
     if isinstance(value, (int, float)):
         return value
+    if isinstance(value, GraphNode):
+        return {
+            "kind": "node",
+            "labels": sorted(str(label) for label in value.labels),
+            "properties": _strip_markers(
+                {
+                    str(k): canonicalize(v, engine, parse_age=False)
+                    for k, v in value.properties.items()
+                }
+            ),
+        }
+    if isinstance(value, GraphRelationship):
+        return {
+            "kind": "relationship",
+            "type": str(value.type),
+            "properties": _strip_markers(
+                {
+                    str(k): canonicalize(v, engine, parse_age=False)
+                    for k, v in value.properties.items()
+                }
+            ),
+        }
+    if isinstance(value, GraphPath):
+        return {
+            "kind": "path",
+            "nodes": [canonicalize(item, engine, parse_age=False) for item in value.nodes],
+            "relationships": [
+                canonicalize(item, engine, parse_age=False) for item in value.relationships
+            ],
+        }
     if isinstance(value, dict):
         kind = value.get("kind") if engine == "age" else None
         if kind == "node":

@@ -135,6 +135,42 @@ gql = query.compile("iso_gql")
 print(gql.statement)
 ```
 
+## Query Result Entities
+
+When a query projects whole graph entities (`RETURN a, r, p`, `collect(n)`, or `{node: a}`), `Session.execute()` returns read-only `GraphNode`, `GraphRelationship`, and `GraphPath` values on every engine and backend (Neo4j, Memgraph, FalkorDB, Apache AGE, and Relate):
+
+```python
+from voyager_ogm import GraphNode, GraphRelationship, GraphPath, json_default
+import json
+
+row = session.execute("MATCH p=(a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, p").first()
+
+node: GraphNode = row["a"]
+node.id  # engine integer ID (when present)
+node.element_id  # engine string element_id (Neo4j, Relate) or None
+node.labels  # frozenset[str], e.g. frozenset({"Person"})
+node.properties  # MappingProxyType read-only view of properties
+node["name"]  # subscript, "in", len(), .get(), .keys() read properties directly
+
+rel: GraphRelationship = row["r"]
+rel.type  # "KNOWS"
+rel.start_id  # start node ID
+rel.end_id  # end node ID
+rel["since"]  # relationship property access
+
+path: GraphPath = row["p"]
+path.nodes  # tuple[GraphNode, ...]
+path.relationships  # tuple[GraphRelationship, ...]
+len(path)  # number of relationships (hops)
+list(path)  # iterates over path.relationships
+
+# Equality and hashing use identity (element_id when not None, else id).
+# Convert to kind-tagged dicts or JSON with .to_dict() / json_default:
+payload = json.dumps(node, default=json_default)
+```
+
+In `execute_to_polars()` and `execute_to_arrow()`, entity columns contain the same `.to_dict()` shape serialized as JSON text (and native Arrow columns carry `voyager.encoding="json"` and, when homogeneous, `voyager.kind` metadata). SQL:2023 PGQ (PostgreSQL 19 and DuckPGQ) projects scalar columns only.
+
 ## Features
 
 - **Multi-dialect query compilation** for openCypher, SQL:2023 PGQ (`GRAPH_TABLE`), ISO GQL, and Apache AGE ([overview](https://github.com/tanishq-kumar/voyager/blob/main/README.md#1-multi-dialect-query-compilation), [example](https://github.com/tanishq-kumar/voyager/blob/main/examples/python/08_multi_dialect_compilation.py)).

@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from voyager_ogm.entities import GraphNode, GraphPath, GraphRelationship
+
 
 class _AgtypeParser:
     """Quote-aware recursive-descent parser for one AGE ``agtype`` value."""
@@ -126,22 +128,25 @@ class _AgtypeParser:
         if self.text.startswith("::vertex", self.pos):
             self.pos += len("::vertex")
             label = result.get("label")
-            return {
-                "kind": "node",
-                "id": result.get("id"),
-                "labels": [str(label)] if label else [],
-                "properties": dict(result.get("properties") or {}),
-            }
+            labels = frozenset({str(label)}) if label else frozenset()
+            props = dict(result.get("properties") or {})
+            return GraphNode._from_trusted(
+                node_id=result.get("id"),
+                element_id=None,
+                labels=labels,
+                properties=props,
+            )
         if self.text.startswith("::edge", self.pos):
             self.pos += len("::edge")
-            return {
-                "kind": "relationship",
-                "id": result.get("id"),
-                "type": str(result.get("label", "")),
-                "start_id": result.get("start_id"),
-                "end_id": result.get("end_id"),
-                "properties": dict(result.get("properties") or {}),
-            }
+            props = dict(result.get("properties") or {})
+            return GraphRelationship._from_trusted(
+                rel_id=result.get("id"),
+                element_id=None,
+                rel_type=str(result.get("label", "")),
+                start_id=result.get("start_id"),
+                end_id=result.get("end_id"),
+                properties=props,
+            )
         return result
 
     def parse_array(self) -> Any:
@@ -165,23 +170,18 @@ class _AgtypeParser:
         self.skip_whitespace()
         if self.text.startswith("::path", self.pos):
             self.pos += len("::path")
-            nodes: list[Any] = []
-            relationships: list[Any] = []
+            nodes: list[GraphNode] = []
+            relationships: list[GraphRelationship] = []
             for index, item in enumerate(items):
                 if index % 2 == 0:
-                    if not isinstance(item, dict) or item.get("kind") != "node":
+                    if not isinstance(item, GraphNode):
                         raise ValueError(f"Expected a vertex at path index {index}")
                     nodes.append(item)
                 else:
-                    if not isinstance(item, dict) or item.get("kind") != "relationship":
+                    if not isinstance(item, GraphRelationship):
                         raise ValueError(f"Expected an edge at path index {index}")
                     relationships.append(item)
-            return {
-                "kind": "path",
-                "nodes": nodes,
-                "relationships": relationships,
-                "sequence": list(range(1, len(relationships) + 1)),
-            }
+            return GraphPath._from_trusted(tuple(nodes), tuple(relationships))
         return items
 
 
@@ -192,10 +192,11 @@ def decode_agtype(text: str) -> Any:
         text: Raw value as returned by PostgreSQL for an ``agtype`` column.
 
     Returns:
-        The decoded Python value. Vertices and edges are maps tagged with
-        ``kind`` set to ``"node"`` or ``"relationship"``; a path is a map with
-        ``kind`` set to ``"path"`` plus its ``nodes`` and ``relationships``.
-        Lists and maps recurse, and scalars keep their Python type.
+        The decoded Python value. Vertices, edges, and paths become
+        :class:`~voyager_ogm.entities.GraphNode`,
+        :class:`~voyager_ogm.entities.GraphRelationship`, and
+        :class:`~voyager_ogm.entities.GraphPath`. Lists and maps recurse, and
+        scalars keep their Python type.
 
     Raises:
         ValueError: If the text is not a well-formed ``agtype`` value.

@@ -9,8 +9,8 @@ pub mod params;
 pub mod transaction;
 
 pub use agtype::{
-    AgeEdge, AgePath, AgeValue, AgeVertex, age_value_to_canonical_json, clean_agtype_string,
-    parse_agtype, rows_to_record_batch,
+    AgeEdge, AgePath, AgeValue, AgeVertex, age_value_to_arrow_json, age_value_to_canonical_json,
+    clean_agtype_string, parse_agtype, rows_to_record_batch, rows_to_record_batch_with_age_columns,
 };
 pub use auth::{ScramClient, compute_md5_password, generate_client_nonce};
 pub use codec::{
