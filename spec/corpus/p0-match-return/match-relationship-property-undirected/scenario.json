@@ -8,7 +8,7 @@
     "scenario": "[5] Return two subgraphs with bound undirected relationship"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match3-rel-property",
   "rows": "unordered",
   "targets": {
     "cypher": {

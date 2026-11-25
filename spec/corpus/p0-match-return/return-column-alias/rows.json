@@ -1,0 +1,16 @@
+{
+  "columns": [
+    "ColumnName"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "node",
+        "labels": [
+          "Singleton"
+        ],
+        "properties": {}
+      }
+    ]
+  ]
+}

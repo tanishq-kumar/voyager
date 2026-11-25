@@ -8,7 +8,7 @@
     "scenario": "Node pattern combining label and inline literal property map"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "person-alice",
   "rows": "unordered",
   "targets": {
     "cypher": {

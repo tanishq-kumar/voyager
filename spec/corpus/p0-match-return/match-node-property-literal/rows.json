@@ -1,0 +1,16 @@
+{
+  "columns": [
+    "n"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "node",
+        "labels": [],
+        "properties": {
+          "name": "bar"
+        }
+      }
+    ]
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voyager-ogm.org/schemas/corpus-fixture/v1.json",
+  "title": "VoyagerCorpusFixtureV1",
+  "description": "Engine-neutral setup graph shared by one or more corpus scenarios. Loaders write it into each engine with that engine's own client, never through Voyager's write compilation. Node and relationship identifiers are local to the fixture: they link relationships to their endpoints and are not loaded as properties.",
+  "type": "object",
+  "required": ["nodes", "relationships"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "description": "Optional self-reference to this schema.",
+      "type": "string"
+    },
+    "description": {
+      "description": "Short human-readable summary of the setup graph.",
+      "type": "string"
+    },
+    "nodes": {
+      "description": "Nodes of the setup graph, in load order.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Node" }
+    },
+    "relationships": {
+      "description": "Relationships of the setup graph, in load order.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Relationship" }
+    }
+  },
+  "$defs": {
+    "Properties": {
+      "description": "Property map. Values are JSON scalars, lists or maps; they load as the engine's native property value.",
+      "type": "object",
+      "additionalProperties": {
+        "type": ["null", "boolean", "integer", "number", "string", "array", "object"]
+      }
+    },
+    "Node": {
+      "type": "object",
+      "required": ["id", "labels", "properties"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Fixture-local identifier referenced by relationship endpoints.",
+          "type": "string",
+          "minLength": 1
+        },
+        "labels": {
+          "description": "Node labels. May be empty for an unlabeled node.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "properties": { "$ref": "#/$defs/Properties" }
+      }
+    },
+    "Relationship": {
+      "type": "object",
+      "required": ["id", "type", "start", "end", "properties"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Fixture-local relationship identifier.",
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "description": "Relationship type.",
+          "type": "string",
+          "minLength": 1
+        },
+        "start": {
+          "description": "Fixture-local id of the start node.",
+          "type": "string",
+          "minLength": 1
+        },
+        "end": {
+          "description": "Fixture-local id of the end node.",
+          "type": "string",
+          "minLength": 1
+        },
+        "properties": { "$ref": "#/$defs/Properties" }
+      }
+    }
+  }
+}

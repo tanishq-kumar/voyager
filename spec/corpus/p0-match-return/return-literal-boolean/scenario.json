@@ -8,7 +8,7 @@
     "scenario": "RETURN boolean literal with column alias"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "single-node",
   "rows": "unordered",
   "targets": {
     "cypher": {

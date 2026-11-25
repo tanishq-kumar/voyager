@@ -8,7 +8,7 @@
     "scenario": "[4] Simple node inline property predicate"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match1-inline-property",
   "rows": "unordered",
   "targets": {
     "cypher": {

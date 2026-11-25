@@ -1,0 +1,16 @@
+{
+  "columns": [
+    "r"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "relationship",
+        "type": "KNOWS",
+        "properties": {
+          "since": 2020
+        }
+      }
+    ]
+  ]
+}

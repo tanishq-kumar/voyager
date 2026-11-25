@@ -8,7 +8,7 @@
     "scenario": "[2] Returning multiple node property values"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "return-multiple-properties",
   "rows": "unordered",
   "targets": {
     "cypher": {

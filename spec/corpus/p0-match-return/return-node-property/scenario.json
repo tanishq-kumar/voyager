@@ -8,7 +8,7 @@
     "scenario": "[2] Returning a node property value"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "return-node-property",
   "rows": "unordered",
   "targets": {
     "cypher": {

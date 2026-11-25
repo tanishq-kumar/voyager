@@ -1,0 +1,49 @@
+{
+  "description": "Match2 [6]: node a has KNOWS and HATES and WONDERS outgoing relationships to b and c.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": [],
+      "properties": {
+        "name": "A"
+      }
+    },
+    {
+      "id": "b",
+      "labels": [],
+      "properties": {
+        "name": "B"
+      }
+    },
+    {
+      "id": "c",
+      "labels": [],
+      "properties": {
+        "name": "C"
+      }
+    }
+  ],
+  "relationships": [
+    {
+      "id": "knows",
+      "type": "KNOWS",
+      "start": "a",
+      "end": "b",
+      "properties": {}
+    },
+    {
+      "id": "hates",
+      "type": "HATES",
+      "start": "a",
+      "end": "c",
+      "properties": {}
+    },
+    {
+      "id": "wonders",
+      "type": "WONDERS",
+      "start": "a",
+      "end": "c",
+      "properties": {}
+    }
+  ]
+}

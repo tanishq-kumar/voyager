@@ -1,0 +1,25 @@
+{
+  "description": "Match1 [2]: one A, one B with a name, and one unlabeled named node.",
+  "nodes": [
+    {
+      "id": "a0",
+      "labels": ["A"],
+      "properties": {}
+    },
+    {
+      "id": "b0",
+      "labels": ["B"],
+      "properties": {
+        "name": "b"
+      }
+    },
+    {
+      "id": "n0",
+      "labels": [],
+      "properties": {
+        "name": "c"
+      }
+    }
+  ],
+  "relationships": []
+}

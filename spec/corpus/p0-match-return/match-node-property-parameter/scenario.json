@@ -10,7 +10,7 @@
   "params": {
     "name": "Alice"
   },
-  "fixture": null,
+  "fixture": "person-alice",
   "rows": "unordered",
   "targets": {
     "cypher": {

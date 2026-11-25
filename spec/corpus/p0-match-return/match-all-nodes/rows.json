@@ -1,0 +1,36 @@
+{
+  "columns": [
+    "n"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "node",
+        "labels": [
+          "A"
+        ],
+        "properties": {}
+      }
+    ],
+    [
+      {
+        "kind": "node",
+        "labels": [
+          "B"
+        ],
+        "properties": {
+          "name": "b"
+        }
+      }
+    ],
+    [
+      {
+        "kind": "node",
+        "labels": [],
+        "properties": {
+          "name": "c"
+        }
+      }
+    ]
+  ]
+}

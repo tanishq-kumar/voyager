@@ -8,7 +8,7 @@
     "scenario": "[6] Match relationships with multiple types"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match2-multiple-types",
   "rows": "unordered",
   "targets": {
     "cypher": {

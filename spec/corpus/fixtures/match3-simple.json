@@ -1,0 +1,24 @@
+{
+  "description": "Match3 [2]/[3]: a single LOOP relationship from an A node to a B node.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": ["A"],
+      "properties": {}
+    },
+    {
+      "id": "b",
+      "labels": ["B"],
+      "properties": {}
+    }
+  ],
+  "relationships": [
+    {
+      "id": "loop",
+      "type": "LOOP",
+      "start": "a",
+      "end": "b",
+      "properties": {}
+    }
+  ]
+}

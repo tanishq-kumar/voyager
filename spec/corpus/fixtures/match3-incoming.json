@@ -1,0 +1,40 @@
+{
+  "description": "Incoming R relationship from B to A plus an unrelated T relationship from C to B.",
+  "nodes": [
+    {
+      "id": "a",
+      "labels": ["A"],
+      "properties": {
+        "num": 1
+      }
+    },
+    {
+      "id": "b",
+      "labels": ["B"],
+      "properties": {
+        "num": 2
+      }
+    },
+    {
+      "id": "c",
+      "labels": ["C"],
+      "properties": {}
+    }
+  ],
+  "relationships": [
+    {
+      "id": "incoming",
+      "type": "R",
+      "start": "b",
+      "end": "a",
+      "properties": {}
+    },
+    {
+      "id": "unrelated",
+      "type": "T",
+      "start": "c",
+      "end": "b",
+      "properties": {}
+    }
+  ]
+}

@@ -8,7 +8,7 @@
     "scenario": "Incoming single-hop directed relationship with edge type"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match3-incoming",
   "rows": "unordered",
   "targets": {
     "cypher": {

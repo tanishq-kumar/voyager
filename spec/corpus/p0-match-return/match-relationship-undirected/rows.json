@@ -1,0 +1,51 @@
+{
+  "columns": [
+    "a",
+    "r",
+    "b"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "node",
+        "labels": [
+          "A"
+        ],
+        "properties": {}
+      },
+      {
+        "kind": "relationship",
+        "type": "LOOP",
+        "properties": {}
+      },
+      {
+        "kind": "node",
+        "labels": [
+          "B"
+        ],
+        "properties": {}
+      }
+    ],
+    [
+      {
+        "kind": "node",
+        "labels": [
+          "B"
+        ],
+        "properties": {}
+      },
+      {
+        "kind": "relationship",
+        "type": "LOOP",
+        "properties": {}
+      },
+      {
+        "kind": "node",
+        "labels": [
+          "A"
+        ],
+        "properties": {}
+      }
+    ]
+  ]
+}

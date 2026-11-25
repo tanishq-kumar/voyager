@@ -54,7 +54,7 @@
       "type": "object"
     },
     "fixture": {
-      "description": "Reference to an engine fixture dataset, or null if empty/none.",
+      "description": "Base name of an engine-neutral fixture under spec/corpus/fixtures/<name>.json, or null only when a scenario intentionally runs on an empty graph.",
       "type": ["string", "null"]
     },
     "rows": {

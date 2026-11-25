@@ -1,0 +1,21 @@
+{
+  "columns": [
+    "r"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "relationship",
+        "type": "HATES",
+        "properties": {}
+      }
+    ],
+    [
+      {
+        "kind": "relationship",
+        "type": "KNOWS",
+        "properties": {}
+      }
+    ]
+  ]
+}

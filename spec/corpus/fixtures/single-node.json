@@ -1,0 +1,11 @@
+{
+  "description": "One empty unlabeled node for scenarios that return literals once per match.",
+  "nodes": [
+    {
+      "id": "n",
+      "labels": [],
+      "properties": {}
+    }
+  ],
+  "relationships": []
+}

@@ -1,0 +1,14 @@
+{
+  "columns": [
+    "r"
+  ],
+  "rows": [
+    [
+      {
+        "kind": "relationship",
+        "type": "T1",
+        "properties": {}
+      }
+    ]
+  ]
+}

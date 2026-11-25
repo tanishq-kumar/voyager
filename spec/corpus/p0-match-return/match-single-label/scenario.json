@@ -8,7 +8,7 @@
     "scenario": "Single-label node match returning node"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match-single-label",
   "rows": "unordered",
   "targets": {
     "cypher": {

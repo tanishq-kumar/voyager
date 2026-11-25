@@ -8,7 +8,7 @@
     "scenario": "Projecting relationship property"
   },
   "params": {},
-  "fixture": null,
+  "fixture": "match3-rel-property",
   "rows": "unordered",
   "targets": {
     "cypher": {
