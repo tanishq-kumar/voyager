@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::config::Auth;
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
-use crate::postgres::agtype::rows_to_record_batch_with_age_columns;
+use crate::postgres::agtype::rows_to_record_batch_with_column_types;
 use crate::postgres::auth::{ScramClient, compute_md5_password};
 use crate::postgres::codec::{
     read_backend_message, write_frontend_message, write_frontend_messages, write_startup_message,
@@ -560,7 +560,8 @@ impl PostgresConnection {
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
         let age_cols = self.age_columns(&field_types);
-        let batch = rows_to_record_batch_with_age_columns(&columns, &rows, &age_cols)?;
+        let batch =
+            rows_to_record_batch_with_column_types(&columns, &rows, &age_cols, &field_types)?;
         let batches = if batch.num_rows() > 0 || !columns.is_empty() {
             vec![batch]
         } else {
@@ -625,8 +626,12 @@ impl PostgresConnection {
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
         let age_cols = self.age_columns(&response.field_types);
-        let batch =
-            rows_to_record_batch_with_age_columns(&response.columns, &response.rows, &age_cols)?;
+        let batch = rows_to_record_batch_with_column_types(
+            &response.columns,
+            &response.rows,
+            &age_cols,
+            &response.field_types,
+        )?;
         let batches = if batch.num_rows() > 0 || !response.columns.is_empty() {
             vec![batch]
         } else {
