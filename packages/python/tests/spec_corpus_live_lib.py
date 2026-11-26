@@ -25,7 +25,8 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.parse import quote
 
 from conftest import get_test_host as test_host
 from jsonschema import Draft202012Validator
@@ -62,6 +63,25 @@ ENGINE_TARGET: dict[str, str] = {
 }
 
 ENGINES: tuple[str, ...] = ("neo4j", "memgraph", "falkordb", "age", "pg19")
+
+#: Execution lanes, from the reference client to Voyager's own clients.
+#:
+#: ``official`` runs through the engine's own Python client (today's behaviour).
+#: ``bridge`` runs through ``Session`` over the Python bridge.
+#: ``native`` runs through ``Session`` with ``backend="native"``.
+LANES: tuple[str, ...] = ("official", "bridge", "native")
+
+#: Default lane preserves today's behaviour.
+DEFAULT_LANE = "official"
+
+#: Lanes available for each engine.  Every engine has a Python bridge and a native
+#: client (Bolt for Neo4j/Memgraph, RESP for FalkorDB, PostgreSQL wire for AGE and
+#: SQL/PGQ), so all three lanes apply everywhere.
+ENGINE_LANES: dict[str, tuple[str, ...]] = {engine: LANES for engine in ENGINES}
+
+#: Known, reviewed lane differences.  Empty unless a difference is observed and
+#: understood; the live harness fails when an entry stops matching.
+KNOWN_LANE_DIFFERENCES_PATH = CORPUS_DIR / "known-lane-differences.json"
 
 #: Engines that name unaliased columns after the Cypher expression text verbatim.
 CYPHER_COLUMN_ENGINES: frozenset[str] = frozenset({"neo4j", "memgraph", "falkordb"})
@@ -165,6 +185,98 @@ def supported_engines(scenario: dict[str, Any]) -> list[str]:
 def scenario_parameters(scenario: dict[str, Any], compiled: dict[str, Any]) -> dict[str, Any]:
     """Merge compiler-extracted parameters with the scenario's user parameters."""
     return {**compiled.get("parameters", {}), **scenario.get("params", {})}
+
+
+def select_lanes(value: str | None) -> tuple[str, ...]:
+    """Resolve a lane selector into the lanes to run.
+
+    ``None`` and an empty string keep the default ``official`` lane; ``"all"``
+    selects every lane; otherwise the value must name one lane from
+    :data:`LANES`.
+    """
+    if value is None or not value.strip():
+        return (DEFAULT_LANE,)
+    lane = value.strip().lower()
+    if lane == "all":
+        return LANES
+    if lane not in LANES:
+        raise ValueError(f"Unknown lane {value!r}; expected one of {', '.join(LANES)} or 'all'")
+    return (lane,)
+
+
+def lane_applies(engine: str, lane: str) -> bool:
+    """Return whether ``engine`` has an execution path for ``lane``."""
+    return lane in ENGINE_LANES.get(engine, ())
+
+
+def load_known_lane_differences(
+    path: Path = KNOWN_LANE_DIFFERENCES_PATH,
+) -> list[dict[str, Any]]:
+    """Load the known lane-difference list, returning an empty list when absent."""
+    if not path.is_file():
+        return []
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, list) or not all(isinstance(entry, dict) for entry in document):
+        raise ValueError(f"{path.name} must contain a JSON array of objects")
+    return document
+
+
+def known_difference_matches(entry: dict[str, Any], difference: ResultDifference) -> bool:
+    """Return whether a known-difference entry covers one observed difference.
+
+    ``column`` is optional: without it the entry covers every difference in the
+    scenario for that engine and lane.
+    """
+    if entry.get("engine") != difference.engine:
+        return False
+    if entry.get("lane") != difference.lane:
+        return False
+    if entry.get("scenario") != difference.scenario:
+        return False
+    column = entry.get("column")
+    return column is None or column == difference.column
+
+
+def partition_known_differences(
+    differences: Sequence[ResultDifference],
+    entries: Sequence[dict[str, Any]],
+) -> tuple[list[tuple[ResultDifference, dict[str, Any]]], list[ResultDifference]]:
+    """Split observed differences into known pairs and unexplained differences."""
+    known: list[tuple[ResultDifference, dict[str, Any]]] = []
+    unexplained: list[ResultDifference] = []
+    for difference in differences:
+        match = next(
+            (entry for entry in entries if known_difference_matches(entry, difference)),
+            None,
+        )
+        if match is None:
+            unexplained.append(difference)
+        else:
+            known.append((difference, match))
+    return known, unexplained
+
+
+def stale_known_differences(
+    entries: Sequence[dict[str, Any]],
+    differences: Sequence[ResultDifference],
+    *,
+    engine: str,
+    lane: str,
+    scenario: str,
+) -> list[dict[str, Any]]:
+    """Return entries for this engine/lane/scenario that no longer match a difference."""
+    scoped = [
+        entry
+        for entry in entries
+        if entry.get("engine") == engine
+        and entry.get("lane") == lane
+        and entry.get("scenario") == scenario
+    ]
+    return [
+        entry
+        for entry in scoped
+        if not any(known_difference_matches(entry, difference) for difference in differences)
+    ]
 
 
 def spec_projection_aliases(spec: dict[str, Any]) -> list[str | None]:
@@ -496,6 +608,159 @@ def canonical_rows(
 ) -> tuple[list[str], list[list[Any]]]:
     """Canonicalize a result set, preserving column order."""
     return list(columns), [[canonicalize(value, engine) for value in row] for row in rows]
+
+
+@dataclass(frozen=True)
+class ResultDifference:
+    """One unexplained or known difference between ``rows.json`` and an execution."""
+
+    scenario: str
+    engine: str
+    lane: str
+    column: str | None
+    expected: Any
+    actual: Any
+    message: str
+
+    def describe(self) -> str:
+        """Render the difference with its scenario, lane, column, expected and actual."""
+        column = self.column if self.column is not None else "<row>"
+        return (
+            f"scenario {self.scenario!r} lane {self.lane!r} engine {self.engine!r} "
+            f"column {column!r}: expected {self.expected!r}, actual {self.actual!r}"
+            f"\n  {self.message}"
+        )
+
+
+def execution_error_difference(
+    *,
+    scenario_id: str,
+    engine: str,
+    lane: str,
+    error: Exception,
+) -> ResultDifference:
+    """Represent a failed lane execution as a difference from the reference lane."""
+    actual = f"{type(error).__name__}: {error}"
+    return ResultDifference(
+        scenario=scenario_id,
+        engine=engine,
+        lane=lane,
+        column=None,
+        expected="successful execution",
+        actual=actual,
+        message=f"execution failed: {actual}",
+    )
+
+
+def compare_execution(
+    expected_doc: dict[str, Any],
+    execution: Execution,
+    *,
+    scenario_id: str,
+    engine: str,
+    lane: str,
+    ordered: bool,
+    aliases: Sequence[str | None] | None = None,
+) -> list[ResultDifference]:
+    """Compare one execution with ``rows.json`` and return structured differences.
+
+    The pass/fail rules are exactly those of :func:`compare_columns` and
+    :func:`compare_rows`; this wrapper adds the scenario, lane and column needed
+    for a readable message and for matching known lane differences.
+    """
+    differences: list[ResultDifference] = []
+
+    def add(column: str | None, expected: Any, actual: Any, message: str) -> None:
+        differences.append(
+            ResultDifference(
+                scenario=scenario_id,
+                engine=engine,
+                lane=lane,
+                column=column,
+                expected=expected,
+                actual=actual,
+                message=message,
+            )
+        )
+
+    expected_columns = expected_doc.get("columns")
+    actual_columns = list(execution.columns)
+    if expected_columns is not None:
+        if len(expected_columns) != len(actual_columns):
+            add(
+                None,
+                list(expected_columns),
+                actual_columns,
+                f"column count: expected {len(expected_columns)} ({list(expected_columns)}), "
+                f"got {len(actual_columns)} ({actual_columns})",
+            )
+        check_all = engine in CYPHER_COLUMN_ENGINES
+        for index, expected_name in enumerate(expected_columns):
+            if index >= len(actual_columns):
+                break
+            actual_name = actual_columns[index]
+            alias = aliases[index] if aliases is not None and index < len(aliases) else None
+            if not check_all and alias is None:
+                continue
+            if actual_name != expected_name:
+                add(
+                    expected_name,
+                    expected_name,
+                    actual_name,
+                    f"column {index}: expected {expected_name!r}, got {actual_name!r}",
+                )
+
+    expected_rows = expected_doc["rows"]
+    actual_rows = list(execution.rows)
+    if len(expected_rows) != len(actual_rows):
+        add(
+            None,
+            len(expected_rows),
+            len(actual_rows),
+            f"row count: expected {len(expected_rows)}, got {len(actual_rows)}",
+        )
+
+    if ordered:
+        for row_index, (expected_row, actual_row) in enumerate(
+            zip(expected_rows, actual_rows, strict=False)
+        ):
+            if len(expected_row) != len(actual_row):
+                add(
+                    None,
+                    expected_row,
+                    actual_row,
+                    f"row {row_index}: expected {len(expected_row)} columns, got {len(actual_row)}",
+                )
+                continue
+            for column_index, (expected_value, actual_value) in enumerate(
+                zip(expected_row, actual_row, strict=True)
+            ):
+                if values_equal(expected_value, actual_value):
+                    continue
+                if expected_columns is not None and column_index < len(expected_columns):
+                    column = expected_columns[column_index]
+                elif column_index < len(actual_columns):
+                    column = actual_columns[column_index]
+                else:
+                    column = str(column_index)
+                add(
+                    column,
+                    expected_value,
+                    actual_value,
+                    f"row {row_index} column {column!r}: "
+                    f"expected {_render_row(expected_row)}, got {_render_row(actual_row)}",
+                )
+        return differences
+
+    expected_keys = Counter(tuple(_row_key(value) for value in row) for row in expected_rows)
+    actual_keys = Counter(tuple(_row_key(value) for value in row) for row in actual_rows)
+    for key, count in (expected_keys - actual_keys).items():
+        rendered = _render_key(key)
+        add(None, rendered, None, f"missing row x{count}: {rendered}")
+    for key, count in (actual_keys - expected_keys).items():
+        rendered = _render_key(key)
+        add(None, None, rendered, f"unexpected row x{count}: {rendered}")
+    return differences
 
 
 # ---------------------------------------------------------------------------
@@ -1129,6 +1394,90 @@ def make_engine(engine: str) -> BaseEngine:
     raise ValueError(f"Unknown engine {engine!r}")
 
 
+def _postgres_credentials() -> tuple[str, str, str]:
+    return (
+        os.environ.get("VOYAGER_TEST_PG_USER", "postgres"),
+        os.environ.get("VOYAGER_TEST_PG_PASSWORD", "voyagerpass123"),
+        os.environ.get("VOYAGER_TEST_PG_DB", "voyager_graph"),
+    )
+
+
+def native_uri(engine: str, adapter: BaseEngine) -> str:
+    """Build the native-client URI for an engine and its loaded fixture namespace."""
+    host, port = engine_endpoint(engine)
+    if engine == "neo4j":
+        password = os.environ.get("VOYAGER_TEST_NEO4J_PASSWORD", "voyagerpass123")
+        return f"bolt://neo4j:{quote(password, safe='')}@{host}:{port}"
+    if engine == "memgraph":
+        return f"bolt://{host}:{port}"
+    if engine == "falkordb":
+        graph_name = str(cast(Any, adapter).graph_name or "")
+        return f"falkordb://{host}:{port}/{quote(graph_name, safe='')}"
+    user, password, database = _postgres_credentials()
+    return (
+        f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
+        f"@{host}:{port}/{quote(database, safe='')}"
+    )
+
+
+def _open_lane_session(engine: str, lane: str, adapter: BaseEngine) -> Any:
+    """Open a Voyager session for the bridge or native lane.
+
+    The session reuses the loaded namespace; it never creates or drops fixtures.
+    """
+    from voyager_ogm import Session
+
+    loader = cast(Any, adapter)
+    if lane == "bridge":
+        from voyager_ogm.bridge import FalkorDBBridge, Neo4jBoltBridge, PostgresBridge
+
+        if engine in ("neo4j", "memgraph"):
+            bridge = Neo4jBoltBridge(loader.driver)
+        elif engine == "falkordb":
+            bridge = FalkorDBBridge(loader.graph)
+        elif engine == "age":
+            bridge = PostgresBridge(loader.conn, graph_name=loader.graph_name)
+        else:
+            bridge = PostgresBridge(loader.conn)
+        return Session(bridge=bridge, dialect=ENGINE_DIALECT[engine], backend="bridge")
+
+    uri = native_uri(engine, adapter)
+    if engine == "age":
+        return Session(
+            uri,
+            dialect=ENGINE_DIALECT[engine],
+            backend="native",
+            graph_name=loader.graph_name,
+            pool_size=1,
+        )
+    if engine == "pg19":
+        session = Session(uri, dialect=ENGINE_DIALECT[engine], backend="native", pool_size=1)
+        # The property graph and its tables live in the scenario schema; a new
+        # native connection needs that schema on its search path to resolve the
+        # unqualified graph and table names the emitter writes.
+        session.execute(f"SET search_path TO {_sql_ident(loader.schema)}, public")
+        return session
+    return Session(uri, dialect=ENGINE_DIALECT[engine], backend="native", pool_size=1)
+
+
+def _execute_with_session(
+    session: Any,
+    statement: str,
+    parameters: dict[str, Any],
+    engine: str,
+) -> tuple[list[str], list[list[Any]]]:
+    result = session.execute(statement, parameters)
+    columns = list(result.columns)
+    # AGE values arrive already decoded on both Voyager backends; parsing them
+    # again would turn a string property such as "2020" into a number.
+    parse_age = engine != "age"
+    rows = [
+        [canonicalize(value, engine, parse_age=parse_age) for value in record.values()]
+        for record in result.all()
+    ]
+    return columns, rows
+
+
 def new_token() -> str:
     """Return a short unique token used for dedicated graph/schema names."""
     return uuid.uuid4().hex[:12]
@@ -1177,11 +1526,19 @@ def execute_scenario(
     token: str,
     *,
     adapter: BaseEngine | None = None,
+    lane: str = DEFAULT_LANE,
 ) -> Execution:
-    """Load the fixture, compile for the engine's dialect, execute and canonicalize rows."""
+    """Load the fixture, compile for the engine's dialect, execute and canonicalize rows.
+
+    The fixture is always loaded through the same official-client loader; ``lane``
+    only changes which Voyager/client path executes the compiled statement.
+    """
+    if lane not in LANES:
+        raise ValueError(f"Unknown lane {lane!r}; expected one of {', '.join(LANES)}")
     owned = adapter is None
     active_adapter = make_engine(engine) if adapter is None else adapter
     load_result: LoadResult | None = None
+    lane_session: Any = None
     try:
         load_result = active_adapter.load(fixture, token)
         graph_name = getattr(active_adapter, "graph_name", None) or None
@@ -1189,7 +1546,17 @@ def execute_scenario(
 
         compiled = compile_query_from_spec(spec, ENGINE_DIALECT[engine], graph_name=graph_name)
         parameters = scenario_parameters(scenario, compiled)
-        columns, rows = active_adapter.execute(compiled["statement"], parameters)
+        if lane == "official":
+            columns, rows = active_adapter.execute(compiled["statement"], parameters)
+        else:
+            lane_session = _open_lane_session(engine, lane, active_adapter)
+            if lane_session.backend != lane:
+                raise RuntimeError(
+                    f"{engine} {lane} lane opened the {lane_session.backend!r} backend"
+                )
+            columns, rows = _execute_with_session(
+                lane_session, compiled["statement"], parameters, engine
+            )
         return Execution(
             statement=compiled["statement"],
             parameters=parameters,
@@ -1200,6 +1567,8 @@ def execute_scenario(
     finally:
         if load_result is not None:
             active_adapter.cleanup(load_result)
+        if lane_session is not None and lane == "native":
+            lane_session.close()
         if owned:
             active_adapter.close()
 
