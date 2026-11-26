@@ -431,9 +431,9 @@ def test_navigation_projects_scalar_columns_for_sql_pgq_dialects(dialect: str) -
     assert "GRAPH_TABLE" in statement
     assert "COLUMNS (" in statement
     assert "._feat121person_" not in statement
-    assert "AS id" in statement
-    assert "AS name" in statement
-    assert "AS age" in statement
+    assert 'AS "id"' in statement
+    assert 'AS "name"' in statement
+    assert 'AS "age"' in statement
 
 
 def test_export_schema_lists_relationship_attributes_without_changing_keys() -> None:

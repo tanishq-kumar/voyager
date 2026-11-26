@@ -180,16 +180,25 @@ def test_column_comparison_unaliased_rules_per_engine() -> None:
             )
             == []
         )
-        # PostgreSQL folds unquoted SQL column aliases to lowercase.
+        # Voyager quotes result aliases, so exact case is required on AGE and SQL/PGQ.
         assert (
             corpus.compare_columns(
                 ["ColumnName"],
-                ["columnname"],
+                ["ColumnName"],
                 engine=engine,
                 aliases=["ColumnName"],
             )
             == []
         )
+        folded = corpus.compare_columns(
+            ["ColumnName"],
+            ["columnname"],
+            engine=engine,
+            aliases=["ColumnName"],
+        )
+        assert folded, f"Expected an alias case mismatch on {engine}"
+        assert "'ColumnName'" in folded[0]
+        assert "'columnname'" in folded[0]
 
     for engine in ("neo4j", "memgraph", "falkordb"):
         diffs = corpus.compare_columns(

@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use tokio_util::codec::{Decoder, Encoder};
 
 use voyager_drivers::redis::{
-    FalkorNode, FalkorQueryResult, FalkorRelationship, FalkorStatistics, RespCodec, RespValue,
-    format_cypher_with_params,
+    FalkorCompactResult, FalkorGraphSchema, FalkorNode, FalkorQueryResult, FalkorRelationship,
+    FalkorStatistics, RespCodec, RespValue, decode_compact_cell, format_cypher_with_params,
 };
 
 #[test]
@@ -550,4 +550,160 @@ fn test_format_cypher_null_and_bool_and_numbers() {
     assert!(formatted.contains("i=-42"));
     assert!(formatted.contains("n=null"));
     assert!(formatted.contains("t=true"));
+}
+
+#[test]
+fn test_falkor_compact_result_decodes_entities_paths_lists_and_maps() {
+    use arrow_array::cast::AsArray;
+
+    let schema = FalkorGraphSchema {
+        version: Some(3),
+        labels: vec!["ZzS".to_string(), "ZzExtra".to_string()],
+        relationships: vec!["ZK".to_string()],
+        properties: vec!["name".to_string(), "w".to_string()],
+    };
+
+    // Node A: id=10, labels=[0,1], props=[[0, 2, "A"]]
+    let compact_node_a = RespValue::Array(Some(vec![
+        RespValue::Integer(8),
+        RespValue::Array(Some(vec![
+            RespValue::Integer(10),
+            RespValue::Array(Some(vec![RespValue::Integer(0), RespValue::Integer(1)])),
+            RespValue::Array(Some(vec![RespValue::Array(Some(vec![
+                RespValue::Integer(0),
+                RespValue::Integer(2),
+                RespValue::BulkString(Some(b"A".to_vec())),
+            ]))])),
+        ])),
+    ]));
+
+    // Node B: id=20, labels=[0], props=[[0, 2, "B"]]
+    let compact_node_b = RespValue::Array(Some(vec![
+        RespValue::Integer(8),
+        RespValue::Array(Some(vec![
+            RespValue::Integer(20),
+            RespValue::Array(Some(vec![RespValue::Integer(0)])),
+            RespValue::Array(Some(vec![RespValue::Array(Some(vec![
+                RespValue::Integer(0),
+                RespValue::Integer(2),
+                RespValue::BulkString(Some(b"B".to_vec())),
+            ]))])),
+        ])),
+    ]));
+
+    // Edge K: id=30, rel=0 ("ZK"), src=10, dst=20, props=[[1, 3, 1]]
+    let compact_edge_k = RespValue::Array(Some(vec![
+        RespValue::Integer(7),
+        RespValue::Array(Some(vec![
+            RespValue::Integer(30),
+            RespValue::Integer(0),
+            RespValue::Integer(10),
+            RespValue::Integer(20),
+            RespValue::Array(Some(vec![RespValue::Array(Some(vec![
+                RespValue::Integer(1),
+                RespValue::Integer(3),
+                RespValue::Integer(1),
+            ]))])),
+        ])),
+    ]));
+
+    // Path p = (a)-[k]->(b)
+    let compact_path = RespValue::Array(Some(vec![
+        RespValue::Integer(9),
+        RespValue::Array(Some(vec![
+            RespValue::Array(Some(vec![
+                RespValue::Integer(6),
+                RespValue::Array(Some(vec![compact_node_a.clone(), compact_node_b.clone()])),
+            ])),
+            RespValue::Array(Some(vec![
+                RespValue::Integer(6),
+                RespValue::Array(Some(vec![compact_edge_k.clone()])),
+            ])),
+        ])),
+    ]));
+
+    // List collect(b) and Map {node: a}
+    let compact_list = RespValue::Array(Some(vec![
+        RespValue::Integer(6),
+        RespValue::Array(Some(vec![compact_node_b])),
+    ]));
+    let compact_map = RespValue::Array(Some(vec![
+        RespValue::Integer(10),
+        RespValue::Array(Some(vec![
+            RespValue::BulkString(Some(b"node".to_vec())),
+            compact_node_a.clone(),
+        ])),
+    ]));
+
+    // Sanity check decode_compact_cell directly
+    match decode_compact_cell(&compact_node_a, &schema).unwrap() {
+        voyager_drivers::bolt::BoltValue::Node(n) => assert_eq!(n.id, 10),
+        other => panic!("Expected BoltValue::Node, got {other:?}"),
+    }
+
+    // Full FalkorCompactResult response: [columns, rows, stats]
+    let resp = RespValue::Array(Some(vec![
+        RespValue::Array(Some(vec![
+            RespValue::BulkString(Some(b"a".to_vec())),
+            RespValue::BulkString(Some(b"k".to_vec())),
+            RespValue::BulkString(Some(b"p".to_vec())),
+            RespValue::BulkString(Some(b"bs".to_vec())),
+            RespValue::BulkString(Some(b"m".to_vec())),
+        ])),
+        RespValue::Array(Some(vec![RespValue::Array(Some(vec![
+            compact_node_a,
+            compact_edge_k,
+            compact_path,
+            compact_list,
+            compact_map,
+        ]))])),
+        RespValue::Array(Some(vec![RespValue::BulkString(Some(
+            b"Graph version: 3".to_vec(),
+        ))])),
+    ]));
+
+    let parsed = FalkorCompactResult::parse(resp).unwrap();
+    assert_eq!(parsed.graph_version, Some(3));
+    assert!(!parsed.needs_schema_refresh(Some(&schema)));
+    assert!(parsed.needs_schema_refresh(None));
+
+    let qr = parsed.to_query_result(&schema).unwrap();
+    let batch = &qr.batches[0];
+    let batch_schema = batch.schema();
+    assert_eq!(
+        batch_schema
+            .field(0)
+            .metadata()
+            .get("voyager.kind")
+            .map(String::as_str),
+        Some("node")
+    );
+    assert_eq!(
+        batch_schema
+            .field(1)
+            .metadata()
+            .get("voyager.kind")
+            .map(String::as_str),
+        Some("relationship")
+    );
+    assert_eq!(
+        batch_schema
+            .field(2)
+            .metadata()
+            .get("voyager.kind")
+            .map(String::as_str),
+        Some("path")
+    );
+
+    let a_json: serde_json::Value =
+        serde_json::from_str(batch.column(0).as_string::<i32>().value(0)).unwrap();
+    assert_eq!(a_json["kind"], "node");
+    assert_eq!(a_json["element_id"], serde_json::Value::Null);
+    assert_eq!(a_json["labels"], serde_json::json!(["ZzExtra", "ZzS"]));
+    assert_eq!(a_json["properties"], serde_json::json!({"name": "A"}));
+
+    let m_json: serde_json::Value =
+        serde_json::from_str(batch.column(4).as_string::<i32>().value(0)).unwrap();
+    assert_eq!(m_json["node"]["kind"], "node");
+    assert_eq!(m_json["node"]["properties"]["name"], "A");
 }

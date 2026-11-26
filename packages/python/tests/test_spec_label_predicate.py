@@ -70,7 +70,7 @@ def test_consumer_emits_native_label_test_per_dialect() -> None:
     assert (
         age["statement"] == "SELECT * FROM cypher('age_graph', $$ MATCH (root:Root)-[]-(i) "
         "WHERE (i.var > $p0) AND label(i) = 'TextNode' RETURN i.var $$, %s) "
-        "AS (var agtype)"
+        'AS ("var" agtype)'
     )
     assert age["parameters"] == {"p0": "te"}
 

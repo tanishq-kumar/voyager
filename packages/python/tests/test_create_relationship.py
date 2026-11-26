@@ -111,7 +111,7 @@ def test_create_relationship_compiles_exact_statements_for_all_dialects() -> Non
         "MATCH (a:Feat192Person) WHERE a.id = $p0 "
         "MATCH (b:Feat192Person) WHERE b.id = $p1 "
         "CREATE (a)-[:FEAT192_KNOWS {since: $p2}]->(b)"
-        " $$, %s) AS (result agtype)"
+        ' $$, %s) AS ("result" agtype)'
     )
     assert age.parameters == cypher.parameters
 

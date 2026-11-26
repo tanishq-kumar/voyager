@@ -4881,7 +4881,7 @@ mod tests {
             ("cypher", "MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l"),
             (
                 "age",
-                "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l $$, %s) AS (name agtype)",
+                "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name SKIP $s LIMIT $l $$, %s) AS (\"name\" agtype)",
             ),
             (
                 "iso_gql",

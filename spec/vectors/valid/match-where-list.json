@@ -63,7 +63,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE (p.age > $p0) AND (p.age < $p1) RETURN p.name $$, %s) AS (name agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE (p.age > $p0) AND (p.age < $p1) RETURN p.name $$, %s) AS (\"name\" agtype)",
       "parameters": {
         "p0": 21,
         "p1": 65

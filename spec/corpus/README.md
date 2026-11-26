@@ -175,12 +175,12 @@ be overridden with `VOYAGER_TEST_NEO4J_PORT`, `VOYAGER_TEST_MEMGRAPH_PORT`,
     checked verbatim by position. All three engines name unaliased columns after
     the emitted expression text verbatim (`n.name`, `COUNT(*)`, `1 + 2`).
   - **Apache AGE, PostgreSQL 19 (SQL/PGQ)**: explicit projection aliases
-    (`AS name` in `query.spec.json`) are checked by position, allowing
-    PostgreSQL's unquoted SQL identifier lowercase folding (so `AS ColumnName`
-    matches `'ColumnName'` or `'columnname'`). Unaliased columns are
-    informational only, because AGE's `AS (...)` column list and SQL/PGQ's
-    `COLUMNS (...)` clause name unaliased columns from the SQL identifiers
-    (e.g. `name` instead of `a.name`).
+    (`AS name` in `query.spec.json`) are checked by position, verbatim.
+    Voyager double-quotes the result column names it emits, so the column keeps
+    the case written in the spec (`AS ColumnName` returns `'ColumnName'`, not
+    `'columnname'`). Unaliased columns are informational only, because AGE's
+    `AS (...)` column list and SQL/PGQ's `COLUMNS (...)` clause name unaliased
+    columns from the SQL identifiers (e.g. `name` instead of `a.name`).
   - Any mismatch fails the live test with a column diff naming the column
     position, expected name, and actual name.
 - **Numbers**: integers and floats compare numerically, so `1` equals `1.0`.

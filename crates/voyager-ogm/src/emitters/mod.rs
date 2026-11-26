@@ -489,6 +489,16 @@ pub(crate) fn push_pgq_quoted_ident(buffer: &mut String, ident: &str) {
     buffer.push('"');
 }
 
+/// Returns a SQL identifier double-quoted, escaping embedded quotes.
+///
+/// Result column aliases use this so PostgreSQL keeps their case instead of
+/// folding unquoted identifiers to lower case.
+pub(crate) fn quote_sql_ident(ident: &str) -> String {
+    let mut quoted = String::with_capacity(ident.len() + 2);
+    push_pgq_quoted_ident(&mut quoted, ident);
+    quoted
+}
+
 /// Emits a node label expression for SQL:2023 PGQ.
 ///
 /// For simple conjunctions, emits ` IS "Label1" IS "Label2"...`.

@@ -9,7 +9,7 @@ use crate::config::Auth;
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
 use crate::redis::codec::{read_resp_value, write_command};
-use crate::redis::graph::FalkorQueryResult;
+use crate::redis::graph::{FalkorCompactResult, FalkorGraphSchema, FalkorQueryResult};
 use crate::redis::resp::RespValue;
 use crate::redis::transaction::{RedisTransaction, format_cypher_with_params};
 use crate::tls::{NetStream, TlsOptions, TlsVerification};
@@ -23,6 +23,7 @@ pub struct RedisConnection {
     is_resp3: bool,
     server_info: HashMap<String, RespValue>,
     default_graph: String,
+    graph_schemas: HashMap<String, FalkorGraphSchema>,
     in_transaction: bool,
     is_valid: bool,
     query_timeout: Option<std::time::Duration>,
@@ -103,6 +104,7 @@ impl RedisConnection {
             is_resp3: false,
             server_info: HashMap::new(),
             default_graph,
+            graph_schemas: HashMap::new(),
             in_transaction: false,
             is_valid: true,
             query_timeout,
@@ -298,6 +300,66 @@ impl RedisConnection {
         FalkorQueryResult::parse(resp)
     }
 
+    /// Executes a Cypher query on FalkorDB via `GRAPH.QUERY` in `--compact` mode.
+    async fn graph_query_compact(
+        &mut self,
+        graph: &str,
+        query: &str,
+        params: &HashMap<String, serde_json::Value>,
+    ) -> Result<FalkorCompactResult> {
+        let formatted = format_cypher_with_params(query, params)?;
+        let resp = self
+            .execute_raw(&["GRAPH.QUERY", graph, &formatted, "--compact"])
+            .await?;
+        FalkorCompactResult::parse(resp)
+    }
+
+    async fn fetch_schema_string_list(
+        &mut self,
+        graph: &str,
+        proc_call: &str,
+    ) -> Result<Vec<String>> {
+        let resp = self
+            .execute_raw(&["GRAPH.RO_QUERY", graph, proc_call, "--compact"])
+            .await?;
+        let parsed = FalkorCompactResult::parse(resp)?;
+        let empty = FalkorGraphSchema::default();
+        let mut out = Vec::with_capacity(parsed.rows.len());
+        for row in &parsed.rows {
+            if let Some(cell) = row.first()
+                && let crate::bolt::BoltValue::String(s) =
+                    crate::redis::graph::decode_compact_cell(cell, &empty)?
+            {
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn refresh_graph_schema(
+        &mut self,
+        graph: &str,
+        version: Option<i64>,
+    ) -> Result<FalkorGraphSchema> {
+        let labels = self
+            .fetch_schema_string_list(graph, "CALL db.labels()")
+            .await?;
+        let relationships = self
+            .fetch_schema_string_list(graph, "CALL db.relationshipTypes()")
+            .await?;
+        let properties = self
+            .fetch_schema_string_list(graph, "CALL db.propertyKeys()")
+            .await?;
+        let schema = FalkorGraphSchema {
+            version,
+            labels,
+            relationships,
+            properties,
+        };
+        self.graph_schemas.insert(graph.to_string(), schema.clone());
+        Ok(schema)
+    }
+
     /// Executes a read-only Cypher query on FalkorDB via `GRAPH.RO_QUERY`.
     pub async fn graph_ro_query(
         &mut self,
@@ -354,8 +416,17 @@ impl AsyncConnection for RedisConnection {
         params: &HashMap<String, serde_json::Value>,
     ) -> Result<QueryResult> {
         let graph = self.default_graph.clone();
-        match self.graph_query(&graph, query, params).await {
-            Ok(falkor_res) => falkor_res.to_query_result(),
+        match self.graph_query_compact(&graph, query, params).await {
+            Ok(compact_res) => {
+                let cached = self.graph_schemas.get(&graph);
+                let schema = if compact_res.needs_schema_refresh(cached) {
+                    self.refresh_graph_schema(&graph, compact_res.graph_version)
+                        .await?
+                } else {
+                    cached.cloned().unwrap_or_default()
+                };
+                compact_res.to_query_result(&schema)
+            }
             Err(e) => {
                 let q_lower = query.trim().to_ascii_lowercase();
                 let is_index_ddl = q_lower.starts_with("create index")

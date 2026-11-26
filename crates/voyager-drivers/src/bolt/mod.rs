@@ -4,6 +4,7 @@
 //! results reuse those types. The Bolt connection itself is gated behind the `bolt` feature,
 //! and the stub server/TestKit backend behind `testkit`.
 
+pub mod canonical;
 #[cfg(feature = "bolt")]
 pub mod connection;
 #[cfg(feature = "bolt")]
@@ -15,6 +16,11 @@ pub mod stream;
 pub mod stub_server;
 #[cfg(feature = "testkit")]
 pub mod testkit;
+
+pub use canonical::{
+    bolt_node_to_canonical_json, bolt_path_to_canonical_json, bolt_relationship_to_canonical_json,
+    bolt_value_to_canonical_json, build_bolt_record_batch,
+};
 
 #[cfg(feature = "bolt")]
 pub use connection::{BOLT_MAGIC_PREAMBLE, BOLT_PROPOSED_VERSIONS, BoltConnection, BoltVersion};

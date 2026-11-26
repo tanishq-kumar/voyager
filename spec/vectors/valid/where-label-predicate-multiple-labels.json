@@ -40,7 +40,7 @@
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (i:Node) WHERE label(i) = 'A' AND label(i) = 'B' RETURN i.name $$) AS (name agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (i:Node) WHERE label(i) = 'A' AND label(i) = 'B' RETURN i.name $$) AS (\"name\" agtype)",
       "parameters": {}
     },
     "iso_gql": {

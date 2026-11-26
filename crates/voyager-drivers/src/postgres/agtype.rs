@@ -210,6 +210,109 @@ pub fn clean_agtype_string(s: &str) -> String {
     String::from_utf8_lossy(&out).trim().to_string()
 }
 
+/// Converts a parsed agtype value into the canonical `.to_dict()` JSON shape
+/// used in Arrow/Polars columns and `GraphNode`/`GraphRelationship`/`GraphPath`.
+pub fn age_value_to_arrow_json(val: &AgeValue) -> serde_json::Value {
+    match val {
+        AgeValue::Null => serde_json::Value::Null,
+        AgeValue::Boolean(b) => serde_json::Value::Bool(*b),
+        AgeValue::Integer(i) => serde_json::Value::Number((*i).into()),
+        AgeValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        AgeValue::String(s) => serde_json::Value::String(s.clone()),
+        AgeValue::Vertex(v) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String("node".to_string()),
+            );
+            obj.insert("id".to_string(), serde_json::Value::Number(v.id.into()));
+            obj.insert("element_id".to_string(), serde_json::Value::Null);
+            let labels = if v.label.is_empty() {
+                Vec::new()
+            } else {
+                vec![serde_json::Value::String(v.label.clone())]
+            };
+            obj.insert("labels".to_string(), serde_json::Value::Array(labels));
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(
+                    v.properties
+                        .iter()
+                        .map(|(k, value)| (k.clone(), value.clone()))
+                        .collect(),
+                ),
+            );
+            serde_json::Value::Object(obj)
+        }
+        AgeValue::Edge(e) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String("relationship".to_string()),
+            );
+            obj.insert("id".to_string(), serde_json::Value::Number(e.id.into()));
+            obj.insert("element_id".to_string(), serde_json::Value::Null);
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(e.label.clone()),
+            );
+            obj.insert(
+                "start_id".to_string(),
+                serde_json::Value::Number(e.start_id.into()),
+            );
+            obj.insert(
+                "end_id".to_string(),
+                serde_json::Value::Number(e.end_id.into()),
+            );
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(
+                    e.properties
+                        .iter()
+                        .map(|(k, value)| (k.clone(), value.clone()))
+                        .collect(),
+                ),
+            );
+            serde_json::Value::Object(obj)
+        }
+        AgeValue::Path(p) => {
+            let nodes: Vec<serde_json::Value> = p
+                .vertices
+                .iter()
+                .map(|v| age_value_to_arrow_json(&AgeValue::Vertex(v.clone())))
+                .collect();
+            let relationships: Vec<serde_json::Value> = p
+                .edges
+                .iter()
+                .map(|e| age_value_to_arrow_json(&AgeValue::Edge(e.clone())))
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "kind".to_string(),
+                serde_json::Value::String("path".to_string()),
+            );
+            obj.insert("nodes".to_string(), serde_json::Value::Array(nodes));
+            obj.insert(
+                "relationships".to_string(),
+                serde_json::Value::Array(relationships),
+            );
+            serde_json::Value::Object(obj)
+        }
+        AgeValue::List(list) => {
+            serde_json::Value::Array(list.iter().map(age_value_to_arrow_json).collect())
+        }
+        AgeValue::Map(map) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in map {
+                obj.insert(k.clone(), age_value_to_arrow_json(v));
+            }
+            serde_json::Value::Object(obj)
+        }
+    }
+}
+
 /// Converts a parsed agtype value into the canonical Python-facing shape.
 ///
 /// Vertices become `{"kind": "node", "id", "labels", "properties"}`, edges
@@ -654,6 +757,21 @@ pub fn rows_to_record_batch(
     column_names: &[String],
     rows: &[Vec<Option<String>>],
 ) -> Result<RecordBatch> {
+    rows_to_record_batch_with_age_columns(column_names, rows, &[])
+}
+
+/// Transforms tabular PostgreSQL / Apache AGE row values into an Apache Arrow [`RecordBatch`].
+///
+/// Columns marked `true` in `age_columns` are decoded as `agtype`: pure scalar
+/// columns map to native Arrow types (`Int64`, `Float64`, `Boolean`, plain `Utf8`),
+/// while columns containing vertices, edges, paths, lists, or maps are serialized
+/// as kind-tagged JSON text and annotated with `voyager.encoding = "json"` (plus
+/// `voyager.kind = "node" | "relationship" | "path"` when homogeneous).
+pub fn rows_to_record_batch_with_age_columns(
+    column_names: &[String],
+    rows: &[Vec<Option<String>>],
+    age_columns: &[bool],
+) -> Result<RecordBatch> {
     if column_names.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
     }
@@ -661,10 +779,167 @@ pub fn rows_to_record_batch(
     let num_rows = rows.len();
     let num_cols = column_names.len();
 
-    let mut inferred_types = vec![DataType::Int64; num_cols];
+    let mut fields = Vec::with_capacity(num_cols);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
 
-    // First pass: type inference per column
-    for (col_idx, inferred_type) in inferred_types.iter_mut().enumerate() {
+    for (col_idx, name) in column_names.iter().enumerate() {
+        if age_columns.get(col_idx).copied().unwrap_or(false) {
+            let mut parsed_cells: Vec<Option<AgeValue>> = Vec::with_capacity(num_rows);
+            let mut int_count = 0usize;
+            let mut float_count = 0usize;
+            let mut bool_count = 0usize;
+            let mut node_count = 0usize;
+            let mut edge_count = 0usize;
+            let mut path_count = 0usize;
+            let mut has_structured = false;
+            let mut non_null_count = 0usize;
+
+            for row in rows {
+                match row.get(col_idx).and_then(|v| v.as_deref()) {
+                    Some(raw) => {
+                        let parsed = parse_agtype(raw)?;
+                        match &parsed {
+                            AgeValue::Null => {
+                                parsed_cells.push(None);
+                            }
+                            AgeValue::Integer(_) => {
+                                int_count += 1;
+                                non_null_count += 1;
+                                parsed_cells.push(Some(parsed));
+                            }
+                            AgeValue::Float(_) => {
+                                float_count += 1;
+                                non_null_count += 1;
+                                parsed_cells.push(Some(parsed));
+                            }
+                            AgeValue::Boolean(_) => {
+                                bool_count += 1;
+                                non_null_count += 1;
+                                parsed_cells.push(Some(parsed));
+                            }
+                            AgeValue::Vertex(_) => {
+                                node_count += 1;
+                                has_structured = true;
+                                non_null_count += 1;
+                                parsed_cells.push(Some(parsed));
+                            }
+                            AgeValue::Edge(_) => {
+                                edge_count += 1;
+                                has_structured = true;
+                                non_null_count += 1;
+                                parsed_cells.push(Some(parsed));
+                            }
+                            AgeValue::Path(_) => {
+                                path_count += 1;
+                                has_structured = true;
+                                non_null_count += 1;
+                                parsed_cells.push(Some(parsed));
+                            }
+                            AgeValue::List(_) | AgeValue::Map(_) => {
+                                has_structured = true;
+                                non_null_count += 1;
+                                parsed_cells.push(Some(parsed));
+                            }
+                            AgeValue::String(_) => {
+                                non_null_count += 1;
+                                parsed_cells.push(Some(parsed));
+                            }
+                        }
+                    }
+                    None => parsed_cells.push(None),
+                }
+            }
+
+            if non_null_count > 0 && int_count == non_null_count {
+                let mut builder = Int64Builder::with_capacity(num_rows);
+                for cell in &parsed_cells {
+                    match cell {
+                        Some(AgeValue::Integer(i)) => builder.append_value(*i),
+                        _ => builder.append_null(),
+                    }
+                }
+                fields.push(Field::new(name, DataType::Int64, true));
+                columns.push(Arc::new(builder.finish()));
+            } else if non_null_count > 0 && float_count == non_null_count {
+                let mut builder = Float64Builder::with_capacity(num_rows);
+                for cell in &parsed_cells {
+                    match cell {
+                        Some(AgeValue::Float(f)) => builder.append_value(*f),
+                        _ => builder.append_null(),
+                    }
+                }
+                fields.push(Field::new(name, DataType::Float64, true));
+                columns.push(Arc::new(builder.finish()));
+            } else if non_null_count > 0
+                && (int_count + float_count) == non_null_count
+                && int_count > 0
+                && float_count > 0
+            {
+                let mut builder = Float64Builder::with_capacity(num_rows);
+                for cell in &parsed_cells {
+                    match cell {
+                        Some(AgeValue::Float(f)) => builder.append_value(*f),
+                        Some(AgeValue::Integer(i)) => builder.append_value(*i as f64),
+                        _ => builder.append_null(),
+                    }
+                }
+                fields.push(Field::new(name, DataType::Float64, true));
+                columns.push(Arc::new(builder.finish()));
+            } else if non_null_count > 0 && bool_count == non_null_count {
+                let mut builder = BooleanBuilder::with_capacity(num_rows);
+                for cell in &parsed_cells {
+                    match cell {
+                        Some(AgeValue::Boolean(b)) => builder.append_value(*b),
+                        _ => builder.append_null(),
+                    }
+                }
+                fields.push(Field::new(name, DataType::Boolean, true));
+                columns.push(Arc::new(builder.finish()));
+            } else if has_structured {
+                let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 64);
+                for cell in &parsed_cells {
+                    match cell {
+                        Some(val) => {
+                            let json_str = serde_json::to_string(&age_value_to_arrow_json(val))
+                                .unwrap_or_else(|_| "null".to_string());
+                            builder.append_value(&json_str);
+                        }
+                        None => builder.append_null(),
+                    }
+                }
+                let mut metadata = HashMap::new();
+                metadata.insert("voyager.encoding".to_string(), "json".to_string());
+                if non_null_count > 0 && node_count == non_null_count {
+                    metadata.insert("voyager.kind".to_string(), "node".to_string());
+                } else if non_null_count > 0 && edge_count == non_null_count {
+                    metadata.insert("voyager.kind".to_string(), "relationship".to_string());
+                } else if non_null_count > 0 && path_count == non_null_count {
+                    metadata.insert("voyager.kind".to_string(), "path".to_string());
+                }
+                fields.push(Field::new(name, DataType::Utf8, true).with_metadata(metadata));
+                columns.push(Arc::new(builder.finish()));
+            } else {
+                let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+                for cell in &parsed_cells {
+                    match cell {
+                        Some(AgeValue::String(s)) => builder.append_value(s),
+                        Some(AgeValue::Integer(i)) => builder.append_value(i.to_string()),
+                        Some(AgeValue::Float(f)) => builder.append_value(f.to_string()),
+                        Some(AgeValue::Boolean(b)) => builder.append_value(b.to_string()),
+                        Some(other) => {
+                            let json_str = serde_json::to_string(&age_value_to_arrow_json(other))
+                                .unwrap_or_else(|_| "null".to_string());
+                            builder.append_value(&json_str);
+                        }
+                        None => builder.append_null(),
+                    }
+                }
+                fields.push(Field::new(name, DataType::Utf8, true));
+                columns.push(Arc::new(builder.finish()));
+            }
+            continue;
+        }
+
         let mut has_non_null = false;
         let mut can_be_int = true;
         let mut can_be_float = true;
@@ -692,25 +967,18 @@ pub fn rows_to_record_batch(
             }
         }
 
-        if !has_non_null {
-            *inferred_type = DataType::Utf8;
+        let data_type = if !has_non_null {
+            DataType::Utf8
         } else if can_be_int {
-            *inferred_type = DataType::Int64;
+            DataType::Int64
         } else if can_be_float {
-            *inferred_type = DataType::Float64;
+            DataType::Float64
         } else if can_be_bool {
-            *inferred_type = DataType::Boolean;
+            DataType::Boolean
         } else {
-            *inferred_type = DataType::Utf8;
-        }
-    }
+            DataType::Utf8
+        };
 
-    // Build Arrow arrays based on inferred types
-    let mut fields = Vec::with_capacity(num_cols);
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
-
-    for (col_idx, name) in column_names.iter().enumerate() {
-        let data_type = &inferred_types[col_idx];
         fields.push(Field::new(name, data_type.clone(), true));
 
         match data_type {
