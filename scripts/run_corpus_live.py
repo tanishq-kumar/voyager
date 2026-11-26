@@ -87,7 +87,12 @@ def main(argv: list[str]) -> int:
     os.environ[LANE_ENV] = options.lane
 
     plugin = SummaryPlugin()
-    exit_code = pytest.main(args, plugins=[plugin])
+    try:
+        with corpus.live_corpus_lock():
+            exit_code = pytest.main(args, plugins=[plugin])
+    except RuntimeError as err:
+        print(f"[ERROR] {err}", file=sys.stderr)
+        return 1
 
     print(f"\nLive corpus summary (lane {options.lane})")
     print(f"{'lane':<10} {'engine':<12} {'passed':>7} {'failed':>7} {'skipped':>8}")

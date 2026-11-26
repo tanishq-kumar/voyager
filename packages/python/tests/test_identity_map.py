@@ -327,18 +327,22 @@ class TestLiveDatabaseIdentityMap:
             pytest.skip(f"Neo4j database not reachable at bolt://{host}:7687")
 
         session = Session(bridge=driver, dialect="cypher", enable_identity_map=True)
+        try:
+            p = Person(id="neo_live_1", name="Neo Person", age=100)
+            session.register(p)
+            p.age = 101
 
-        p = Person(id="neo_live_1", name="Neo Person", age=100)
-        session.register(p)
-        p.age = 101
+            results = session.flush(key_field="id")
+            assert len(results) == 1
+            assert results[0].total_records == 1
+            assert p.dirty_fields == {}
 
-        results = session.flush(key_field="id")
-        assert len(results) == 1
-        assert results[0].total_records == 1
-        assert p.dirty_fields == {}
-
-        # Verify query
-        res = session.execute("MATCH (n:Person {id: 'neo_live_1'}) RETURN n.age AS age")
-        assert res.fetchone() == {"age": 101}
-
-        session.close()
+            # Verify query
+            res = session.execute("MATCH (n:Person {id: 'neo_live_1'}) RETURN n.age AS age")
+            assert res.fetchone() == {"age": 101}
+        finally:
+            try:
+                session.execute("MATCH (n:Person {id: 'neo_live_1'}) DETACH DELETE n")
+            finally:
+                session.close()
+                driver.close()

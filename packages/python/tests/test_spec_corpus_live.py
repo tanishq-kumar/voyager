@@ -15,6 +15,7 @@ client.  Run with::
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,13 @@ pytestmark = pytest.mark.live
 SCENARIOS = corpus.discover_scenarios()
 SELECTED_LANES = corpus.select_lanes(os.environ.get("VOYAGER_CORPUS_LANE") or corpus.DEFAULT_LANE)
 KNOWN_DIFFERENCES = corpus.load_known_lane_differences()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _live_corpus_run_lock() -> Iterator[None]:
+    """Prevent overlapping local live corpus runs against shared databases."""
+    with corpus.live_corpus_lock():
+        yield
 
 
 def _cases() -> list[pytest.ParameterSet]:
@@ -89,6 +97,7 @@ def test_live_corpus_scenario(scenario_id: str, engine: str, lane: str, scenario
             lane=lane,
             ordered=scenario.get("rows") == "ordered",
             aliases=corpus.spec_projection_aliases(spec),
+            unordered_list_columns=corpus.spec_unordered_list_columns(spec),
         )
     _, unexplained = corpus.partition_known_differences(differences, KNOWN_DIFFERENCES)
     stale = corpus.stale_known_differences(

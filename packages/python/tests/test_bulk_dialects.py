@@ -6,7 +6,6 @@ Cypher to a SQL server; an unknown dialect raises ``UNSUPPORTED_DIALECT``.
 
 from __future__ import annotations
 
-import duckdb
 import pytest
 from voyager_ogm import Field, Node, Session, VoyagerError, create_bulk_create_plan, node
 
@@ -19,6 +18,9 @@ class Person(Node):
 
 @pytest.fixture()
 def duckdb_connection():
+    # duckdb is not installed on every supported Python (see pyproject.toml), so only
+    # the tests that need a DuckDB connection are skipped when it is missing.
+    duckdb = pytest.importorskip("duckdb")
     connection = duckdb.connect(":memory:")
     try:
         yield connection
