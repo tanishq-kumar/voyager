@@ -237,7 +237,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let q_start = Instant::now();
                 let mut conn = pool.acquire().await.unwrap();
                 let mut params = HashMap::new();
-                params.insert("id".to_string(), serde_json::Value::Number(id.into()));
+                params.insert(
+                    "id".to_string(),
+                    serde_json::Value::Number(id.into()).into(),
+                );
                 let res = conn.execute(point_query_tmpl, &params).await.unwrap();
                 assert_eq!(res.row_count(), 1);
                 q_start.elapsed().as_secs_f64() * 1000.0
@@ -340,7 +343,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let q_start = Instant::now();
                 let mut conn = pool.acquire().await.unwrap();
                 let mut params = HashMap::new();
-                params.insert("id".to_string(), serde_json::Value::Number(id.into()));
+                params.insert(
+                    "id".to_string(),
+                    serde_json::Value::Number(id.into()).into(),
+                );
                 let res = conn.execute(traversal_query, &params).await.unwrap();
                 let _count = res.row_count();
                 q_start.elapsed().as_secs_f64() * 1000.0

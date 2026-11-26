@@ -5,6 +5,10 @@ use std::collections::HashMap;
 
 use crate::engine::{AsyncTransaction, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
+use crate::params::{
+    ParamValue, format_datetime_iso, format_iso_date, format_iso_duration, format_iso_time,
+    parse_decimal_f64,
+};
 use crate::redis::connection::{RedisConnection, falkordb_transaction_error};
 use crate::redis::graph::FalkorQueryResult;
 use crate::redis::resp::RespValue;
@@ -33,7 +37,7 @@ impl<'a> RedisTransaction<'a> {
     pub async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         if !self.is_active {
             return Err(NetError::TransactionError(
@@ -150,7 +154,7 @@ impl<'a> AsyncTransaction for RedisTransaction<'a> {
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         self.execute(query, params).await
     }
@@ -204,8 +208,24 @@ fn render_identifier_or_key(key: &str, out: &mut String) -> Result<()> {
     Ok(())
 }
 
+/// Helper to emit a double-quoted Cypher string literal with backslash escaping.
+fn push_cypher_string(s: &str, out: &mut String) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            '\t' => out.push_str(r"\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 /// Recursively renders a JSON value as a Cypher literal for FalkorDB's `CYPHER name=value` prefix.
-fn render_cypher_literal(val: &serde_json::Value, out: &mut String) -> Result<()> {
+fn render_json_cypher_literal(val: &serde_json::Value, out: &mut String) -> Result<()> {
     match val {
         serde_json::Value::Null => {
             out.push_str("null");
@@ -220,21 +240,143 @@ fn render_cypher_literal(val: &serde_json::Value, out: &mut String) -> Result<()
             Ok(())
         }
         serde_json::Value::String(s) => {
-            out.push('"');
-            for ch in s.chars() {
-                match ch {
-                    '"' => out.push_str(r#"\""#),
-                    '\\' => out.push_str(r"\\"),
-                    '\n' => out.push_str(r"\n"),
-                    '\r' => out.push_str(r"\r"),
-                    '\t' => out.push_str(r"\t"),
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
+            push_cypher_string(s, out);
             Ok(())
         }
         serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render_json_cypher_literal(item, out)?;
+            }
+            out.push(']');
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            out.push('{');
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (i, (key, value)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render_identifier_or_key(key, out)?;
+                out.push_str(": ");
+                render_json_cypher_literal(value, out)?;
+            }
+            out.push('}');
+            Ok(())
+        }
+    }
+}
+
+/// Recursively renders a typed [`ParamValue`] as a Cypher literal for FalkorDB's `CYPHER name=value` prefix.
+///
+/// Matches [`FalkorDBBridge`]'s `_adapt_falkordb_value` for temporal types (ISO strings) and
+/// decimals (numeric literals when finite).
+fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
+    match val {
+        ParamValue::Json(v) => render_json_cypher_literal(v, out),
+        ParamValue::Float(f) => {
+            if f.is_finite() {
+                let s = f.to_string();
+                out.push_str(&s);
+                if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                    out.push_str(".0");
+                }
+                Ok(())
+            } else {
+                Err(NetError::ExecutionError(
+                    "FalkorDB Cypher parameter header does not support NaN or Infinity float literals"
+                        .to_string(),
+                ))
+            }
+        }
+        ParamValue::Bytes(_) => Err(NetError::ExecutionError(
+            "FalkorDB Cypher does not support binary bytes parameters".to_string(),
+        )),
+        ParamValue::Date { year, month, day } => {
+            push_cypher_string(&format_iso_date(*year, *month, *day), out);
+            Ok(())
+        }
+        ParamValue::Time {
+            hour,
+            minute,
+            second,
+            nanosecond,
+            tz_offset_seconds,
+        } => {
+            push_cypher_string(
+                &format_iso_time(*hour, *minute, *second, *nanosecond, *tz_offset_seconds),
+                out,
+            );
+            Ok(())
+        }
+        ParamValue::LocalDateTime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            nanosecond,
+        } => {
+            let text = format!(
+                "{}T{}",
+                format_iso_date(*year, *month, *day),
+                format_iso_time(*hour, *minute, *second, *nanosecond, None)
+            );
+            push_cypher_string(&text, out);
+            Ok(())
+        }
+        ParamValue::DateTime {
+            utc_seconds,
+            nanosecond,
+            tz,
+        } => {
+            let text = format_datetime_iso(*utc_seconds, *nanosecond, Some(tz.offset_seconds()));
+            push_cypher_string(&text, out);
+            Ok(())
+        }
+        ParamValue::Duration {
+            months,
+            days,
+            seconds,
+            nanoseconds,
+        } => {
+            let text = format_iso_duration(*months, *days, *seconds, *nanoseconds);
+            push_cypher_string(&text, out);
+            Ok(())
+        }
+        ParamValue::Uuid(s) => {
+            push_cypher_string(s, out);
+            Ok(())
+        }
+        ParamValue::Decimal(s) => {
+            let f = parse_decimal_f64(s).ok_or_else(|| {
+                NetError::ExecutionError(format!("Invalid decimal parameter literal: {s:?}"))
+            })?;
+            render_cypher_literal(&ParamValue::Float(f), out)
+        }
+        ParamValue::Point2D { srid, x, y } => {
+            if *srid == 4326 {
+                out.push_str(&format!("{{latitude: {y}, longitude: {x}}}"));
+            } else {
+                out.push_str(&format!("{{srid: {srid}, x: {x}, y: {y}}}"));
+            }
+            Ok(())
+        }
+        ParamValue::Point3D { srid, x, y, z } => {
+            if *srid == 4979 {
+                out.push_str(&format!("{{latitude: {y}, longitude: {x}, height: {z}}}"));
+            } else {
+                out.push_str(&format!("{{srid: {srid}, x: {x}, y: {y}, z: {z}}}"));
+            }
+            Ok(())
+        }
+        ParamValue::List(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
@@ -245,9 +387,9 @@ fn render_cypher_literal(val: &serde_json::Value, out: &mut String) -> Result<()
             out.push(']');
             Ok(())
         }
-        serde_json::Value::Object(map) => {
+        ParamValue::Map(map) => {
             out.push('{');
-            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            let mut entries: Vec<(&String, &ParamValue)> = map.iter().collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (i, (key, value)) in entries.into_iter().enumerate() {
                 if i > 0 {
@@ -266,7 +408,7 @@ fn render_cypher_literal(val: &serde_json::Value, out: &mut String) -> Result<()
 /// Helper function to prefix a Cypher query with parameters in FalkorDB's native syntax.
 pub fn format_cypher_with_params(
     query: &str,
-    params: &HashMap<String, serde_json::Value>,
+    params: &HashMap<String, ParamValue>,
 ) -> Result<String> {
     if params.is_empty() {
         return Ok(query.to_string());

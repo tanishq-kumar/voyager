@@ -139,7 +139,7 @@ from voyager_ogm.streaming import (
     to_polars,
 )
 from voyager_ogm.transaction import AsyncTransaction, Transaction, TransactionSavepoint
-from voyager_ogm.types import Point, parse_iso_duration, to_iso_duration
+from voyager_ogm.types import Duration, Point, parse_iso_duration, to_iso_duration
 from voyager_ogm.unit_of_work import SavepointContext, UnitOfWork
 from voyager_ogm.viewer import GraphViewer, explore, show, view_graph, visualize_query
 
@@ -239,6 +239,7 @@ __all__ = [
     "ConformanceReport",
     "DatabaseBridge",
     "DuckDbBridge",
+    "Duration",
     "ExecutionResult",
     "Expression",
     "FalkorDBBridge",

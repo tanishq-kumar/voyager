@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::config::PoolConfig;
 use crate::engine::{AsyncConnection, AsyncEngine, ConnectionFactory, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
+use crate::params::ParamValue;
 use crate::pool::ConnectionPool;
 
 /// Type alias for executed query logs in mock connections.
-pub type ExecutedQueryLog = Arc<Mutex<Vec<(String, HashMap<String, serde_json::Value>)>>>;
+pub type ExecutedQueryLog = Arc<Mutex<Vec<(String, HashMap<String, ParamValue>)>>>;
 /// Type alias for canned query result queues in mock connections.
 pub type CannedResultQueue = Arc<Mutex<VecDeque<Result<QueryResult>>>>;
 
@@ -74,7 +75,7 @@ impl MockConnection {
     }
 
     /// Returns a snapshot of all executed queries.
-    pub fn get_executed_queries(&self) -> Vec<(String, HashMap<String, serde_json::Value>)> {
+    pub fn get_executed_queries(&self) -> Vec<(String, HashMap<String, ParamValue>)> {
         self.executed_queries.lock().clone()
     }
 }
@@ -90,7 +91,7 @@ impl AsyncConnection for MockConnection {
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         if !self.is_valid {
             return Err(NetError::Closed("Mock connection is closed".to_string()));
@@ -282,7 +283,7 @@ impl AsyncEngine for MockEngine {
     async fn execute(
         &self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         let mut conn = self.pool.acquire().await?;
         conn.execute(query, params).await

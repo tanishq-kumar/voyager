@@ -18,7 +18,7 @@ fn test_falkordb_backslash_quote_injection_defense() {
     // Attacker supplies a string ending with a backslash before a quote breakout payload
     params.insert(
         "p".to_string(),
-        serde_json::Value::String(r#"malicious\" OR 1=1 --"#.to_string()),
+        serde_json::Value::String(r#"malicious\" OR 1=1 --"#.to_string()).into(),
     );
 
     let formatted = format_cypher_with_params("MATCH (n) RETURN n", &params).unwrap();
@@ -263,8 +263,8 @@ fn test_resp_array_and_map_allocation_bomb_rejected() {
 #[test]
 fn test_postgres_parameter_collision_and_injection_prevention() {
     let mut params = HashMap::new();
-    params.insert("p1".to_string(), serde_json::json!(42));
-    params.insert("p10".to_string(), serde_json::json!(100));
+    params.insert("p1".to_string(), serde_json::json!(42).into());
+    params.insert("p10".to_string(), serde_json::json!(100).into());
 
     let query = "SELECT * FROM users WHERE id = $p10 AND age = $p1;";
     let prepared = prepare_postgres_statement(query, &params).expect("prepare should succeed");
@@ -284,7 +284,7 @@ fn test_postgres_parameter_collision_and_injection_prevention() {
     let mut quote_params = HashMap::new();
     quote_params.insert(
         "name".to_string(),
-        serde_json::json!("O'Reilly'; DROP TABLE authors; --"),
+        serde_json::json!("O'Reilly'; DROP TABLE authors; --").into(),
     );
     let quote_query = "SELECT * FROM authors WHERE name = $name;";
     let quote_prepared =

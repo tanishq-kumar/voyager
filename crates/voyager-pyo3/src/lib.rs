@@ -9,7 +9,9 @@ use pyo3::exceptions::{
 };
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyString, PyTuple,
+};
 
 pyo3::create_exception!(
     voyager_ogm._voyager_rs,
@@ -2884,6 +2886,17 @@ struct EntityConstructors {
     node_from_trusted: Py<PyAny>,
     rel_from_trusted: Py<PyAny>,
     path_from_trusted: Py<PyAny>,
+    datetime_cls: Py<PyAny>,
+    date_cls: Py<PyAny>,
+    time_cls: Py<PyAny>,
+    timedelta_cls: Py<PyAny>,
+    timezone_cls: Py<PyAny>,
+    utc_obj: Py<PyAny>,
+    uuid_cls: Py<PyAny>,
+    decimal_cls: Py<PyAny>,
+    zoneinfo_cls: Py<PyAny>,
+    duration_cls: Py<PyAny>,
+    parse_pg_interval_fn: Py<PyAny>,
 }
 
 static ENTITY_CONSTRUCTORS: PyOnceLock<EntityConstructors> = PyOnceLock::new();
@@ -2894,10 +2907,28 @@ fn entity_constructors<'py>(py: Python<'py>) -> PyResult<&'py EntityConstructors
         let node_cls = mod_entities.getattr("GraphNode")?;
         let rel_cls = mod_entities.getattr("GraphRelationship")?;
         let path_cls = mod_entities.getattr("GraphPath")?;
+        let dt_mod = py.import("datetime")?;
+        let timezone_cls = dt_mod.getattr("timezone")?;
+        let utc_obj = timezone_cls.getattr("utc")?.unbind();
+        let uuid_mod = py.import("uuid")?;
+        let dec_mod = py.import("decimal")?;
+        let zi_mod = py.import("zoneinfo")?;
+        let types_mod = py.import("voyager_ogm.types")?;
         Ok(EntityConstructors {
             node_from_trusted: node_cls.getattr("_from_trusted")?.unbind(),
             rel_from_trusted: rel_cls.getattr("_from_trusted")?.unbind(),
             path_from_trusted: path_cls.getattr("_from_trusted")?.unbind(),
+            datetime_cls: dt_mod.getattr("datetime")?.unbind(),
+            date_cls: dt_mod.getattr("date")?.unbind(),
+            time_cls: dt_mod.getattr("time")?.unbind(),
+            timedelta_cls: dt_mod.getattr("timedelta")?.unbind(),
+            timezone_cls: timezone_cls.unbind(),
+            utc_obj,
+            uuid_cls: uuid_mod.getattr("UUID")?.unbind(),
+            decimal_cls: dec_mod.getattr("Decimal")?.unbind(),
+            zoneinfo_cls: zi_mod.getattr("ZoneInfo")?.unbind(),
+            duration_cls: types_mod.getattr("Duration")?.unbind(),
+            parse_pg_interval_fn: types_mod.getattr("parse_pg_interval_text")?.unbind(),
         })
     })
 }
@@ -2950,11 +2981,12 @@ fn is_entity_path_obj(map: &serde_json::Map<String, serde_json::Value>) -> bool 
             .all(|k| matches!(k.as_str(), "kind" | "nodes" | "relationships" | "sequence"))
 }
 
-/// Converts a canonical JSON value to Python objects, hydrating entity objects
+/// Converts a canonical JSON value to Python objects, optionally hydrating entity objects
 /// into `GraphNode`, `GraphRelationship`, and `GraphPath` instances.
 fn json_value_to_py<'py>(
     py: Python<'py>,
     value: &serde_json::Value,
+    hydrate_entities: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     match value {
         serde_json::Value::Null => Ok(py.None().into_bound(py)),
@@ -2962,6 +2994,8 @@ fn json_value_to_py<'py>(
         serde_json::Value::Number(value) => {
             if let Some(integer) = value.as_i64() {
                 Ok(integer.into_pyobject(py)?.to_owned().into_any())
+            } else if let Some(unsigned) = value.as_u64() {
+                Ok(unsigned.into_pyobject(py)?.to_owned().into_any())
             } else {
                 Ok(value
                     .as_f64()
@@ -2974,21 +3008,21 @@ fn json_value_to_py<'py>(
         serde_json::Value::Array(values) => {
             let list = PyList::empty(py);
             for value in values {
-                list.append(json_value_to_py(py, value)?)?;
+                list.append(json_value_to_py(py, value, hydrate_entities)?)?;
             }
             Ok(list.into_any())
         }
         serde_json::Value::Object(values) => {
-            if is_entity_node_obj(values) {
+            if hydrate_entities && is_entity_node_obj(values) {
                 let ctors = entity_constructors(py)?;
                 let id_py = values
                     .get("id")
-                    .map(|v| json_value_to_py(py, v))
+                    .map(|v| json_value_to_py(py, v, true))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py));
                 let eid_py = values
                     .get("element_id")
-                    .map(|v| json_value_to_py(py, v))
+                    .map(|v| json_value_to_py(py, v, true))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py));
                 let labels_arr = values["labels"].as_array().expect("checked");
@@ -2997,13 +3031,13 @@ fn json_value_to_py<'py>(
                     if let Some(s) = lbl.as_str() {
                         label_objs.push(s.into_pyobject(py)?.into_any());
                     } else {
-                        label_objs.push(json_value_to_py(py, lbl)?);
+                        label_objs.push(json_value_to_py(py, lbl, true)?);
                     }
                 }
                 let labels_fs = PyFrozenSet::new(py, &label_objs)?;
                 let props_dict = PyDict::new(py);
                 for (pk, pv) in values["properties"].as_object().expect("checked") {
-                    props_dict.set_item(pk, json_value_to_py(py, pv)?)?;
+                    props_dict.set_item(pk, json_value_to_py(py, pv, true)?)?;
                 }
                 return ctors
                     .node_from_trusted
@@ -3011,30 +3045,30 @@ fn json_value_to_py<'py>(
                     .call1((id_py, eid_py, labels_fs, props_dict));
             }
 
-            if is_entity_rel_obj(values) {
+            if hydrate_entities && is_entity_rel_obj(values) {
                 let ctors = entity_constructors(py)?;
-                let id_py = json_value_to_py(py, &values["id"])?;
+                let id_py = json_value_to_py(py, &values["id"], true)?;
                 let eid_py = values
                     .get("element_id")
-                    .map(|v| json_value_to_py(py, v))
+                    .map(|v| json_value_to_py(py, v, true))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py));
                 let rel_type = values["type"].as_str().expect("checked");
-                let start_id_py = json_value_to_py(py, &values["start_id"])?;
-                let end_id_py = json_value_to_py(py, &values["end_id"])?;
+                let start_id_py = json_value_to_py(py, &values["start_id"], true)?;
+                let end_id_py = json_value_to_py(py, &values["end_id"], true)?;
                 let start_eid_py = values
                     .get("start_element_id")
-                    .map(|v| json_value_to_py(py, v))
+                    .map(|v| json_value_to_py(py, v, true))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py));
                 let end_eid_py = values
                     .get("end_element_id")
-                    .map(|v| json_value_to_py(py, v))
+                    .map(|v| json_value_to_py(py, v, true))
                     .transpose()?
                     .unwrap_or_else(|| py.None().into_bound(py));
                 let props_dict = PyDict::new(py);
                 for (pk, pv) in values["properties"].as_object().expect("checked") {
-                    props_dict.set_item(pk, json_value_to_py(py, pv)?)?;
+                    props_dict.set_item(pk, json_value_to_py(py, pv, true)?)?;
                 }
                 return ctors.rel_from_trusted.bind(py).call1((
                     id_py,
@@ -3048,17 +3082,17 @@ fn json_value_to_py<'py>(
                 ));
             }
 
-            if is_entity_path_obj(values) {
+            if hydrate_entities && is_entity_path_obj(values) {
                 let ctors = entity_constructors(py)?;
                 let nodes_arr = values["nodes"].as_array().expect("checked");
                 let rels_arr = values["relationships"].as_array().expect("checked");
                 let mut node_objs = Vec::with_capacity(nodes_arr.len());
                 for n in nodes_arr {
-                    node_objs.push(json_value_to_py(py, n)?);
+                    node_objs.push(json_value_to_py(py, n, true)?);
                 }
                 let mut rel_objs = Vec::with_capacity(rels_arr.len());
                 for r in rels_arr {
-                    rel_objs.push(json_value_to_py(py, r)?);
+                    rel_objs.push(json_value_to_py(py, r, true)?);
                 }
                 let nodes_tuple = PyTuple::new(py, &node_objs)?;
                 let rels_tuple = PyTuple::new(py, &rel_objs)?;
@@ -3070,9 +3104,586 @@ fn json_value_to_py<'py>(
 
             let dict = PyDict::new(py);
             for (key, value) in values {
-                dict.set_item(key, json_value_to_py(py, value)?)?;
+                dict.set_item(key, json_value_to_py(py, value, hydrate_entities)?)?;
             }
             Ok(dict.into_any())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PyTemporalTz<'a> {
+    Offset(i64),
+    Zone(&'a str),
+    LocalZone(&'a str),
+}
+
+fn make_py_offset_tz<'py>(
+    py: Python<'py>,
+    offset_secs: i64,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let ctors = entity_constructors(py)?;
+    if offset_secs == 0 {
+        return Ok(Some(ctors.utc_obj.bind(py).clone()));
+    }
+    if offset_secs.abs() >= 86_400 {
+        return Ok(None);
+    }
+    let td = ctors.timedelta_cls.bind(py).call1((0, offset_secs))?;
+    Ok(Some(ctors.timezone_cls.bind(py).call1((td,))?))
+}
+
+fn days_to_py_date<'py>(
+    py: Python<'py>,
+    days: i64,
+    fallback_iso: Option<&str>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let (year, month, day) = voyager_drivers::bolt::packstream::days_to_ymd(days);
+    if !(1..=9999).contains(&year) {
+        let iso = fallback_iso
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("{year:04}-{month:02}-{day:02}"));
+        return Ok(iso.into_pyobject(py)?.into_any());
+    }
+    let ctors = entity_constructors(py)?;
+    ctors.date_cls.bind(py).call1((year, month, day))
+}
+
+fn nanos_to_py_time<'py>(
+    py: Python<'py>,
+    nanos_of_day: i64,
+    tz_offset_seconds: Option<i64>,
+    fallback_iso: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    if !(0..86_400_000_000_000).contains(&nanos_of_day) || nanos_of_day % 1_000 != 0 {
+        return Ok(fallback_iso.into_pyobject(py)?.into_any());
+    }
+    let (h, m, s, ns) = voyager_drivers::bolt::packstream::nanos_to_hmsn(nanos_of_day);
+    let us = ns / 1_000;
+    let ctors = entity_constructors(py)?;
+    match tz_offset_seconds {
+        None => ctors.time_cls.bind(py).call1((h, m, s, us)),
+        Some(offset) => match make_py_offset_tz(py, offset)? {
+            Some(tz) => ctors.time_cls.bind(py).call1((h, m, s, us, tz)),
+            None => Ok(fallback_iso.into_pyobject(py)?.into_any()),
+        },
+    }
+}
+
+fn epoch_nanos_to_py_datetime<'py>(
+    py: Python<'py>,
+    epoch_seconds: i64,
+    nanoseconds: i64,
+    tz: Option<PyTemporalTz<'_>>,
+    fallback_iso: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    if !(0..1_000_000_000).contains(&nanoseconds) || nanoseconds % 1_000 != 0 {
+        return Ok(fallback_iso.into_pyobject(py)?.into_any());
+    }
+    let us = nanoseconds / 1_000;
+    let ctors = entity_constructors(py)?;
+    let split_secs = |secs: i64| -> (i32, u32, u32, i64, i64, i64) {
+        let days = secs.div_euclid(86_400);
+        let rem = secs.rem_euclid(86_400);
+        let (y, m, d) = voyager_drivers::bolt::packstream::days_to_ymd(days);
+        (y, m, d, rem / 3_600, (rem % 3_600) / 60, rem % 60)
+    };
+
+    match tz {
+        None => {
+            let (y, m, d, hh, mm, ss) = split_secs(epoch_seconds);
+            if !(1..=9999).contains(&y) {
+                return Ok(fallback_iso.into_pyobject(py)?.into_any());
+            }
+            ctors.datetime_cls.bind(py).call1((y, m, d, hh, mm, ss, us))
+        }
+        Some(PyTemporalTz::Offset(offset)) => {
+            let Some(local_secs) = epoch_seconds.checked_add(offset) else {
+                return Ok(fallback_iso.into_pyobject(py)?.into_any());
+            };
+            let (y, m, d, hh, mm, ss) = split_secs(local_secs);
+            if !(1..=9999).contains(&y) {
+                return Ok(fallback_iso.into_pyobject(py)?.into_any());
+            }
+            let Some(tz_obj) = make_py_offset_tz(py, offset)? else {
+                return Ok(fallback_iso.into_pyobject(py)?.into_any());
+            };
+            ctors
+                .datetime_cls
+                .bind(py)
+                .call1((y, m, d, hh, mm, ss, us, tz_obj))
+        }
+        Some(PyTemporalTz::Zone(zone_id)) => {
+            let (y, m, d, hh, mm, ss) = split_secs(epoch_seconds);
+            if !(1..=9999).contains(&y) {
+                return Ok(fallback_iso.into_pyobject(py)?.into_any());
+            }
+            let Ok(zi) = ctors.zoneinfo_cls.bind(py).call1((zone_id,)) else {
+                return Ok(fallback_iso.into_pyobject(py)?.into_any());
+            };
+            let utc = ctors.utc_obj.bind(py);
+            let dt_utc = ctors
+                .datetime_cls
+                .bind(py)
+                .call1((y, m, d, hh, mm, ss, us, utc))?;
+            match dt_utc.call_method1("astimezone", (zi,)) {
+                Ok(dt_zoned) => Ok(dt_zoned),
+                Err(_) => Ok(fallback_iso.into_pyobject(py)?.into_any()),
+            }
+        }
+        Some(PyTemporalTz::LocalZone(zone_id)) => {
+            let (y, m, d, hh, mm, ss) = split_secs(epoch_seconds);
+            if !(1..=9999).contains(&y) {
+                return Ok(fallback_iso.into_pyobject(py)?.into_any());
+            }
+            let Ok(zi) = ctors.zoneinfo_cls.bind(py).call1((zone_id,)) else {
+                return Ok(fallback_iso.into_pyobject(py)?.into_any());
+            };
+            ctors
+                .datetime_cls
+                .bind(py)
+                .call1((y, m, d, hh, mm, ss, us, zi))
+        }
+    }
+}
+
+fn decimal128_to_py<'py>(py: Python<'py>, raw: i128, scale: i8) -> PyResult<Bound<'py, PyAny>> {
+    let ctors = entity_constructors(py)?;
+    let s = if scale == 0 {
+        raw.to_string()
+    } else if scale < 0 {
+        if raw == 0 {
+            "0".to_string()
+        } else {
+            let zeros = "0".repeat((-scale) as usize);
+            format!("{raw}{zeros}")
+        }
+    } else {
+        let neg = raw < 0;
+        let digits = raw.unsigned_abs().to_string();
+        let scale_u = scale as usize;
+        let sign = if neg { "-" } else { "" };
+        if digits.len() <= scale_u {
+            let pad = "0".repeat(scale_u - digits.len());
+            format!("{sign}0.{pad}{digits}")
+        } else {
+            let split = digits.len() - scale_u;
+            format!("{sign}{}.{}", &digits[..split], &digits[split..])
+        }
+    };
+    ctors.decimal_cls.bind(py).call1((s,))
+}
+
+fn parse_hms_str(raw: &str) -> Option<(u32, u32, u32, i64)> {
+    let (hms, frac_opt) = match raw.split_once('.') {
+        Some((l, r)) => (l, Some(r)),
+        None => (raw, None),
+    };
+    let mut parts = hms.split(':');
+    let h: u32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let s: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    let nanos = if let Some(frac) = frac_opt {
+        if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut padded = [b'0'; 9];
+        padded[..frac.len()].copy_from_slice(frac.as_bytes());
+        std::str::from_utf8(&padded).ok()?.parse::<i64>().ok()?
+    } else {
+        0
+    };
+    Some((h, m, s, nanos))
+}
+
+fn parse_tz_suffix_seconds(raw: &str) -> Option<i64> {
+    if raw.eq_ignore_ascii_case("z") {
+        return Some(0);
+    }
+    let (sign, rest) = if let Some(r) = raw.strip_prefix('+') {
+        (1i64, r)
+    } else {
+        let r = raw.strip_prefix('-')?;
+        (-1i64, r)
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let oh: i64 = parts[0].parse().ok()?;
+    let om: i64 = if parts.len() >= 2 {
+        parts[1].parse().ok()?
+    } else {
+        0
+    };
+    let os: i64 = if parts.len() == 3 {
+        parts[2].parse().ok()?
+    } else {
+        0
+    };
+    if !(0..=23).contains(&oh) || !(0..=59).contains(&om) || !(0..=59).contains(&os) {
+        return None;
+    }
+    Some(sign * (oh * 3_600 + om * 60 + os))
+}
+
+fn parse_voyager_typed_utf8<'py>(
+    py: Python<'py>,
+    kind: &str,
+    s: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let ctors = entity_constructors(py)?;
+    let trimmed = s.trim();
+    match kind {
+        "decimal" => ctors.decimal_cls.bind(py).call1((trimmed,)),
+        "uuid" => ctors.uuid_cls.bind(py).call1((trimmed,)),
+        "duration" => {
+            if trimmed.starts_with('P') || trimmed.starts_with("-P") {
+                match ctors
+                    .duration_cls
+                    .bind(py)
+                    .call_method1("from_iso", (trimmed,))
+                {
+                    Ok(v) => Ok(v),
+                    Err(_) => Ok(s.into_pyobject(py)?.into_any()),
+                }
+            } else {
+                match ctors.parse_pg_interval_fn.bind(py).call1((trimmed,)) {
+                    Ok(v) => Ok(v),
+                    Err(_) => Ok(s.into_pyobject(py)?.into_any()),
+                }
+            }
+        }
+        "date" => {
+            let mut parts = trimmed.split('-');
+            if let (Some(ys), Some(ms), Some(ds), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+                && let (Ok(y), Ok(m), Ok(d)) =
+                    (ys.parse::<i32>(), ms.parse::<u32>(), ds.parse::<u32>())
+                && (1..=9999).contains(&y)
+                && (1..=12).contains(&m)
+                && (1..=31).contains(&d)
+            {
+                return ctors.date_cls.bind(py).call1((y, m, d));
+            }
+            Ok(s.into_pyobject(py)?.into_any())
+        }
+        "time" | "time_tz" => {
+            let bytes = trimmed.as_bytes();
+            let tz_start = if bytes.ends_with(b"Z") || bytes.ends_with(b"z") {
+                Some(trimmed.len() - 1)
+            } else {
+                bytes.iter().rposition(|&b| b == b'+' || b == b'-')
+            };
+            let (hms_part, tz_offset) = match tz_start {
+                Some(idx) => (&trimmed[..idx], parse_tz_suffix_seconds(&trimmed[idx..])),
+                None => (trimmed, None),
+            };
+            if (tz_start.is_some() || kind == "time_tz") && tz_offset.is_none() {
+                return Ok(s.into_pyobject(py)?.into_any());
+            }
+            if let Some((h, m, sec, nanos)) = parse_hms_str(hms_part.trim()) {
+                let total_ns =
+                    ((h as i64) * 3_600 + (m as i64) * 60 + (sec as i64)) * 1_000_000_000 + nanos;
+                return nanos_to_py_time(py, total_ns, tz_offset, trimmed);
+            }
+            Ok(s.into_pyobject(py)?.into_any())
+        }
+        "local_datetime" | "datetime_tz" => {
+            let (main, bracket_zone) = if let Some(b_start) = trimmed.find('[')
+                && trimmed.ends_with(']')
+            {
+                (
+                    &trimmed[..b_start],
+                    Some(&trimmed[b_start + 1..trimmed.len() - 1]),
+                )
+            } else {
+                (trimmed, None)
+            };
+            let Some((date_part, time_tz_part)) =
+                main.split_once('T').or_else(|| main.split_once(' '))
+            else {
+                return Ok(s.into_pyobject(py)?.into_any());
+            };
+            let mut dparts = date_part.split('-');
+            let (Some(ys), Some(ms), Some(ds), None) =
+                (dparts.next(), dparts.next(), dparts.next(), dparts.next())
+            else {
+                return Ok(s.into_pyobject(py)?.into_any());
+            };
+            let (Ok(y), Ok(mo), Ok(da)) = (ys.parse::<i32>(), ms.parse::<u32>(), ds.parse::<u32>())
+            else {
+                return Ok(s.into_pyobject(py)?.into_any());
+            };
+            if !(1..=9999).contains(&y) || !(1..=12).contains(&mo) || !(1..=31).contains(&da) {
+                return Ok(s.into_pyobject(py)?.into_any());
+            }
+            let bytes = time_tz_part.as_bytes();
+            let tz_idx = if bytes.ends_with(b"Z") || bytes.ends_with(b"z") {
+                Some(time_tz_part.len() - 1)
+            } else {
+                bytes.iter().rposition(|&b| b == b'+' || b == b'-')
+            };
+            let (hms_part, offset_opt) = match tz_idx {
+                Some(idx) => (
+                    &time_tz_part[..idx],
+                    parse_tz_suffix_seconds(&time_tz_part[idx..]),
+                ),
+                None => (time_tz_part, None),
+            };
+            if tz_idx.is_some() && offset_opt.is_none() {
+                return Ok(s.into_pyobject(py)?.into_any());
+            }
+            if kind == "datetime_tz" && bracket_zone.is_none() && offset_opt.is_none() {
+                return Ok(s.into_pyobject(py)?.into_any());
+            }
+            let Some((h, mi, sec, nanos)) = parse_hms_str(hms_part.trim()) else {
+                return Ok(s.into_pyobject(py)?.into_any());
+            };
+            if nanos % 1_000 != 0 {
+                return Ok(s.into_pyobject(py)?.into_any());
+            }
+            let us = nanos / 1_000;
+            if let Some(zone_id) = bracket_zone {
+                let Ok(zi) = ctors.zoneinfo_cls.bind(py).call1((zone_id,)) else {
+                    return Ok(s.into_pyobject(py)?.into_any());
+                };
+                if let Some(offset) = offset_opt {
+                    let days = voyager_drivers::bolt::packstream::ymd_to_days(y, mo, da);
+                    let local_secs =
+                        days * 86_400 + (h as i64) * 3_600 + (mi as i64) * 60 + (sec as i64);
+                    let utc_secs = local_secs - offset;
+                    return epoch_nanos_to_py_datetime(
+                        py,
+                        utc_secs,
+                        nanos,
+                        Some(PyTemporalTz::Zone(zone_id)),
+                        trimmed,
+                    );
+                }
+                return ctors
+                    .datetime_cls
+                    .bind(py)
+                    .call1((y, mo, da, h, mi, sec, us, zi));
+            }
+            if let Some(offset) = offset_opt {
+                let Some(tz_obj) = make_py_offset_tz(py, offset)? else {
+                    return Ok(s.into_pyobject(py)?.into_any());
+                };
+                return ctors
+                    .datetime_cls
+                    .bind(py)
+                    .call1((y, mo, da, h, mi, sec, us, tz_obj));
+            }
+            ctors
+                .datetime_cls
+                .bind(py)
+                .call1((y, mo, da, h, mi, sec, us))
+        }
+        _ => Ok(s.into_pyobject(py)?.into_any()),
+    }
+}
+
+fn bolt_node_to_py<'py>(
+    py: Python<'py>,
+    node: &voyager_drivers::BoltNode,
+) -> PyResult<Bound<'py, PyAny>> {
+    let ctors = entity_constructors(py)?;
+    let eid_py = match &node.element_id {
+        Some(eid) => eid.into_pyobject(py)?.into_any(),
+        None => py.None().into_bound(py),
+    };
+    let mut labels: Vec<Bound<'py, PyAny>> = Vec::with_capacity(node.labels.len());
+    for lbl in &node.labels {
+        labels.push(lbl.into_pyobject(py)?.into_any());
+    }
+    let labels_fs = PyFrozenSet::new(py, &labels)?;
+    let props = PyDict::new(py);
+    for (k, v) in &node.properties {
+        props.set_item(k, bolt_value_to_py(py, v)?)?;
+    }
+    ctors
+        .node_from_trusted
+        .bind(py)
+        .call1((node.id, eid_py, labels_fs, props))
+}
+
+fn bolt_rel_to_py<'py>(
+    py: Python<'py>,
+    rel: &voyager_drivers::BoltRelationship,
+) -> PyResult<Bound<'py, PyAny>> {
+    let ctors = entity_constructors(py)?;
+    let eid_py = match &rel.element_id {
+        Some(eid) => eid.into_pyobject(py)?.into_any(),
+        None => py.None().into_bound(py),
+    };
+    let start_eid_py = match &rel.start_element_id {
+        Some(eid) => eid.into_pyobject(py)?.into_any(),
+        None => py.None().into_bound(py),
+    };
+    let end_eid_py = match &rel.end_element_id {
+        Some(eid) => eid.into_pyobject(py)?.into_any(),
+        None => py.None().into_bound(py),
+    };
+    let props = PyDict::new(py);
+    for (k, v) in &rel.properties {
+        props.set_item(k, bolt_value_to_py(py, v)?)?;
+    }
+    ctors.rel_from_trusted.bind(py).call1((
+        rel.id,
+        eid_py,
+        rel.rel_type.as_str(),
+        rel.start_node_id,
+        rel.end_node_id,
+        props,
+        start_eid_py,
+        end_eid_py,
+    ))
+}
+
+fn bolt_value_to_py<'py>(
+    py: Python<'py>,
+    value: &voyager_drivers::BoltValue,
+) -> PyResult<Bound<'py, PyAny>> {
+    use voyager_drivers::{BoltRelationship, BoltValue};
+
+    match value {
+        BoltValue::Null => Ok(py.None().into_bound(py)),
+        BoltValue::Boolean(b) => Ok(b.into_pyobject(py)?.to_owned().into_any()),
+        BoltValue::Integer(i) => Ok(i.into_pyobject(py)?.to_owned().into_any()),
+        BoltValue::Float(f) => Ok(f.into_pyobject(py)?.into_any()),
+        BoltValue::Bytes(bytes) => Ok(PyBytes::new(py, bytes).into_any()),
+        BoltValue::String(s) => Ok(s.into_pyobject(py)?.into_any()),
+        BoltValue::List(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(bolt_value_to_py(py, item)?)?;
+            }
+            Ok(list.into_any())
+        }
+        BoltValue::Map(map) => {
+            let dict = PyDict::new(py);
+            for (k, v) in map {
+                dict.set_item(k, bolt_value_to_py(py, v)?)?;
+            }
+            Ok(dict.into_any())
+        }
+        BoltValue::Structure { tag, fields } => {
+            let dict = PyDict::new(py);
+            dict.set_item("tag", *tag)?;
+            let list = PyList::empty(py);
+            for f in fields {
+                list.append(bolt_value_to_py(py, f)?)?;
+            }
+            dict.set_item("fields", list)?;
+            Ok(dict.into_any())
+        }
+        BoltValue::Node(node) => bolt_node_to_py(py, node),
+        BoltValue::Relationship(rel) => bolt_rel_to_py(py, rel),
+        BoltValue::Path(path) => {
+            let ctors = entity_constructors(py)?;
+            let mut node_objs = Vec::new();
+            let mut rel_objs = Vec::new();
+            if path.sequence.is_empty() {
+                for node in &path.nodes {
+                    node_objs.push(bolt_node_to_py(py, node)?);
+                }
+            } else {
+                if let Some(first) = path.nodes.first() {
+                    node_objs.push(bolt_node_to_py(py, first)?);
+                }
+                let mut current_node_idx = 0usize;
+                for step_idx in 0..(path.sequence.len() / 2) {
+                    let rel_code = path.sequence[2 * step_idx];
+                    let next_node_raw = path.sequence[2 * step_idx + 1];
+                    let next_node_idx = usize::try_from(next_node_raw).unwrap_or(0);
+                    let rel_idx = rel_code.unsigned_abs().saturating_sub(1) as usize;
+                    if let (Some(prev_node), Some(next_node), Some(unbound_rel)) = (
+                        path.nodes.get(current_node_idx),
+                        path.nodes.get(next_node_idx),
+                        path.relationships.get(rel_idx),
+                    ) {
+                        node_objs.push(bolt_node_to_py(py, next_node)?);
+                        let (start_node, end_node) = if rel_code > 0 {
+                            (prev_node, next_node)
+                        } else {
+                            (next_node, prev_node)
+                        };
+                        let bound = BoltRelationship {
+                            id: unbound_rel.id,
+                            start_node_id: start_node.id,
+                            end_node_id: end_node.id,
+                            rel_type: unbound_rel.rel_type.clone(),
+                            properties: unbound_rel.properties.clone(),
+                            element_id: unbound_rel.element_id.clone(),
+                            start_element_id: start_node.element_id.clone(),
+                            end_element_id: end_node.element_id.clone(),
+                        };
+                        rel_objs.push(bolt_rel_to_py(py, &bound)?);
+                        current_node_idx = next_node_idx;
+                    }
+                }
+            }
+            let nodes_tuple = PyTuple::new(py, &node_objs)?;
+            let rels_tuple = PyTuple::new(py, &rel_objs)?;
+            ctors
+                .path_from_trusted
+                .bind(py)
+                .call1((nodes_tuple, rels_tuple))
+        }
+        BoltValue::Point2D(pt) => {
+            let dict = PyDict::new(py);
+            dict.set_item("srid", pt.srid)?;
+            dict.set_item("x", pt.x)?;
+            dict.set_item("y", pt.y)?;
+            Ok(dict.into_any())
+        }
+        BoltValue::Point3D(pt) => {
+            let dict = PyDict::new(py);
+            dict.set_item("srid", pt.srid)?;
+            dict.set_item("x", pt.x)?;
+            dict.set_item("y", pt.y)?;
+            dict.set_item("z", pt.z)?;
+            Ok(dict.into_any())
+        }
+        BoltValue::Date(d) => days_to_py_date(py, d.days, Some(&d.to_iso_string())),
+        BoltValue::LocalTime(lt) => nanos_to_py_time(py, lt.nanoseconds, None, &lt.to_iso_string()),
+        BoltValue::Time(t) => nanos_to_py_time(
+            py,
+            t.nanoseconds,
+            Some(t.tz_offset_seconds),
+            &t.to_iso_string(),
+        ),
+        BoltValue::LocalDateTime(ldt) => {
+            epoch_nanos_to_py_datetime(py, ldt.seconds, ldt.nanoseconds, None, &ldt.to_iso_string())
+        }
+        BoltValue::DateTime(dt) => epoch_nanos_to_py_datetime(
+            py,
+            dt.seconds,
+            dt.nanoseconds,
+            Some(PyTemporalTz::Offset(dt.tz_offset_seconds)),
+            &dt.to_iso_string(),
+        ),
+        BoltValue::DateTimeZoneId(dtz) => epoch_nanos_to_py_datetime(
+            py,
+            dtz.seconds,
+            dtz.nanoseconds,
+            Some(if dtz.is_local {
+                PyTemporalTz::LocalZone(&dtz.zone_id)
+            } else {
+                PyTemporalTz::Zone(&dtz.zone_id)
+            }),
+            &dtz.to_iso_string(),
+        ),
+        BoltValue::Duration(dur) => {
+            let ctors = entity_constructors(py)?;
+            ctors
+                .duration_cls
+                .bind(py)
+                .call1((dur.months, dur.days, dur.seconds, dur.nanoseconds))
         }
     }
 }
@@ -3081,20 +3692,46 @@ fn json_value_to_py<'py>(
 enum Utf8ColMode {
     Plain,
     JsonEntities,
-    AgeAgtype,
+    JsonPure,
+    Typed(&'static str),
+}
+
+fn utf8_col_mode_for_field(field: &arrow_schema::Field) -> Utf8ColMode {
+    let meta = field.metadata();
+    if meta.get("voyager.encoding").is_some_and(|v| v == "json") {
+        if meta.get("voyager.type").is_some_and(|v| v == "json") {
+            return Utf8ColMode::JsonPure;
+        }
+        return Utf8ColMode::JsonEntities;
+    }
+    if meta.contains_key("voyager.kind") {
+        return Utf8ColMode::JsonEntities;
+    }
+    match meta.get("voyager.type").map(String::as_str) {
+        Some("date") => Utf8ColMode::Typed("date"),
+        Some("time") => Utf8ColMode::Typed("time"),
+        Some("time_tz") => Utf8ColMode::Typed("time_tz"),
+        Some("local_datetime") => Utf8ColMode::Typed("local_datetime"),
+        Some("datetime_tz") => Utf8ColMode::Typed("datetime_tz"),
+        Some("decimal") => Utf8ColMode::Typed("decimal"),
+        Some("uuid") => Utf8ColMode::Typed("uuid"),
+        Some("duration") => Utf8ColMode::Typed("duration"),
+        _ => Utf8ColMode::Plain,
+    }
 }
 
 /// Converts one Arrow array element to the corresponding Python value.
 ///
-/// Supports the scalar types the native PostgreSQL client emits and nested
-/// `List` values, so PostgreSQL array columns arrive as Python lists.
+/// Handles all Arrow scalar, temporal, binary, uuid extension, decimal,
+/// duration/struct, JSON metadata, and nested `List` types.
 fn arrow_array_value_to_py<'py>(
+    field: &arrow_schema::Field,
     array: &dyn arrow_array::Array,
     index: usize,
     py: Python<'py>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use arrow_array::*;
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, TimeUnit};
 
     if array.is_null(index) {
         return Ok(py.None().into_bound(py));
@@ -3107,6 +3744,30 @@ fn arrow_array_value_to_py<'py>(
         }
         DataType::Int32 => {
             let values = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::Int16 => {
+            let values = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::Int8 => {
+            let values = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::UInt64 => {
+            let values = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::UInt32 => {
+            let values = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::UInt16 => {
+            let values = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::UInt8 => {
+            let values = array.as_any().downcast_ref::<UInt8Array>().unwrap();
             Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
         }
         DataType::Float64 => {
@@ -3124,23 +3785,286 @@ fn arrow_array_value_to_py<'py>(
             let values = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
         }
+        DataType::Binary => {
+            let values = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            Ok(PyBytes::new(py, values.value(index)).into_any())
+        }
+        DataType::LargeBinary => {
+            let values = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            Ok(PyBytes::new(py, values.value(index)).into_any())
+        }
+        DataType::FixedSizeBinary(16) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            let bytes = values.value(index);
+            if field
+                .metadata()
+                .get("ARROW:extension:name")
+                .is_some_and(|v| v == "arrow.uuid")
+            {
+                let ctors = entity_constructors(py)?;
+                ctors
+                    .uuid_cls
+                    .bind(py)
+                    .call1((py.None(), PyBytes::new(py, bytes)))
+            } else {
+                Ok(PyBytes::new(py, bytes).into_any())
+            }
+        }
+        DataType::FixedSizeBinary(_) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            Ok(PyBytes::new(py, values.value(index)).into_any())
+        }
+        DataType::Decimal128(_, scale) => {
+            let values = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            decimal128_to_py(py, values.value(index), *scale)
+        }
+        DataType::Date32 => {
+            let values = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            days_to_py_date(py, values.value(index) as i64, None)
+        }
+        DataType::Date64 => {
+            let values = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            days_to_py_date(py, values.value(index).div_euclid(86_400_000), None)
+        }
+        DataType::Time32(TimeUnit::Second) => {
+            let values = array.as_any().downcast_ref::<Time32SecondArray>().unwrap();
+            let s = values.value(index) as i64;
+            let iso = format!("{:02}:{:02}:{:02}", s / 3_600, (s % 3_600) / 60, s % 60);
+            nanos_to_py_time(py, s * 1_000_000_000, None, &iso)
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .unwrap();
+            let ns = (values.value(index) as i64) * 1_000_000;
+            let iso = voyager_drivers::bolt::packstream::BoltLocalTime { nanoseconds: ns }
+                .to_iso_string();
+            nanos_to_py_time(py, ns, None, &iso)
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .unwrap();
+            let ns = values.value(index) * 1_000;
+            let iso = voyager_drivers::bolt::packstream::BoltLocalTime { nanoseconds: ns }
+                .to_iso_string();
+            nanos_to_py_time(py, ns, None, &iso)
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .unwrap();
+            let ns = values.value(index);
+            let iso = voyager_drivers::bolt::packstream::BoltLocalTime { nanoseconds: ns }
+                .to_iso_string();
+            nanos_to_py_time(py, ns, None, &iso)
+        }
+        DataType::Timestamp(unit, tz_opt) => {
+            let (secs, nanos) = match unit {
+                TimeUnit::Second => {
+                    let v = array
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .unwrap()
+                        .value(index);
+                    (v, 0i64)
+                }
+                TimeUnit::Millisecond => {
+                    let v = array
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap()
+                        .value(index);
+                    (v.div_euclid(1_000), v.rem_euclid(1_000) * 1_000_000)
+                }
+                TimeUnit::Microsecond => {
+                    let v = array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .value(index);
+                    (v.div_euclid(1_000_000), v.rem_euclid(1_000_000) * 1_000)
+                }
+                TimeUnit::Nanosecond => {
+                    let v = array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap()
+                        .value(index);
+                    (v.div_euclid(1_000_000_000), v.rem_euclid(1_000_000_000))
+                }
+            };
+            let tz = tz_opt.as_deref().map(|z| {
+                if z == "UTC" {
+                    PyTemporalTz::Offset(0)
+                } else {
+                    PyTemporalTz::Zone(z)
+                }
+            });
+            let iso = match tz_opt.as_deref() {
+                None => voyager_drivers::bolt::packstream::BoltLocalDateTime {
+                    seconds: secs,
+                    nanoseconds: nanos,
+                }
+                .to_iso_string(),
+                Some("UTC") => voyager_drivers::bolt::packstream::BoltDateTime {
+                    seconds: secs,
+                    nanoseconds: nanos,
+                    tz_offset_seconds: 0,
+                }
+                .to_iso_string(),
+                Some(z) => voyager_drivers::bolt::packstream::BoltDateTimeZoneId {
+                    seconds: secs,
+                    nanoseconds: nanos,
+                    zone_id: z.to_string(),
+                    is_local: false,
+                }
+                .to_iso_string(),
+            };
+            epoch_nanos_to_py_datetime(py, secs, nanos, tz, &iso)
+        }
+        DataType::Duration(unit) => {
+            let total_ns: i128 = match unit {
+                TimeUnit::Second => {
+                    array
+                        .as_any()
+                        .downcast_ref::<DurationSecondArray>()
+                        .unwrap()
+                        .value(index) as i128
+                        * 1_000_000_000
+                }
+                TimeUnit::Millisecond => {
+                    array
+                        .as_any()
+                        .downcast_ref::<DurationMillisecondArray>()
+                        .unwrap()
+                        .value(index) as i128
+                        * 1_000_000
+                }
+                TimeUnit::Microsecond => {
+                    array
+                        .as_any()
+                        .downcast_ref::<DurationMicrosecondArray>()
+                        .unwrap()
+                        .value(index) as i128
+                        * 1_000
+                }
+                TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<DurationNanosecondArray>()
+                    .unwrap()
+                    .value(index) as i128,
+            };
+            let total_secs = (total_ns / 1_000_000_000) as i64;
+            let ns = (total_ns % 1_000_000_000) as i64;
+            let ctors = entity_constructors(py)?;
+            ctors
+                .duration_cls
+                .bind(py)
+                .call1((0i64, 0i64, total_secs, ns))
+        }
+        DataType::Struct(sub_fields) => {
+            let values = array.as_any().downcast_ref::<StructArray>().unwrap();
+            if field
+                .metadata()
+                .get("voyager.type")
+                .is_some_and(|v| v == "duration")
+                && sub_fields.len() == 4
+            {
+                let months = values
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(index);
+                let days = values
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(index);
+                let seconds = values
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(index);
+                let nanoseconds = values
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(index);
+                let ctors = entity_constructors(py)?;
+                return ctors
+                    .duration_cls
+                    .bind(py)
+                    .call1((months, days, seconds, nanoseconds));
+            }
+            let dict = PyDict::new(py);
+            for (col_idx, sub_field) in sub_fields.iter().enumerate() {
+                let sub_arr = values.column(col_idx);
+                dict.set_item(
+                    sub_field.name(),
+                    arrow_array_value_to_py(sub_field.as_ref(), sub_arr.as_ref(), index, py)?,
+                )?;
+            }
+            Ok(dict.into_any())
+        }
         DataType::Utf8 => {
             let values = array.as_any().downcast_ref::<StringArray>().unwrap();
-            Ok(values.value(index).into_pyobject(py)?.into_any())
+            let s = values.value(index);
+            match utf8_col_mode_for_field(field) {
+                Utf8ColMode::JsonEntities => {
+                    let parsed: serde_json::Value = serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    json_value_to_py(py, &parsed, true)
+                }
+                Utf8ColMode::JsonPure => {
+                    let parsed: serde_json::Value = serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    json_value_to_py(py, &parsed, false)
+                }
+                Utf8ColMode::Typed(kind) => parse_voyager_typed_utf8(py, kind, s),
+                Utf8ColMode::Plain => Ok(s.into_pyobject(py)?.into_any()),
+            }
         }
         DataType::LargeUtf8 => {
             let values = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            Ok(values.value(index).into_pyobject(py)?.into_any())
+            let s = values.value(index);
+            match utf8_col_mode_for_field(field) {
+                Utf8ColMode::JsonEntities => {
+                    let parsed: serde_json::Value = serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    json_value_to_py(py, &parsed, true)
+                }
+                Utf8ColMode::JsonPure => {
+                    let parsed: serde_json::Value = serde_json::from_str(s)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    json_value_to_py(py, &parsed, false)
+                }
+                Utf8ColMode::Typed(kind) => parse_voyager_typed_utf8(py, kind, s),
+                Utf8ColMode::Plain => Ok(s.into_pyobject(py)?.into_any()),
+            }
         }
-        DataType::List(_) => {
+        DataType::List(item_field) => {
             let values = array.as_any().downcast_ref::<ListArray>().unwrap();
             let child = values.value(index);
-            arrow_array_values_to_py(child.as_ref(), py)
+            arrow_array_values_to_py(item_field.as_ref(), child.as_ref(), py)
         }
-        DataType::LargeList(_) => {
+        DataType::LargeList(item_field) => {
             let values = array.as_any().downcast_ref::<LargeListArray>().unwrap();
             let child = values.value(index);
-            arrow_array_values_to_py(child.as_ref(), py)
+            arrow_array_values_to_py(item_field.as_ref(), child.as_ref(), py)
         }
         _ => Ok(py.None().into_bound(py)),
     }
@@ -3148,50 +4072,41 @@ fn arrow_array_value_to_py<'py>(
 
 /// Converts a whole Arrow array into a Python list.
 fn arrow_array_values_to_py<'py>(
+    field: &arrow_schema::Field,
     array: &dyn arrow_array::Array,
     py: Python<'py>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let list = PyList::empty(py);
     for index in 0..array.len() {
-        list.append(arrow_array_value_to_py(array, index, py)?)?;
+        list.append(arrow_array_value_to_py(field, array, index, py)?)?;
     }
     Ok(list.into_any())
 }
 
 fn record_batch_to_py_dicts<'py>(
     batch: &arrow_array::RecordBatch,
-    age_columns: &[bool],
+    _age_columns: &[bool],
+    bolt_rows: Option<&[Vec<voyager_drivers::BoltValue>]>,
+    row_offset: usize,
     py: Python<'py>,
 ) -> PyResult<Bound<'py, PyList>> {
-    use arrow_array::*;
-    use arrow_schema::DataType;
-
     let num_rows = batch.num_rows();
     let num_cols = batch.num_columns();
     let schema = batch.schema();
     let fields = schema.fields();
 
     let mut col_names = Vec::with_capacity(num_cols);
-    let mut utf8_modes = Vec::with_capacity(num_cols);
-    for (col_idx, field) in fields.iter().enumerate() {
+    let mut col_modes = Vec::with_capacity(num_cols);
+    for field in fields.iter() {
         col_names.push(PyString::intern(py, field.name().as_str()));
-        let meta = field.metadata();
-        let is_json = meta.get("voyager.encoding").is_some_and(|v| v == "json")
-            || meta.contains_key("voyager.kind");
-        let mode = if is_json {
-            Utf8ColMode::JsonEntities
-        } else if age_columns.get(col_idx).copied().unwrap_or(false) {
-            Utf8ColMode::AgeAgtype
-        } else {
-            Utf8ColMode::Plain
-        };
-        utf8_modes.push(mode);
+        col_modes.push(utf8_col_mode_for_field(field.as_ref()));
     }
 
     let list = PyList::empty(py);
 
     for row in 0..num_rows {
         let dict = PyDict::new(py);
+        let bolt_row = bolt_rows.and_then(|rows| rows.get(row_offset + row));
         for col_idx in 0..num_cols {
             let col = batch.column(col_idx);
             let field_name = &col_names[col_idx];
@@ -3199,74 +4114,16 @@ fn record_batch_to_py_dicts<'py>(
                 dict.set_item(field_name, py.None())?;
                 continue;
             }
-            match col.data_type() {
-                DataType::Int64 => {
-                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                    dict.set_item(field_name, arr.value(row))?;
-                }
-                DataType::Int32 => {
-                    let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-                    dict.set_item(field_name, arr.value(row))?;
-                }
-                DataType::Float64 => {
-                    let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                    dict.set_item(field_name, arr.value(row))?;
-                }
-                DataType::Float32 => {
-                    let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-                    dict.set_item(field_name, arr.value(row) as f64)?;
-                }
-                DataType::Boolean => {
-                    let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-                    dict.set_item(field_name, arr.value(row))?;
-                }
-                DataType::Utf8 => {
-                    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                    let value = arr.value(row);
-                    match utf8_modes[col_idx] {
-                        Utf8ColMode::JsonEntities => {
-                            let parsed: serde_json::Value = serde_json::from_str(value)
-                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                            dict.set_item(field_name, json_value_to_py(py, &parsed)?)?;
-                        }
-                        Utf8ColMode::AgeAgtype => {
-                            let decoded = voyager_drivers::parse_agtype(value)
-                                .map(|val| voyager_drivers::age_value_to_arrow_json(&val))
-                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                            dict.set_item(field_name, json_value_to_py(py, &decoded)?)?;
-                        }
-                        Utf8ColMode::Plain => {
-                            dict.set_item(field_name, value)?;
-                        }
-                    }
-                }
-                DataType::LargeUtf8 => {
-                    let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                    let value = arr.value(row);
-                    match utf8_modes[col_idx] {
-                        Utf8ColMode::JsonEntities => {
-                            let parsed: serde_json::Value = serde_json::from_str(value)
-                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                            dict.set_item(field_name, json_value_to_py(py, &parsed)?)?;
-                        }
-                        Utf8ColMode::AgeAgtype => {
-                            let decoded = voyager_drivers::parse_agtype(value)
-                                .map(|val| voyager_drivers::age_value_to_arrow_json(&val))
-                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                            dict.set_item(field_name, json_value_to_py(py, &decoded)?)?;
-                        }
-                        Utf8ColMode::Plain => {
-                            dict.set_item(field_name, value)?;
-                        }
-                    }
-                }
-                DataType::List(_) | DataType::LargeList(_) => {
-                    dict.set_item(field_name, arrow_array_value_to_py(col.as_ref(), row, py)?)?;
-                }
-                _ => {
-                    dict.set_item(field_name, py.None())?;
-                }
+            if matches!(col_modes[col_idx], Utf8ColMode::JsonEntities)
+                && let Some(bolt_val) = bolt_row.and_then(|r| r.get(col_idx))
+            {
+                dict.set_item(field_name, bolt_value_to_py(py, bolt_val)?)?;
+                continue;
             }
+            dict.set_item(
+                field_name,
+                arrow_array_value_to_py(fields[col_idx].as_ref(), col.as_ref(), row, py)?,
+            )?;
         }
         list.append(dict)?;
     }
@@ -3279,6 +4136,8 @@ fn record_batch_to_py_dicts<'py>(
 pub struct PyArrowStream {
     batch: arrow_array::RecordBatch,
     consumed: Arc<AtomicBool>,
+    bolt_rows: Option<Arc<Vec<Vec<voyager_drivers::BoltValue>>>>,
+    row_offset: usize,
 }
 
 impl PyArrowStream {
@@ -3287,6 +4146,21 @@ impl PyArrowStream {
         Self {
             batch,
             consumed: Arc::new(AtomicBool::new(false)),
+            bolt_rows: None,
+            row_offset: 0,
+        }
+    }
+
+    /// Creates a `PyArrowStream` preserving raw Bolt records for nested `Session.execute()` fidelity.
+    pub fn from_batch_with_bolt(
+        batch: arrow_array::RecordBatch,
+        bolt_rows: Option<Arc<Vec<Vec<voyager_drivers::BoltValue>>>>,
+    ) -> Self {
+        Self {
+            batch,
+            consumed: Arc::new(AtomicBool::new(false)),
+            bolt_rows,
+            row_offset: 0,
         }
     }
 }
@@ -3341,7 +4215,13 @@ impl PyArrowStream {
 
     /// Exports rows as a list of Python dictionaries.
     fn to_dicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        record_batch_to_py_dicts(&self.batch, &[], py)
+        record_batch_to_py_dicts(
+            &self.batch,
+            &[],
+            self.bolt_rows.as_deref().map(Vec::as_slice),
+            self.row_offset,
+            py,
+        )
     }
 
     /// Slices the record batch into chunked batches of `batch_size` rows each, returning PyArrowStreams.
@@ -3354,7 +4234,12 @@ impl PyArrowStream {
         while offset < num_rows {
             let length = chunk_size.min(num_rows - offset);
             let sliced = self.batch.slice(offset, length);
-            chunks.push(PyArrowStream::from_batch(sliced));
+            chunks.push(PyArrowStream {
+                batch: sliced,
+                consumed: Arc::new(AtomicBool::new(false)),
+                bolt_rows: self.bolt_rows.clone(),
+                row_offset: self.row_offset + offset,
+            });
             offset += length;
         }
         Ok(chunks)
@@ -3770,77 +4655,362 @@ fn py_spec_to_json_value(val: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> 
     }
 }
 
-fn py_any_to_json_value(val: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+struct ParamPyTypes {
+    datetime_cls: Py<PyAny>,
+    date_cls: Py<PyAny>,
+    time_cls: Py<PyAny>,
+    timedelta_cls: Py<PyAny>,
+    uuid_cls: Py<PyAny>,
+    decimal_cls: Py<PyAny>,
+    duration_cls: Py<PyAny>,
+    point_cls: Py<PyAny>,
+}
+
+static PARAM_PY_TYPES: PyOnceLock<ParamPyTypes> = PyOnceLock::new();
+
+fn param_py_types<'py>(py: Python<'py>) -> PyResult<&'py ParamPyTypes> {
+    PARAM_PY_TYPES.get_or_try_init(py, || {
+        let dt_mod = py.import("datetime")?;
+        let uuid_mod = py.import("uuid")?;
+        let dec_mod = py.import("decimal")?;
+        let types_mod = py.import("voyager_ogm.types")?;
+        Ok(ParamPyTypes {
+            datetime_cls: dt_mod.getattr("datetime")?.unbind(),
+            date_cls: dt_mod.getattr("date")?.unbind(),
+            time_cls: dt_mod.getattr("time")?.unbind(),
+            timedelta_cls: dt_mod.getattr("timedelta")?.unbind(),
+            uuid_cls: uuid_mod.getattr("UUID")?.unbind(),
+            decimal_cls: dec_mod.getattr("Decimal")?.unbind(),
+            duration_cls: types_mod.getattr("Duration")?.unbind(),
+            point_cls: types_mod.getattr("Point")?.unbind(),
+        })
+    })
+}
+
+fn extract_non_bool_f64(obj: &Bound<'_, PyAny>) -> Option<f64> {
+    if obj.is_none() || obj.is_instance_of::<PyBool>() {
+        return None;
+    }
+    obj.extract::<f64>().ok()
+}
+
+fn srid_from_crs(crs: &str, is_3d: bool) -> Option<i64> {
+    let norm = crs.trim().to_ascii_lowercase();
+    match (norm.as_str(), is_3d) {
+        ("wgs-84" | "wgs84" | "epsg:4326", false) => Some(4326),
+        ("wgs-84" | "wgs84" | "wgs-84-3d" | "wgs84-3d" | "epsg:4979", true) => Some(4979),
+        ("wgs-84-3d" | "wgs84-3d" | "epsg:4979", false) => Some(4979),
+        ("cartesian" | "cartesian-2d" | "epsg:7203", false) => Some(7203),
+        ("cartesian" | "cartesian-3d" | "epsg:9157", true) => Some(9157),
+        ("cartesian-3d" | "epsg:9157", false) => Some(9157),
+        _ => None,
+    }
+}
+
+fn extract_point_param_from_mapping(
+    mapping: &Bound<'_, PyAny>,
+) -> Option<voyager_drivers::ParamValue> {
+    use voyager_drivers::ParamValue;
+
+    let dict = mapping.cast::<PyDict>().ok()?;
+    let srid_opt = match dict.get_item("srid").ok().flatten() {
+        Some(v) if !v.is_none() && !v.is_instance_of::<PyBool>() => Some(v.extract::<i64>().ok()?),
+        Some(v) if v.is_instance_of::<PyBool>() => return None,
+        _ => None,
+    };
+    let crs_opt = match dict.get_item("crs").ok().flatten() {
+        Some(v) if !v.is_none() => Some(v.extract::<String>().ok()?),
+        _ => None,
+    };
+
+    let lat_obj = dict.get_item("latitude").ok().flatten();
+    let lon_obj = dict.get_item("longitude").ok().flatten();
+    let height_obj = dict.get_item("height").ok().flatten();
+    let x_obj = dict.get_item("x").ok().flatten();
+    let y_obj = dict.get_item("y").ok().flatten();
+    let z_obj = dict.get_item("z").ok().flatten();
+
+    let height_or_z = height_obj
+        .as_ref()
+        .filter(|v| !v.is_none())
+        .or_else(|| z_obj.as_ref().filter(|v| !v.is_none()));
+    let has_3d = height_or_z.is_some();
+    let z_val = match height_or_z {
+        Some(v) => Some(extract_non_bool_f64(v)?),
+        None => None,
+    };
+
+    let is_geo_by_srid = srid_opt.map(|s| s == 4326 || s == 4979);
+    let is_geo_by_keys = lat_obj.as_ref().is_some_and(|v| !v.is_none())
+        || lon_obj.as_ref().is_some_and(|v| !v.is_none())
+        || height_obj.as_ref().is_some_and(|v| !v.is_none());
+    let is_geo_by_crs = crs_opt
+        .as_deref()
+        .and_then(|c| srid_from_crs(c, has_3d))
+        .map(|s| s == 4326 || s == 4979);
+
+    let is_geo = is_geo_by_srid.or(is_geo_by_crs).unwrap_or(is_geo_by_keys);
+
+    let (x, y) = if is_geo {
+        let lon = lon_obj
+            .as_ref()
+            .filter(|v| !v.is_none())
+            .or_else(|| x_obj.as_ref().filter(|v| !v.is_none()))
+            .and_then(extract_non_bool_f64)?;
+        let lat = lat_obj
+            .as_ref()
+            .filter(|v| !v.is_none())
+            .or_else(|| y_obj.as_ref().filter(|v| !v.is_none()))
+            .and_then(extract_non_bool_f64)?;
+        (lon, lat)
+    } else {
+        let x = x_obj.as_ref().and_then(extract_non_bool_f64)?;
+        let y = y_obj.as_ref().and_then(extract_non_bool_f64)?;
+        (x, y)
+    };
+
+    let srid = match srid_opt {
+        Some(s) => s,
+        None => match crs_opt.as_deref().and_then(|c| srid_from_crs(c, has_3d)) {
+            Some(s) => s,
+            None if is_geo => {
+                if z_val.is_some() {
+                    4979
+                } else {
+                    4326
+                }
+            }
+            None => {
+                if z_val.is_some() {
+                    9157
+                } else {
+                    7203
+                }
+            }
+        },
+    };
+
+    if let Some(z) = z_val {
+        Some(ParamValue::Point3D { srid, x, y, z })
+    } else {
+        Some(ParamValue::Point2D { srid, x, y })
+    }
+}
+
+fn extract_timedelta_offset_seconds(offset_obj: &Bound<'_, PyAny>) -> PyResult<i32> {
+    let days: i64 = offset_obj.getattr("days")?.extract()?;
+    let secs: i64 = offset_obj.getattr("seconds")?.extract()?;
+    let micros: i64 = offset_obj.getattr("microseconds")?.extract()?;
+    if micros != 0 {
+        return Err(PyValueError::new_err(
+            "Sub-second UTC offsets are not supported by native drivers",
+        ));
+    }
+    i32::try_from(days * 86_400 + secs)
+        .map_err(|_| PyValueError::new_err("UTC offset seconds out of 32-bit range"))
+}
+
+fn extract_zone_id(tzinfo: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    if let Ok(key) = tzinfo.getattr("key")
+        && !key.is_none()
+        && let Ok(s) = key.extract::<String>()
+        && !s.is_empty()
+    {
+        return Ok(Some(s));
+    }
+    if let Ok(zone) = tzinfo.getattr("zone")
+        && !zone.is_none()
+        && let Ok(s) = zone.extract::<String>()
+        && !s.is_empty()
+    {
+        return Ok(Some(s));
+    }
+    Ok(None)
+}
+
+fn py_any_to_param_value(val: &Bound<'_, PyAny>) -> PyResult<voyager_drivers::ParamValue> {
+    use voyager_drivers::{ParamTimezone, ParamValue};
+
     if val.is_none() {
-        Ok(serde_json::Value::Null)
+        Ok(ParamValue::Json(serde_json::Value::Null))
     } else if let Ok(b) = val.cast::<PyBool>() {
-        Ok(serde_json::Value::Bool(b.is_true()))
+        Ok(ParamValue::Json(serde_json::Value::Bool(b.is_true())))
     } else if let Ok(i) = val.cast::<PyInt>() {
         let val_i: i64 = i.extract()?;
-        Ok(serde_json::Value::Number(val_i.into()))
+        Ok(ParamValue::Json(serde_json::Value::Number(val_i.into())))
     } else if let Ok(f) = val.cast::<PyFloat>() {
-        if let Some(n) = serde_json::Number::from_f64(f.value()) {
-            Ok(serde_json::Value::Number(n))
+        let fv = f.value();
+        if let Some(n) = serde_json::Number::from_f64(fv) {
+            Ok(ParamValue::Json(serde_json::Value::Number(n)))
         } else {
-            Ok(serde_json::Value::Null)
+            Ok(ParamValue::Float(fv))
         }
     } else if let Ok(s) = val.cast::<PyString>() {
-        Ok(serde_json::Value::String(s.to_string_lossy().into_owned()))
+        Ok(ParamValue::Json(serde_json::Value::String(
+            s.to_string_lossy().into_owned(),
+        )))
+    } else if let Ok(b) = val.cast::<PyBytes>() {
+        Ok(ParamValue::Bytes(b.as_bytes().to_vec()))
+    } else if let Ok(ba) = val.cast::<PyByteArray>() {
+        Ok(ParamValue::Bytes(ba.to_vec()))
     } else if let Ok(list) = val.cast::<PyList>() {
         let mut items = Vec::with_capacity(list.len());
         for item in list {
-            items.push(py_any_to_json_value(&item)?);
+            items.push(py_any_to_param_value(&item)?);
         }
-        Ok(serde_json::Value::Array(items))
+        Ok(ParamValue::List(items))
     } else if let Ok(tuple) = val.cast::<PyTuple>() {
         let mut items = Vec::with_capacity(tuple.len());
         for item in tuple {
-            items.push(py_any_to_json_value(&item)?);
+            items.push(py_any_to_param_value(&item)?);
         }
-        Ok(serde_json::Value::Array(items))
+        Ok(ParamValue::List(items))
     } else if let Ok(dict) = val.cast::<PyDict>() {
-        let mut map = serde_json::Map::with_capacity(dict.len());
+        if dict.len() == 1
+            && let Ok(Some(inner)) = dict.get_item("__voyager_spatial__")
+            && let Some(pt) = extract_point_param_from_mapping(&inner)
+        {
+            return Ok(pt);
+        }
+        let mut map = HashMap::with_capacity(dict.len());
         for (k, v) in dict {
             let key = if let Ok(s) = k.cast::<PyString>() {
                 s.to_string_lossy().into_owned()
             } else {
                 k.extract::<String>()?
             };
-            map.insert(key, py_any_to_json_value(&v)?);
+            map.insert(key, py_any_to_param_value(&v)?);
         }
-        Ok(serde_json::Value::Object(map))
-    } else if val.hasattr("isoformat")? {
-        let iso: String = val.call_method0("isoformat")?.extract()?;
-        Ok(serde_json::Value::String(iso))
-    } else if val.hasattr("hex")? && val.hasattr("urn")? {
-        let s: String = val.str()?.extract()?;
-        Ok(serde_json::Value::String(s))
-    } else if val.get_type().name()? == "Decimal" {
-        if let Ok(f) = val
-            .call_method0("__float__")
-            .and_then(|v| v.extract::<f64>())
-        {
-            if let Some(n) = serde_json::Number::from_f64(f) {
-                Ok(serde_json::Value::Number(n))
-            } else {
-                Ok(serde_json::Value::Null)
+        Ok(ParamValue::Map(map))
+    } else {
+        let py = val.py();
+        let types = param_py_types(py)?;
+        if val.is_instance(types.datetime_cls.bind(py))? {
+            let year: i32 = val.getattr("year")?.extract()?;
+            let month: u8 = val.getattr("month")?.extract()?;
+            let day: u8 = val.getattr("day")?.extract()?;
+            let hour: u8 = val.getattr("hour")?.extract()?;
+            let minute: u8 = val.getattr("minute")?.extract()?;
+            let second: u8 = val.getattr("second")?.extract()?;
+            let microsecond: u32 = val.getattr("microsecond")?.extract()?;
+            let nanosecond = microsecond.saturating_mul(1_000);
+
+            let tzinfo = val.getattr("tzinfo")?;
+            if tzinfo.is_none() {
+                return Ok(ParamValue::LocalDateTime {
+                    year,
+                    month,
+                    day,
+                    hour,
+                    minute,
+                    second,
+                    nanosecond,
+                });
             }
+            let offset_obj = val.call_method0("utcoffset")?;
+            if offset_obj.is_none() {
+                return Ok(ParamValue::LocalDateTime {
+                    year,
+                    month,
+                    day,
+                    hour,
+                    minute,
+                    second,
+                    nanosecond,
+                });
+            }
+            let offset_seconds = extract_timedelta_offset_seconds(&offset_obj)?;
+            let local_days =
+                voyager_drivers::bolt::packstream::ymd_to_days(year, month as u32, day as u32);
+            let local_seconds = local_days * 86_400
+                + (hour as i64) * 3_600
+                + (minute as i64) * 60
+                + (second as i64);
+            let utc_seconds = local_seconds - (offset_seconds as i64);
+            let tz = match extract_zone_id(&tzinfo)? {
+                Some(id) => ParamTimezone::ZoneId { id, offset_seconds },
+                None => ParamTimezone::OffsetSeconds(offset_seconds),
+            };
+            Ok(ParamValue::DateTime {
+                utc_seconds,
+                nanosecond,
+                tz,
+            })
+        } else if val.is_instance(types.date_cls.bind(py))? {
+            let year: i32 = val.getattr("year")?.extract()?;
+            let month: u8 = val.getattr("month")?.extract()?;
+            let day: u8 = val.getattr("day")?.extract()?;
+            Ok(ParamValue::Date { year, month, day })
+        } else if val.is_instance(types.time_cls.bind(py))? {
+            let hour: u8 = val.getattr("hour")?.extract()?;
+            let minute: u8 = val.getattr("minute")?.extract()?;
+            let second: u8 = val.getattr("second")?.extract()?;
+            let microsecond: u32 = val.getattr("microsecond")?.extract()?;
+            let nanosecond = microsecond.saturating_mul(1_000);
+            let offset_obj = val.call_method0("utcoffset")?;
+            let tz_offset_seconds = if offset_obj.is_none() {
+                None
+            } else {
+                Some(extract_timedelta_offset_seconds(&offset_obj)?)
+            };
+            Ok(ParamValue::Time {
+                hour,
+                minute,
+                second,
+                nanosecond,
+                tz_offset_seconds,
+            })
+        } else if val.is_instance(types.timedelta_cls.bind(py))? {
+            let days: i64 = val.getattr("days")?.extract()?;
+            let seconds: i64 = val.getattr("seconds")?.extract()?;
+            let microseconds: i64 = val.getattr("microseconds")?.extract()?;
+            Ok(ParamValue::Duration {
+                months: 0,
+                days,
+                seconds,
+                nanoseconds: microseconds.saturating_mul(1_000),
+            })
+        } else if val.is_instance(types.duration_cls.bind(py))? {
+            let months: i64 = val.getattr("months")?.extract()?;
+            let days: i64 = val.getattr("days")?.extract()?;
+            let seconds: i64 = val.getattr("seconds")?.extract()?;
+            let nanoseconds: i64 = val.getattr("nanoseconds")?.extract()?;
+            Ok(ParamValue::Duration {
+                months,
+                days,
+                seconds,
+                nanoseconds,
+            })
+        } else if val.is_instance(types.point_cls.bind(py))? {
+            let srid: i64 = val.getattr("srid")?.extract()?;
+            let x: f64 = val.getattr("x")?.extract()?;
+            let y: f64 = val.getattr("y")?.extract()?;
+            let z_obj = val.getattr("z")?;
+            if !z_obj.is_none() {
+                let z: f64 = z_obj.extract()?;
+                Ok(ParamValue::Point3D { srid, x, y, z })
+            } else {
+                Ok(ParamValue::Point2D { srid, x, y })
+            }
+        } else if val.is_instance(types.uuid_cls.bind(py))? {
+            let s: String = val.str()?.extract()?;
+            Ok(ParamValue::Uuid(s))
+        } else if val.is_instance(types.decimal_cls.bind(py))? {
+            let s: String = val.str()?.extract()?;
+            Ok(ParamValue::Decimal(s))
+        } else if val.hasattr("to_cypher_dict")? {
+            let cypher_dict = val.call_method0("to_cypher_dict")?;
+            py_any_to_param_value(&cypher_dict)
         } else {
             let s: String = val.str()?.extract()?;
-            Ok(serde_json::Value::String(s))
+            Ok(ParamValue::Json(serde_json::Value::String(s)))
         }
-    } else if val.hasattr("to_cypher_dict")? {
-        let cypher_dict = val.call_method0("to_cypher_dict")?;
-        py_any_to_json_value(&cypher_dict)
-    } else {
-        let s: String = val.str()?.extract()?;
-        Ok(serde_json::Value::String(s))
     }
 }
 
-fn py_dict_to_json_params(
+fn py_dict_to_params(
     dict_opt: Option<Bound<'_, PyDict>>,
-) -> PyResult<HashMap<String, serde_json::Value>> {
+) -> PyResult<HashMap<String, voyager_drivers::ParamValue>> {
     let mut params = HashMap::new();
     if let Some(dict) = dict_opt {
         params.reserve(dict.len());
@@ -3850,11 +5020,21 @@ fn py_dict_to_json_params(
             } else {
                 k.extract::<String>()?
             };
-            let val = py_any_to_json_value(&v)?;
+            let val = py_any_to_param_value(&v)?;
             params.insert(key, val);
         }
     }
     Ok(params)
+}
+
+/// Inspects the typed [`ParamValue`] representations produced for a Python parameter dict (for testing).
+#[pyfunction]
+#[pyo3(signature = (params=None))]
+fn inspect_native_params(params: Option<Bound<'_, PyDict>>) -> PyResult<String> {
+    let converted = py_dict_to_params(params)?;
+    let deterministic: std::collections::BTreeMap<String, voyager_drivers::ParamValue> =
+        converted.into_iter().collect();
+    serde_json::to_string(&deterministic).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// Native query result containing columnar Apache Arrow record batch and execution summary counters.
@@ -3953,7 +5133,13 @@ impl PyNativeQueryResult {
 
     /// Exports rows as a list of Python dictionaries.
     fn to_dicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        record_batch_to_py_dicts(&self.stream.batch, &self.age_columns, py)
+        record_batch_to_py_dicts(
+            &self.stream.batch,
+            &self.age_columns,
+            self.stream.bolt_rows.as_deref().map(Vec::as_slice),
+            self.stream.row_offset,
+            py,
+        )
     }
 
     /// Access to result records as a list of Python dictionaries.
@@ -3986,13 +5172,14 @@ fn query_result_to_py(query_result: voyager_drivers::QueryResult) -> PyResult<Py
     let columns = query_result.columns.clone();
     let summary = query_result.summary.clone();
     let age_columns = query_result.age_columns.clone();
+    let bolt_rows = query_result.bolt_rows.clone();
     let batch = query_result
         .into_single_batch()
         .map_err(|e| PyValueError::new_err(e.to_string()))?
         .unwrap_or_else(|| empty_batch_for_columns(&columns));
 
     Ok(PyNativeQueryResult {
-        stream: PyArrowStream::from_batch(batch),
+        stream: PyArrowStream::from_batch_with_bolt(batch, bolt_rows),
         columns,
         summary,
         age_columns,
@@ -4103,7 +5290,7 @@ impl PyNativeClient {
         query: String,
         params: Option<Bound<'py, PyDict>>,
     ) -> PyResult<PyNativeQueryResult> {
-        let params_map = py_dict_to_json_params(params)?;
+        let params_map = py_dict_to_params(params)?;
         let client = self.client.clone();
         let query_result = py
             .detach(|| {
@@ -4123,7 +5310,7 @@ impl PyNativeClient {
         query: String,
         params: Option<Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let params_map = py_dict_to_json_params(params)?;
+        let params_map = py_dict_to_params(params)?;
         let client = self.client.clone();
         let _ = get_tokio_runtime();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -4343,7 +5530,7 @@ impl PyNativeTransaction {
         params: Option<Bound<'_, PyDict>>,
     ) -> PyResult<PyNativeQueryResult> {
         self.ensure_active()?;
-        let params_map = py_dict_to_json_params(params)?;
+        let params_map = py_dict_to_params(params)?;
         let mut tx = self.take()?;
         let (tx, result) = py.detach(|| {
             let result =
@@ -4364,7 +5551,7 @@ impl PyNativeTransaction {
         params: Option<Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.ensure_active()?;
-        let params_map = py_dict_to_json_params(params)?;
+        let params_map = py_dict_to_params(params)?;
         let inner = self.inner.clone();
         let state = self.state.clone();
         let _ = get_tokio_runtime();
@@ -6999,6 +8186,7 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(adapt_tantivy_query, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_fulltext_search, m)?)?;
     m.add_function(wrap_pyfunction!(introspect_schema_json, m)?)?;
+    m.add_function(wrap_pyfunction!(inspect_native_params, m)?)?;
     m.add_class::<PyQueryBuilder>()?;
     m.add_class::<PyAstExpr>()?;
     m.add_class::<PyArrowStream>()?;

@@ -4,6 +4,7 @@ use bytes::BytesMut;
 use std::collections::HashMap;
 use tokio_util::codec::{Decoder, Encoder};
 
+use voyager_drivers::params::{ParamTimezone, ParamValue};
 use voyager_drivers::redis::{
     FalkorCompactResult, FalkorGraphSchema, FalkorNode, FalkorQueryResult, FalkorRelationship,
     FalkorStatistics, RespCodec, RespValue, decode_compact_cell, format_cypher_with_params,
@@ -430,9 +431,9 @@ fn test_falkor_query_result_to_arrow_record_batch() {
 #[test]
 fn test_format_cypher_with_params() {
     let mut params = HashMap::new();
-    params.insert("name".to_string(), serde_json::json!("Alice"));
-    params.insert("age".to_string(), serde_json::json!(30));
-    params.insert("active".to_string(), serde_json::json!(true));
+    params.insert("name".to_string(), serde_json::json!("Alice").into());
+    params.insert("age".to_string(), serde_json::json!(30).into());
+    params.insert("active".to_string(), serde_json::json!(true).into());
 
     let query = "MATCH (n:Person {name: $name, age: $age}) RETURN n";
     let formatted = format_cypher_with_params(query, &params).unwrap();
@@ -457,7 +458,8 @@ fn test_format_cypher_list_of_maps_and_nested() {
         serde_json::json!([
             {"pid": 1, "name": "Alice", "tags": ["admin", "staff"]},
             {"pid": 2, "name": "Bob", "tags": []}
-        ]),
+        ])
+        .into(),
     );
 
     let query = "UNWIND $batch AS row MERGE (n:Zz {pid: row.pid}) SET n.name = row.name";
@@ -475,7 +477,7 @@ fn test_format_cypher_hostile_strings() {
     let mut params = HashMap::new();
     params.insert(
         "hostile".to_string(),
-        serde_json::json!("hello \"world\" \\ \n \r \t 🚀 \u{2603}"),
+        serde_json::json!("hello \"world\" \\ \n \r \t 🚀 \u{2603}").into(),
     );
 
     let query = "RETURN $hostile";
@@ -495,7 +497,8 @@ fn test_format_cypher_non_plain_identifier_keys() {
             "dot.key": 3,
             "key with space": 4,
             "123lead_num": 5,
-        }),
+        })
+        .into(),
     );
 
     let query = "RETURN $data";
@@ -515,7 +518,8 @@ fn test_format_cypher_backtick_in_key_rejected() {
         "data".to_string(),
         serde_json::json!({
             "invalid`key": 42
-        }),
+        })
+        .into(),
     );
 
     let res = format_cypher_with_params("RETURN $data", &params);
@@ -527,7 +531,7 @@ fn test_format_cypher_backtick_in_key_rejected() {
 #[test]
 fn test_format_cypher_dollar_prefix_stripped() {
     let mut params = HashMap::new();
-    params.insert("$batch".to_string(), serde_json::json!([1, 2, 3]));
+    params.insert("$batch".to_string(), serde_json::json!([1, 2, 3]).into());
 
     let query = "UNWIND $batch AS x RETURN x";
     let formatted = format_cypher_with_params(query, &params).unwrap();
@@ -538,11 +542,11 @@ fn test_format_cypher_dollar_prefix_stripped() {
 #[test]
 fn test_format_cypher_null_and_bool_and_numbers() {
     let mut params = HashMap::new();
-    params.insert("n".to_string(), serde_json::Value::Null);
-    params.insert("t".to_string(), serde_json::json!(true));
-    params.insert("f".to_string(), serde_json::json!(false));
-    params.insert("i".to_string(), serde_json::json!(-42));
-    params.insert("fl".to_string(), serde_json::json!(12.345));
+    params.insert("n".to_string(), serde_json::Value::Null.into());
+    params.insert("t".to_string(), serde_json::json!(true).into());
+    params.insert("f".to_string(), serde_json::json!(false).into());
+    params.insert("i".to_string(), serde_json::json!(-42).into());
+    params.insert("fl".to_string(), serde_json::json!(12.345).into());
 
     let formatted = format_cypher_with_params("RETURN 1", &params).unwrap();
     assert!(formatted.contains("f=false"));
@@ -706,4 +710,277 @@ fn test_falkor_compact_result_decodes_entities_paths_lists_and_maps() {
         serde_json::from_str(batch.column(4).as_string::<i32>().value(0)).unwrap();
     assert_eq!(m_json["node"]["kind"], "node");
     assert_eq!(m_json["node"]["properties"]["name"], "A");
+}
+
+#[test]
+fn test_format_cypher_typed_params_and_compact_temporal_decode() {
+    let mut params = HashMap::new();
+    params.insert(
+        "d".to_string(),
+        ParamValue::Date {
+            year: 2024,
+            month: 1,
+            day: 2,
+        },
+    );
+    params.insert(
+        "t".to_string(),
+        ParamValue::Time {
+            hour: 14,
+            minute: 30,
+            second: 15,
+            nanosecond: 123_456_000,
+            tz_offset_seconds: None,
+        },
+    );
+    params.insert(
+        "dt".to_string(),
+        ParamValue::DateTime {
+            utc_seconds: 1_704_161_045,
+            nanosecond: 0,
+            tz: ParamTimezone::ZoneId {
+                id: "Europe/Berlin".to_string(),
+                offset_seconds: 3600,
+            },
+        },
+    );
+    params.insert(
+        "td".to_string(),
+        ParamValue::Duration {
+            months: 0,
+            days: 2,
+            seconds: 3661,
+            nanoseconds: 500_000_000,
+        },
+    );
+    params.insert(
+        "neg_td".to_string(),
+        ParamValue::Duration {
+            months: 0,
+            days: -1,
+            seconds: 86395,
+            nanoseconds: 0,
+        },
+    );
+    params.insert(
+        "neg_sec".to_string(),
+        ParamValue::Duration {
+            months: 0,
+            days: 0,
+            seconds: -5,
+            nanoseconds: 0,
+        },
+    );
+    params.insert(
+        "u".to_string(),
+        ParamValue::Uuid("12345678-1234-5678-1234-567812345678".to_string()),
+    );
+    params.insert("dec".to_string(), ParamValue::Decimal("123.45".to_string()));
+    params.insert("plain".to_string(), ParamValue::from("2024-01-02"));
+
+    let formatted = format_cypher_with_params("RETURN $d", &params).unwrap();
+    assert!(formatted.contains(r#"d="2024-01-02""#), "{formatted}");
+    assert!(formatted.contains(r#"t="14:30:15.123456""#), "{formatted}");
+    assert!(
+        formatted.contains(r#"dt="2024-01-02T03:04:05+01:00""#),
+        "{formatted}"
+    );
+    assert!(formatted.contains(r#"td="P2DT1H1M1.5S""#), "{formatted}");
+    assert!(
+        formatted.contains(r#"neg_td="P-1DT23H59M55S""#),
+        "{formatted}"
+    );
+    assert!(formatted.contains(r#"neg_sec="-PT5S""#), "{formatted}");
+    assert!(
+        formatted.contains(r#"u="12345678-1234-5678-1234-567812345678""#),
+        "{formatted}"
+    );
+    assert!(formatted.contains("dec=123.45"), "{formatted}");
+    assert!(formatted.contains(r#"plain="2024-01-02""#), "{formatted}");
+
+    // Non-finite Decimal rejected like non-finite Float on FalkorDB
+    let mut dec_nan = HashMap::new();
+    dec_nan.insert("d".to_string(), ParamValue::Decimal("NaN".to_string()));
+    assert!(format_cypher_with_params("RETURN $d", &dec_nan).is_err());
+
+    // Bytes rejected cleanly on FalkorDB
+    let mut bytes_params = HashMap::new();
+    bytes_params.insert("b".to_string(), ParamValue::Bytes(vec![1, 2, 3]));
+    assert!(format_cypher_with_params("RETURN $b", &bytes_params).is_err());
+
+    // Compact scalar types 13..=16 decode into temporal BoltValues
+    let schema = FalkorGraphSchema::default();
+    let date_cell = RespValue::Array(Some(vec![
+        RespValue::Integer(14),
+        RespValue::Integer(1_704_153_600),
+    ]));
+    assert_eq!(
+        decode_compact_cell(&date_cell, &schema)
+            .unwrap()
+            .as_date()
+            .unwrap()
+            .to_iso_string(),
+        "2024-01-02"
+    );
+    let time_cell = RespValue::Array(Some(vec![
+        RespValue::Integer(15),
+        RespValue::Integer(52215),
+    ]));
+    assert_eq!(
+        decode_compact_cell(&time_cell, &schema)
+            .unwrap()
+            .as_local_time()
+            .unwrap()
+            .to_iso_string(),
+        "14:30:15"
+    );
+    let dt_cell = RespValue::Array(Some(vec![
+        RespValue::Integer(13),
+        RespValue::Integer(1_704_164_645),
+    ]));
+    assert_eq!(
+        decode_compact_cell(&dt_cell, &schema)
+            .unwrap()
+            .as_local_datetime()
+            .unwrap()
+            .to_iso_string(),
+        "2024-01-02T03:04:05"
+    );
+    let dur_cell = RespValue::Array(Some(vec![
+        RespValue::Integer(16),
+        RespValue::Integer(176_461),
+    ]));
+    assert_eq!(
+        decode_compact_cell(&dur_cell, &schema)
+            .unwrap()
+            .as_duration()
+            .unwrap()
+            .to_iso_string(),
+        "P2DT1H1M1S"
+    );
+    // Negative sub-day remainder: split like Python's timedelta (floor division).
+    let neg_dur_cell = RespValue::Array(Some(vec![
+        RespValue::Integer(16),
+        RespValue::Integer(-93_600),
+    ]));
+    let neg = *decode_compact_cell(&neg_dur_cell, &schema)
+        .unwrap()
+        .as_duration()
+        .unwrap();
+    assert_eq!(
+        (neg.months, neg.days, neg.seconds, neg.nanoseconds),
+        (0, -2, 79_200, 0)
+    );
+}
+
+#[test]
+fn test_format_cypher_float_specials_and_spatial_points() {
+    use voyager_drivers::ParamValue;
+    use voyager_drivers::redis::transaction::format_cypher_with_params;
+
+    let mut ok_params = HashMap::new();
+    ok_params.insert("f".to_string(), ParamValue::Float(3.0));
+    ok_params.insert(
+        "p2".to_string(),
+        ParamValue::Point2D {
+            srid: 4326,
+            x: 13.405,
+            y: 52.52,
+        },
+    );
+    ok_params.insert(
+        "p3".to_string(),
+        ParamValue::Point3D {
+            srid: 9157,
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },
+    );
+    let rendered = format_cypher_with_params("RETURN $f, $p2, $p3", &ok_params).unwrap();
+    assert!(rendered.contains("f=3.0"), "{rendered}");
+    assert!(
+        rendered.contains("p2={latitude: 52.52, longitude: 13.405}"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("p3={srid: 9157, x: 1, y: 2, z: 3}"),
+        "{rendered}"
+    );
+
+    let mut nan_params = HashMap::new();
+    nan_params.insert("f".to_string(), ParamValue::Float(f64::NAN));
+    assert!(format_cypher_with_params("RETURN $f", &nan_params).is_err());
+
+    let mut inf_params = HashMap::new();
+    inf_params.insert("f".to_string(), ParamValue::Float(f64::INFINITY));
+    assert!(format_cypher_with_params("RETURN $f", &inf_params).is_err());
+}
+
+#[test]
+fn test_falkordb_compact_temporal_errors_tag15_timestamp_and_bolt_rows() {
+    use voyager_drivers::redis::graph::{
+        FalkorCompactResult, FalkorGraphSchema, decode_compact_cell,
+    };
+    use voyager_drivers::redis::resp::RespValue;
+
+    let schema = FalkorGraphSchema::default();
+    // Malformed payloads on tags 13..=16 return errors instead of silently returning 0
+    for tag in [13i64, 14, 15, 16] {
+        let bad = RespValue::Array(Some(vec![
+            RespValue::Integer(tag),
+            RespValue::BulkString(Some(b"bad".to_vec())),
+        ]));
+        assert!(
+            decode_compact_cell(&bad, &schema).is_err(),
+            "tag {tag} should fail on non-integer payload"
+        );
+    }
+
+    // Tag 15 (TIME) carrying a full Unix timestamp (> 86400) decodes via rem_euclid(86400)
+    let ts_time = RespValue::Array(Some(vec![
+        RespValue::Integer(15),
+        RespValue::Integer(1_704_119_415), // 2024-01-01T14:30:15Z
+    ]));
+    assert_eq!(
+        decode_compact_cell(&ts_time, &schema)
+            .unwrap()
+            .as_local_time()
+            .unwrap()
+            .to_iso_string(),
+        "14:30:15"
+    );
+
+    // Scalar-only FalkorCompactResult drops bolt_rows; entity/mixed retains bolt_rows
+    let scalar_res = FalkorCompactResult {
+        columns: vec!["x".to_string()],
+        rows: vec![vec![RespValue::Array(Some(vec![
+            RespValue::Integer(3),
+            RespValue::Integer(42),
+        ]))]],
+        statistics: Default::default(),
+        graph_version: None,
+    }
+    .to_query_result(&schema)
+    .unwrap();
+    assert!(scalar_res.bolt_rows.is_none());
+
+    let mixed_res = FalkorCompactResult {
+        columns: vec!["xs".to_string()],
+        rows: vec![vec![RespValue::Array(Some(vec![
+            RespValue::Integer(6),
+            RespValue::Array(Some(vec![
+                RespValue::Array(Some(vec![RespValue::Integer(3), RespValue::Integer(1)])),
+                RespValue::Array(Some(vec![
+                    RespValue::Integer(5),
+                    RespValue::BulkString(Some(b"2.5".to_vec())),
+                ])),
+            ])),
+        ]))]],
+        statistics: Default::default(),
+        graph_version: None,
+    }
+    .to_query_result(&schema)
+    .unwrap();
+    assert!(mixed_res.bolt_rows.is_some());
 }

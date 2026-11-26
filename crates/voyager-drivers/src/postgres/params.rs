@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde_json::Value;
 
 use crate::error::{NetError, Result};
+use crate::params::{ParamValue, format_datetime_iso, format_iso_date, format_iso_time};
 
 /// Placeholder convention detected in a compiled statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +69,7 @@ fn unparameterized(statement: &str) -> PreparedPostgresStatement {
 /// The returned SQL text never contains a caller-supplied parameter value.
 pub fn prepare_postgres_statement(
     query: &str,
-    params: &HashMap<String, Value>,
+    params: &HashMap<String, ParamValue>,
 ) -> Result<PreparedPostgresStatement> {
     if params.is_empty() {
         return Ok(unparameterized(query));
@@ -105,57 +106,85 @@ pub fn prepare_postgres_statement(
 /// PostgreSQL type OID constants needed to type parameter values.
 mod parameter_oids {
     pub(super) const BOOL: i32 = 16;
+    pub(super) const BYTEA: i32 = 17;
     pub(super) const INT8: i32 = 20;
     pub(super) const FLOAT8: i32 = 701;
+    pub(super) const DATE: i32 = 1082;
+    pub(super) const TIME: i32 = 1083;
+    pub(super) const TIMESTAMP: i32 = 1114;
+    pub(super) const TIMESTAMPTZ: i32 = 1184;
+    pub(super) const INTERVAL: i32 = 1186;
+    pub(super) const TIMETZ: i32 = 1266;
+    pub(super) const NUMERIC: i32 = 1700;
+    pub(super) const UUID: i32 = 2950;
 
     pub(super) const BOOL_ARRAY: i32 = 1000;
+    pub(super) const BYTEA_ARRAY: i32 = 1001;
     pub(super) const INT8_ARRAY: i32 = 1016;
     pub(super) const FLOAT8_ARRAY: i32 = 1022;
+    pub(super) const DATE_ARRAY: i32 = 1182;
+    pub(super) const TIME_ARRAY: i32 = 1183;
+    pub(super) const TIMESTAMP_ARRAY: i32 = 1115;
+    pub(super) const TIMESTAMPTZ_ARRAY: i32 = 1185;
+    pub(super) const INTERVAL_ARRAY: i32 = 1187;
+    pub(super) const TIMETZ_ARRAY: i32 = 1270;
+    pub(super) const NUMERIC_ARRAY: i32 = 1231;
+    pub(super) const UUID_ARRAY: i32 = 2951;
 }
 
 /// Chooses a PostgreSQL type OID for a parameter value.
 ///
-/// `0` means "untyped, let the server infer". Only booleans, numbers and lists
-/// of them are typed: PostgreSQL cannot infer a bare parameter used as a
-/// `GRAPH_TABLE` predicate, and these types compare and assign cleanly against
-/// any integer, numeric or float column. Strings stay untyped because dates,
-/// timestamps, UUIDs and other values arrive here as text: typing them `text`
-/// would break `date = $1` or `uuid = $1`, which the server resolves from the
-/// column when the parameter is untyped. Maps stay untyped for the same reason
-/// (json, jsonb or text columns). SQL NULL, empty lists and mixed lists stay
-/// untyped too.
-fn value_oid(value: &Value) -> i32 {
-    use parameter_oids as oid;
-
+/// `0` means "untyped, let the server infer". Typed values (booleans, numbers,
+/// temporal values, UUID, numeric, bytea, and homogeneous arrays of them) carry
+/// their PostgreSQL type OID. Genuine strings (`ParamValue::Json(Value::String(_))`),
+/// maps, SQL NULL, empty lists, and mixed lists stay untyped (`0`) so the server
+/// resolves them from column context.
+fn value_oid(value: &ParamValue) -> i32 {
     match value {
-        Value::Null => 0,
-        Value::Bool(_) => oid::BOOL,
-        Value::Number(number) => {
-            if number.as_i64().is_some() || number.as_u64().is_some() {
-                oid::INT8
-            } else {
-                oid::FLOAT8
-            }
-        }
-        Value::String(_) | Value::Object(_) => 0,
-        Value::Array(items) => array_oid(items).unwrap_or(0),
+        ParamValue::Json(v) => json_value_oid(v),
+        ParamValue::List(items) => param_array_oid(items).unwrap_or(0),
+        ParamValue::Map(_) => 0,
+        other => scalar_param_oid(other).unwrap_or(0),
     }
 }
 
-/// Chooses the array type OID for a JSON list, or `None` when ambiguous.
-///
-/// Nested lists are PostgreSQL multi-dimensional arrays, so they reuse the
-/// base element's array OID. A list with no non-null elements, or with mixed
-/// element types, stays untyped and lets the server infer from context.
-fn array_oid(items: &[Value]) -> Option<i32> {
+fn json_value_oid(value: &Value) -> i32 {
+    match value {
+        Value::Null | Value::String(_) | Value::Object(_) => 0,
+        Value::Array(items) => json_array_oid(items).unwrap_or(0),
+        other => scalar_json_oid(other).unwrap_or(0),
+    }
+}
+
+fn element_to_array_oid(element: i32) -> i32 {
     use parameter_oids as oid;
 
+    match element {
+        oid::BOOL => oid::BOOL_ARRAY,
+        oid::BYTEA => oid::BYTEA_ARRAY,
+        oid::INT8 => oid::INT8_ARRAY,
+        oid::FLOAT8 => oid::FLOAT8_ARRAY,
+        oid::DATE => oid::DATE_ARRAY,
+        oid::TIME => oid::TIME_ARRAY,
+        oid::TIMESTAMP => oid::TIMESTAMP_ARRAY,
+        oid::TIMESTAMPTZ => oid::TIMESTAMPTZ_ARRAY,
+        oid::INTERVAL => oid::INTERVAL_ARRAY,
+        oid::TIMETZ => oid::TIMETZ_ARRAY,
+        oid::NUMERIC => oid::NUMERIC_ARRAY,
+        oid::UUID => oid::UUID_ARRAY,
+        _ => element,
+    }
+}
+
+/// Chooses the array type OID for a typed list, or `None` when ambiguous.
+fn param_array_oid(items: &[ParamValue]) -> Option<i32> {
     let mut element_oid: Option<i32> = None;
     for item in items {
         let candidate = match item {
-            Value::Null => continue,
-            Value::Array(nested) => base_array_element_oid(nested)?,
-            other => scalar_element_oid(other)?,
+            ParamValue::Json(Value::Null) => continue,
+            ParamValue::List(nested) => base_param_array_element_oid(nested)?,
+            ParamValue::Json(Value::Array(nested)) => base_json_array_element_oid(nested)?,
+            other => scalar_param_oid(other)?,
         };
         match element_oid {
             None => element_oid = Some(candidate),
@@ -164,28 +193,80 @@ fn array_oid(items: &[Value]) -> Option<i32> {
         }
     }
 
-    element_oid.map(|element| match element {
-        oid::BOOL => oid::BOOL_ARRAY,
-        oid::INT8 => oid::INT8_ARRAY,
-        oid::FLOAT8 => oid::FLOAT8_ARRAY,
-        _ => element,
-    })
+    element_oid.map(element_to_array_oid)
+}
+
+fn base_param_array_element_oid(items: &[ParamValue]) -> Option<i32> {
+    for item in items {
+        match item {
+            ParamValue::Json(Value::Null) => continue,
+            ParamValue::List(nested) => return base_param_array_element_oid(nested),
+            ParamValue::Json(Value::Array(nested)) => return base_json_array_element_oid(nested),
+            other => return scalar_param_oid(other),
+        }
+    }
+    None
+}
+
+fn scalar_param_oid(value: &ParamValue) -> Option<i32> {
+    use parameter_oids as oid;
+
+    match value {
+        ParamValue::Json(v) => scalar_json_oid(v),
+        ParamValue::Float(_) => Some(oid::FLOAT8),
+        ParamValue::Bytes(_) => Some(oid::BYTEA),
+        ParamValue::Date { .. } => Some(oid::DATE),
+        ParamValue::Time {
+            tz_offset_seconds: None,
+            ..
+        } => Some(oid::TIME),
+        ParamValue::Time {
+            tz_offset_seconds: Some(_),
+            ..
+        } => Some(oid::TIMETZ),
+        ParamValue::LocalDateTime { .. } => Some(oid::TIMESTAMP),
+        ParamValue::DateTime { .. } => Some(oid::TIMESTAMPTZ),
+        ParamValue::Duration { .. } => Some(oid::INTERVAL),
+        ParamValue::Uuid(_) => Some(oid::UUID),
+        ParamValue::Decimal(_) => Some(oid::NUMERIC),
+        ParamValue::Point2D { .. } | ParamValue::Point3D { .. } => None,
+        ParamValue::List(_) | ParamValue::Map(_) => None,
+    }
+}
+
+/// Chooses the array type OID for a JSON list, or `None` when ambiguous.
+fn json_array_oid(items: &[Value]) -> Option<i32> {
+    let mut element_oid: Option<i32> = None;
+    for item in items {
+        let candidate = match item {
+            Value::Null => continue,
+            Value::Array(nested) => base_json_array_element_oid(nested)?,
+            other => scalar_json_oid(other)?,
+        };
+        match element_oid {
+            None => element_oid = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return None,
+        }
+    }
+
+    element_oid.map(element_to_array_oid)
 }
 
 /// Returns the scalar element OID nested inside a JSON list.
-fn base_array_element_oid(items: &[Value]) -> Option<i32> {
+fn base_json_array_element_oid(items: &[Value]) -> Option<i32> {
     for item in items {
         match item {
             Value::Null => continue,
-            Value::Array(nested) => return base_array_element_oid(nested),
-            other => return scalar_element_oid(other),
+            Value::Array(nested) => return base_json_array_element_oid(nested),
+            other => return scalar_json_oid(other),
         }
     }
     None
 }
 
 /// Returns the PostgreSQL type OID for a non-null scalar JSON value.
-fn scalar_element_oid(value: &Value) -> Option<i32> {
+fn scalar_json_oid(value: &Value) -> Option<i32> {
     use parameter_oids as oid;
 
     match value {
@@ -209,10 +290,10 @@ fn looks_like_age_statement(query: &str) -> bool {
 }
 
 /// Serializes the full AGE parameter map into a deterministic JSON object.
-fn age_parameter_map(params: &HashMap<String, Value>) -> Result<Vec<u8>> {
-    let sorted: BTreeMap<&str, &Value> = params
+fn age_parameter_map(params: &HashMap<String, ParamValue>) -> Result<Vec<u8>> {
+    let sorted: BTreeMap<&str, Value> = params
         .iter()
-        .map(|(key, value)| (key.as_str(), value))
+        .map(|(key, value)| (key.as_str(), value.to_json_value()))
         .collect();
     serde_json::to_vec(&sorted)
         .map_err(|e| NetError::ProtocolError(format!("Failed to encode AGE parameter map: {e}")))
@@ -281,7 +362,7 @@ type BoundParameter = (Option<Vec<u8>>, i32);
 /// Rewrites named `$name` placeholders to positional `$1`, `$2`, ... values.
 fn rewrite_named_placeholders(
     query: &str,
-    params: &HashMap<String, Value>,
+    params: &HashMap<String, ParamValue>,
 ) -> (String, Vec<BoundParameter>) {
     let bytes = query.as_bytes();
     let mut out = String::with_capacity(query.len());
@@ -366,8 +447,93 @@ fn rewrite_named_placeholders(
     (out, bound)
 }
 
-/// Encodes a JSON parameter as PostgreSQL text-format `Bind` bytes.
-fn value_to_text(value: &Value) -> Option<Vec<u8>> {
+/// Formats an `f64` for PostgreSQL text-format `Bind` bytes (preserving `NaN`/`Infinity`/`-Infinity`).
+fn format_pg_float(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".to_string()
+    } else if f.is_infinite() {
+        if f.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
+    } else {
+        f.to_string()
+    }
+}
+
+/// Formats a `ParamValue::Duration` in PostgreSQL `interval` text input syntax.
+fn format_pg_interval(months: i64, days: i64, seconds: i64, nanoseconds: i64) -> String {
+    let total_us = (seconds as i128) * 1_000_000 + (nanoseconds as i128) / 1_000;
+    if months == 0 && days == 0 && total_us == 0 {
+        return "0 seconds".to_string();
+    }
+    let sign = if total_us < 0 { "-" } else { "" };
+    let abs_us = total_us.unsigned_abs();
+    let s = abs_us / 1_000_000;
+    let us = abs_us % 1_000_000;
+    format!("{months} mons {days} days {sign}{s}.{us:06} seconds")
+}
+
+/// Encodes a typed parameter as PostgreSQL text-format `Bind` bytes.
+fn value_to_text(value: &ParamValue) -> Option<Vec<u8>> {
+    match value {
+        ParamValue::Json(v) => json_to_text(v),
+        ParamValue::Float(f) => Some(format_pg_float(*f).into_bytes()),
+        ParamValue::Bytes(b) => Some(format!("\\x{}", hex::encode(b)).into_bytes()),
+        ParamValue::Date { year, month, day } => {
+            Some(format_iso_date(*year, *month, *day).into_bytes())
+        }
+        ParamValue::Time {
+            hour,
+            minute,
+            second,
+            nanosecond,
+            tz_offset_seconds,
+        } => Some(
+            format_iso_time(*hour, *minute, *second, *nanosecond, *tz_offset_seconds).into_bytes(),
+        ),
+        ParamValue::LocalDateTime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            nanosecond,
+        } => Some(
+            format!(
+                "{}T{}",
+                format_iso_date(*year, *month, *day),
+                format_iso_time(*hour, *minute, *second, *nanosecond, None)
+            )
+            .into_bytes(),
+        ),
+        ParamValue::DateTime {
+            utc_seconds,
+            nanosecond,
+            ..
+        } => Some(format_datetime_iso(*utc_seconds, *nanosecond, None).into_bytes()),
+        ParamValue::Duration {
+            months,
+            days,
+            seconds,
+            nanoseconds,
+        } => Some(format_pg_interval(*months, *days, *seconds, *nanoseconds).into_bytes()),
+        ParamValue::Uuid(s) | ParamValue::Decimal(s) => Some(s.as_bytes().to_vec()),
+        ParamValue::Point2D { .. } | ParamValue::Point3D { .. } => {
+            serde_json::to_vec(&value.to_json_value()).ok()
+        }
+        ParamValue::List(items) => {
+            let mut out = String::new();
+            encode_pg_param_array(items, &mut out);
+            Some(out.into_bytes())
+        }
+        ParamValue::Map(_) => serde_json::to_vec(&value.to_json_value()).ok(),
+    }
+}
+
+fn json_to_text(value: &Value) -> Option<Vec<u8>> {
     match value {
         Value::Null => None,
         Value::String(s) => Some(s.as_bytes().to_vec()),
@@ -384,6 +550,83 @@ fn value_to_text(value: &Value) -> Option<Vec<u8>> {
         }
         // Top-level maps are sent as JSON text.
         Value::Object(_) => serde_json::to_vec(value).ok(),
+    }
+}
+
+/// Encodes a typed parameter array as PostgreSQL array literal text (`{elem1,elem2}`).
+fn encode_pg_param_array(items: &[ParamValue], out: &mut String) {
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        encode_pg_param_array_element(item, out);
+    }
+    out.push('}');
+}
+
+fn encode_pg_param_array_element(value: &ParamValue, out: &mut String) {
+    match value {
+        ParamValue::Json(v) => encode_pg_array_element(v, out),
+        ParamValue::Float(f) => escape_and_quote_element(&format_pg_float(*f), out),
+        ParamValue::Bytes(b) => escape_and_quote_element(&format!("\\x{}", hex::encode(b)), out),
+        ParamValue::Date { year, month, day } => {
+            escape_and_quote_element(&format_iso_date(*year, *month, *day), out);
+        }
+        ParamValue::Time {
+            hour,
+            minute,
+            second,
+            nanosecond,
+            tz_offset_seconds,
+        } => {
+            escape_and_quote_element(
+                &format_iso_time(*hour, *minute, *second, *nanosecond, *tz_offset_seconds),
+                out,
+            );
+        }
+        ParamValue::LocalDateTime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            nanosecond,
+        } => {
+            let text = format!(
+                "{}T{}",
+                format_iso_date(*year, *month, *day),
+                format_iso_time(*hour, *minute, *second, *nanosecond, None)
+            );
+            escape_and_quote_element(&text, out);
+        }
+        ParamValue::DateTime {
+            utc_seconds,
+            nanosecond,
+            ..
+        } => {
+            escape_and_quote_element(&format_datetime_iso(*utc_seconds, *nanosecond, None), out);
+        }
+        ParamValue::Duration {
+            months,
+            days,
+            seconds,
+            nanoseconds,
+        } => {
+            escape_and_quote_element(
+                &format_pg_interval(*months, *days, *seconds, *nanoseconds),
+                out,
+            );
+        }
+        ParamValue::Uuid(s) => escape_and_quote_element(s, out),
+        ParamValue::Decimal(s) => out.push_str(s),
+        ParamValue::List(nested) => encode_pg_param_array(nested, out),
+        ParamValue::Map(_) | ParamValue::Point2D { .. } | ParamValue::Point3D { .. } => {
+            if let Ok(json_str) = serde_json::to_string(&value.to_json_value()) {
+                escape_and_quote_element(&json_str, out);
+            }
+        }
     }
 }
 
@@ -548,10 +791,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn params(entries: &[(&str, Value)]) -> HashMap<String, Value> {
+    fn params(entries: &[(&str, Value)]) -> HashMap<String, ParamValue> {
         entries
             .iter()
-            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .map(|(key, value)| ((*key).to_string(), ParamValue::from(value.clone())))
             .collect()
     }
 
@@ -797,5 +1040,249 @@ mod tests {
         assert_eq!(prepared.statement, query);
         assert!(!prepared.is_parameterized());
         assert_eq!(prepared.placeholder_style, ParameterPlaceholderStyle::None);
+    }
+
+    #[test]
+    fn typed_temporal_uuid_numeric_and_bytea_oids_and_text_encodings() {
+        use crate::params::ParamTimezone;
+
+        let mut p = HashMap::new();
+        p.insert(
+            "d".to_string(),
+            ParamValue::Date {
+                year: 2024,
+                month: 1,
+                day: 2,
+            },
+        );
+        p.insert(
+            "t".to_string(),
+            ParamValue::Time {
+                hour: 14,
+                minute: 30,
+                second: 15,
+                nanosecond: 123_456_000,
+                tz_offset_seconds: None,
+            },
+        );
+        p.insert(
+            "tz".to_string(),
+            ParamValue::Time {
+                hour: 14,
+                minute: 30,
+                second: 15,
+                nanosecond: 0,
+                tz_offset_seconds: Some(7200),
+            },
+        );
+        p.insert(
+            "ts".to_string(),
+            ParamValue::LocalDateTime {
+                year: 2024,
+                month: 1,
+                day: 2,
+                hour: 3,
+                minute: 4,
+                second: 5,
+                nanosecond: 123_456_000,
+            },
+        );
+        p.insert(
+            "tstz".to_string(),
+            ParamValue::DateTime {
+                utc_seconds: 1_704_164_645,
+                nanosecond: 123_456_000,
+                tz: ParamTimezone::OffsetSeconds(0),
+            },
+        );
+        p.insert(
+            "iv".to_string(),
+            ParamValue::Duration {
+                months: 0,
+                days: 2,
+                seconds: 3661,
+                nanoseconds: 500_000_000,
+            },
+        );
+        p.insert(
+            "neg_iv".to_string(),
+            ParamValue::Duration {
+                months: 0,
+                days: -1,
+                seconds: 86395,
+                nanoseconds: 0,
+            },
+        );
+        p.insert(
+            "u".to_string(),
+            ParamValue::Uuid("12345678-1234-5678-1234-567812345678".to_string()),
+        );
+        p.insert("num".to_string(), ParamValue::Decimal("123.45".to_string()));
+        p.insert("b".to_string(), ParamValue::Bytes(vec![0x01, 0xAB, 0xFF]));
+        p.insert("raw_str".to_string(), ParamValue::from("2024-01-02"));
+
+        let query = "SELECT $d, $t, $tz, $ts, $tstz, $iv, $neg_iv, $u, $num, $b, $raw_str";
+        let prepared = prepare_postgres_statement(query, &p).expect("prepare should succeed");
+
+        assert_eq!(
+            prepared.parameter_oids,
+            vec![1082, 1083, 1266, 1114, 1184, 1186, 1186, 2950, 1700, 17, 0]
+        );
+        assert_eq!(
+            prepared.parameter_values,
+            vec![
+                Some(b"2024-01-02".to_vec()),
+                Some(b"14:30:15.123456".to_vec()),
+                Some(b"14:30:15+02:00".to_vec()),
+                Some(b"2024-01-02T03:04:05.123456".to_vec()),
+                Some(b"2024-01-02T03:04:05.123456+00:00".to_vec()),
+                Some(b"0 mons 2 days 3661.500000 seconds".to_vec()),
+                Some(b"0 mons -1 days 86395.000000 seconds".to_vec()),
+                Some(b"12345678-1234-5678-1234-567812345678".to_vec()),
+                Some(b"123.45".to_vec()),
+                Some(br"\x01abff".to_vec()),
+                Some(b"2024-01-02".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_arrays_use_matching_array_oids_and_mixed_stay_untyped() {
+        use crate::params::ParamTimezone;
+
+        let mut p = HashMap::new();
+        p.insert(
+            "dates".to_string(),
+            ParamValue::List(vec![
+                ParamValue::Date {
+                    year: 2024,
+                    month: 1,
+                    day: 2,
+                },
+                ParamValue::Json(Value::Null),
+            ]),
+        );
+        p.insert(
+            "times".to_string(),
+            ParamValue::List(vec![ParamValue::Time {
+                hour: 1,
+                minute: 2,
+                second: 3,
+                nanosecond: 0,
+                tz_offset_seconds: None,
+            }]),
+        );
+        p.insert(
+            "timetzs".to_string(),
+            ParamValue::List(vec![ParamValue::Time {
+                hour: 1,
+                minute: 2,
+                second: 3,
+                nanosecond: 0,
+                tz_offset_seconds: Some(0),
+            }]),
+        );
+        p.insert(
+            "tss".to_string(),
+            ParamValue::List(vec![ParamValue::LocalDateTime {
+                year: 2024,
+                month: 1,
+                day: 2,
+                hour: 3,
+                minute: 4,
+                second: 5,
+                nanosecond: 0,
+            }]),
+        );
+        p.insert(
+            "tstzs".to_string(),
+            ParamValue::List(vec![ParamValue::DateTime {
+                utc_seconds: 1_704_164_645,
+                nanosecond: 0,
+                tz: ParamTimezone::OffsetSeconds(0),
+            }]),
+        );
+        p.insert(
+            "ivs".to_string(),
+            ParamValue::List(vec![ParamValue::Duration {
+                months: 0,
+                days: 1,
+                seconds: 0,
+                nanoseconds: 0,
+            }]),
+        );
+        p.insert(
+            "uuids".to_string(),
+            ParamValue::List(vec![ParamValue::Uuid(
+                "12345678-1234-5678-1234-567812345678".to_string(),
+            )]),
+        );
+        p.insert(
+            "nums".to_string(),
+            ParamValue::List(vec![ParamValue::Decimal("12.34".to_string())]),
+        );
+        p.insert(
+            "byteas".to_string(),
+            ParamValue::List(vec![ParamValue::Bytes(vec![0x01, 0x02])]),
+        );
+        p.insert(
+            "mixed".to_string(),
+            ParamValue::List(vec![
+                ParamValue::Date {
+                    year: 2024,
+                    month: 1,
+                    day: 2,
+                },
+                ParamValue::from("2024-01-03"),
+            ]),
+        );
+
+        let query =
+            "SELECT $dates, $times, $timetzs, $tss, $tstzs, $ivs, $uuids, $nums, $byteas, $mixed";
+        let prepared = prepare_postgres_statement(query, &p).expect("prepare should succeed");
+        assert_eq!(
+            prepared.parameter_oids,
+            vec![1182, 1183, 1270, 1115, 1185, 1187, 2951, 1231, 1001, 0]
+        );
+        assert_eq!(
+            prepared.parameter_values[0].as_deref(),
+            Some(br#"{"2024-01-02",NULL}"#.as_slice())
+        );
+        assert_eq!(
+            prepared.parameter_values[8].as_deref(),
+            Some(br#"{"\\x0102"}"#.as_slice())
+        );
+    }
+
+    #[test]
+    fn age_parameter_map_handles_typed_params_deterministically() {
+        let mut p = HashMap::new();
+        p.insert(
+            "d".to_string(),
+            ParamValue::Date {
+                year: 2024,
+                month: 1,
+                day: 2,
+            },
+        );
+        p.insert("dec".to_string(), ParamValue::Decimal("12.5".to_string()));
+        p.insert(
+            "u".to_string(),
+            ParamValue::Uuid("12345678-1234-5678-1234-567812345678".to_string()),
+        );
+
+        let query = "SELECT * FROM cypher('g', $$ RETURN $d, $dec, $u $$, %s) AS (v agtype)";
+        let prepared = prepare_postgres_statement(query, &p).expect("prepare should succeed");
+        assert_eq!(prepared.parameter_oids, vec![0]);
+        let decoded: Value =
+            serde_json::from_slice(prepared.parameter_values[0].as_ref().unwrap()).unwrap();
+        assert_eq!(
+            decoded,
+            json!({
+                "d": "2024-01-02",
+                "dec": 12.5,
+                "u": "12345678-1234-5678-1234-567812345678",
+            })
+        );
     }
 }

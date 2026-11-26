@@ -260,8 +260,8 @@ def test_pg19_native_typed_parameters_and_bare_boolean_predicate() -> None:
                 == []
             )
 
-            # Dates, timestamps and UUIDs reach the driver as strings; they must stay
-            # untyped so the server resolves them from the column, as psycopg does.
+            # Genuine strings stay untyped so the server resolves them from column
+            # context, while typed date/timestamptz/uuid values bind with their PG OIDs.
             native_session.execute(
                 "CREATE TABLE typed_values (d date, ts timestamptz, u uuid, j jsonb)"
             )
@@ -367,4 +367,78 @@ def test_age_native_arrays_and_typed_parameters_match_bridge() -> None:
             cur.execute("LOAD 'age'; SET search_path = ag_catalog, \"$user\", public;")
             cur.execute(f"SELECT drop_graph('{graph}', true)")
             cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        conn.close()
+
+
+@pytest.mark.live
+def test_pg19_native_and_bridge_typed_uuid_datetime_and_numeric_scale_parity() -> None:
+    """Native and psycopg bridge behave identically for UUID/aware-datetime against typed and text columns, and numeric(10,2) scale."""
+    conn = _connect(PG19_PORT)
+    schema = f"zz_native_uuid_dt_{uuid.uuid4().hex[:10]}"
+    u = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    aware_midnight = datetime.datetime(2024, 1, 2, 0, 0, 0, tzinfo=datetime.UTC)
+    aware_later = datetime.datetime(2024, 1, 2, 3, 0, 0, tzinfo=datetime.UTC)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA "{schema}"')
+            cur.execute(f'SET search_path TO "{schema}", public')
+            cur.execute(
+                """
+                CREATE TABLE typed_parity (
+                    id int PRIMARY KEY,
+                    u uuid,
+                    d date,
+                    ts timestamptz,
+                    txt text,
+                    num numeric(10, 2)
+                )
+                """
+            )
+            cur.execute(
+                "INSERT INTO typed_parity VALUES (1, %s, DATE '2024-01-02', %s, %s, 1.50)",
+                (u, aware_midnight, str(u)),
+            )
+
+        bridge_session = Session(bridge=PostgresBridge(conn), dialect="sql_pgq")
+        native_session = Session(_uri(PG19_PORT), dialect="sql_pgq", backend="native", pool_size=1)
+        try:
+            native_session.execute(f'SET search_path TO "{schema}", public')
+
+            # Typed columns match on both native and bridge
+            for q, params in (
+                ("SELECT id FROM typed_parity WHERE u = $u", {"u": u}),
+                ("SELECT id FROM typed_parity WHERE ts = $ts", {"ts": aware_midnight}),
+                ("SELECT id FROM typed_parity WHERE txt = $u::text", {"u": u}),
+            ):
+                assert native_session.execute(q, params).all() == [{"id": 1}]
+                assert bridge_session.execute(q, params).all() == [{"id": 1}]
+
+            # Uncast uuid against text column fails on BOTH native and bridge
+            for sess in (native_session, bridge_session):
+                with pytest.raises((ValueError, RuntimeError, psycopg.Error)):
+                    sess.execute("SELECT id FROM typed_parity WHERE txt = $u", {"u": u}).all()
+
+            # date = aware_datetime compares as timestamptz (midnight matches, non-midnight does not) on BOTH
+            for sess in (native_session, bridge_session):
+                assert sess.execute(
+                    "SELECT id FROM typed_parity WHERE d = $dt", {"dt": aware_midnight}
+                ).all() == [{"id": 1}]
+                assert (
+                    sess.execute(
+                        "SELECT id FROM typed_parity WHERE d = $dt", {"dt": aware_later}
+                    ).all()
+                    == []
+                )
+
+            # numeric(10, 2) preserves trailing zero scale
+            n_num = native_session.execute("SELECT num FROM typed_parity WHERE id = 1").first()
+            b_num = bridge_session.execute("SELECT num FROM typed_parity WHERE id = 1").first()
+            assert n_num is not None and b_num is not None
+            assert isinstance(n_num["num"], Decimal) and isinstance(b_num["num"], Decimal)
+            assert str(n_num["num"]) == str(b_num["num"]) == "1.50"
+        finally:
+            native_session.close()
+    finally:
+        with conn.cursor() as cur:
+            cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         conn.close()

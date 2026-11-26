@@ -79,9 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut seed_params = HashMap::new();
             for (k, v) in &compiled_seed.parameters {
                 if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-                    seed_params.insert(k.clone(), serde_json::json!(i));
+                    seed_params.insert(k.clone(), serde_json::json!(i).into());
                 } else if let voyager_ogm::ast::LiteralValue::String(s) = v {
-                    seed_params.insert(k.clone(), serde_json::json!(s));
+                    seed_params.insert(k.clone(), serde_json::json!(s).into());
                 }
             }
             conn.execute(&compiled_seed.statement, &seed_params).await?;
@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut exp_params = HashMap::new();
             for (k, v) in &compiled_exp.parameters {
                 if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-                    exp_params.insert(k.clone(), serde_json::json!(i));
+                    exp_params.insert(k.clone(), serde_json::json!(i).into());
                 }
             }
 
@@ -133,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut prof_params = HashMap::new();
             for (k, v) in &compiled_prof.parameters {
                 if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-                    prof_params.insert(k.clone(), serde_json::json!(i));
+                    prof_params.insert(k.clone(), serde_json::json!(i).into());
                 }
             }
 
@@ -195,9 +195,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut seed_params = HashMap::new();
             for (k, v) in &compiled_seed.parameters {
                 if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-                    seed_params.insert(k.clone(), serde_json::json!(i));
+                    seed_params.insert(k.clone(), serde_json::json!(i).into());
                 } else if let voyager_ogm::ast::LiteralValue::String(s) = v {
-                    seed_params.insert(k.clone(), serde_json::json!(s));
+                    seed_params.insert(k.clone(), serde_json::json!(s).into());
                 }
             }
             conn.execute(&compiled_seed.statement, &seed_params).await?;

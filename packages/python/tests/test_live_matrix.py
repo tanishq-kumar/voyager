@@ -1588,7 +1588,7 @@ class TestPostgres19LiveMatrix:
                 .order_by(a.username)
             )
             compiled_agg = q_agg.compile("sql_pgq", graph_name="live_pgq_graph")
-            assert "GROUP BY source_user" in compiled_agg.statement
+            assert 'GROUP BY "source_user"' in compiled_agg.statement
 
             df_agg = session.execute_to_polars(compiled_agg)
             assert df_agg.shape == (1, 3)

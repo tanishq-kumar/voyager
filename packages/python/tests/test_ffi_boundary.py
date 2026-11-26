@@ -449,3 +449,222 @@ def test_execution_result_lazy_stream_materialization():
     tbl = res.to_arrow()
     assert tbl.num_rows == 5_000
     assert len(res) == 5_000
+
+
+def _pg_msg(tag: bytes, payload: bytes) -> bytes:
+    import struct
+
+    return tag + struct.pack("!I", len(payload) + 4) + payload
+
+
+def _pg_row_description(cols: list[tuple[str, int, int]]) -> bytes:
+    import struct
+
+    out = bytearray(struct.pack("!H", len(cols)))
+    for name, oid, typmod in cols:
+        out.extend(name.encode("utf-8") + b"\x00")
+        out.extend(struct.pack("!IHIHIH", 0, 0, oid, 0xFFFF, typmod & 0xFFFFFFFF, 0))
+    return _pg_msg(b"T", bytes(out))
+
+
+def _pg_data_row(values: list[bytes | None]) -> bytes:
+    import struct
+
+    out = bytearray(struct.pack("!H", len(values)))
+    for v in values:
+        if v is None:
+            out.extend(struct.pack("!i", -1))
+        else:
+            out.extend(struct.pack("!i", len(v)) + v)
+    return _pg_msg(b"D", bytes(out))
+
+
+def test_native_pg_stub_interval_numeric_scale_and_era_fallback():
+    """Offline PG wire stub verifies Duration(us) days=0, numeric(10,2) scale, and BC era fallback."""
+    import socket
+    import struct
+    import threading
+    from decimal import Decimal
+
+    from voyager_ogm import Duration, NativeClient
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.settimeout(3.0)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def _recv_exact(sock: socket.socket, n: int) -> bytes:
+        out = bytearray()
+        while len(out) < n:
+            chunk = sock.recv(n - len(out))
+            if not chunk:
+                return bytes(out)
+            out.extend(chunk)
+        return bytes(out)
+
+    def _serve() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            conn.settimeout(3.0)
+            # Read startup packet (len + payload)
+            hdr = _recv_exact(conn, 4)
+            if len(hdr) < 4:
+                return
+            plen = struct.unpack("!I", hdr)[0]
+            _recv_exact(conn, plen - 4)
+            conn.sendall(_pg_msg(b"R", struct.pack("!I", 0)))
+            conn.sendall(_pg_msg(b"K", struct.pack("!II", 1, 2)))
+            conn.sendall(_pg_msg(b"Z", b"I"))
+
+            typmod_10_2 = ((10 << 16) | 2) + 4
+            rd = _pg_row_description(
+                [
+                    ("iv", 1186, -1),
+                    ("num", 1700, typmod_10_2),
+                    ("ts_bc", 1184, -1),
+                    ("t_bc", 1266, -1),
+                ]
+            )
+            dr = _pg_data_row(
+                [
+                    b"25:00:00",
+                    b"1.50",
+                    b"0044-03-15 10:00:00+00 BC",
+                    b"10:00:00+00 BC",
+                ]
+            )
+
+            while True:
+                msg_hdr = _recv_exact(conn, 5)
+                if len(msg_hdr) < 5:
+                    break
+                tag = msg_hdr[:1]
+                mlen = struct.unpack("!I", msg_hdr[1:])[0]
+                _recv_exact(conn, max(0, mlen - 4))
+                if tag == b"Q":
+                    conn.sendall(rd + dr + _pg_msg(b"C", b"SELECT 1\x00") + _pg_msg(b"Z", b"I"))
+                elif tag == b"S":
+                    conn.sendall(
+                        _pg_msg(b"1", b"")
+                        + _pg_msg(b"2", b"")
+                        + rd
+                        + dr
+                        + _pg_msg(b"C", b"SELECT 1\x00")
+                        + _pg_msg(b"Z", b"I")
+                    )
+                elif tag == b"X":
+                    break
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    try:
+        client = NativeClient(
+            f"postgresql://postgres@127.0.0.1:{port}/voyager_graph?sslmode=disable",
+            min_idle=1,
+            max_size=1,
+        )
+        try:
+            rows = client.execute_sync("SELECT 1", {}).records
+            assert len(rows) == 1
+            row = rows[0]
+            assert row["iv"] == Duration(months=0, days=0, seconds=90_000, nanoseconds=0)
+            assert row["iv"].days == 0 and row["iv"].seconds == 90_000
+            assert isinstance(row["num"], Decimal) and str(row["num"]) == "1.50"
+            assert row["ts_bc"] == "0044-03-15 10:00:00+00 BC"
+            assert row["t_bc"] == "10:00:00+00 BC"
+        finally:
+            client.close()
+    finally:
+        srv.close()
+        t.join(timeout=2)
+
+
+def test_native_bolt_v4_0x66_local_zone_stub():
+    """Offline Bolt v4.4 wire stub verifies 0x66 local wall-clock seconds convert via ZoneInfo."""
+    import socket
+    import struct
+    import threading
+    import zoneinfo
+
+    from voyager_ogm import NativeClient
+
+    def _pack_chunks(msg: bytes) -> bytes:
+        return struct.pack("!H", len(msg)) + msg + b"\x00\x00"
+
+    def _ps_str(s: str) -> bytes:
+        b = s.encode("utf-8")
+        if len(b) < 16:
+            return bytes([0x80 + len(b)]) + b
+        return bytes([0xD0, len(b)]) + b
+
+    def _ps_int(v: int) -> bytes:
+        if -16 <= v <= 127:
+            return struct.pack("!b", v)
+        return b"\xca" + struct.pack("!i", v)
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def _read_msg(conn: socket.socket) -> bytes:
+        out = bytearray()
+        while True:
+            hdr = conn.recv(2)
+            if len(hdr) < 2:
+                return bytes(out)
+            sz = struct.unpack("!H", hdr)[0]
+            if sz == 0:
+                return bytes(out)
+            while sz > 0:
+                chunk = conn.recv(sz)
+                out.extend(chunk)
+                sz -= len(chunk)
+
+    def _serve() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            conn.recv(20)  # magic + 4 versions
+            conn.sendall(bytes([0x00, 0x00, 0x04, 0x04]))  # negotiate Bolt 4.4
+            _read_msg(conn)  # HELLO
+            conn.sendall(_pack_chunks(b"\xb1\x70\xa0"))  # SUCCESS {}
+            while True:
+                msg = _read_msg(conn)
+                if not msg:
+                    break
+                tag = msg[1] if len(msg) > 1 else 0
+                if tag == 0x10:  # RUN
+                    _read_msg(conn)  # PULL
+                    # SUCCESS {"fields": ["dt"]}
+                    run_ok = b"\xb1\x70\xa1" + _ps_str("fields") + b"\x91" + _ps_str("dt")
+                    # RECORD [0x66(1704164645, 0, "Europe/Berlin")] -> 2024-01-02 03:04:05 local
+                    dtz = (
+                        b"\xb3\x66" + _ps_int(1_704_164_645) + _ps_int(0) + _ps_str("Europe/Berlin")
+                    )
+                    rec = b"\xb1\x71\x91" + dtz
+                    pull_ok = b"\xb1\x70\xa0"
+                    conn.sendall(_pack_chunks(run_ok) + _pack_chunks(rec) + _pack_chunks(pull_ok))
+                elif tag == 0x0F:  # RESET
+                    conn.sendall(_pack_chunks(b"\xb1\x70\xa0"))
+                elif tag == 0x02:  # GOODBYE
+                    break
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    try:
+        client = NativeClient(f"bolt://127.0.0.1:{port}", min_idle=1, max_size=1)
+        try:
+            rows = client.execute_sync("RETURN 1 AS dt", {}).records
+            assert len(rows) == 1
+            row = rows[0]
+            expected = datetime.datetime(
+                2024, 1, 2, 3, 4, 5, tzinfo=zoneinfo.ZoneInfo("Europe/Berlin")
+            )
+            assert row["dt"] == expected
+            assert row["dt"].utcoffset() == datetime.timedelta(hours=1)
+        finally:
+            client.close()
+    finally:
+        srv.close()
+        t.join(timeout=2)

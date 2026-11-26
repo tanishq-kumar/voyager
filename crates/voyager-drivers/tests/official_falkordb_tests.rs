@@ -290,7 +290,7 @@ async fn test_official_falkordb_param_roundtrip() {
 
     for (name, val) in test_params {
         let mut params = HashMap::new();
-        params.insert(name.to_string(), val.clone());
+        params.insert(name.to_string(), val.clone().into());
 
         let query = format!("RETURN ${}", name);
         let res = conn
@@ -342,7 +342,7 @@ async fn test_official_falkordb_non_identifier_param_keys() {
 
     for (key, val) in edge_case_keys {
         let mut params = HashMap::new();
-        params.insert(key.to_string(), serde_json::json!(val));
+        params.insert(key.to_string(), serde_json::json!(val).into());
 
         let query = format!("RETURN ${}", key);
         let res = conn

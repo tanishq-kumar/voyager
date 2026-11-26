@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::error::{NetError, Result};
+use crate::params::{ParamTimezone, ParamValue, parse_decimal_f64};
 
 /// Maximum recursion depth allowed when decoding nested PackStream structures (Lists, Maps, Structs)
 /// to prevent stack overflow denial-of-service on untrusted network payloads.
@@ -338,25 +339,39 @@ impl BoltLocalDateTime {
 /// Represents a DateTime with named IANA timezone decoded from a Bolt PackStream structure (`tag = 0x4A`, `0x66`, or `0x69`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BoltDateTimeZoneId {
-    /// Seconds since Unix epoch (1970-01-01T00:00:00Z).
+    /// Seconds since Unix epoch (1970-01-01T00:00:00Z), or local wall-clock seconds when `is_local` is `true` (Bolt v4 `0x66`).
     pub seconds: i64,
     /// Sub-second nanoseconds (0..999_999_999).
     pub nanoseconds: i64,
     /// IANA timezone identifier (e.g. "Europe/Berlin", "America/New_York", "UTC").
     pub zone_id: String,
+    /// `true` when decoded from legacy Bolt v4 tag `0x66` carrying local wall-clock seconds rather than UTC epoch seconds.
+    #[serde(default)]
+    pub is_local: bool,
 }
 
 impl BoltDateTimeZoneId {
-    /// Creates a new `BoltDateTimeZoneId`.
+    /// Creates a new `BoltDateTimeZoneId` with UTC epoch seconds (Bolt v5+ `0x69`).
     pub fn new(seconds: i64, nanoseconds: i64, zone_id: impl Into<String>) -> Self {
         Self {
             seconds,
             nanoseconds,
             zone_id: zone_id.into(),
+            is_local: false,
         }
     }
 
-    /// Formats the datetime as an ISO-8601 extended string with zone ID (`"YYYY-MM-DDTHH:MM:SS.ffffff[Zone/Id]"`).
+    /// Creates a legacy Bolt v4 (`0x66`) `BoltDateTimeZoneId` with local wall-clock seconds.
+    pub fn new_local(local_seconds: i64, nanoseconds: i64, zone_id: impl Into<String>) -> Self {
+        Self {
+            seconds: local_seconds,
+            nanoseconds,
+            zone_id: zone_id.into(),
+            is_local: true,
+        }
+    }
+
+    /// Formats the datetime as an ISO-8601 extended string with zone ID (`"YYYY-MM-DDTHH:MM:SS.ffffffZ[Zone/Id]"` or without `Z` when local).
     pub fn to_iso_string(&self) -> String {
         let days = self.seconds.div_euclid(86400);
         let secs_of_day = self.seconds.rem_euclid(86400);
@@ -364,7 +379,8 @@ impl BoltDateTimeZoneId {
         let h = (secs_of_day / 3600) as u32;
         let min = ((secs_of_day % 3600) / 60) as u32;
         let sec = (secs_of_day % 60) as u32;
-        let time_part = format_time_string(h, min, sec, self.nanoseconds as u32, Some("Z"));
+        let tz_marker = if self.is_local { None } else { Some("Z") };
+        let time_part = format_time_string(h, min, sec, self.nanoseconds as u32, tz_marker);
         format!("{:04}-{:02}-{:02}T{}[{}]", y, m, d, time_part, self.zone_id)
     }
 }
@@ -395,46 +411,62 @@ impl BoltDuration {
 
     /// Formats the duration as an ISO-8601 duration string (e.g. `"P1Y2M3DT4H5M6S"`).
     pub fn to_iso_string(&self) -> String {
-        if self.months == 0 && self.days == 0 && self.seconds == 0 && self.nanoseconds == 0 {
+        let total_ns = (self.seconds as i128) * 1_000_000_000 + (self.nanoseconds as i128);
+        if self.months == 0 && self.days == 0 && total_ns == 0 {
             return "PT0S".to_string();
         }
-        let mut res = String::from("P");
-        if self.months != 0 {
-            let years = self.months / 12;
-            let rem_months = self.months % 12;
+        let all_non_pos = self.months <= 0 && self.days <= 0 && total_ns <= 0;
+        let (m_val, d_val, ns_val, prefix) = if all_non_pos {
+            (
+                self.months.unsigned_abs() as i128,
+                self.days.unsigned_abs() as i128,
+                total_ns.unsigned_abs() as i128,
+                "-P",
+            )
+        } else {
+            (self.months as i128, self.days as i128, total_ns, "P")
+        };
+
+        let mut res = String::from(prefix);
+        if m_val != 0 {
+            let years = m_val / 12;
+            let rem_months = m_val % 12;
             if years != 0 {
-                res.push_str(&format!("{}Y", years));
+                res.push_str(&format!("{years}Y"));
             }
-            if rem_months != 0 || years == 0 {
-                res.push_str(&format!("{}M", rem_months));
+            if rem_months != 0 {
+                res.push_str(&format!("{rem_months}M"));
             }
         }
-        if self.days != 0 {
-            res.push_str(&format!("{}D", self.days));
+        if d_val != 0 {
+            res.push_str(&format!("{d_val}D"));
         }
-        if self.seconds != 0 || self.nanoseconds != 0 {
+        if ns_val != 0 {
             res.push('T');
-            let h = self.seconds / 3600;
-            let m = (self.seconds % 3600) / 60;
-            let s = self.seconds % 60;
+            let t_sign = if ns_val < 0 { "-" } else { "" };
+            let abs_ns = ns_val.unsigned_abs();
+            let total_secs = abs_ns / 1_000_000_000;
+            let sub_ns = (abs_ns % 1_000_000_000) as u32;
+            let h = total_secs / 3600;
+            let m = (total_secs % 3600) / 60;
+            let s = total_secs % 60;
             if h != 0 {
-                res.push_str(&format!("{}H", h));
+                res.push_str(&format!("{t_sign}{h}H"));
             }
             if m != 0 {
-                res.push_str(&format!("{}M", m));
+                res.push_str(&format!("{t_sign}{m}M"));
             }
-            if s != 0 || self.nanoseconds != 0 || (h == 0 && m == 0) {
-                if self.nanoseconds != 0 {
-                    let nanos = self.nanoseconds.unsigned_abs();
-                    if nanos.is_multiple_of(1_000_000) {
-                        res.push_str(&format!("{}.{:03}S", s, nanos / 1_000_000));
-                    } else if nanos.is_multiple_of(1_000) {
-                        res.push_str(&format!("{}.{:06}S", s, nanos / 1_000));
+            if s != 0 || sub_ns != 0 {
+                if sub_ns != 0 {
+                    if sub_ns.is_multiple_of(1_000_000) {
+                        res.push_str(&format!("{t_sign}{s}.{:03}S", sub_ns / 1_000_000));
+                    } else if sub_ns.is_multiple_of(1_000) {
+                        res.push_str(&format!("{t_sign}{s}.{:06}S", sub_ns / 1_000));
                     } else {
-                        res.push_str(&format!("{}.{:09}S", s, nanos));
+                        res.push_str(&format!("{t_sign}{s}.{:09}S", sub_ns));
                     }
                 } else {
-                    res.push_str(&format!("{}S", s));
+                    res.push_str(&format!("{t_sign}{s}S"));
                 }
             }
         }
@@ -567,6 +599,142 @@ impl From<&serde_json::Value> for BoltValue {
                 }
                 BoltValue::Map(map)
             }
+        }
+    }
+}
+
+/// Converts a typed [`ParamValue`] into a [`BoltValue`] for the negotiated Bolt major version.
+///
+/// Bolt v5+ uses UTC seconds with tags `0x49` (`DateTime`) and `0x69` (`DateTimeZoneId`);
+/// legacy Bolt (< v5) uses local wall-clock seconds with tags `0x46` and `0x66`.
+/// UUIDs and Decimals are encoded as strings because Bolt has no native wire type for them.
+pub fn param_to_bolt_value(param: &ParamValue, bolt_major: u8) -> Result<BoltValue> {
+    match param {
+        ParamValue::Json(v) => Ok(BoltValue::from(v)),
+        ParamValue::Float(f) => Ok(BoltValue::Float(*f)),
+        ParamValue::Bytes(b) => Ok(BoltValue::Bytes(b.clone())),
+        ParamValue::Date { year, month, day } => Ok(BoltValue::Date(BoltDate::from_ymd(
+            *year,
+            *month as u32,
+            *day as u32,
+        )?)),
+        ParamValue::Time {
+            hour,
+            minute,
+            second,
+            nanosecond,
+            tz_offset_seconds,
+        } => {
+            let nanos = ((*hour as i64) * 3_600 + (*minute as i64) * 60 + (*second as i64))
+                * 1_000_000_000
+                + (*nanosecond as i64);
+            match tz_offset_seconds {
+                Some(off) => Ok(BoltValue::Time(BoltTime::new(nanos, *off as i64))),
+                None => Ok(BoltValue::LocalTime(BoltLocalTime::new(nanos))),
+            }
+        }
+        ParamValue::LocalDateTime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            nanosecond,
+        } => {
+            let date = BoltDate::from_ymd(*year, *month as u32, *day as u32)?;
+            let seconds = date.days * 86_400
+                + (*hour as i64) * 3_600
+                + (*minute as i64) * 60
+                + (*second as i64);
+            Ok(BoltValue::LocalDateTime(BoltLocalDateTime::new(
+                seconds,
+                *nanosecond as i64,
+            )))
+        }
+        ParamValue::DateTime {
+            utc_seconds,
+            nanosecond,
+            tz,
+        } => {
+            if bolt_major >= 5 {
+                match tz {
+                    ParamTimezone::OffsetSeconds(off) => Ok(BoltValue::DateTime(
+                        BoltDateTime::new(*utc_seconds, *nanosecond as i64, *off as i64),
+                    )),
+                    ParamTimezone::ZoneId { id, .. } => Ok(BoltValue::DateTimeZoneId(
+                        BoltDateTimeZoneId::new(*utc_seconds, *nanosecond as i64, id.clone()),
+                    )),
+                }
+            } else {
+                match tz {
+                    ParamTimezone::OffsetSeconds(off) => {
+                        let local_secs = utc_seconds.saturating_add(*off as i64);
+                        Ok(BoltValue::Structure {
+                            tag: 0x46,
+                            fields: vec![
+                                BoltValue::Integer(local_secs),
+                                BoltValue::Integer(*nanosecond as i64),
+                                BoltValue::Integer(*off as i64),
+                            ],
+                        })
+                    }
+                    ParamTimezone::ZoneId { id, offset_seconds } => {
+                        let local_secs = utc_seconds.saturating_add(*offset_seconds as i64);
+                        Ok(BoltValue::Structure {
+                            tag: 0x66,
+                            fields: vec![
+                                BoltValue::Integer(local_secs),
+                                BoltValue::Integer(*nanosecond as i64),
+                                BoltValue::String(id.clone()),
+                            ],
+                        })
+                    }
+                }
+            }
+        }
+        ParamValue::Duration {
+            months,
+            days,
+            seconds,
+            nanoseconds,
+        } => Ok(BoltValue::Duration(BoltDuration::new(
+            *months,
+            *days,
+            *seconds,
+            *nanoseconds,
+        ))),
+        ParamValue::Uuid(s) => Ok(BoltValue::String(s.clone())),
+        ParamValue::Decimal(s) => {
+            let f = parse_decimal_f64(s).ok_or_else(|| {
+                NetError::ProtocolError(format!("Invalid decimal parameter value: {s:?}"))
+            })?;
+            Ok(BoltValue::Float(f))
+        }
+        ParamValue::Point2D { srid, x, y } => Ok(BoltValue::Point2D(BoltPoint2D {
+            srid: *srid,
+            x: *x,
+            y: *y,
+        })),
+        ParamValue::Point3D { srid, x, y, z } => Ok(BoltValue::Point3D(BoltPoint3D {
+            srid: *srid,
+            x: *x,
+            y: *y,
+            z: *z,
+        })),
+        ParamValue::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(param_to_bolt_value(item, bolt_major)?);
+            }
+            Ok(BoltValue::List(out))
+        }
+        ParamValue::Map(map) => {
+            let mut out = HashMap::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), param_to_bolt_value(v, bolt_major)?);
+            }
+            Ok(BoltValue::Map(out))
         }
     }
 }
@@ -1057,7 +1225,8 @@ impl PackStream {
             BoltValue::Integer(dtz.nanoseconds),
             BoltValue::String(dtz.zone_id.clone()),
         ];
-        Self::encode_structure(0x4A, &fields, buf);
+        let tag = if dtz.is_local { 0x66 } else { 0x69 };
+        Self::encode_structure(tag, &fields, buf);
     }
 
     fn encode_duration(dur: &BoltDuration, buf: &mut BytesMut) {
@@ -1453,8 +1622,14 @@ impl PackStream {
             Some(BoltValue::Integer(tz)) => *tz,
             _ => return Ok(BoltValue::Structure { tag, fields }),
         };
+        // Legacy Bolt (< v5) tag 0x46 encodes local wall-clock seconds rather than UTC.
+        let utc_seconds = if tag == 0x46 {
+            seconds.saturating_sub(tz_offset_seconds)
+        } else {
+            seconds
+        };
         Ok(BoltValue::DateTime(BoltDateTime {
-            seconds,
+            seconds: utc_seconds,
             nanoseconds,
             tz_offset_seconds,
         }))
@@ -1498,6 +1673,7 @@ impl PackStream {
             seconds,
             nanoseconds,
             zone_id,
+            is_local: tag == 0x66,
         }))
     }
 

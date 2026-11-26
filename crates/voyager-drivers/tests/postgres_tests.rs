@@ -492,7 +492,7 @@ fn test_prepared_age_statement_parse_and_bind_encoding() {
     let query =
         "SELECT * FROM cypher('g', $$ MATCH (n) WHERE n.name = $p0 RETURN n $$, %s) AS (n agtype)";
     let mut params = HashMap::new();
-    params.insert("p0".to_string(), serde_json::json!("Alice"));
+    params.insert("p0".to_string(), serde_json::json!("Alice").into());
     let prepared = prepare_postgres_statement(query, &params).unwrap();
 
     let parse = FrontendMessage::Parse {
@@ -528,8 +528,8 @@ fn test_prepared_age_statement_parse_and_bind_encoding() {
 fn test_prepared_sql_statement_parse_and_bind_encoding() {
     let query = "SELECT * FROM t WHERE a = $p10 AND b = $p1 AND c = $p10";
     let mut params = HashMap::new();
-    params.insert("p1".to_string(), serde_json::json!(42));
-    params.insert("p10".to_string(), serde_json::json!("x' OR 1=1 --"));
+    params.insert("p1".to_string(), serde_json::json!(42).into());
+    params.insert("p10".to_string(), serde_json::json!("x' OR 1=1 --").into());
     let prepared = prepare_postgres_statement(query, &params).unwrap();
 
     let parse = FrontendMessage::Parse {

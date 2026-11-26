@@ -51,7 +51,10 @@ async fn run_size_benchmark(
 ) -> Result<LargePayloadMetric, Box<dyn std::error::Error>> {
     let payload = "X".repeat(size_mb * 1024 * 1024);
     let mut params = HashMap::new();
-    params.insert("data".to_string(), serde_json::Value::String(payload));
+    params.insert(
+        "data".to_string(),
+        serde_json::Value::String(payload).into(),
+    );
     let query = "RETURN $data AS payload, size($data) AS byte_len";
 
     let mut latencies = Vec::new();

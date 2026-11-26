@@ -53,15 +53,24 @@ async fn test_live_neo4j_bolt_crud_and_arrow() {
     let mut create_params = HashMap::new();
     create_params.insert(
         "name1".to_string(),
-        serde_json::Value::String("Alice".to_string()),
+        serde_json::Value::String("Alice".to_string()).into(),
     );
-    create_params.insert("age1".to_string(), serde_json::Value::Number(30.into()));
+    create_params.insert(
+        "age1".to_string(),
+        serde_json::Value::Number(30.into()).into(),
+    );
     create_params.insert(
         "name2".to_string(),
-        serde_json::Value::String("Bob".to_string()),
+        serde_json::Value::String("Bob".to_string()).into(),
     );
-    create_params.insert("age2".to_string(), serde_json::Value::Number(25.into()));
-    create_params.insert("since".to_string(), serde_json::Value::Number(2022.into()));
+    create_params.insert(
+        "age2".to_string(),
+        serde_json::Value::Number(25.into()).into(),
+    );
+    create_params.insert(
+        "since".to_string(),
+        serde_json::Value::Number(2022.into()).into(),
+    );
 
     let insert_query = "
         CREATE (a:VoyagerTest:Person {name: $name1, age: $age1})
@@ -82,7 +91,10 @@ async fn test_live_neo4j_bolt_crud_and_arrow() {
 
     // 3. Query records with Arrow conversion
     let mut query_params = HashMap::new();
-    query_params.insert("min_age".to_string(), serde_json::Value::Number(20.into()));
+    query_params.insert(
+        "min_age".to_string(),
+        serde_json::Value::Number(20.into()).into(),
+    );
 
     let select_query = "
         MATCH (a:VoyagerTest:Person)-[r:KNOWS]->(b:VoyagerTest:Person)
@@ -157,7 +169,10 @@ async fn test_live_neo4j_connection_pool_concurrency() {
         tasks.push(tokio::spawn(async move {
             let mut conn = pool_clone.acquire().await.expect("Live acquire failed");
             let mut params = HashMap::new();
-            params.insert("val".to_string(), serde_json::Value::Number(i.into()));
+            params.insert(
+                "val".to_string(),
+                serde_json::Value::Number(i.into()).into(),
+            );
             let res = conn
                 .execute("RETURN $val AS res", &params)
                 .await
@@ -223,7 +238,7 @@ async fn test_live_neo4j_fluent_builder_with_clause_and_pagination() {
     let mut query_params = HashMap::new();
     for (k, v) in &compiled.parameters {
         if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-            query_params.insert(k.clone(), serde_json::json!(i));
+            query_params.insert(k.clone(), serde_json::json!(i).into());
         }
     }
 
@@ -373,14 +388,14 @@ async fn test_live_neo4j_simultaneous_explain_and_profile_connections() {
     let mut exp_params = HashMap::new();
     for (k, v) in &compiled_exp.parameters {
         if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-            exp_params.insert(k.clone(), serde_json::json!(i));
+            exp_params.insert(k.clone(), serde_json::json!(i).into());
         }
     }
 
     let mut prof_params = HashMap::new();
     for (k, v) in &compiled_prof.parameters {
         if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-            prof_params.insert(k.clone(), serde_json::json!(i));
+            prof_params.insert(k.clone(), serde_json::json!(i).into());
         }
     }
 

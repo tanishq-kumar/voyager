@@ -1,12 +1,21 @@
 //! Apache AGE `agtype` parser, graph entity structures, and Apache Arrow RecordBatch deserialization.
 
-use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
+use arrow_array::builder::{
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, DurationMicrosecondBuilder,
+    DurationNanosecondBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder,
+    LargeBinaryBuilder, StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+};
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::bolt::canonical::{
+    append_duration_struct, duration_struct_fields, make_duration_struct_builder,
+    wrap_flat_array_in_list,
+};
+use crate::bolt::packstream::{BoltDuration, ymd_to_days};
 use crate::bolt::{BoltNode, BoltPath, BoltRelationship, BoltValue};
 use crate::error::{NetError, Result};
 
@@ -523,13 +532,15 @@ impl<'a> AgtypeParser<'a> {
         }
         let num_str = &self.input[start..self.pos];
         self.skip_whitespace();
-        let _ = self.consume("::numeric");
+        let _ = self.consume("::numeric") || self.consume("::float");
         if num_str.contains('.') || num_str.contains('e') || num_str.contains('E') {
             num_str.parse::<f64>().map(AgeValue::Float).map_err(|e| {
                 NetError::ProtocolError(format!("Failed to parse float '{}': {}", num_str, e))
             })
+        } else if let Ok(i) = num_str.parse::<i64>() {
+            Ok(AgeValue::Integer(i))
         } else {
-            num_str.parse::<i64>().map(AgeValue::Integer).map_err(|e| {
+            num_str.parse::<f64>().map(AgeValue::Float).map_err(|e| {
                 NetError::ProtocolError(format!("Failed to parse integer '{}': {}", num_str, e))
             })
         }
@@ -729,6 +740,26 @@ impl<'a> AgtypeParser<'a> {
             b't' if self.consume_keyword("true") => Ok(AgeValue::Boolean(true)),
             b'f' if self.consume_keyword("false") => Ok(AgeValue::Boolean(false)),
             b'n' if self.consume_keyword("null") => Ok(AgeValue::Null),
+            b'N' if self.consume_keyword("NaN") => {
+                self.skip_whitespace();
+                let _ = self.consume("::numeric") || self.consume("::float");
+                Ok(AgeValue::Float(f64::NAN))
+            }
+            b'I' if self.consume_keyword("Infinity") => {
+                self.skip_whitespace();
+                let _ = self.consume("::numeric") || self.consume("::float");
+                Ok(AgeValue::Float(f64::INFINITY))
+            }
+            b'-' if self.consume_keyword("-Infinity") => {
+                self.skip_whitespace();
+                let _ = self.consume("::numeric") || self.consume("::float");
+                Ok(AgeValue::Float(f64::NEG_INFINITY))
+            }
+            b'+' if self.consume_keyword("+Infinity") => {
+                self.skip_whitespace();
+                let _ = self.consume("::numeric") || self.consume("::float");
+                Ok(AgeValue::Float(f64::INFINITY))
+            }
             b'-' | b'+' | b'0'..=b'9' => self.parse_number(),
             _ => {
                 let s = self.input[self.pos..].trim().to_string();
@@ -752,31 +783,27 @@ pub fn parse_agtype(raw: &str) -> Result<AgeValue> {
     Ok(val)
 }
 
-/// Element representation for a decoded PostgreSQL array column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PgArrayElement {
-    /// 16/32/64-bit integers are widened to Arrow `Int64`.
-    Int64,
-    /// `real`, `double precision` and `numeric` are widened to Arrow `Float64`.
-    Float64,
-    /// Boolean elements (`t` / `f` in text output).
-    Boolean,
-    /// Text and temporal elements stay as their PostgreSQL text representation.
-    Utf8,
-}
-
-/// Maps a PostgreSQL array type OID to the element representation used for decoding.
-///
-/// Only the array OIDs whose element types are supported are listed. An array
-/// column with any other OID keeps the previous text-literal behaviour.
-fn pg_array_element(oid: i32) -> Option<PgArrayElement> {
+/// Maps a PostgreSQL array type OID to its element type OID.
+fn pg_array_element_oid(oid: i32) -> Option<i32> {
     match oid {
-        1000 => Some(PgArrayElement::Boolean),               // _bool
-        1005 | 1007 | 1016 => Some(PgArrayElement::Int64),   // _int2, _int4, _int8
-        1021 | 1022 | 1231 => Some(PgArrayElement::Float64), // _float4, _float8, _numeric
-        1003 | 1009 | 1014 | 1015 | 1041 => Some(PgArrayElement::Utf8), // _name, _text, _bpchar, _varchar, _inet
-        1182 | 1183 | 1185 | 1187 | 1270 | 1115 => Some(PgArrayElement::Utf8), // date/time arrays
-        199 | 3807 | 2951 => Some(PgArrayElement::Utf8),                // _json, _jsonb, _uuid
+        1000 => Some(16),                             // _bool -> bool
+        1001 => Some(17),                             // _bytea -> bytea
+        1005 => Some(21),                             // _int2 -> int2
+        1007 => Some(23),                             // _int4 -> int4
+        1016 => Some(20),                             // _int8 -> int8
+        1021 => Some(700),                            // _float4 -> float4
+        1022 => Some(701),                            // _float8 -> float8
+        1231 => Some(1700),                           // _numeric -> numeric
+        1003 | 1009 | 1014 | 1015 | 1041 => Some(25), // _name, _text, _bpchar, _varchar, _inet
+        1182 => Some(1082),                           // _date -> date
+        1183 => Some(1083),                           // _time -> time
+        1270 => Some(1266),                           // _timetz -> timetz
+        1115 => Some(1114),                           // _timestamp -> timestamp
+        1185 => Some(1184),                           // _timestamptz -> timestamptz
+        1187 => Some(1186),                           // _interval -> interval
+        199 => Some(114),                             // _json -> json
+        3807 => Some(3802),                           // _jsonb -> jsonb
+        2951 => Some(2950),                           // _uuid -> uuid
         _ => None,
     }
 }
@@ -961,117 +988,1071 @@ fn parse_bool_element(value: &str, column: &str) -> Result<bool> {
     }
 }
 
-fn list_field(name: &str, element: &DataType) -> Field {
-    Field::new(
-        name,
-        DataType::List(Arc::new(Field::new("item", element.clone(), true))),
-        true,
-    )
+fn field_with_meta(name: &str, data_type: DataType, key: &str, value: &str) -> Field {
+    let mut meta = HashMap::new();
+    meta.insert(key.to_string(), value.to_string());
+    Field::new(name, data_type, true).with_metadata(meta)
 }
 
-fn build_int64_list(parsed: &[Option<Vec<Option<String>>>], name: &str) -> Result<ArrayRef> {
-    let mut builder = arrow_array::builder::ListBuilder::new(Int64Builder::new());
-    for cell in parsed {
+fn build_utf8_with_meta(
+    name: &str,
+    cells: &[Option<&str>],
+    meta: &[(&str, &str)],
+) -> (Field, ArrayRef) {
+    let mut builder = StringBuilder::with_capacity(cells.len(), cells.len() * 16);
+    for cell in cells {
         match cell {
+            Some(v) => builder.append_value(v),
             None => builder.append_null(),
-            Some(elements) => {
-                for element in elements {
-                    match element {
-                        Some(value) => builder
-                            .values()
-                            .append_value(parse_int_element(value, name)?),
-                        None => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
         }
     }
-    Ok(Arc::new(builder.finish()))
+    let mut field = Field::new(name, DataType::Utf8, true);
+    if !meta.is_empty() {
+        let mut map = HashMap::with_capacity(meta.len());
+        for (k, v) in meta {
+            map.insert((*k).to_string(), (*v).to_string());
+        }
+        field = field.with_metadata(map);
+    }
+    (field, Arc::new(builder.finish()))
 }
 
-fn build_float64_list(parsed: &[Option<Vec<Option<String>>>], name: &str) -> Result<ArrayRef> {
-    let mut builder = arrow_array::builder::ListBuilder::new(Float64Builder::new());
-    for cell in parsed {
-        match cell {
-            None => builder.append_null(),
-            Some(elements) => {
-                for element in elements {
-                    match element {
-                        Some(value) => builder
-                            .values()
-                            .append_value(parse_float_element(value, name)?),
-                        None => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
-        }
+fn pg_numeric_typmod_scale(typmod: i32) -> Option<i16> {
+    if typmod >= 4 {
+        Some(((typmod - 4) & 0xFFFF) as i16)
+    } else {
+        None
     }
-    Ok(Arc::new(builder.finish()))
 }
 
-fn build_bool_list(parsed: &[Option<Vec<Option<String>>>], name: &str) -> Result<ArrayRef> {
-    let mut builder = arrow_array::builder::ListBuilder::new(BooleanBuilder::new());
-    for cell in parsed {
-        match cell {
-            None => builder.append_null(),
-            Some(elements) => {
-                for element in elements {
-                    match element {
-                        Some(value) => builder
-                            .values()
-                            .append_value(parse_bool_element(value, name)?),
-                        None => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
+fn try_parse_decimal128_column(
+    cells: &[Option<&str>],
+    typmod: Option<i32>,
+) -> Option<(u8, Vec<Option<i128>>)> {
+    const MAX_DECIMAL128: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999_i128;
+
+    let mut max_scale: usize = 0;
+    if let Some(tm) = typmod
+        && let Some(decl_scale) = pg_numeric_typmod_scale(tm)
+    {
+        if !(0..=38).contains(&decl_scale) {
+            return None;
         }
+        max_scale = decl_scale as usize;
     }
-    Ok(Arc::new(builder.finish()))
+
+    let mut parsed_parts: Vec<Option<(bool, &str, &str)>> = Vec::with_capacity(cells.len());
+
+    for cell in cells {
+        let Some(raw) = cell else {
+            parsed_parts.push(None);
+            continue;
+        };
+        let s = raw.trim();
+        let (neg, unsigned) = if let Some(rest) = s.strip_prefix('-') {
+            (true, rest)
+        } else if let Some(rest) = s.strip_prefix('+') {
+            (false, rest)
+        } else {
+            (false, s)
+        };
+        if unsigned.is_empty() || unsigned.contains(['e', 'E']) {
+            return None;
+        }
+        let (int_part, frac_part) = match unsigned.split_once('.') {
+            Some((i, f)) => {
+                if f.contains('.') {
+                    return None;
+                }
+                (i, f)
+            }
+            None => (unsigned, ""),
+        };
+        if (int_part.is_empty() && frac_part.is_empty())
+            || !int_part.bytes().all(|b| b.is_ascii_digit())
+            || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        if frac_part.len() > 38 {
+            return None;
+        }
+        max_scale = max_scale.max(frac_part.len());
+        parsed_parts.push(Some((neg, int_part.trim_start_matches('0'), frac_part)));
+    }
+
+    let mut values = Vec::with_capacity(cells.len());
+    for item in parsed_parts {
+        let Some((neg, int_part, frac_part)) = item else {
+            values.push(None);
+            continue;
+        };
+        if int_part.len() + max_scale > 38 {
+            return None;
+        }
+        let mut mag: i128 = 0;
+        for b in int_part.bytes().chain(frac_part.bytes()) {
+            mag = mag.checked_mul(10)?.checked_add((b - b'0') as i128)?;
+        }
+        for _ in 0..(max_scale - frac_part.len()) {
+            mag = mag.checked_mul(10)?;
+        }
+        if mag > MAX_DECIMAL128 {
+            return None;
+        }
+        let signed = if neg && mag != 0 { -mag } else { mag };
+        values.push(Some(signed));
+    }
+    Some((max_scale as u8, values))
 }
 
-fn build_utf8_list(parsed: &[Option<Vec<Option<String>>>]) -> Result<ArrayRef> {
-    let mut builder = arrow_array::builder::ListBuilder::new(StringBuilder::new());
-    for cell in parsed {
-        match cell {
-            None => builder.append_null(),
-            Some(elements) => {
-                for element in elements {
-                    match element {
-                        Some(value) => builder.values().append_value(value),
-                        None => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
+fn parse_pg_uuid(raw: &str) -> Option<[u8; 16]> {
+    let mut hex_bytes = [0u8; 32];
+    let mut idx = 0usize;
+    for b in raw.trim().bytes() {
+        if b == b'-' {
+            continue;
+        }
+        if idx >= 32 || !b.is_ascii_hexdigit() {
+            return None;
+        }
+        hex_bytes[idx] = b;
+        idx += 1;
+    }
+    if idx != 32 {
+        return None;
+    }
+    let hex_val = |b: u8| -> u8 {
+        match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => b - b'A' + 10,
+        }
+    };
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = (hex_val(hex_bytes[i * 2]) << 4) | hex_val(hex_bytes[i * 2 + 1]);
+    }
+    Some(out)
+}
+
+fn decode_pg_bytea(raw: &str) -> Option<Vec<u8>> {
+    if let Some(hex) = raw.strip_prefix("\\x").or_else(|| raw.strip_prefix("\\X")) {
+        if hex.len() % 2 != 0 {
+            return None;
+        }
+        let hex_val = |b: u8| -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
             }
+        };
+        let bytes = hex.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for chunk in bytes.chunks_exact(2) {
+            out.push((hex_val(chunk[0])? << 4) | hex_val(chunk[1])?);
+        }
+        return Some(out);
+    }
+
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+            if i + 3 < bytes.len()
+                && (b'0'..=b'7').contains(&bytes[i + 1])
+                && (b'0'..=b'7').contains(&bytes[i + 2])
+                && (b'0'..=b'7').contains(&bytes[i + 3])
+            {
+                let v = ((bytes[i + 1] - b'0') << 6)
+                    | ((bytes[i + 2] - b'0') << 3)
+                    | (bytes[i + 3] - b'0');
+                out.push(v);
+                i += 4;
+                continue;
+            }
+            return None;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    Some(out)
+}
+
+fn parse_pg_ymd(raw: &str) -> Option<(i32, u32, u32)> {
+    let s = raw.trim();
+    if s.eq_ignore_ascii_case("infinity")
+        || s.eq_ignore_ascii_case("-infinity")
+        || s.ends_with("BC")
+    {
+        return None;
+    }
+    let mut parts = s.split('-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some()
+        || !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+fn parse_pg_date_days(raw: &str) -> Option<i32> {
+    let (y, m, d) = parse_pg_ymd(raw)?;
+    i32::try_from(ymd_to_days(y, m, d)).ok()
+}
+
+fn parse_pg_hms_frac(raw: &str) -> Option<(i64, i64, i64, i64)> {
+    let (hms, frac_str) = match raw.split_once('.') {
+        Some((l, r)) => (l, Some(r)),
+        None => (raw, None),
+    };
+    let mut parts = hms.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let s: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some()
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&m)
+        || !(0..=59).contains(&s)
+    {
+        return None;
+    }
+    let nanos = if let Some(frac) = frac_str {
+        if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut padded = [b'0'; 9];
+        padded[..frac.len()].copy_from_slice(frac.as_bytes());
+        std::str::from_utf8(&padded).ok()?.parse::<i64>().ok()?
+    } else {
+        0
+    };
+    Some((h, m, s, nanos))
+}
+
+fn parse_pg_time_micros(raw: &str) -> Option<i64> {
+    let (h, m, s, nanos) = parse_pg_hms_frac(raw.trim())?;
+    if nanos % 1_000 != 0 {
+        return None;
+    }
+    Some((h * 3_600 + m * 60 + s) * 1_000_000 + nanos / 1_000)
+}
+
+fn parse_pg_timestamp_micros(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let (date_str, time_str) = s.split_once(' ').or_else(|| s.split_once('T'))?;
+    let (year, month, day) = parse_pg_ymd(date_str)?;
+    let (h, m, sec, nanos) = parse_pg_hms_frac(time_str.trim())?;
+    if nanos % 1_000 != 0 {
+        return None;
+    }
+    let days = ymd_to_days(year, month, day);
+    let total_secs = days
+        .checked_mul(86_400)?
+        .checked_add(h * 3_600 + m * 60 + sec)?;
+    total_secs
+        .checked_mul(1_000_000)?
+        .checked_add(nanos / 1_000)
+}
+
+fn parse_pg_tz_offset(raw: &str) -> Option<(i32, usize)> {
+    let bytes = raw.as_bytes();
+    if bytes.ends_with(b"Z") || bytes.ends_with(b"z") {
+        return Some((0, raw.len() - 1));
+    }
+    let mut split_idx = None;
+    for (idx, b) in bytes.iter().enumerate().rev() {
+        if *b == b'+' || *b == b'-' {
+            split_idx = Some(idx);
+            break;
+        }
+        if *b == b' ' || *b == b'T' {
+            return None;
         }
     }
-    Ok(Arc::new(builder.finish()))
+    let idx = split_idx?;
+    let sign = if bytes[idx] == b'-' { -1 } else { 1 };
+    let off_str = &raw[idx + 1..];
+    let parts: Vec<&str> = off_str.split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let oh: i32 = parts[0].parse().ok()?;
+    let om: i32 = if parts.len() >= 2 {
+        parts[1].parse().ok()?
+    } else {
+        0
+    };
+    let os: i32 = if parts.len() == 3 {
+        parts[2].parse().ok()?
+    } else {
+        0
+    };
+    if !(0..=23).contains(&oh) || !(0..=59).contains(&om) || !(0..=59).contains(&os) {
+        return None;
+    }
+    Some((sign * (oh * 3_600 + om * 60 + os), idx))
+}
+
+fn parse_pg_timestamptz_micros(raw: &str) -> Option<(i64, i32)> {
+    let s = raw.trim();
+    let (offset_secs, split_at) = parse_pg_tz_offset(s)?;
+    let dt_part = &s[..split_at];
+    let local_micros = parse_pg_timestamp_micros(dt_part)?;
+    let utc_micros = local_micros.checked_sub((offset_secs as i64).checked_mul(1_000_000)?)?;
+    Some((utc_micros, offset_secs))
+}
+
+fn parse_hms_duration_token(tok: &str) -> Option<(i64, i64)> {
+    let (neg, unsigned) = if let Some(rest) = tok.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = tok.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, tok)
+    };
+    let (hms, frac_str) = match unsigned.split_once('.') {
+        Some((l, r)) => (l, Some(r)),
+        None => (unsigned, None),
+    };
+    let mut parts = hms.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let s: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let nanos = if let Some(frac) = frac_str {
+        if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut padded = [b'0'; 9];
+        padded[..frac.len()].copy_from_slice(frac.as_bytes());
+        std::str::from_utf8(&padded).ok()?.parse::<i64>().ok()?
+    } else {
+        0
+    };
+    let total_secs = h.checked_mul(3_600)?.checked_add(m * 60 + s)?;
+    if neg {
+        Some((-total_secs, -nanos))
+    } else {
+        Some((total_secs, nanos))
+    }
+}
+
+fn parse_pg_interval_sec_decimal(raw: &str) -> Option<(i64, i64)> {
+    let (neg, unsigned) = if let Some(rest) = raw.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = raw.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, raw)
+    };
+    let (sec_str, frac_str) = match unsigned.split_once('.') {
+        Some((l, r)) => (l, Some(r)),
+        None => (unsigned, None),
+    };
+    let secs: i64 = if sec_str.is_empty() {
+        0
+    } else {
+        sec_str.parse().ok()?
+    };
+    let nanos = if let Some(frac) = frac_str {
+        if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut padded = [b'0'; 9];
+        padded[..frac.len()].copy_from_slice(frac.as_bytes());
+        std::str::from_utf8(&padded).ok()?.parse::<i64>().ok()?
+    } else {
+        0
+    };
+    if neg {
+        Some((-secs, -nanos))
+    } else {
+        Some((secs, nanos))
+    }
+}
+
+fn parse_pg_iso_duration(raw: &str) -> Option<BoltDuration> {
+    let (overall_neg, rest) = if let Some(r) = raw.strip_prefix("-P") {
+        (true, r)
+    } else {
+        let r = raw.strip_prefix('P')?;
+        (false, r)
+    };
+    let (date_part, time_part) = match rest.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (rest, None),
+    };
+    let mut months: i64 = 0;
+    let mut days: i64 = 0;
+    let mut seconds: i64 = 0;
+    let mut nanoseconds: i64 = 0;
+
+    let mut num_start = 0usize;
+    let d_bytes = date_part.as_bytes();
+    for (idx, &b) in d_bytes.iter().enumerate() {
+        if b.is_ascii_alphabetic() {
+            let v: i64 = date_part[num_start..idx].parse().ok()?;
+            match b {
+                b'Y' => months = months.checked_add(v.checked_mul(12)?)?,
+                b'M' => months = months.checked_add(v)?,
+                b'W' => days = days.checked_add(v.checked_mul(7)?)?,
+                b'D' => days = days.checked_add(v)?,
+                _ => return None,
+            }
+            num_start = idx + 1;
+        }
+    }
+    if num_start != d_bytes.len() {
+        return None;
+    }
+
+    if let Some(tp) = time_part {
+        let mut t_start = 0usize;
+        let t_bytes = tp.as_bytes();
+        for (idx, &b) in t_bytes.iter().enumerate() {
+            if b.is_ascii_alphabetic() {
+                let slice = &tp[t_start..idx];
+                match b {
+                    b'H' => {
+                        let v: i64 = slice.parse().ok()?;
+                        seconds = seconds.checked_add(v.checked_mul(3_600)?)?;
+                    }
+                    b'M' => {
+                        let v: i64 = slice.parse().ok()?;
+                        seconds = seconds.checked_add(v.checked_mul(60)?)?;
+                    }
+                    b'S' => {
+                        let (s, ns) = parse_pg_interval_sec_decimal(slice)?;
+                        seconds = seconds.checked_add(s)?;
+                        nanoseconds = nanoseconds.checked_add(ns)?;
+                    }
+                    _ => return None,
+                }
+                t_start = idx + 1;
+            }
+        }
+        if t_start != t_bytes.len() {
+            return None;
+        }
+    }
+
+    let extra_secs = nanoseconds.div_euclid(1_000_000_000);
+    seconds = seconds.checked_add(extra_secs)?;
+    nanoseconds = nanoseconds.rem_euclid(1_000_000_000);
+    if overall_neg {
+        months = -months;
+        days = -days;
+        seconds = -seconds;
+        if nanoseconds != 0 {
+            seconds = seconds.checked_sub(1)?;
+            nanoseconds = 1_000_000_000 - nanoseconds;
+        }
+    }
+    Some(BoltDuration {
+        months,
+        days,
+        seconds,
+        nanoseconds,
+    })
+}
+
+fn parse_pg_interval(raw: &str) -> Option<BoltDuration> {
+    let mut s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with('P') || s.starts_with("-P") {
+        return parse_pg_iso_duration(s);
+    }
+    let mut ago = false;
+    if let Some(rest) = s.strip_prefix('@') {
+        s = rest.trim_start();
+    }
+    if let Some(rest) = s.strip_suffix("ago") {
+        ago = true;
+        s = rest.trim_end();
+    }
+
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let mut months: i64 = 0;
+    let mut days: i64 = 0;
+    let mut seconds: i64 = 0;
+    let mut nanoseconds: i64 = 0;
+
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if tok.contains(':') {
+            let (ts, tns) = parse_hms_duration_token(tok)?;
+            seconds = seconds.checked_add(ts)?;
+            nanoseconds = nanoseconds.checked_add(tns)?;
+            i += 1;
+            continue;
+        }
+        if let Some((y_str, m_str)) = tok.strip_prefix(['+', '-']).unwrap_or(tok).split_once('-')
+            && !y_str.is_empty()
+            && !m_str.is_empty()
+            && y_str.bytes().all(|b| b.is_ascii_digit())
+            && m_str.bytes().all(|b| b.is_ascii_digit())
+        {
+            let sign: i64 = if tok.starts_with('-') { -1 } else { 1 };
+            let y: i64 = y_str.parse().ok()?;
+            let m: i64 = m_str.parse().ok()?;
+            months = months.checked_add(sign.checked_mul(y.checked_mul(12)?.checked_add(m)?)?)?;
+            i += 1;
+            continue;
+        }
+        let next_is_unit = i + 1 < tokens.len()
+            && matches!(
+                tokens[i + 1].to_ascii_lowercase().as_str(),
+                "year"
+                    | "years"
+                    | "yr"
+                    | "yrs"
+                    | "y"
+                    | "mon"
+                    | "mons"
+                    | "month"
+                    | "months"
+                    | "day"
+                    | "days"
+                    | "d"
+                    | "hour"
+                    | "hours"
+                    | "hr"
+                    | "hrs"
+                    | "h"
+                    | "min"
+                    | "mins"
+                    | "minute"
+                    | "minutes"
+                    | "m"
+                    | "sec"
+                    | "secs"
+                    | "second"
+                    | "seconds"
+                    | "s"
+            );
+        if !next_is_unit {
+            if let Ok(d_val) = tok.parse::<i64>() {
+                days = days.checked_add(d_val)?;
+                i += 1;
+                continue;
+            }
+            return None;
+        }
+        let unit = tokens[i + 1].to_ascii_lowercase();
+        match unit.as_str() {
+            "year" | "years" | "yr" | "yrs" | "y" => {
+                let v: i64 = tok.parse().ok()?;
+                months = months.checked_add(v.checked_mul(12)?)?;
+            }
+            "mon" | "mons" | "month" | "months" => {
+                let v: i64 = tok.parse().ok()?;
+                months = months.checked_add(v)?;
+            }
+            "day" | "days" | "d" => {
+                let v: i64 = tok.parse().ok()?;
+                days = days.checked_add(v)?;
+            }
+            "hour" | "hours" | "hr" | "hrs" | "h" => {
+                let v: i64 = tok.parse().ok()?;
+                seconds = seconds.checked_add(v.checked_mul(3_600)?)?;
+            }
+            "min" | "mins" | "minute" | "minutes" | "m" => {
+                let v: i64 = tok.parse().ok()?;
+                seconds = seconds.checked_add(v.checked_mul(60)?)?;
+            }
+            "sec" | "secs" | "second" | "seconds" | "s" => {
+                let (sv, ns) = parse_pg_interval_sec_decimal(tok)?;
+                seconds = seconds.checked_add(sv)?;
+                nanoseconds = nanoseconds.checked_add(ns)?;
+            }
+            _ => return None,
+        }
+        i += 2;
+    }
+
+    let total_ns = (seconds as i128)
+        .checked_mul(1_000_000_000)?
+        .checked_add(nanoseconds as i128)?;
+    let total_ns = if ago { -total_ns } else { total_ns };
+    if ago {
+        months = -months;
+        days = -days;
+    }
+    let norm_secs = i64::try_from(total_ns / 1_000_000_000).ok()?;
+    let norm_ns = (total_ns % 1_000_000_000) as i64;
+    Some(BoltDuration {
+        months,
+        days,
+        seconds: norm_secs,
+        nanoseconds: norm_ns,
+    })
+}
+
+fn pg_duration_micros(dur: &BoltDuration) -> Option<i64> {
+    if dur.months != 0 || dur.days != 0 || dur.nanoseconds % 1_000 != 0 {
+        return None;
+    }
+    dur.seconds
+        .checked_mul(1_000_000)?
+        .checked_add(dur.nanoseconds / 1_000)
+}
+
+fn pg_duration_nanos(dur: &BoltDuration) -> Option<i64> {
+    if dur.months != 0 || dur.days != 0 {
+        return None;
+    }
+    dur.seconds
+        .checked_mul(1_000_000_000)?
+        .checked_add(dur.nanoseconds)
+}
+
+fn build_pg_typed_values(
+    field_name: &str,
+    oid: i32,
+    typmod: Option<i32>,
+    cells: &[Option<&str>],
+) -> Result<Option<(Field, ArrayRef)>> {
+    let n = cells.len();
+    match oid {
+        16 => {
+            let mut builder = BooleanBuilder::with_capacity(n);
+            for cell in cells {
+                match cell {
+                    Some(v) => builder.append_value(parse_bool_element(v, field_name)?),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Some((
+                Field::new(field_name, DataType::Boolean, true),
+                Arc::new(builder.finish()),
+            )))
+        }
+        20 | 21 | 23 => {
+            let mut builder = Int64Builder::with_capacity(n);
+            for cell in cells {
+                match cell {
+                    Some(v) => builder.append_value(parse_int_element(v, field_name)?),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Some((
+                Field::new(field_name, DataType::Int64, true),
+                Arc::new(builder.finish()),
+            )))
+        }
+        700 | 701 => {
+            let mut builder = Float64Builder::with_capacity(n);
+            for cell in cells {
+                match cell {
+                    Some(v) => builder.append_value(parse_float_element(v, field_name)?),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Some((
+                Field::new(field_name, DataType::Float64, true),
+                Arc::new(builder.finish()),
+            )))
+        }
+        1700 => {
+            if let Some((scale, values)) = try_parse_decimal128_column(cells, typmod) {
+                let mut builder = Decimal128Builder::with_capacity(n);
+                for val in values {
+                    match val {
+                        Some(v) => builder.append_value(v),
+                        None => builder.append_null(),
+                    }
+                }
+                let arr = builder
+                    .finish()
+                    .with_precision_and_scale(38, scale as i8)
+                    .map_err(NetError::ArrowError)?;
+                Ok(Some((
+                    Field::new(field_name, DataType::Decimal128(38, scale as i8), true),
+                    Arc::new(arr),
+                )))
+            } else {
+                Ok(Some(build_utf8_with_meta(
+                    field_name,
+                    cells,
+                    &[("voyager.type", "decimal")],
+                )))
+            }
+        }
+        2950 => {
+            let mut parsed = Vec::with_capacity(n);
+            let mut all_ok = true;
+            for cell in cells {
+                match cell {
+                    Some(v) => match parse_pg_uuid(v) {
+                        Some(bytes) => parsed.push(Some(bytes)),
+                        None => {
+                            all_ok = false;
+                            break;
+                        }
+                    },
+                    None => parsed.push(None),
+                }
+            }
+            if all_ok {
+                let mut builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
+                for cell in parsed {
+                    match cell {
+                        Some(bytes) => builder.append_value(bytes).map_err(NetError::ArrowError)?,
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    field_with_meta(
+                        field_name,
+                        DataType::FixedSizeBinary(16),
+                        "ARROW:extension:name",
+                        "arrow.uuid",
+                    ),
+                    Arc::new(builder.finish()),
+                )))
+            } else {
+                Ok(Some(build_utf8_with_meta(
+                    field_name,
+                    cells,
+                    &[("voyager.type", "uuid")],
+                )))
+            }
+        }
+        17 => {
+            let mut decoded: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+            let mut total_len = 0usize;
+            for cell in cells {
+                match cell {
+                    Some(raw) => {
+                        let bytes = decode_pg_bytea(raw).ok_or_else(|| {
+                            NetError::ProtocolError(format!(
+                                "Invalid bytea value in column {field_name:?}"
+                            ))
+                        })?;
+                        total_len += bytes.len();
+                        decoded.push(Some(bytes));
+                    }
+                    None => decoded.push(None),
+                }
+            }
+            if total_len <= i32::MAX as usize {
+                let mut builder = BinaryBuilder::with_capacity(n, total_len);
+                for cell in decoded {
+                    match cell {
+                        Some(bytes) => builder.append_value(&bytes),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    Field::new(field_name, DataType::Binary, true),
+                    Arc::new(builder.finish()),
+                )))
+            } else {
+                let mut builder = LargeBinaryBuilder::with_capacity(n, total_len);
+                for cell in decoded {
+                    match cell {
+                        Some(bytes) => builder.append_value(&bytes),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    Field::new(field_name, DataType::LargeBinary, true),
+                    Arc::new(builder.finish()),
+                )))
+            }
+        }
+        1082 => {
+            let mut parsed = Vec::with_capacity(n);
+            let mut all_ok = true;
+            for cell in cells {
+                match cell {
+                    Some(v) => match parse_pg_date_days(v) {
+                        Some(days) => parsed.push(Some(days)),
+                        None => {
+                            all_ok = false;
+                            break;
+                        }
+                    },
+                    None => parsed.push(None),
+                }
+            }
+            if all_ok {
+                let mut builder = Date32Builder::with_capacity(n);
+                for cell in parsed {
+                    match cell {
+                        Some(days) => builder.append_value(days),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    Field::new(field_name, DataType::Date32, true),
+                    Arc::new(builder.finish()),
+                )))
+            } else {
+                Ok(Some(build_utf8_with_meta(
+                    field_name,
+                    cells,
+                    &[("voyager.type", "date")],
+                )))
+            }
+        }
+        1083 => {
+            let mut parsed = Vec::with_capacity(n);
+            let mut all_ok = true;
+            for cell in cells {
+                match cell {
+                    Some(v) => match parse_pg_time_micros(v) {
+                        Some(us) => parsed.push(Some(us)),
+                        None => {
+                            all_ok = false;
+                            break;
+                        }
+                    },
+                    None => parsed.push(None),
+                }
+            }
+            if all_ok {
+                let mut builder = Time64MicrosecondBuilder::with_capacity(n);
+                for cell in parsed {
+                    match cell {
+                        Some(us) => builder.append_value(us),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    Field::new(field_name, DataType::Time64(TimeUnit::Microsecond), true),
+                    Arc::new(builder.finish()),
+                )))
+            } else {
+                Ok(Some(build_utf8_with_meta(
+                    field_name,
+                    cells,
+                    &[("voyager.type", "time")],
+                )))
+            }
+        }
+        1266 => Ok(Some(build_utf8_with_meta(
+            field_name,
+            cells,
+            &[("voyager.type", "time_tz")],
+        ))),
+        1114 => {
+            let mut parsed = Vec::with_capacity(n);
+            let mut all_ok = true;
+            for cell in cells {
+                match cell {
+                    Some(v) => match parse_pg_timestamp_micros(v) {
+                        Some(us) => parsed.push(Some(us)),
+                        None => {
+                            all_ok = false;
+                            break;
+                        }
+                    },
+                    None => parsed.push(None),
+                }
+            }
+            if all_ok {
+                let mut builder = TimestampMicrosecondBuilder::with_capacity(n);
+                for cell in parsed {
+                    match cell {
+                        Some(us) => builder.append_value(us),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    Field::new(
+                        field_name,
+                        DataType::Timestamp(TimeUnit::Microsecond, None),
+                        true,
+                    ),
+                    Arc::new(builder.finish()),
+                )))
+            } else {
+                Ok(Some(build_utf8_with_meta(
+                    field_name,
+                    cells,
+                    &[("voyager.type", "local_datetime")],
+                )))
+            }
+        }
+        1184 => {
+            let mut parsed = Vec::with_capacity(n);
+            let mut all_utc = true;
+            for cell in cells {
+                match cell {
+                    Some(v) => match parse_pg_timestamptz_micros(v) {
+                        Some((us, 0)) => parsed.push(Some(us)),
+                        _ => {
+                            all_utc = false;
+                            break;
+                        }
+                    },
+                    None => parsed.push(None),
+                }
+            }
+            if all_utc {
+                let mut builder =
+                    TimestampMicrosecondBuilder::with_capacity(n).with_timezone("UTC".to_string());
+                for cell in parsed {
+                    match cell {
+                        Some(us) => builder.append_value(us),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    Field::new(
+                        field_name,
+                        DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+                        true,
+                    ),
+                    Arc::new(builder.finish()),
+                )))
+            } else {
+                Ok(Some(build_utf8_with_meta(
+                    field_name,
+                    cells,
+                    &[("voyager.type", "datetime_tz")],
+                )))
+            }
+        }
+        1186 => {
+            let mut parsed = Vec::with_capacity(n);
+            let mut all_ok = true;
+            for cell in cells {
+                match cell {
+                    Some(v) => match parse_pg_interval(v) {
+                        Some(dur) => parsed.push(Some(dur)),
+                        None => {
+                            all_ok = false;
+                            break;
+                        }
+                    },
+                    None => parsed.push(None),
+                }
+            }
+            if !all_ok {
+                return Ok(Some(build_utf8_with_meta(
+                    field_name,
+                    cells,
+                    &[("voyager.type", "duration")],
+                )));
+            }
+            if parsed
+                .iter()
+                .all(|d| d.as_ref().is_none_or(|v| pg_duration_micros(v).is_some()))
+            {
+                let mut builder = DurationMicrosecondBuilder::with_capacity(n);
+                for cell in &parsed {
+                    match cell.as_ref().and_then(pg_duration_micros) {
+                        Some(us) => builder.append_value(us),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    Field::new(field_name, DataType::Duration(TimeUnit::Microsecond), true),
+                    Arc::new(builder.finish()),
+                )))
+            } else if parsed
+                .iter()
+                .all(|d| d.as_ref().is_none_or(|v| pg_duration_nanos(v).is_some()))
+            {
+                let mut builder = DurationNanosecondBuilder::with_capacity(n);
+                for cell in &parsed {
+                    match cell.as_ref().and_then(pg_duration_nanos) {
+                        Some(ns) => builder.append_value(ns),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Some((
+                    Field::new(field_name, DataType::Duration(TimeUnit::Nanosecond), true),
+                    Arc::new(builder.finish()),
+                )))
+            } else {
+                let mut builder = make_duration_struct_builder(n);
+                for cell in &parsed {
+                    append_duration_struct(&mut builder, cell.as_ref());
+                }
+                Ok(Some((
+                    field_with_meta(
+                        field_name,
+                        DataType::Struct(duration_struct_fields()),
+                        "voyager.type",
+                        "duration",
+                    ),
+                    Arc::new(builder.finish()),
+                )))
+            }
+        }
+        114 | 3802 => Ok(Some(build_utf8_with_meta(
+            field_name,
+            cells,
+            &[("voyager.encoding", "json"), ("voyager.type", "json")],
+        ))),
+        19 | 25 | 869 | 1042 | 1043 => Ok(Some(build_utf8_with_meta(field_name, cells, &[]))),
+        _ => Ok(None),
+    }
 }
 
 fn array_column_batch(
     name: &str,
-    element: PgArrayElement,
+    elem_oid: i32,
+    typmod: Option<i32>,
     rows: &[Vec<Option<String>>],
     col_idx: usize,
 ) -> Result<(Field, ArrayRef)> {
     let mut parsed: Vec<Option<Vec<Option<String>>>> = Vec::with_capacity(rows.len());
+    let mut total_elems = 0usize;
     for row in rows {
         match row.get(col_idx).and_then(|value| value.as_deref()) {
-            Some(raw) => parsed.push(Some(parse_pg_array_literal(raw)?)),
+            Some(raw) => {
+                let items = parse_pg_array_literal(raw)?;
+                total_elems += items.len();
+                parsed.push(Some(items));
+            }
             None => parsed.push(None),
         }
     }
 
-    let (data_type, array) = match element {
-        PgArrayElement::Int64 => (DataType::Int64, build_int64_list(&parsed, name)?),
-        PgArrayElement::Float64 => (DataType::Float64, build_float64_list(&parsed, name)?),
-        PgArrayElement::Boolean => (DataType::Boolean, build_bool_list(&parsed, name)?),
-        PgArrayElement::Utf8 => (DataType::Utf8, build_utf8_list(&parsed)?),
-    };
-    Ok((list_field(name, &data_type), array))
+    let mut flat_cells: Vec<Option<&str>> = Vec::with_capacity(total_elems);
+    let mut row_lengths: Vec<Option<usize>> = Vec::with_capacity(rows.len());
+
+    for cell in &parsed {
+        match cell {
+            Some(items) => {
+                for item in items {
+                    flat_cells.push(item.as_deref());
+                }
+                row_lengths.push(Some(items.len()));
+            }
+            None => row_lengths.push(None),
+        }
+    }
+
+    let (item_field, flat_array) =
+        match build_pg_typed_values("item", elem_oid, typmod, &flat_cells)? {
+            Some(pair) => pair,
+            None => build_utf8_with_meta("item", &flat_cells, &[]),
+        };
+    wrap_flat_array_in_list(name, item_field, flat_array.as_ref(), &row_lengths)
 }
 
 /// Dynamically transforms tabular row values into an Apache Arrow [`RecordBatch`].
@@ -1109,6 +2090,19 @@ pub fn rows_to_record_batch_with_column_types(
     age_columns: &[bool],
     column_types: &[i32],
 ) -> Result<RecordBatch> {
+    rows_to_record_batch_with_column_metadata(column_names, rows, age_columns, column_types, &[])
+}
+
+/// Like [`rows_to_record_batch_with_column_types`], also accepting PostgreSQL
+/// `type_modifier` (`typmod`) values from `RowDescription` (for example to
+/// preserve declared `NUMERIC(p, s)` scale).
+pub fn rows_to_record_batch_with_column_metadata(
+    column_names: &[String],
+    rows: &[Vec<Option<String>>],
+    age_columns: &[bool],
+    column_types: &[i32],
+    column_type_modifiers: &[i32],
+) -> Result<RecordBatch> {
     if column_names.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
     }
@@ -1125,6 +2119,7 @@ pub fn rows_to_record_batch_with_column_types(
             let mut int_count = 0usize;
             let mut float_count = 0usize;
             let mut bool_count = 0usize;
+            let mut string_count = 0usize;
             let mut node_count = 0usize;
             let mut edge_count = 0usize;
             let mut path_count = 0usize;
@@ -1178,6 +2173,7 @@ pub fn rows_to_record_batch_with_column_types(
                                 parsed_cells.push(Some(parsed));
                             }
                             AgeValue::String(_) => {
+                                string_count += 1;
                                 non_null_count += 1;
                                 parsed_cells.push(Some(parsed));
                             }
@@ -1232,7 +2228,7 @@ pub fn rows_to_record_batch_with_column_types(
                 }
                 fields.push(Field::new(name, DataType::Boolean, true));
                 columns.push(Arc::new(builder.finish()));
-            } else if has_structured {
+            } else if has_structured || (non_null_count > 0 && string_count != non_null_count) {
                 let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 64);
                 for cell in &parsed_cells {
                     match cell {
@@ -1260,15 +2256,7 @@ pub fn rows_to_record_batch_with_column_types(
                 for cell in &parsed_cells {
                     match cell {
                         Some(AgeValue::String(s)) => builder.append_value(s),
-                        Some(AgeValue::Integer(i)) => builder.append_value(i.to_string()),
-                        Some(AgeValue::Float(f)) => builder.append_value(f.to_string()),
-                        Some(AgeValue::Boolean(b)) => builder.append_value(b.to_string()),
-                        Some(other) => {
-                            let json_str = serde_json::to_string(&age_value_to_arrow_json(other))
-                                .unwrap_or_else(|_| "null".to_string());
-                            builder.append_value(&json_str);
-                        }
-                        None => builder.append_null(),
+                        _ => builder.append_null(),
                     }
                 }
                 fields.push(Field::new(name, DataType::Utf8, true));
@@ -1277,14 +2265,23 @@ pub fn rows_to_record_batch_with_column_types(
             continue;
         }
 
-        if let Some(element) = column_types
-            .get(col_idx)
-            .and_then(|oid| pg_array_element(*oid))
-        {
-            let (field, array) = array_column_batch(name, element, rows, col_idx)?;
-            fields.push(field);
-            columns.push(array);
-            continue;
+        if let Some(&oid) = column_types.get(col_idx) {
+            let typmod = column_type_modifiers.get(col_idx).copied();
+            if let Some(elem_oid) = pg_array_element_oid(oid) {
+                let (field, array) = array_column_batch(name, elem_oid, typmod, rows, col_idx)?;
+                fields.push(field);
+                columns.push(array);
+                continue;
+            }
+            let cells: Vec<Option<&str>> = rows
+                .iter()
+                .map(|row| row.get(col_idx).and_then(|v| v.as_deref()))
+                .collect();
+            if let Some((field, array)) = build_pg_typed_values(name, oid, typmod, &cells)? {
+                fields.push(field);
+                columns.push(array);
+                continue;
+            }
         }
 
         let mut has_non_null = false;
@@ -1465,9 +2462,9 @@ mod pg_array_tests {
             nums.column(0)
                 .as_list::<i32>()
                 .value(0)
-                .as_primitive::<arrow_array::types::Float64Type>()
+                .as_primitive::<arrow_array::types::Decimal128Type>()
                 .value(1),
-            2.0
+            200
         );
 
         let texts = batch_for(
@@ -1487,11 +2484,16 @@ mod pg_array_tests {
     }
 
     #[test]
-    fn decodes_date_and_timestamp_arrays_as_text() {
+    fn decodes_date_and_timestamp_arrays_to_native_arrow_types() {
         let dates = batch_for(1182, &[Some("{2026-01-15,2026-02-20}")]);
         let date_list = dates.column(0).as_list::<i32>();
         let date_values = date_list.value(0);
-        assert_eq!(date_values.as_string::<i32>().value(1), "2026-02-20");
+        assert_eq!(
+            date_values
+                .as_primitive::<arrow_array::types::Date32Type>()
+                .value(1),
+            ymd_to_days(2026, 2, 20) as i32
+        );
 
         let timestamps = batch_for(
             1115,
@@ -1500,8 +2502,10 @@ mod pg_array_tests {
         let timestamp_list = timestamps.column(0).as_list::<i32>();
         let timestamp_values = timestamp_list.value(0);
         assert_eq!(
-            timestamp_values.as_string::<i32>().value(0),
-            "2026-01-15 10:11:12"
+            timestamp_values
+                .as_primitive::<arrow_array::types::TimestampMicrosecondType>()
+                .value(0),
+            parse_pg_timestamp_micros("2026-01-15 10:11:12").unwrap()
         );
     }
 
@@ -1528,5 +2532,202 @@ mod pg_array_tests {
         let batch = rows_to_record_batch_with_column_types(&columns, &rows, &[false], &[999999])
             .expect("unknown array OID should fall back");
         assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn decodes_pg_scalar_typed_columns_and_fallbacks() {
+        use arrow_array::cast::AsArray;
+        use arrow_schema::TimeUnit;
+
+        let cols = vec![
+            "b".to_string(),
+            "u".to_string(),
+            "num_ok".to_string(),
+            "num_nan".to_string(),
+            "d".to_string(),
+            "t".to_string(),
+            "ttz".to_string(),
+            "ts".to_string(),
+            "tstz".to_string(),
+            "iv_hms".to_string(),
+            "iv_days".to_string(),
+            "iv_cal".to_string(),
+            "j".to_string(),
+        ];
+        let oids = vec![
+            17, 2950, 1700, 1700, 1082, 1083, 1266, 1114, 1184, 1186, 1186, 1186, 3802,
+        ];
+        let rows = vec![vec![
+            Some(r"\x0102fe".to_string()),
+            Some("12345678-1234-5678-1234-567812345678".to_string()),
+            Some("123.45".to_string()),
+            Some("NaN".to_string()),
+            Some("2024-01-02".to_string()),
+            Some("14:30:15.123456".to_string()),
+            Some("14:30:15+02".to_string()),
+            Some("2024-01-02 03:04:05.123456".to_string()),
+            Some("2024-01-02 03:04:05.123456+00".to_string()),
+            Some("25:00:00.5".to_string()),
+            Some("2 days 01:01:01.5".to_string()),
+            Some("1 year 2 mons 3 days 04:05:06".to_string()),
+            Some(r#"{"a":1}"#.to_string()),
+        ]];
+        let batch = rows_to_record_batch_with_column_types(&cols, &rows, &[false; 13], &oids)
+            .expect("pg scalar typed batch");
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).data_type(), &DataType::Binary);
+        assert_eq!(batch.column(0).as_binary::<i32>().value(0), &[1, 2, 254]);
+        assert_eq!(schema.field(1).data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("arrow.uuid")
+        );
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema
+                .field(3)
+                .metadata()
+                .get("voyager.type")
+                .map(String::as_str),
+            Some("decimal")
+        );
+        assert_eq!(schema.field(4).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Time64(TimeUnit::Microsecond)
+        );
+        assert_eq!(
+            schema
+                .field(6)
+                .metadata()
+                .get("voyager.type")
+                .map(String::as_str),
+            Some("time_tz")
+        );
+        assert_eq!(
+            schema.field(7).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            schema.field(8).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            schema.field(9).data_type(),
+            &DataType::Duration(TimeUnit::Microsecond)
+        );
+        assert!(matches!(schema.field(10).data_type(), DataType::Struct(_)));
+        assert_eq!(
+            schema
+                .field(10)
+                .metadata()
+                .get("voyager.type")
+                .map(String::as_str),
+            Some("duration")
+        );
+        assert!(matches!(schema.field(11).data_type(), DataType::Struct(_)));
+        assert_eq!(
+            schema
+                .field(11)
+                .metadata()
+                .get("voyager.type")
+                .map(String::as_str),
+            Some("duration")
+        );
+        assert_eq!(
+            schema
+                .field(12)
+                .metadata()
+                .get("voyager.encoding")
+                .map(String::as_str),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn preserves_pg_numeric_scale_and_parses_all_interval_styles() {
+        use arrow_array::cast::AsArray;
+
+        // NUMERIC(10, 2) typmod = ((10 << 16) | 2) + 4 = 655366
+        let typmod_10_2 = ((10 << 16) | 2) + 4;
+        let batch = rows_to_record_batch_with_column_metadata(
+            &[
+                "n_untyped".to_string(),
+                "n_typmod".to_string(),
+                "n_null".to_string(),
+            ],
+            &[vec![
+                Some("1.50".to_string()),
+                Some("1.50".to_string()),
+                None,
+            ]],
+            &[false; 3],
+            &[1700, 1700, 1700],
+            &[-1, typmod_10_2, typmod_10_2],
+        )
+        .unwrap();
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            batch.schema().field(1).data_type(),
+            &DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            batch.schema().field(2).data_type(),
+            &DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Decimal128Type>()
+                .value(0),
+            150
+        );
+
+        // postgres_verbose and sql_standard intervals
+        assert_eq!(
+            parse_pg_interval("@ 0"),
+            Some(BoltDuration::new(0, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_pg_interval("@ 5.25 secs ago"),
+            Some(BoltDuration::new(0, 0, -5, -250_000_000))
+        );
+        assert_eq!(
+            parse_pg_interval("+1-2 +3 +4:05:06.5"),
+            Some(BoltDuration::new(14, 3, 14_706, 500_000_000))
+        );
+        assert_eq!(
+            parse_pg_interval("-1-2"),
+            Some(BoltDuration::new(-14, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_pg_interval("-3"),
+            Some(BoltDuration::new(0, -3, 0, 0))
+        );
+    }
+
+    #[test]
+    fn parses_age_float_specials_and_large_ints() {
+        assert!(matches!(parse_agtype("NaN").unwrap(), AgeValue::Float(f) if f.is_nan()));
+        assert_eq!(
+            parse_agtype("Infinity").unwrap(),
+            AgeValue::Float(f64::INFINITY)
+        );
+        assert_eq!(
+            parse_agtype("-Infinity").unwrap(),
+            AgeValue::Float(f64::NEG_INFINITY)
+        );
+        assert!(matches!(
+            parse_agtype("99999999999999999999999999").unwrap(),
+            AgeValue::Float(_)
+        ));
     }
 }

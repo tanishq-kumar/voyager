@@ -4,6 +4,7 @@ use bytes::BytesMut;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use voyager_drivers::bolt::packstream::param_to_bolt_value;
 use voyager_drivers::bolt::{
     BoltConnection, BoltDate, BoltDateTime, BoltDateTimeZoneId, BoltDuration, BoltLocalDateTime,
     BoltLocalTime, BoltNode, BoltPath, BoltPoint2D, BoltPoint3D, BoltRelationship, BoltRequest,
@@ -12,6 +13,7 @@ use voyager_drivers::bolt::{
 };
 use voyager_drivers::config::{ConnectionConfig, PoolConfig};
 use voyager_drivers::engine::{AsyncConnection, ConnectionFactory};
+use voyager_drivers::params::{ParamTimezone, ParamValue};
 use voyager_drivers::pool::ConnectionPool;
 
 #[test]
@@ -263,7 +265,7 @@ async fn test_bolt_stub_server_handshake_and_query() {
     let mut params = HashMap::new();
     params.insert(
         "name".to_string(),
-        serde_json::Value::String("Alice".to_string()),
+        serde_json::Value::String("Alice".to_string()).into(),
     );
 
     let result = conn
@@ -353,7 +355,10 @@ async fn test_bolt_connection_pool_end_to_end() {
         handles.push(tokio::spawn(async move {
             let mut conn = pool_clone.acquire().await.expect("Acquire failed");
             let mut params = HashMap::new();
-            params.insert("idx".to_string(), serde_json::Value::Number(i.into()));
+            params.insert(
+                "idx".to_string(),
+                serde_json::Value::Number(i.into()).into(),
+            );
             let result = conn
                 .execute("MATCH (n:Person) RETURN n.name, n.age", &params)
                 .await
@@ -660,4 +665,533 @@ fn test_build_bolt_record_batch_entity_metadata_and_json() {
     assert_eq!(parsed["element_id"], serde_json::Value::Null);
     assert_eq!(parsed["labels"], serde_json::json!(["ZzS"]));
     assert_eq!(parsed["properties"], serde_json::json!({"name": "A"}));
+}
+
+#[test]
+fn test_param_to_bolt_value_v5_and_legacy_v4() {
+    // Date -> BoltDate
+    let d = ParamValue::Date {
+        year: 2024,
+        month: 1,
+        day: 2,
+    };
+    let bv_d = param_to_bolt_value(&d, 5).unwrap();
+    assert_eq!(bv_d.as_date().unwrap().to_iso_string(), "2024-01-02");
+
+    // LocalTime (0x74) and offset Time (0x54)
+    let lt = ParamValue::Time {
+        hour: 14,
+        minute: 30,
+        second: 15,
+        nanosecond: 123_456_000,
+        tz_offset_seconds: None,
+    };
+    assert_eq!(
+        param_to_bolt_value(&lt, 5)
+            .unwrap()
+            .as_local_time()
+            .unwrap()
+            .to_iso_string(),
+        "14:30:15.123456"
+    );
+
+    let ot = ParamValue::Time {
+        hour: 14,
+        minute: 30,
+        second: 15,
+        nanosecond: 123_456_000,
+        tz_offset_seconds: Some(7200),
+    };
+    assert_eq!(
+        param_to_bolt_value(&ot, 5)
+            .unwrap()
+            .as_time()
+            .unwrap()
+            .to_iso_string(),
+        "14:30:15.123456+02:00"
+    );
+
+    // LocalDateTime (0x64)
+    let ldt = ParamValue::LocalDateTime {
+        year: 2024,
+        month: 1,
+        day: 2,
+        hour: 3,
+        minute: 4,
+        second: 5,
+        nanosecond: 123_456_000,
+    };
+    assert_eq!(
+        param_to_bolt_value(&ldt, 5)
+            .unwrap()
+            .as_local_datetime()
+            .unwrap()
+            .to_iso_string(),
+        "2024-01-02T03:04:05.123456"
+    );
+
+    // Aware DateTime with offset: 2024-01-02T03:04:05.123456+02:00 -> utc_seconds = 1704157445
+    let dt_off = ParamValue::DateTime {
+        utc_seconds: 1_704_157_445,
+        nanosecond: 123_456_000,
+        tz: ParamTimezone::OffsetSeconds(7200),
+    };
+    let bv_v5 = param_to_bolt_value(&dt_off, 5).unwrap();
+    assert_eq!(
+        bv_v5.as_datetime().unwrap().to_iso_string(),
+        "2024-01-02T03:04:05.123456+02:00"
+    );
+    let mut buf5 = BytesMut::new();
+    PackStream::encode(&bv_v5, &mut buf5);
+    assert_eq!(buf5[1], 0x49); // Bolt 5 UTC DateTime tag 'I'
+
+    let bv_v4 = param_to_bolt_value(&dt_off, 4).unwrap();
+    match &bv_v4 {
+        BoltValue::Structure { tag, fields } => {
+            assert_eq!(*tag, 0x46); // Legacy Bolt 4 DateTime tag 'F'
+            assert_eq!(fields[0], BoltValue::Integer(1_704_157_445 + 7200));
+            assert_eq!(fields[1], BoltValue::Integer(123_456_000));
+            assert_eq!(fields[2], BoltValue::Integer(7200));
+        }
+        other => panic!("Expected legacy 0x46 structure, got {other:?}"),
+    }
+    let mut buf4 = BytesMut::new();
+    PackStream::encode(&bv_v4, &mut buf4);
+    assert_eq!(buf4[1], 0x46);
+    let decoded_v4 = PackStream::decode(&mut buf4.freeze()).unwrap();
+    assert_eq!(
+        decoded_v4.as_datetime().unwrap().to_iso_string(),
+        "2024-01-02T03:04:05.123456+02:00"
+    );
+
+    // Aware DateTime with ZoneId (Europe/Berlin, +01:00 in Jan): 2024-01-02T03:04:05+01:00 -> utc = 1704161045
+    let dt_zone = ParamValue::DateTime {
+        utc_seconds: 1_704_161_045,
+        nanosecond: 0,
+        tz: ParamTimezone::ZoneId {
+            id: "Europe/Berlin".to_string(),
+            offset_seconds: 3600,
+        },
+    };
+    let bv_z5 = param_to_bolt_value(&dt_zone, 5).unwrap();
+    let mut buf_z5 = BytesMut::new();
+    PackStream::encode(&bv_z5, &mut buf_z5);
+    assert_eq!(buf_z5[1], 0x69); // Bolt 5 UTC DateTimeZoneId tag 'i'
+    let decoded_z5 = PackStream::decode(&mut buf_z5.freeze()).unwrap();
+    assert_eq!(
+        decoded_z5.as_datetime_zone_id().unwrap().zone_id,
+        "Europe/Berlin"
+    );
+    assert_eq!(
+        decoded_z5.as_datetime_zone_id().unwrap().seconds,
+        1_704_161_045
+    );
+
+    let bv_z4 = param_to_bolt_value(&dt_zone, 4).unwrap();
+    match &bv_z4 {
+        BoltValue::Structure { tag, fields } => {
+            assert_eq!(*tag, 0x66); // Legacy Bolt 4 DateTimeZoneId tag 'f'
+            assert_eq!(fields[0], BoltValue::Integer(1_704_161_045 + 3600));
+            assert_eq!(fields[2], BoltValue::String("Europe/Berlin".to_string()));
+        }
+        other => panic!("Expected legacy 0x66 structure, got {other:?}"),
+    }
+
+    // Duration, Bytes, Uuid, Decimal, nested List & Map, and plain String
+    let dur = ParamValue::Duration {
+        months: 0,
+        days: 2,
+        seconds: 3661,
+        nanoseconds: 500_000_000,
+    };
+    assert_eq!(
+        param_to_bolt_value(&dur, 5)
+            .unwrap()
+            .as_duration()
+            .unwrap()
+            .to_iso_string(),
+        "P2DT1H1M1.500S"
+    );
+
+    let bytes = ParamValue::Bytes(vec![0x01, 0x02, 0xFE]);
+    assert_eq!(
+        param_to_bolt_value(&bytes, 5).unwrap(),
+        BoltValue::Bytes(vec![0x01, 0x02, 0xFE])
+    );
+
+    let uuid = ParamValue::Uuid("12345678-1234-5678-1234-567812345678".to_string());
+    assert_eq!(
+        param_to_bolt_value(&uuid, 5).unwrap(),
+        BoltValue::String("12345678-1234-5678-1234-567812345678".to_string())
+    );
+
+    let dec = ParamValue::Decimal("123.45".to_string());
+    assert_eq!(
+        param_to_bolt_value(&dec, 5).unwrap(),
+        BoltValue::Float(123.45)
+    );
+    let dec_nan = ParamValue::Decimal("NaN".to_string());
+    assert!(matches!(
+        param_to_bolt_value(&dec_nan, 5).unwrap(),
+        BoltValue::Float(f) if f.is_nan()
+    ));
+    let dec_snan = ParamValue::Decimal("sNaN".to_string());
+    assert!(matches!(
+        param_to_bolt_value(&dec_snan, 5).unwrap(),
+        BoltValue::Float(f) if f.is_nan()
+    ));
+    let dec_inf = ParamValue::Decimal("Infinity".to_string());
+    assert_eq!(
+        param_to_bolt_value(&dec_inf, 5).unwrap(),
+        BoltValue::Float(f64::INFINITY)
+    );
+    let dec_ninf = ParamValue::Decimal("-Infinity".to_string());
+    assert_eq!(
+        param_to_bolt_value(&dec_ninf, 5).unwrap(),
+        BoltValue::Float(f64::NEG_INFINITY)
+    );
+
+    let plain_str = ParamValue::from("2024-01-02");
+    assert_eq!(
+        param_to_bolt_value(&plain_str, 5).unwrap(),
+        BoltValue::String("2024-01-02".to_string())
+    );
+
+    let mut nested_map = HashMap::new();
+    nested_map.insert("d".to_string(), d.clone());
+    nested_map.insert("raw".to_string(), plain_str.clone());
+    let nested_list = ParamValue::List(vec![ParamValue::Map(nested_map), bytes.clone()]);
+    match param_to_bolt_value(&nested_list, 5).unwrap() {
+        BoltValue::List(items) => {
+            assert!(
+                items[0]
+                    .as_map()
+                    .unwrap()
+                    .get("d")
+                    .unwrap()
+                    .as_date()
+                    .is_some()
+            );
+            assert_eq!(
+                items[0].as_map().unwrap().get("raw").unwrap().as_str(),
+                Some("2024-01-02")
+            );
+            assert_eq!(items[1], BoltValue::Bytes(vec![0x01, 0x02, 0xFE]));
+        }
+        other => panic!("Expected BoltValue::List, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_build_bolt_record_batch_native_temporal_and_binary_types() {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    use arrow_schema::{DataType, TimeUnit};
+    use voyager_drivers::bolt::{
+        BoltDate, BoltDateTime, BoltDateTimeZoneId, BoltDuration, BoltLocalDateTime, BoltLocalTime,
+        BoltTime,
+    };
+
+    let cols = vec![
+        "d".to_string(),
+        "lt".to_string(),
+        "ttz".to_string(),
+        "ldt".to_string(),
+        "dt_utc".to_string(),
+        "dt_berlin".to_string(),
+        "dt_offset".to_string(),
+        "dt_unknown_tz".to_string(),
+        "dur_td".to_string(),
+        "dur_cal".to_string(),
+        "bin".to_string(),
+        "d_list".to_string(),
+    ];
+    let rows = vec![vec![
+        BoltValue::Date(BoltDate { days: 19_724 }),
+        BoltValue::LocalTime(BoltLocalTime {
+            nanoseconds: 52_215_123_456_000,
+        }),
+        BoltValue::Time(BoltTime {
+            nanoseconds: 52_215_000_000_000,
+            tz_offset_seconds: 7200,
+        }),
+        BoltValue::LocalDateTime(BoltLocalDateTime {
+            seconds: 1_704_164_645,
+            nanoseconds: 123_456_000,
+        }),
+        BoltValue::DateTime(BoltDateTime {
+            seconds: 1_704_164_645,
+            nanoseconds: 0,
+            tz_offset_seconds: 0,
+        }),
+        BoltValue::DateTimeZoneId(BoltDateTimeZoneId {
+            seconds: 1_704_161_045,
+            nanoseconds: 0,
+            zone_id: "Europe/Berlin".to_string(),
+            is_local: false,
+        }),
+        BoltValue::DateTime(BoltDateTime {
+            seconds: 1_704_157_445,
+            nanoseconds: 0,
+            tz_offset_seconds: 7200,
+        }),
+        BoltValue::DateTimeZoneId(BoltDateTimeZoneId {
+            seconds: 1_704_164_645,
+            nanoseconds: 0,
+            zone_id: "Mars/Olympus".to_string(),
+            is_local: false,
+        }),
+        BoltValue::Duration(BoltDuration {
+            months: 0,
+            days: 0,
+            seconds: 90_000,
+            nanoseconds: 500_000_000,
+        }),
+        BoltValue::Duration(BoltDuration {
+            months: 14,
+            days: 3,
+            seconds: 4,
+            nanoseconds: 5000,
+        }),
+        BoltValue::Bytes(vec![1, 2, 254]),
+        BoltValue::List(vec![
+            BoltValue::Date(BoltDate { days: 19_723 }),
+            BoltValue::Null,
+            BoltValue::Date(BoltDate { days: 19_724 }),
+        ]),
+    ]];
+
+    let batch = build_bolt_record_batch(&cols, &rows).unwrap();
+    let schema = batch.schema();
+    assert_eq!(schema.field(0).data_type(), &DataType::Date32);
+    assert_eq!(
+        schema.field(1).data_type(),
+        &DataType::Time64(TimeUnit::Nanosecond)
+    );
+    assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
+    assert_eq!(
+        schema
+            .field(2)
+            .metadata()
+            .get("voyager.type")
+            .map(String::as_str),
+        Some("time_tz")
+    );
+    assert_eq!(
+        schema.field(3).data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
+    assert_eq!(
+        schema.field(4).data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+    );
+    assert_eq!(
+        schema.field(5).data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, Some("Europe/Berlin".into()))
+    );
+    assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+    assert_eq!(
+        schema
+            .field(6)
+            .metadata()
+            .get("voyager.type")
+            .map(String::as_str),
+        Some("datetime_tz")
+    );
+    assert_eq!(schema.field(7).data_type(), &DataType::Utf8);
+    assert_eq!(
+        schema
+            .field(7)
+            .metadata()
+            .get("voyager.type")
+            .map(String::as_str),
+        Some("datetime_tz")
+    );
+    assert_eq!(
+        schema.field(8).data_type(),
+        &DataType::Duration(TimeUnit::Microsecond)
+    );
+    assert!(matches!(schema.field(9).data_type(), DataType::Struct(_)));
+    assert_eq!(
+        schema
+            .field(9)
+            .metadata()
+            .get("voyager.type")
+            .map(String::as_str),
+        Some("duration")
+    );
+    assert_eq!(schema.field(10).data_type(), &DataType::Binary);
+    assert!(matches!(schema.field(11).data_type(), DataType::List(_)));
+    let date_list = batch.column(11).as_list::<i32>().value(0);
+    assert_eq!(date_list.len(), 3);
+    assert!(date_list.is_null(1));
+}
+
+#[test]
+fn test_param_to_bolt_value_float_specials_and_points() {
+    use voyager_drivers::bolt::{BoltPoint2D, BoltPoint3D};
+
+    let nan_val = param_to_bolt_value(&ParamValue::Float(f64::NAN), 5).unwrap();
+    assert!(matches!(nan_val, BoltValue::Float(f) if f.is_nan()));
+    let inf_val = param_to_bolt_value(&ParamValue::Float(f64::INFINITY), 5).unwrap();
+    assert_eq!(inf_val, BoltValue::Float(f64::INFINITY));
+
+    let p2 = ParamValue::Point2D {
+        srid: 4326,
+        x: 13.405,
+        y: 52.52,
+    };
+    assert_eq!(
+        param_to_bolt_value(&p2, 5).unwrap(),
+        BoltValue::Point2D(BoltPoint2D {
+            srid: 4326,
+            x: 13.405,
+            y: 52.52
+        })
+    );
+
+    let p3 = ParamValue::Point3D {
+        srid: 9157,
+        x: 1.0,
+        y: 2.0,
+        z: 3.0,
+    };
+    assert_eq!(
+        param_to_bolt_value(&p3, 5).unwrap(),
+        BoltValue::Point3D(BoltPoint3D {
+            srid: 9157,
+            x: 1.0,
+            y: 2.0,
+            z: 3.0
+        })
+    );
+}
+
+#[test]
+fn test_duration_iso_mixed_signs_and_param_from_f64() {
+    use voyager_drivers::params::format_iso_duration;
+
+    assert_eq!(format_iso_duration(1, 0, 0, -500_000_000), "P1MT-0.5S");
+    assert_eq!(format_iso_duration(1, 0, -1, 500_000_000), "P1MT-0.5S");
+    assert_eq!(format_iso_duration(-1, -2, -3, -500_000_000), "-P1M2DT3.5S");
+    assert_eq!(format_iso_duration(1, -2, 3, 0), "P1M-2DT3S");
+    assert_eq!(format_iso_duration(0, 1, -5, 0), "P1DT-5S");
+    assert_eq!(format_iso_duration(0, 0, 90_000, 0), "PT25H");
+
+    assert_eq!(
+        BoltDuration::new(1, 0, 0, -500_000_000).to_iso_string(),
+        "P1MT-0.500S"
+    );
+    assert_eq!(
+        BoltDuration::new(1, 0, -1, 500_000_000).to_iso_string(),
+        "P1MT-0.500S"
+    );
+
+    assert!(matches!(ParamValue::from(f64::NAN), ParamValue::Float(f) if f.is_nan()));
+    assert_eq!(
+        ParamValue::from(f64::INFINITY),
+        ParamValue::Float(f64::INFINITY)
+    );
+    assert_eq!(
+        ParamValue::from(f64::NEG_INFINITY),
+        ParamValue::Float(f64::NEG_INFINITY)
+    );
+}
+
+#[test]
+fn test_bolt_mixed_numeric_routing_legacy_0x66_and_bolt_rows_flag() {
+    use arrow_schema::DataType;
+    use voyager_drivers::bolt::canonical::{batch_needs_bolt_rows, build_bolt_record_batch};
+
+    // Mixed int + float in list and scalar columns routes to JSON + bolt_rows (no float64 coercion)
+    let cols = vec![
+        "xs".to_string(),
+        "scalar".to_string(),
+        "pure_int".to_string(),
+    ];
+    let rows = vec![
+        vec![
+            BoltValue::List(vec![
+                BoltValue::Integer(9_007_199_254_740_993),
+                BoltValue::Float(2.5),
+            ]),
+            BoltValue::Integer(1),
+            BoltValue::Integer(42),
+        ],
+        vec![
+            BoltValue::List(vec![BoltValue::Integer(1), BoltValue::Float(2.5)]),
+            BoltValue::Float(2.5),
+            BoltValue::Integer(43),
+        ],
+    ];
+    let batch = build_bolt_record_batch(&cols, &rows).unwrap();
+    assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+    assert_eq!(
+        batch
+            .schema()
+            .field(0)
+            .metadata()
+            .get("voyager.encoding")
+            .map(String::as_str),
+        Some("json")
+    );
+    assert_eq!(batch.schema().field(1).data_type(), &DataType::Utf8);
+    assert_eq!(
+        batch
+            .schema()
+            .field(1)
+            .metadata()
+            .get("voyager.encoding")
+            .map(String::as_str),
+        Some("json")
+    );
+    assert_eq!(batch.schema().field(2).data_type(), &DataType::Int64);
+    assert!(batch_needs_bolt_rows(&batch));
+
+    // Scalar-only batch does not need bolt_rows
+    let scalar_batch = build_bolt_record_batch(
+        &["n".to_string(), "d".to_string()],
+        &[vec![
+            BoltValue::Integer(1),
+            BoltValue::Duration(BoltDuration::new(0, 0, 90_000, 0)),
+        ]],
+    )
+    .unwrap();
+    assert!(!batch_needs_bolt_rows(&scalar_batch));
+
+    // Legacy Bolt v4 tag 0x66 carries local wall-clock seconds
+    let local_secs = 1_704_164_645; // 2024-01-02T03:04:05 local
+    let legacy_struct = BoltValue::Structure {
+        tag: 0x66,
+        fields: vec![
+            BoltValue::Integer(local_secs),
+            BoltValue::Integer(123_456_000),
+            BoltValue::String("Europe/Berlin".to_string()),
+        ],
+    };
+    let mut buf = BytesMut::new();
+    PackStream::encode(&legacy_struct, &mut buf);
+    let decoded = PackStream::decode(&mut buf.freeze()).unwrap();
+    let dtz = decoded.as_datetime_zone_id().expect("BoltDateTimeZoneId");
+    assert!(dtz.is_local);
+    assert_eq!(dtz.seconds, local_secs);
+    assert_eq!(dtz.zone_id, "Europe/Berlin");
+    assert_eq!(
+        dtz.to_iso_string(),
+        "2024-01-02T03:04:05.123456[Europe/Berlin]"
+    );
+
+    // Legacy 0x66 routes to datetime_tz Utf8 fallback (not UTC Arrow Timestamp)
+    let dtz_batch = build_bolt_record_batch(&["dt".to_string()], &[vec![decoded.clone()]]).unwrap();
+    assert_eq!(dtz_batch.schema().field(0).data_type(), &DataType::Utf8);
+    assert_eq!(
+        dtz_batch
+            .schema()
+            .field(0)
+            .metadata()
+            .get("voyager.type")
+            .map(String::as_str),
+        Some("datetime_tz")
+    );
+    assert!(!batch_needs_bolt_rows(&dtz_batch));
 }

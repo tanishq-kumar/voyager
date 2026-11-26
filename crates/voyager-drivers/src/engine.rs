@@ -6,8 +6,11 @@ use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::bolt::BoltValue;
 use crate::error::{NetError, Result};
+use crate::params::ParamValue;
 
 /// Execution summary metrics and mutation counters returned after query execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +59,7 @@ impl QuerySummary {
 
 /// Query result container containing projected column names, Apache Arrow record batches, and execution statistics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct QueryResult {
     /// Ordered list of projected return column names.
     pub columns: Vec<String>,
@@ -66,6 +70,9 @@ pub struct QueryResult {
     /// Per-column flags marking Apache AGE `agtype` columns whose text values
     /// still need decoding before they reach Python.
     pub age_columns: Vec<bool>,
+    /// Optional raw Bolt rows retained alongside Arrow batches so nested
+    /// entities, maps, and mixed lists preserve full temporal/binary/float fidelity.
+    pub bolt_rows: Option<Arc<Vec<Vec<BoltValue>>>>,
 }
 
 impl QueryResult {
@@ -76,7 +83,14 @@ impl QueryResult {
             batches,
             summary,
             age_columns: Vec::new(),
+            bolt_rows: None,
         }
+    }
+
+    /// Attaches raw [`BoltValue`] rows for lossless nested entity/container conversion.
+    pub fn with_bolt_rows(mut self, rows: Vec<Vec<BoltValue>>) -> Self {
+        self.bolt_rows = Some(Arc::new(rows));
+        self
     }
 
     /// Creates an empty `QueryResult` for non-returning mutating queries.
@@ -86,6 +100,7 @@ impl QueryResult {
             batches: Vec::new(),
             summary,
             age_columns: Vec::new(),
+            bolt_rows: None,
         }
     }
 
@@ -122,7 +137,7 @@ pub trait AsyncConnection: Send + Sync {
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult>;
 
     /// Sends a lightweight liveness probe / ping to verify socket connectivity.
@@ -203,7 +218,7 @@ impl AsyncConnection for Box<dyn AsyncConnection> {
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         (**self).execute(query, params).await
     }
@@ -268,7 +283,7 @@ pub trait AsyncTransaction: Send + Sync {
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult>;
 
     /// Commits the active transaction to durable storage.
@@ -330,7 +345,7 @@ pub trait AsyncEngine: Send + Sync {
     async fn execute(
         &self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult>;
 
     /// Returns the engine's health status and connection pool statistics.
