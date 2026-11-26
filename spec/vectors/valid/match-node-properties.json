@@ -44,7 +44,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person {name: $p0, age: $age}) RETURN p.name $$, %s) AS (name agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person {name: $p0, age: $age}) RETURN p.name $$, %s) AS (\"name\" agtype)",
       "parameters": {
         "p0": "Alice"
       }

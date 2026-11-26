@@ -89,7 +89,7 @@
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (a:Person)-[r1:KNOWS]->(b:Person)<-[r2:KNOWS]-(c:Person)-[r3:KNOWS]-(d:Person) RETURN a.name, d.name $$) AS (name agtype, name_1 agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (a:Person)-[r1:KNOWS]->(b:Person)<-[r2:KNOWS]-(c:Person)-[r3:KNOWS]-(d:Person) RETURN a.name, d.name $$) AS (\"name\" agtype, \"name_1\" agtype)",
       "parameters": {}
     },
     "iso_gql": {
@@ -97,11 +97,11 @@
       "parameters": {}
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") <-[r2 IS \"KNOWS\"]- (c IS \"Person\") -[r3 IS \"KNOWS\"]- (d IS \"Person\") COLUMNS (a.name, d.name AS name_1))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") <-[r2 IS \"KNOWS\"]- (c IS \"Person\") -[r3 IS \"KNOWS\"]- (d IS \"Person\") COLUMNS (a.name, d.name AS \"name_1\"))",
       "parameters": {}
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") <-[r2 IS \"KNOWS\"]- (c IS \"Person\") -[r3 IS \"KNOWS\"]- (d IS \"Person\") COLUMNS (a.name, d.name AS name_1))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") <-[r2 IS \"KNOWS\"]- (c IS \"Person\") -[r3 IS \"KNOWS\"]- (d IS \"Person\") COLUMNS (a.name, d.name AS \"name_1\"))",
       "parameters": {}
     }
   }

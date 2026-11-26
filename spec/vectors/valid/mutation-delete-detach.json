@@ -33,7 +33,7 @@
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) DETACH DELETE p $$) AS (result agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) DETACH DELETE p $$) AS (\"result\" agtype)",
       "parameters": {}
     },
     "iso_gql": {

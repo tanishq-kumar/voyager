@@ -60,7 +60,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH *, $p0 AS threshold WHERE threshold > $p1 RETURN p.name $$, %s) AS (name agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH *, $p0 AS threshold WHERE threshold > $p1 RETURN p.name $$, %s) AS (\"name\" agtype)",
       "parameters": {
         "p1": 0,
         "p0": 30

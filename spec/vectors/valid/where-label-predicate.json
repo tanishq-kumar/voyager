@@ -69,7 +69,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (root:Root)-[]-(i) WHERE (i.var > $p0) AND label(i) = 'TextNode' RETURN i.var $$, %s) AS (var agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (root:Root)-[]-(i) WHERE (i.var > $p0) AND label(i) = 'TextNode' RETURN i.var $$, %s) AS (\"var\" agtype)",
       "parameters": {
         "p0": "te"
       }

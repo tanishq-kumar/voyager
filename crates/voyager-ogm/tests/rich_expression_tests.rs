@@ -280,7 +280,7 @@ fn test_branching_graph_topologies_multi_pattern() {
 
     let mut age_emitter = AgeEmitter::new("my_graph");
     let compiled_age = age_emitter.visit_query(&arena, root).unwrap();
-    assert!(compiled_age.statement.contains("SELECT * FROM cypher('my_graph', $$ MATCH (u:User)-[:WORKS_AT]->(c:Company), (u)-[:LIVES_IN]->(city:City) WHERE c.name = $p0 RETURN u.name AS user_name, city.name AS city_name $$, %s) AS (user_name agtype, city_name agtype)"));
+    assert!(compiled_age.statement.contains("SELECT * FROM cypher('my_graph', $$ MATCH (u:User)-[:WORKS_AT]->(c:Company), (u)-[:LIVES_IN]->(city:City) WHERE c.name = $p0 RETURN u.name AS user_name, city.name AS city_name $$, %s) AS (\"user_name\" agtype, \"city_name\" agtype)"));
 }
 
 #[test]
@@ -301,7 +301,7 @@ fn test_sql_pgq_rich_expressions() {
     let compiled = pgq_emitter.visit_query(&arena, root).unwrap();
     assert_eq!(
         compiled.statement,
-        "SELECT * FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") COLUMNS (UPPER(p.name) AS upper_name))"
+        "SELECT * FROM GRAPH_TABLE (social_graph MATCH (p IS \"Person\") COLUMNS (UPPER(p.name) AS \"upper_name\"))"
     );
 }
 
@@ -336,6 +336,6 @@ fn test_spatial_distance_functions() {
     let compiled_pgq = pgq_emitter.visit_query(&arena, root).unwrap();
     assert_eq!(
         compiled_pgq.statement,
-        "SELECT * FROM GRAPH_TABLE (places_graph MATCH (p IS \"Place\") COLUMNS (ST_Distance(p.location, p.destination) AS dist))"
+        "SELECT * FROM GRAPH_TABLE (places_graph MATCH (p IS \"Place\") COLUMNS (ST_Distance(p.location, p.destination) AS \"dist\"))"
     );
 }
