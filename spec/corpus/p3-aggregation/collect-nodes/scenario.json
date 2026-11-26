@@ -21,8 +21,8 @@
       "status": "supported"
     },
     "sqlpgq": {
-      "status": "known-diff",
-      "reason": "PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) rejects returning or aggregating a whole node (COLUMNS (n AS n)) with column \"n\" does not exist; see #286."
+      "status": "unsupported",
+      "reason": "UNSUPPORTED_FEATURE: SQL/PGQ cannot collect whole node or relationship values; COLLECT(n) is rejected at compile time because GRAPH_TABLE COLUMNS only projects scalar expressions and properties."
     }
   }
 }
