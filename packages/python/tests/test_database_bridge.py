@@ -464,7 +464,7 @@ def test_postgres_bridge_execute_bulk_with_bulk_ingestion_plan():
     bridge = PostgresBridge(mock_conn)
 
     data = [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
-    plan = create_bulk_create_plan(Person, data, batch_size=1, dialect="sql_pgq")
+    plan = create_bulk_create_plan(Person, data, batch_size=1, dialect="cypher")
 
     res = bridge.execute_bulk(plan)
     assert res.total_batches == 2
