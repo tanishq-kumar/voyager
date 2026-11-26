@@ -188,7 +188,7 @@ Voyager is structured as a monorepo:
 
 * `crates/voyager-ogm`: Core query compiler — fluent builder, AST arena, optimizer, multi-dialect emitters (openCypher, SQL:2023 PGQ, ISO GQL, Apache AGE), schema registry, Arrow bridge.
 * `crates/voyager-drivers`: Native async driver layer — Bolt (Neo4j, Memgraph), PostgreSQL wire (Apache AGE, PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)), Redis RESP (FalkorDB), connection pooling, native transactions.
-* `crates/voyager-cli`: The `voyager` binary — diagnostics (`doctor`), plus early `compile`/`bench` placeholders (planned short alias: `voy`).
+* `crates/voyager-cli`: The `voyager` binary — diagnostics (`doctor`), plus early `compile`/`bench` placeholders (the release archives add the short alias `voy`).
 * `crates/voyager-pyo3`: PyO3 native extension for the Python package (not published to crates.io; built into the wheel by maturin).
 * `packages/python/voyager_ogm`: Python SDK — sessions, models, bridges, Polars streaming, graph viewer.
 * `examples/`: Progressive Python learning path (01-31) plus a README cross-indexing the Rust examples in `crates/*/examples/`.
@@ -248,9 +248,12 @@ If a fix should also ship on an older release line, add a `backport-X.Y` label (
 
 Voyager OGM follows SemVer with pre-1.0 rules and a tag-driven, trusted-publishing release process. In short (see [RELEASING.md](RELEASING.md) for the full standard):
 
-1. From an up-to-date `main`, create a release branch (`chore/release-<version>`) and run `just release-prepare <version>` — it runs full CI, bumps the workspace version, refreshes lockfiles, cuts the changelog section, and creates the `chore(release): v<version>` commit.
+1. From an up-to-date `main`, create a release branch (`chore/release-<version>`) and run `just release-prepare <version>` — it runs full CI, bumps the workspace version in `Cargo.toml`, updates the lockstep `voyager-ogm[cli]` pin in `pyproject.toml`, refreshes lockfiles, cuts the changelog section, and creates the `chore(release): v<version>` commit.
 2. Open the release PR to `main` with the labels `full-ci` and `skip-changelog`, and merge it once green.
-3. On `main`, run `just release-tag <version>` and push the annotated tag. `.github/workflows/release.yml` then builds the wheels, creates the GitHub Release, and publishes via OIDC trusted publishing — TestPyPI and crates.io for every tag; PyPI for stable tags only. `voyager-pyo3` is never published as a crate (it ships as the Python wheel).
+3. On `main`, run `just release-tag <version>` and push the annotated tag. `.github/workflows/release.yml` then builds and smoke-tests the `voyager-ogm` wheels/sdist, the six-target `voyager-cli` binary archives (`voyager-cli-v<version>-<target>.tar.gz` / `.zip` with `SHA256SUMS` and build provenance attestations) and the `voyager-cli` Python wheels, creates the GitHub Release, and publishes via OIDC trusted publishing — TestPyPI (`voyager-ogm` and `voyager-cli`) and crates.io (`voyager-ogm`, `voyager-drivers`, `voyager-cli`) for every tag; PyPI (`voyager-ogm` and `voyager-cli`) for stable tags only. `voyager-pyo3` is never published as a crate (it ships as the `voyager-ogm` Python wheel).
+
+> [!NOTE]
+> PyPI and TestPyPI require OIDC trusted publishers to be configured for **both** `voyager-ogm` and `voyager-cli` (owner `tanishq-kumar`, repository `voyager`, workflow `release.yml`, environments `testpypi` and `pypi`) before the first release that publishes `voyager-cli`.
 
 Patch releases for an older line (`X.Y`) use a `chore/release-X.Y.N` branch off `release/X.Y` and tag on `release/X.Y` instead of `main`; see [RELEASING.md section 4](RELEASING.md#4-maintenance-branches-releasexy-and-backports).
 

@@ -1,6 +1,6 @@
 [package]
 name = "voyager-cli"
-description = "Command-line interface for Voyager OGM (the `voyager` and `voy` binaries)"
+description = "Command-line interface for Voyager OGM (the `voyager` command)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,9 +16,6 @@ default-run = "voyager"
 name = "voyager"
 path = "src/main.rs"
 
-[[bin]]
-name = "voy"
-path = "src/bin/voy.rs"
 
 [lints]
 workspace = true
@@ -37,3 +34,11 @@ voyager-drivers = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

@@ -1977,6 +1977,10 @@ wheels = [
 ]
 
 [[package]]
+name = "voyager-cli"
+source = { directory = "packages/cli" }
+
+[[package]]
 name = "voyager-ogm"
 source = { editable = "." }
 dependencies = [
@@ -1992,6 +1996,9 @@ age = [
 analytics = [
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "networkx", version = "3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+cli = [
+    { name = "voyager-cli" },
 ]
 dev = [
     { name = "anywidget" },
@@ -2073,8 +2080,9 @@ requires-dist = [
     { name = "traitlets", marker = "extra == 'notebook'", specifier = ">=5.0.0" },
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.1" },
     { name = "tzdata", marker = "sys_platform == 'win32' and extra == 'dev'", specifier = ">=2024.1" },
+    { name = "voyager-cli", marker = "extra == 'cli'", directory = "packages/cli" },
 ]
-provides-extras = ["age", "analytics", "dev", "duckdb", "neo4j", "notebook", "relate", "sqlalchemy"]
+provides-extras = ["age", "analytics", "cli", "dev", "duckdb", "neo4j", "notebook", "relate", "sqlalchemy"]
 
 [package.metadata.requires-dev]
 dev = [

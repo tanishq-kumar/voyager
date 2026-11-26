@@ -6,8 +6,9 @@
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/tanishq-kumar/voyager/blob/main/LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://github.com/tanishq-kumar/voyager/blob/main/Cargo.toml)
 
-The command-line interface for Voyager OGM. It installs two identical binaries,
-`voyager` and the short alias `voy`, and provides four subcommands:
+The command-line interface for Voyager OGM. It is a single binary, `voyager`
+(the release archives also include the short alias `voy`), and provides four
+subcommands:
 
 - `doctor` reports build facts, or checks a database connection with `--uri`.
 - `introspect` prints a live database's graph schema.
@@ -19,15 +20,64 @@ ISO GQL or SQL/PGQ text; use the Rust or Python query builders for that.
 
 ## Install
 
+### Prebuilt binaries (GitHub Releases)
+
+Archives for Linux (`x86_64-unknown-linux-gnu`, static `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`), macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`), and Windows (`x86_64-pc-windows-msvc`) are attached to every [GitHub Release](https://github.com/tanishq-kumar/voyager/releases) as `voyager-cli-v<version>-<target>.tar.gz` (or `.zip` on Windows), alongside `SHA256SUMS` and GitHub build provenance attestations. macOS and Windows binaries are not OS code-signed yet. The Linux `-gnu` binaries need glibc 2.28 or newer (Debian 10+, Ubuntu 20.04+, RHEL 8+); the static `musl` binary runs on any x86_64 Linux, including Alpine.
+
+Verify the checksum and attestation before unpacking:
+
+```bash
+# 1. Verify the SHA-256 checksum
+grep "voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz" SHA256SUMS | sha256sum -c -
+
+# 2. Verify GitHub build provenance (requires GitHub CLI)
+gh attestation verify voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz --repo tanishq-kumar/voyager
+
+# 3. Unpack and put the directory (with `voyager` and its `voy` alias) on your PATH
+tar -xzf voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz
+```
+
+### cargo-binstall
+
+```bash
+cargo binstall voyager-cli
+```
+
+### Cargo (from source)
+
 ```bash
 cargo install voyager-cli
 ```
 
-Both `voyager` and `voy` are installed. Check the installed version with either:
+### Python (`pip` / `uv`)
+
+Install the standalone CLI wheel or pull it in via the `cli` extra of `voyager-ogm`:
+
+```bash
+pip install "voyager-ogm[cli]"
+# or standalone without the Python SDK:
+pip install voyager-cli
+```
+
+Check the installed version:
 
 ```bash
 voyager --version
-voy --version
+```
+
+### The `voy` alias
+
+`voy` is a short alias for `voyager`. The release archives include it: a symlink
+on Linux and macOS, and a `voy.cmd` shim on Windows. `cargo install`,
+`cargo binstall` and `pip` install only `voyager`; add the alias yourself if you
+want it:
+
+```bash
+alias voy=voyager                # bash / zsh
+```
+
+```powershell
+Set-Alias voy voyager            # PowerShell
 ```
 
 ## Exit codes

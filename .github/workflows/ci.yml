@@ -125,7 +125,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install Dev Dependencies
-        run: uv sync --all-extras --all-groups
+        run: uv sync --all-extras --no-extra cli --all-groups
 
       - name: Check Rust Formatting
         run: cargo fmt --all --check
@@ -134,16 +134,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Check Python Formatting (Ruff)
-        run: uv run --all-extras ruff format --check .
+        run: uv run --all-extras --no-extra cli ruff format --check .
 
       - name: Run Python Linters (Ruff)
-        run: uv run --all-extras ruff check .
+        run: uv run --all-extras --no-extra cli ruff check .
 
       - name: Check Python Types (ty)
-        run: uv run --all-extras ty check packages/python/voyager_ogm
+        run: uv run --all-extras --no-extra cli ty check packages/python/voyager_ogm
 
       - name: Check Python Types (mypy)
-        run: uv run --all-extras mypy packages/python/voyager_ogm
+        run: uv run --all-extras --no-extra cli mypy packages/python/voyager_ogm
 
   # =========================================================================
   # 2b. Cargo Feature Combination Check (cheap clippy gate, no test runs)
@@ -369,13 +369,13 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install Dev Dependencies
-        run: uv sync --all-extras --python ${{ matrix.python-version }}
+        run: uv sync --all-extras --no-extra cli --python ${{ matrix.python-version }}
 
       - name: Build Native Python Extension (maturin develop)
-        run: uv run --all-extras --python ${{ matrix.python-version }} maturin develop --uv
+        run: uv run --all-extras --no-extra cli --python ${{ matrix.python-version }} maturin develop --uv
 
       - name: Run Pytest Suite (Unit & Functional Tests)
-        run: uv run --all-extras --python ${{ matrix.python-version }} pytest -m "not live"
+        run: uv run --all-extras --no-extra cli --python ${{ matrix.python-version }} pytest -m "not live"
 
   # =========================================================================
   # 4b. Base-Only Wheel Install Smoke Test (no optional extras)

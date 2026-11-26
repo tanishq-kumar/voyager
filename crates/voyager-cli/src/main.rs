@@ -1,4 +1,4 @@
-//! Voyager OGM Command-Line Interface (`voyager`, also installed as `voy`).
+//! Voyager OGM Command-Line Interface (`voyager`; release installs add the short alias `voy`).
 //!
 //! The CLI compiles and validates Query Spec v1 JSON documents with the Rust
 //! consumer in [`voyager_ogm::spec`], diagnoses database connections through
@@ -51,8 +51,8 @@ Exit codes:
     long_about = "The Voyager CLI compiles Query Spec v1 JSON documents with the same consumer as \
                   `compile_query_from_spec`, validates them without emitting a statement, checks \
                   database connections through voyager-drivers, and prints a live database's graph \
-                  schema in the shape of `export_schema`. The same program is installed as both \
-                  `voyager` and `voy`.",
+                  schema in the shape of `export_schema`. Release archives and the Python wheel \
+                  also install the short alias `voy`, which runs this program.",
     after_help = EXIT_HELP
 )]
 struct Cli {

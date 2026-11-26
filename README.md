@@ -148,7 +148,7 @@ cargo add voyager-drivers --no-default-features --features bolt
 
 A URI or client that targets a protocol whose feature is disabled returns a `NetError` naming the missing feature. The `testkit` feature is opt-in and intended for tests.
 
-#### `voyager-cli`: the `voyager` and `voy` binaries
+#### `voyager-cli`: the `voyager` command
 
 [![crates.io](https://img.shields.io/crates/v/voyager-cli.svg)](https://crates.io/crates/voyager-cli)
 
@@ -156,13 +156,15 @@ A URI or client that targets a protocol whose feature is disabled returns a `Net
 cargo install voyager-cli
 ```
 
-`cargo install` installs both `voyager` and the short alias `voy`. Check the
-installed version with either:
+Check the installed version:
 
 ```bash
 voyager --version
-voy --version
 ```
+
+Prebuilt binaries for Linux, macOS and Windows are attached to each GitHub
+Release; those archives also include the short alias `voy`. See the
+[CLI README](crates/voyager-cli/README.md#install) for every install option.
 
 The CLI works on Query Spec v1 JSON; it does not parse query text. Compile a
 document from a file or stdin:
