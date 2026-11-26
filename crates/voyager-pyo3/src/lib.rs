@@ -811,10 +811,34 @@ fn handle_dict_expr(
     if let Some(ver_item) = dict.get_item("spec_version")? {
         let ver_path = path.key("spec_version");
         let ver: u32 = extract_required(&ver_item, &ver_path, "an integer major version")?;
-        if ver != 1 {
+        if ver != voyager_ogm::spec::SPEC_VERSION {
             return Err(make_voyager_err(
                 voyager_ogm::ErrorCode::InvalidSpec,
-                format!("Unsupported expression spec_version: {ver}. Supported major versions: 1."),
+                format!(
+                    "Unsupported expression spec_version: {ver}. Supported major versions: {}.",
+                    voyager_ogm::spec::SPEC_VERSION
+                ),
+            ));
+        }
+    }
+    if let Some(rev_item) = dict.get_item("spec_revision")?
+        && !rev_item.is_none()
+    {
+        let rev_path = path.key("spec_revision");
+        let rev: u32 = extract_required(&rev_item, &rev_path, "an integer spec revision")?;
+        if rev < 1 {
+            return Err(path_error(
+                &rev_path,
+                format!("Invalid expression spec_revision: {rev}. The minimum revision is 1."),
+            ));
+        }
+        if rev > voyager_ogm::spec::SPEC_REVISION {
+            return Err(path_error(
+                &rev_path,
+                format!(
+                    "The expression requires Query Spec revision {rev}; this Voyager supports up to revision {}.",
+                    voyager_ogm::spec::SPEC_REVISION
+                ),
             ));
         }
     }
@@ -3560,7 +3584,7 @@ fn compile_bulk_create<'py>(
         dialect,
         graph_name.as_deref(),
     )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    .map_err(|e| make_voyager_err(e.code(), e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("statement", compiled.statement)?;
@@ -3596,7 +3620,7 @@ fn compile_bulk_merge<'py>(
         dialect,
         graph_name.as_deref(),
     )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    .map_err(|e| make_voyager_err(e.code(), e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("statement", compiled.statement)?;
@@ -3633,7 +3657,7 @@ fn compile_bulk_merge_create_only<'py>(
             dialect,
             graph_name: graph_name.as_deref(),
         })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e| make_voyager_err(e.code(), e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("statement", compiled.statement)?;
@@ -3676,7 +3700,7 @@ fn compile_bulk_create_rel<'py>(
         graph_name: graph_name.as_deref(),
     };
     let compiled = voyager_ogm::bulk::compile_bulk_create_rel_with_config(&config)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e| make_voyager_err(e.code(), e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("statement", compiled.statement)?;
@@ -7021,6 +7045,8 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         None,
     )?;
     m.add("__version__", voyager_ogm::VERSION)?;
+    m.add("QUERY_SPEC_VERSION", voyager_ogm::spec::SPEC_VERSION)?;
+    m.add("QUERY_SPEC_REVISION", voyager_ogm::spec::SPEC_REVISION)?;
     Ok(())
 }
 

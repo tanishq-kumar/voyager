@@ -5,16 +5,27 @@
 
 use crate::ast::{AstNode, Direction, ExecutionMode, LabelExpression, QueryAstArena};
 use crate::emitters::{AgeEmitter, CypherEmitter, DEFAULT_AGE_GRAPH, IsoGqlEmitter};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::visitor::{AstVisitor, CompiledQuery};
 
+/// Emits a compiled bulk statement for `dialect`.
+///
+/// openCypher and the Cypher-speaking servers share the Cypher emitter, ISO GQL
+/// and Apache AGE keep their own emitters, and SQL/PGQ is rejected: the bulk
+/// compiler has no element-table schema, so it cannot name the vertex and edge
+/// tables a `sql_pgq` or `duckpgq` `INSERT` would need.
 fn emit_bulk_query(
     dialect: &str,
     graph_name: Option<&str>,
     arena: &QueryAstArena,
     root_handle: crate::ast::NodeHandle,
 ) -> Result<CompiledQuery> {
-    match dialect.to_lowercase().as_str() {
+    let normalized = dialect.to_lowercase();
+    match normalized.as_str() {
+        "cypher" | "opencypher" | "neo4j" | "memgraph" | "falkordb" | "falkor" => {
+            let mut emitter = CypherEmitter::new();
+            emitter.visit_query(arena, root_handle)
+        }
         "iso_gql" | "gql" => {
             let mut emitter = IsoGqlEmitter::new();
             emitter.visit_query(arena, root_handle)
@@ -24,10 +35,19 @@ fn emit_bulk_query(
             let mut emitter = AgeEmitter::new(name);
             emitter.visit_query(arena, root_handle)
         }
-        _ => {
-            let mut emitter = CypherEmitter::new();
-            emitter.visit_query(arena, root_handle)
-        }
+        "sql_pgq" | "pgq" | "sql" | "duckpgq" | "duck_pgq" => Err(Error::UnsupportedFeature {
+            dialect: dialect.to_string(),
+            feature: "bulk ingestion needs the property graph's element tables (table and column names), \
+                      which the bulk compiler does not receive; use the Cypher bulk plan for Neo4j, \
+                      Memgraph or FalkorDB, or write SQL/PGQ rows with an explicit INSERT"
+                .to_string(),
+        }),
+        other => Err(Error::UnsupportedDialect {
+            dialect: other.to_string(),
+            feature: "bulk ingestion (choose 'cypher', 'iso_gql', 'apache_age', 'sql_pgq', or \
+                      'duckpgq')"
+                .to_string(),
+        }),
     }
 }
 

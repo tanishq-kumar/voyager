@@ -160,7 +160,7 @@ def test_duckdb_unit_of_work_rollback_restores_entity_and_rows():
         "CREATE TABLE EmbeddedTxPerson(id VARCHAR PRIMARY KEY, name VARCHAR, balance DOUBLE)"
     )
     con.execute("INSERT INTO EmbeddedTxPerson VALUES ('p1', 'Alice', 100.0)")
-    session = Session(bridge=con, dialect="sql_pgq", enable_identity_map=True)
+    session = Session(bridge=con, dialect="cypher", enable_identity_map=True)
 
     person = EmbeddedTxPerson(id="p1", name="Alice", balance=100.0)
     session.register(person, is_clean=True)
