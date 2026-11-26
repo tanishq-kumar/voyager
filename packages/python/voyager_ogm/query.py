@@ -1444,12 +1444,16 @@ class Query:
         """Serialises this query into a Query Spec v1 document.
 
         The returned dictionary is JSON-serialisable (arrays are Python lists)
-        and validates against ``spec/query_spec.v1.schema.json``. Compiling it
+        and validates against ``spec/query_spec.v1.schema.json``. It describes
+        the query before optimisation: ``compile(..., optimize=True)`` may
+        produce a different statement from the exported document. Compiling it
         with :func:`voyager_ogm.compile_query_from_spec` produces the same
-        statement and parameters as :meth:`compile` for every supported dialect.
+        statement and parameters as an unoptimised :meth:`compile` for every
+        supported dialect.
 
         Returns:
-            A Query Spec v1 document with ``spec_version`` at the root.
+            A Query Spec v1 document with ``spec_version`` and the current
+            ``spec_revision`` at the root.
 
         Raises:
             VoyagerError: With code ``UNSUPPORTED_FEATURE`` when the query uses a

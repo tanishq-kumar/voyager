@@ -611,6 +611,11 @@ fn print_build_facts() {
         }
     );
     println!("supported dialects: cypher, age, iso_gql, sql_pgq, duck_pgq");
+    println!(
+        "query spec: v{} revision {}",
+        voyager_ogm::spec::SPEC_VERSION,
+        voyager_ogm::spec::SPEC_REVISION
+    );
     println!("connection checks: run `voyager doctor --uri <URI>`");
 }
 

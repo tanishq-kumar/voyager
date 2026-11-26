@@ -1,5 +1,5 @@
 {
-  "description": "skip and offset remain aliases even when both are parameters; the second key is rejected.",
+  "description": "offset is no longer an alias, including the parameter form; any root offset is rejected.",
   "spec": {
     "spec_version": 1,
     "matches": [
@@ -34,7 +34,7 @@
       "o"
     ]
   },
-  "schema_valid": true,
+  "schema_valid": false,
   "expected": {
     "error": "INVALID_SPEC",
     "path": "/offset"

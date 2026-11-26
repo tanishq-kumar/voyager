@@ -1,8 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://voyager-ogm.org/schemas/query-spec/v1.json",
+  "x-spec-revision": 1,
   "title": "VoyagerQuerySpecV1",
-  "description": "Voyager OGM Cross-Language Query Specification Interchange Protocol v1 ABI Contract. JSON null at an optional key or position means the same as omitting it. Only the document root requires spec_version; nested specs (matches, with_clauses, subqueries, object-wrapped expressions) may omit it, and if present it must be 1.",
+  "description": "Voyager OGM Cross-Language Query Specification Interchange Protocol v1 ABI Contract, revision 1. JSON null at an optional key or position means the same as omitting it. Only the document root requires spec_version; nested specs (matches, with_clauses, subqueries, object-wrapped expressions) may omit it, and if present it must be 1. spec_revision is optional everywhere; a missing value means revision 1, and a value newer than this schema's x-spec-revision is rejected by the consumer. The $id stays stable across v1 revisions; x-spec-revision identifies the revision this document describes.",
   "allOf": [{ "$ref": "#/$defs/QuerySpec" }],
   "required": ["spec_version"],
   "$defs": {
@@ -13,6 +14,11 @@
           "description": "Major specification protocol version. Required at the document root; optional in nested specs, and if present it must be strictly 1.",
           "type": "integer",
           "const": 1
+        },
+        "spec_revision": {
+          "description": "Optional v1 revision this document requires. Missing or null means revision 1. A value newer than the consumer's supported revision is INVALID_SPEC at /spec_revision.",
+          "type": ["integer", "null"],
+          "minimum": 1
         },
         "load_csv": {
           "description": "Optional LOAD CSV clause tuple: [url, with_headers, alias]. null means omitted.",
@@ -70,14 +76,7 @@
           "items": { "$ref": "#/$defs/OrderByItem" }
         },
         "skip": {
-          "description": "Pagination skip / offset count: an integral JSON number such as 0 or 0.0, or [\"param\", name] to bind it at execution time. null means omitted. Do not also set offset.",
-          "oneOf": [
-            { "$ref": "#/$defs/PaginationValue" },
-            { "type": "null" }
-          ]
-        },
-        "offset": {
-          "description": "Alias for skip: an integral JSON number, or [\"param\", name] to bind it at execution time. null means omitted. Setting both skip and offset is INVALID_SPEC at the second key.",
+          "description": "Pagination skip count: an integral JSON number such as 0 or 0.0, or [\"param\", name] to bind it at execution time. null means omitted. The former 'offset' alias is rejected.",
           "oneOf": [
             { "$ref": "#/$defs/PaginationValue" },
             { "type": "null" }
@@ -105,6 +104,11 @@
           "description": "Optional nested spec version; if present it must be 1.",
           "type": "integer",
           "const": 1
+        },
+        "spec_revision": {
+          "description": "Optional v1 revision this match clause requires. Missing or null means revision 1.",
+          "type": ["integer", "null"],
+          "minimum": 1
         },
         "optional": {
           "description": "Whether this is an OPTIONAL MATCH. null means omitted (false).",
@@ -138,6 +142,11 @@
           "description": "Optional nested spec version; if present it must be 1.",
           "type": "integer",
           "const": 1
+        },
+        "spec_revision": {
+          "description": "Optional v1 revision this with clause requires. Missing or null means revision 1.",
+          "type": ["integer", "null"],
+          "minimum": 1
         },
         "distinct": {
           "description": "Whether this WITH applies distinct deduplication. null means omitted.",
@@ -609,10 +618,11 @@
       ]
     },
     "ObjectWrappedExpression": {
-      "description": "Object-wrapped expression: { spec_version?: 1, expr: Expression }. spec_version is optional here because it is required only at the document root.",
+      "description": "Object-wrapped expression: { spec_version?: 1, spec_revision?: N, expr: Expression }. spec_version is optional here because it is required only at the document root, and spec_revision is optional everywhere.",
       "type": "object",
       "properties": {
         "spec_version": { "type": "integer", "const": 1 },
+        "spec_revision": { "type": ["integer", "null"], "minimum": 1 },
         "expr": { "$ref": "#/$defs/Expression" }
       },
       "required": ["expr"],
@@ -660,20 +670,9 @@
       "enum": ["normal", "explain", "profile", "explain_and_profile"]
     },
     "EdgeDirection": {
-      "description": "Edge direction. The spelling is exact: 'outgoing' ('out', '->'), 'incoming' ('in', '<-'), or 'undirected' ('both', '-', '--').",
+      "description": "Edge direction. The spelling is exact: 'outgoing', 'incoming', or 'undirected'. The former aliases 'out', '->', 'in', '<-', 'both', '-', and '--' are rejected.",
       "type": "string",
-      "enum": [
-        "outgoing",
-        "incoming",
-        "undirected",
-        "out",
-        "in",
-        "->",
-        "<-",
-        "-",
-        "--",
-        "both"
-      ]
+      "enum": ["outgoing", "incoming", "undirected"]
     },
     "BinaryOperator": {
       "description": "Binary operator. The consumer matches operator names case-insensitively; the canonical spellings are lowercase.",

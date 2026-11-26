@@ -1,0 +1,35 @@
+{
+  "description": "A document that requires a newer v1 revision is rejected; the schema accepts any revision >= 1, the consumer rejects what it does not support.",
+  "spec": {
+    "spec_version": 1,
+    "spec_revision": 2,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/spec_revision"
+  }
+}
