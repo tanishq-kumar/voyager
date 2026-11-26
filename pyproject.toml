@@ -134,6 +134,7 @@ dev = [
     "traitlets>=5.0.0",
     "ty>=0.0.78",
     "jsonschema>=4.26.0",
+    "hypothesis>=6.170.17",
 ]
 
 [tool.ty.environment]

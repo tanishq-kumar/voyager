@@ -5061,6 +5061,99 @@ fn inspect_native_params(params: Option<Bound<'_, PyDict>>) -> PyResult<String> 
     serde_json::to_string(&deterministic).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// Inspects the native wire encoding produced for a dialect, statement, and parameter dict (for diagnostics).
+#[pyfunction]
+#[pyo3(signature = (dialect, statement, params=None, bolt_major=5))]
+fn inspect_native_wire(
+    dialect: &str,
+    statement: &str,
+    params: Option<Bound<'_, PyDict>>,
+    bolt_major: u8,
+) -> PyResult<String> {
+    let converted = py_dict_to_params(params)?;
+    let norm = dialect.trim().to_ascii_lowercase();
+    let payload = match norm.as_str() {
+        "neo4j" | "memgraph" | "bolt" | "cypher" => {
+            let mut values = serde_json::Map::new();
+            let mut sorted: Vec<_> = converted.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in sorted {
+                let encoded =
+                    match voyager_drivers::bolt::packstream::param_to_bolt_value(v, bolt_major) {
+                        Ok(bv) => format!("{bv:?}"),
+                        Err(err) => format!("ERR: {err}"),
+                    };
+                values.insert(k.clone(), serde_json::Value::String(encoded));
+            }
+            serde_json::json!({
+                "protocol": "bolt",
+                "bolt_major": bolt_major,
+                "values": values,
+            })
+        }
+        "postgres" | "pg19" | "sql_pgq" | "age" => {
+            match voyager_drivers::postgres::prepare_postgres_statement(statement, &converted) {
+                Ok(prepared) => {
+                    let values: Vec<serde_json::Value> = prepared
+                        .parameter_values
+                        .iter()
+                        .map(|opt| match opt {
+                            None => serde_json::Value::Null,
+                            Some(bytes) => {
+                                let s = String::from_utf8_lossy(bytes);
+                                if s.len() > 256 {
+                                    // Truncate on a char boundary so multi-byte UTF-8 never panics.
+                                    let mut preview = String::new();
+                                    for ch in s.chars() {
+                                        if preview.len() + ch.len_utf8() > 256 {
+                                            break;
+                                        }
+                                        preview.push(ch);
+                                    }
+                                    serde_json::Value::String(format!(
+                                        "{preview}... ({} bytes)",
+                                        bytes.len()
+                                    ))
+                                } else {
+                                    serde_json::Value::String(s.into_owned())
+                                }
+                            }
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "protocol": "postgres",
+                        "statement": prepared.statement,
+                        "oids": prepared.parameter_oids,
+                        "values": values,
+                    })
+                }
+                Err(err) => serde_json::json!({
+                    "protocol": "postgres",
+                    "error": err.to_string(),
+                }),
+            }
+        }
+        "falkordb" | "redis" => {
+            match voyager_drivers::redis::format_cypher_with_params(statement, &converted) {
+                Ok(cypher) => serde_json::json!({
+                    "protocol": "resp",
+                    "cypher": cypher,
+                }),
+                Err(err) => serde_json::json!({
+                    "protocol": "resp",
+                    "error": err.to_string(),
+                }),
+            }
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "Unsupported dialect for wire inspection: {other}"
+            )));
+        }
+    };
+    serde_json::to_string(&payload).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// Native query result containing columnar Apache Arrow record batch and execution summary counters.
 #[pyclass(name = "NativeQueryResult", from_py_object)]
 #[derive(Clone)]
@@ -8211,6 +8304,7 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolve_fulltext_search, m)?)?;
     m.add_function(wrap_pyfunction!(introspect_schema_json, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_native_params, m)?)?;
+    m.add_function(wrap_pyfunction!(inspect_native_wire, m)?)?;
     m.add_class::<PyQueryBuilder>()?;
     m.add_class::<PyAstExpr>()?;
     m.add_class::<PyArrowStream>()?;

@@ -136,6 +136,10 @@ corpus-live engine="." lane="official":
 corpus-record-rows *scenario:
     uv run python scripts/record_corpus_rows.py {{scenario}}
 
+# Run live differential value conformance tests on one engine (neo4j, memgraph, falkordb, age, pg19, duckdb) or all engines
+values-live *args:
+    uv run --no-sync python scripts/run_values_live.py {{args}}
+
 # Run Relate embedded database integration tests
 test-relate:
     uv run --no-sync pytest packages/python/tests/test_relate_compatibility.py -v
