@@ -6,7 +6,7 @@ that all created constraints can be dropped by Voyager's drop DDL, that SHOW CON
 reflects existence and uniqueness constraints, that relationship constraints safely no-op,
 and that duplicate create and drop calls are idempotent.
 
-Set ``VOYAGER_TEST_HOST`` to run against remote Memgraph instance (default 127.0.0.1).
+Set ``VOYAGER_TEST_HOST`` to run against remote Memgraph instance (via ``conftest.get_test_host()``).
 """
 
 from __future__ import annotations
@@ -16,11 +16,12 @@ import socket
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import Field, Node, Relationship, SchemaManager, Session, node, relationship
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 PID = os.getpid()
 
 LABEL = f"Zz335MemgraphNode_{PID}"

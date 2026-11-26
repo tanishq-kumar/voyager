@@ -288,7 +288,7 @@ def test_multi_dialect_rich_expressions() -> None:
     # SQL:2023 PGQ
     pgq_res = q.compile("sql_pgq", graph_name="corp_graph")
     assert "GRAPH_TABLE (corp_graph" in pgq_res.statement
-    assert "COLUMNS (p.name, p.salary / $p2 AS monthly_salary)" in pgq_res.statement
+    assert 'COLUMNS (p.name, p.salary / $p2 AS "monthly_salary")' in pgq_res.statement
 
 
 def test_scalar_mathematical_functions() -> None:

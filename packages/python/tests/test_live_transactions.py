@@ -7,10 +7,11 @@ the native Rust client. Tests skip automatically when containers are absent.
 from __future__ import annotations
 
 import re
-import socket
 from typing import Any
 
 import pytest
+from conftest import get_test_host
+from conftest import is_port_open as _port_open
 from voyager_ogm import Session
 
 pytestmark = pytest.mark.live
@@ -32,23 +33,15 @@ except ImportError:
     PSYCOPG_AVAILABLE = False
 
 
-NEO4J_URI = "bolt://127.0.0.1:7687"
+HOST = get_test_host()
+NEO4J_URI = f"bolt://{HOST}:7687"
 NEO4J_AUTH = ("neo4j", "voyagerpass123")
-MEMGRAPH_URI = "bolt://127.0.0.1:7688"
+MEMGRAPH_URI = f"bolt://{HOST}:7688"
 AGE_DSN = (
-    "host=127.0.0.1 port=5455 user=postgres password=voyagerpass123 "
+    f"host={HOST} port=5455 user=postgres password=voyagerpass123 "
     "dbname=voyager_graph connect_timeout=2"
 )
 AGE_GRAPH = "voyager_tx_graph"
-
-
-def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
-    """Returns True when a TCP port accepts connections."""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 def _count_value(value: Any) -> int:
@@ -137,11 +130,11 @@ def _make_session(engine: str, path: str) -> Session:
         return Session(bridge=conn, dialect="cypher")
 
     if engine == "neo4j":
-        uri = "bolt://neo4j:voyagerpass123@127.0.0.1:7687?connect_timeout=2"
+        uri = f"bolt://neo4j:voyagerpass123@{HOST}:7687?connect_timeout=2"
     elif engine == "memgraph":
-        uri = "bolt://127.0.0.1:7688?connect_timeout=2"
+        uri = f"bolt://{HOST}:7688?connect_timeout=2"
     else:
-        uri = "age://postgres:voyagerpass123@127.0.0.1:5455/voyager_graph?connect_timeout=2"
+        uri = f"age://postgres:voyagerpass123@{HOST}:5455/voyager_graph?connect_timeout=2"
     return Session(bridge=uri, dialect="cypher", backend="native")
 
 
@@ -158,18 +151,18 @@ def _require_engine(engine: str) -> None:
     if engine == "neo4j":
         if not NEO4J_AVAILABLE:
             pytest.skip("neo4j driver not installed")
-        if not _port_open("127.0.0.1", 7687):
-            pytest.skip("Neo4j container not available on port 7687")
+        if not _port_open(HOST, 7687):
+            pytest.skip(f"Neo4j container not available on {HOST}:7687")
     elif engine == "memgraph":
         if not NEO4J_AVAILABLE:
             pytest.skip("neo4j driver not installed")
-        if not _port_open("127.0.0.1", 7688):
-            pytest.skip("Memgraph container not available on port 7688")
+        if not _port_open(HOST, 7688):
+            pytest.skip(f"Memgraph container not available on {HOST}:7688")
     else:
         if not PSYCOPG_AVAILABLE:
             pytest.skip("psycopg not installed")
-        if not _port_open("127.0.0.1", 5455):
-            pytest.skip("Apache AGE container not available on port 5455")
+        if not _port_open(HOST, 5455):
+            pytest.skip(f"Apache AGE container not available on {HOST}:5455")
         _ensure_age_graph()
 
 

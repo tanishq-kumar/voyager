@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from conftest import is_port_open
+from conftest import get_test_host, is_port_open
 from voyager_ogm import Field, Node, Query, SchemaManager, Session, VectorProperty
 from voyager_ogm.schema import SchemaRegistry
 from voyager_ogm.session import AsyncSession
@@ -373,18 +373,21 @@ class TestSessionSchemaLifecycle:
         assert res is not None
 
 
+HOST = get_test_host()
+
+
 @pytest.mark.live
 class TestLiveEngineVectorIntegration:
     """Integration tests against live Neo4j and FalkorDB instances when reachable."""
 
     @pytest.mark.skipif(
-        not is_port_open("127.0.0.1", 7687),
-        reason="Neo4j container not reachable on port 7687",
+        not is_port_open(HOST, 7687),
+        reason=f"Neo4j container not reachable on {HOST}:7687",
     )
     def test_live_neo4j_vector_lifecycle(self) -> None:
         pytest.importorskip("neo4j")
 
-        neo4j_uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
+        neo4j_uri = os.environ.get("NEO4J_URI", f"bolt://{HOST}:7687")
         neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
         neo4j_pass = os.environ.get("NEO4J_PASSWORD", "voyagerpass123")
 
@@ -430,14 +433,14 @@ class TestLiveEngineVectorIntegration:
             driver.close()
 
     @pytest.mark.skipif(
-        not is_port_open("127.0.0.1", 6379),
-        reason="FalkorDB container not reachable on port 6379",
+        not is_port_open(HOST, 6379),
+        reason=f"FalkorDB container not reachable on {HOST}:6379",
     )
     def test_live_falkordb_vector_lifecycle(self) -> None:
         pytest.importorskip("falkordb")
         from falkordb import FalkorDB
 
-        client = FalkorDB(host="127.0.0.1", port=6379)
+        client = FalkorDB(host=HOST, port=6379)
         g = client.select_graph("voyager_vector_test")
         session = Session(g, dialect="falkordb")
 
@@ -458,14 +461,14 @@ class TestLiveEngineVectorIntegration:
                 pass
 
     @pytest.mark.skipif(
-        not is_port_open("127.0.0.1", 7688),
-        reason="Memgraph container not reachable on port 7688",
+        not is_port_open(HOST, 7688),
+        reason=f"Memgraph container not reachable on {HOST}:7688",
     )
     def test_live_memgraph_vector_lifecycle(self) -> None:
         pytest.importorskip("neo4j")
         from neo4j import GraphDatabase
 
-        uri = os.environ.get("MEMGRAPH_URI", "bolt://127.0.0.1:7688")
+        uri = os.environ.get("MEMGRAPH_URI", f"bolt://{HOST}:7688")
         driver = GraphDatabase.driver(uri, auth=("", ""))
         try:
             session = Session(driver, dialect="memgraph")

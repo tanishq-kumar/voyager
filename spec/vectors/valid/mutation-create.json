@@ -25,7 +25,7 @@
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ CREATE (c:Company) $$) AS (result agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ CREATE (c:Company) $$) AS (\"result\" agtype)",
       "parameters": {}
     },
     "iso_gql": {

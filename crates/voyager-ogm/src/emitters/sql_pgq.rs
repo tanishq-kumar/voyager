@@ -4,7 +4,7 @@ use crate::ast::{
     AggregationFunc, AstNode, BinaryOp, Direction, ExecutionMode, LabelExpression, LiteralValue,
     NodeHandle, ProjectionItem, QueryAstArena, UnaryOp,
 };
-use crate::emitters::DisambiguatedColumn;
+use crate::emitters::{DisambiguatedColumn, quote_sql_ident};
 use crate::error::{Error, Result};
 use crate::visitor::{AstVisitor, ColumnMeta, CompiledQuery};
 use std::collections::HashMap;
@@ -1031,7 +1031,7 @@ impl SqlPgqEmitter {
 
             if let Some(alias) = &disambiguated[i].emitted_alias {
                 self.buffer.push_str(" AS ");
-                self.buffer.push_str(alias);
+                self.buffer.push_str(&quote_sql_ident(alias));
             }
         }
         self.buffer.push(')');
@@ -1252,7 +1252,8 @@ impl AstVisitor for SqlPgqEmitter {
                             // is equivalent. No COLUMNS entry is needed for it.
                             let func_call = "COUNT(*)".to_string();
                             if let Some(alias) = &disambiguated[idx].emitted_alias {
-                                outer_select_items.push(format!("{func_call} AS {alias}"));
+                                outer_select_items
+                                    .push(format!("{func_call} AS {}", quote_sql_ident(alias)));
                             } else {
                                 outer_select_items.push(func_call);
                             }
@@ -1281,25 +1282,27 @@ impl AstVisitor for SqlPgqEmitter {
                             col_alias
                         };
 
+                        let quoted_inner = quote_sql_ident(&inner_col_name);
                         let func_call = match func {
-                            AggregationFunc::Count => format!("COUNT({inner_col_name})"),
+                            AggregationFunc::Count => format!("COUNT({quoted_inner})"),
                             AggregationFunc::CountDistinct => {
-                                format!("COUNT(DISTINCT {inner_col_name})")
+                                format!("COUNT(DISTINCT {quoted_inner})")
                             }
-                            AggregationFunc::Sum => format!("COALESCE(SUM({inner_col_name}), 0)"),
-                            AggregationFunc::Avg => format!("AVG({inner_col_name})"),
-                            AggregationFunc::Min => format!("MIN({inner_col_name})"),
-                            AggregationFunc::Max => format!("MAX({inner_col_name})"),
+                            AggregationFunc::Sum => format!("COALESCE(SUM({quoted_inner}), 0)"),
+                            AggregationFunc::Avg => format!("AVG({quoted_inner})"),
+                            AggregationFunc::Min => format!("MIN({quoted_inner})"),
+                            AggregationFunc::Max => format!("MAX({quoted_inner})"),
                             AggregationFunc::Collect => {
                                 let empty_arr = self.empty_array_literal();
                                 format!(
-                                    "COALESCE(ARRAY_AGG({inner_col_name}) FILTER (WHERE {inner_col_name} IS NOT NULL), {empty_arr})"
+                                    "COALESCE(ARRAY_AGG({quoted_inner}) FILTER (WHERE {quoted_inner} IS NOT NULL), {empty_arr})"
                                 )
                             }
                         };
 
                         if let Some(alias) = &disambiguated[idx].emitted_alias {
-                            outer_select_items.push(format!("{func_call} AS {alias}"));
+                            outer_select_items
+                                .push(format!("{func_call} AS {}", quote_sql_ident(alias)));
                         } else {
                             outer_select_items.push(func_call);
                         }
@@ -1323,9 +1326,13 @@ impl AstVisitor for SqlPgqEmitter {
                         };
 
                         if inner_alias != *target_col_name {
-                            outer_select_items.push(format!("{inner_alias} AS {target_col_name}"));
+                            outer_select_items.push(format!(
+                                "{} AS {}",
+                                quote_sql_ident(&inner_alias),
+                                quote_sql_ident(target_col_name)
+                            ));
                         } else {
-                            outer_select_items.push(inner_alias.clone());
+                            outer_select_items.push(quote_sql_ident(&inner_alias));
                         }
 
                         if !group_by_keys.contains(&inner_alias) {
@@ -1368,7 +1375,7 @@ impl AstVisitor for SqlPgqEmitter {
                     }
                     self.buffer.push_str(expr_sql);
                     self.buffer.push_str(" AS ");
-                    self.buffer.push_str(alias);
+                    self.buffer.push_str(&quote_sql_ident(alias));
                 }
                 self.buffer.push_str("))");
 
@@ -1378,7 +1385,7 @@ impl AstVisitor for SqlPgqEmitter {
                         if i > 0 {
                             self.buffer.push_str(", ");
                         }
-                        self.buffer.push_str(key);
+                        self.buffer.push_str(&quote_sql_ident(key));
                     }
                 }
             } else if !hidden_columns.is_empty() {
@@ -1388,7 +1395,7 @@ impl AstVisitor for SqlPgqEmitter {
                     if i > 0 {
                         self.buffer.push_str(", ");
                     }
-                    self.buffer.push_str(&d.name);
+                    self.buffer.push_str(&quote_sql_ident(&d.name));
                 }
                 self.buffer.push_str(" FROM GRAPH_TABLE (");
                 self.buffer.push_str(&self.graph_name);
@@ -1404,14 +1411,14 @@ impl AstVisitor for SqlPgqEmitter {
                     self.emit_expression(arena, proj.expression, false)?;
                     if let Some(alias) = &disambiguated[i].emitted_alias {
                         self.buffer.push_str(" AS ");
-                        self.buffer.push_str(alias);
+                        self.buffer.push_str(&quote_sql_ident(alias));
                     }
                 }
                 for (expr, alias) in &hidden_columns {
                     self.buffer.push_str(", ");
                     self.emit_expression(arena, *expr, false)?;
                     self.buffer.push_str(" AS ");
-                    self.buffer.push_str(alias);
+                    self.buffer.push_str(&quote_sql_ident(alias));
                 }
                 self.buffer.push_str("))");
             } else {
@@ -1436,7 +1443,7 @@ impl AstVisitor for SqlPgqEmitter {
                     if i > 0 {
                         self.buffer.push_str(", ");
                     }
-                    self.buffer.push_str(col);
+                    self.buffer.push_str(&quote_sql_ident(col));
                     if *is_asc {
                         self.buffer.push_str(" ASC NULLS LAST");
                     } else {
@@ -1564,7 +1571,7 @@ mod tests {
     fn sql_pgq_count_over_whole_entity_rewrites_to_count_star() {
         assert_eq!(
             count_over_whole_entity(AggregationFunc::Count, false).unwrap(),
-            "SELECT COUNT(*) AS cnt FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS _c0))"
+            "SELECT COUNT(*) AS \"cnt\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS \"_c0\"))"
         );
     }
 
@@ -1572,7 +1579,7 @@ mod tests {
     fn sql_pgq_distinct_count_over_whole_entity_rewrites_to_count_star() {
         assert_eq!(
             count_over_whole_entity(AggregationFunc::Count, true).unwrap(),
-            "SELECT DISTINCT COUNT(*) AS cnt FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS _c0))"
+            "SELECT DISTINCT COUNT(*) AS \"cnt\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS \"_c0\"))"
         );
     }
 
@@ -1590,7 +1597,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             compiled.statement,
-            "SELECT COUNT(*) AS cnt FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS _c0))"
+            "SELECT COUNT(*) AS \"cnt\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS \"_c0\"))"
         );
     }
 
@@ -1606,7 +1613,7 @@ mod tests {
         let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
         assert_eq!(
             compiled.statement,
-            "SELECT city, COUNT(*) AS cnt FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city)) GROUP BY city"
+            "SELECT \"city\", COUNT(*) AS \"cnt\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS \"city\")) GROUP BY \"city\""
         );
     }
 
@@ -1673,7 +1680,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS \"Person\") COLUMNS (p.name AS actor))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS \"Person\") COLUMNS (p.name AS \"actor\"))"
         );
     }
 
@@ -1695,7 +1702,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\" | \"HATES\"]-> (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\" | \"HATES\"]-> (b IS \"Person\") COLUMNS (a.name, b.name AS \"name_1\"))"
         );
     }
 
@@ -1938,7 +1945,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name, age FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
+            "SELECT \"name\", \"age\" FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age, p.age + $p0 AS \"_ord_0\")) ORDER BY \"_ord_0\" ASC NULLS LAST"
         );
         assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
     }
@@ -1956,7 +1963,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
+            "SELECT \"name\" FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS \"_ord_0\")) ORDER BY \"_ord_0\" ASC NULLS LAST"
         );
         assert!(compiled.parameters.is_empty());
     }
@@ -1975,7 +1982,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY age ASC NULLS LAST"
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY \"age\" ASC NULLS LAST"
         );
         assert!(compiled.parameters.is_empty());
     }
@@ -1999,7 +2006,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name, city FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) ORDER BY _ord_0 ASC NULLS LAST, city DESC NULLS FIRST, _ord_1 ASC NULLS LAST"
+            "SELECT \"name\", \"city\" FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.city, p.age AS \"_ord_0\", p.age + $p0 AS \"_ord_1\")) ORDER BY \"_ord_0\" ASC NULLS LAST, \"city\" DESC NULLS FIRST, \"_ord_1\" ASC NULLS LAST"
         );
         assert_eq!(compiled.parameters.get("p0"), Some(&LiteralValue::Int64(1)));
     }
@@ -2018,7 +2025,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST, _ord_0 DESC NULLS FIRST"
+            "SELECT \"name\" FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age AS \"_ord_0\")) ORDER BY \"_ord_0\" ASC NULLS LAST, \"_ord_0\" DESC NULLS FIRST"
         );
     }
 
@@ -2035,7 +2042,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name ASC NULLS LAST"
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY \"name\" ASC NULLS LAST"
         );
     }
 
@@ -2052,7 +2059,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY name DESC NULLS FIRST"
+            "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name)) ORDER BY \"name\" DESC NULLS FIRST"
         );
     }
 
@@ -2114,7 +2121,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT COALESCE(SUM(age), 0) AS total_age FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.age AS age))"
+            "SELECT COALESCE(SUM(\"age\"), 0) AS \"total_age\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.age AS \"age\"))"
         );
     }
 
@@ -2130,7 +2137,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), '{}') AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city))"
+            "SELECT COALESCE(ARRAY_AGG(\"city\") FILTER (WHERE \"city\" IS NOT NULL), '{}') AS \"cities\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS \"city\"))"
         );
     }
 
@@ -2147,7 +2154,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT DISTINCT COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), '{}') AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city))"
+            "SELECT DISTINCT COALESCE(ARRAY_AGG(\"city\") FILTER (WHERE \"city\" IS NOT NULL), '{}') AS \"cities\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS \"city\"))"
         );
     }
 
@@ -2165,7 +2172,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT country, COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), '{}') AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.country AS country, n.age AS age, n.city AS city)) GROUP BY country"
+            "SELECT \"country\", COALESCE(SUM(\"age\"), 0) AS \"total_age\", COALESCE(ARRAY_AGG(\"city\") FILTER (WHERE \"city\" IS NOT NULL), '{}') AS \"cities\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.country AS \"country\", n.age AS \"age\", n.city AS \"city\")) GROUP BY \"country\""
         );
     }
 
@@ -2184,7 +2191,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(age) FILTER (WHERE age IS NOT NULL), '{}') AS ages FROM GRAPH_TABLE (g MATCH (n IS \"Person\") WHERE $p0 COLUMNS (n.age AS age))"
+            "SELECT COALESCE(SUM(\"age\"), 0) AS \"total_age\", COALESCE(ARRAY_AGG(\"age\") FILTER (WHERE \"age\" IS NOT NULL), '{}') AS \"ages\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") WHERE $p0 COLUMNS (n.age AS \"age\"))"
         );
     }
 
@@ -2203,7 +2210,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT COALESCE(SUM(age), 0) AS total_age FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.age AS age))"
+            "SELECT COALESCE(SUM(\"age\"), 0) AS \"total_age\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.age AS \"age\"))"
         );
     }
 
@@ -2222,7 +2229,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city))"
+            "SELECT COALESCE(ARRAY_AGG(\"city\") FILTER (WHERE \"city\" IS NOT NULL), []) AS \"cities\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS \"city\"))"
         );
     }
 
@@ -2242,7 +2249,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT DISTINCT COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS city))"
+            "SELECT DISTINCT COALESCE(ARRAY_AGG(\"city\") FILTER (WHERE \"city\" IS NOT NULL), []) AS \"cities\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS \"city\"))"
         );
     }
 
@@ -2263,7 +2270,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT country, COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(city) FILTER (WHERE city IS NOT NULL), []) AS cities FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.country AS country, n.age AS age, n.city AS city)) GROUP BY country"
+            "SELECT \"country\", COALESCE(SUM(\"age\"), 0) AS \"total_age\", COALESCE(ARRAY_AGG(\"city\") FILTER (WHERE \"city\" IS NOT NULL), []) AS \"cities\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.country AS \"country\", n.age AS \"age\", n.city AS \"city\")) GROUP BY \"country\""
         );
     }
 
@@ -2285,7 +2292,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT COALESCE(SUM(age), 0) AS total_age, COALESCE(ARRAY_AGG(age) FILTER (WHERE age IS NOT NULL), []) AS ages FROM GRAPH_TABLE (g MATCH (n IS \"Person\") WHERE $p0 COLUMNS (n.age AS age))"
+            "SELECT COALESCE(SUM(\"age\"), 0) AS \"total_age\", COALESCE(ARRAY_AGG(\"age\") FILTER (WHERE \"age\" IS NOT NULL), []) AS \"ages\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") WHERE $p0 COLUMNS (n.age AS \"age\"))"
         );
     }
 
@@ -2307,7 +2314,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, c.name AS name_1))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, c.name AS \"name_1\"))"
         );
     }
 
@@ -2332,7 +2339,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") -[r2 IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, b.name AS name_1, c.name AS name_2))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\") -[r2 IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, b.name AS \"name_1\", c.name AS \"name_2\"))"
         );
     }
 
@@ -2354,7 +2361,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name AS name, c.name AS name_1))"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name AS \"name\", c.name AS \"name_1\"))"
         );
     }
 
@@ -2375,7 +2382,7 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT name, name_1, COUNT(age) AS cnt FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (b IS \"Person\") COLUMNS (a.name AS name, b.name AS name_1, b.age AS age)) GROUP BY name, name_1"
+            "SELECT \"name\", \"name_1\", COUNT(\"age\") AS \"cnt\" FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (b IS \"Person\") COLUMNS (a.name AS \"name\", b.name AS \"name_1\", b.age AS \"age\")) GROUP BY \"name\", \"name_1\""
         );
     }
 
@@ -2421,7 +2428,106 @@ mod tests {
 
         assert_eq!(
             compiled.statement,
-            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, c.name AS name_1)) ORDER BY name_1 DESC NULLS FIRST"
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (c IS \"Person\") COLUMNS (a.name, c.name AS \"name_1\")) ORDER BY \"name_1\" DESC NULLS FIRST"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_quotes_mixed_case_alias() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("p"), vec!["Person"])
+            .r#return()
+            .field("p", "name", Some("ColumnName"));
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS \"Person\") COLUMNS (p.name AS \"ColumnName\"))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_quotes_reserved_word_alias() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .r#match()
+            .node(Some("p"), vec!["Person"])
+            .r#return()
+            .field("p", "name", Some("select"))
+            .field("p", "age", Some("order"));
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS \"Person\") COLUMNS (p.name AS \"select\", p.age AS \"order\"))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_emit_columns_escapes_embedded_double_quote() {
+        let mut arena = QueryAstArena::new();
+        let expr = arena.alloc(AstNode::Identifier("p".to_string()));
+        let projections = vec![ProjectionItem {
+            expression: expr,
+            alias: Some("quoted\"alias".to_string()),
+            aggregation: None,
+        }];
+        let disambiguated = vec![DisambiguatedColumn {
+            name: "quoted\"alias".to_string(),
+            emitted_alias: Some("quoted\"alias".to_string()),
+        }];
+
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        emitter
+            .emit_columns(&arena, &projections, &disambiguated)
+            .unwrap();
+
+        assert_eq!(emitter.buffer, " COLUMNS (p AS \"quoted\"\"alias\")");
+    }
+
+    #[test]
+    fn sql_pgq_order_by_alias_keeps_alias_case() {
+        let mut builder = QueryBuilder::new();
+        let name = builder.prop("p", "name");
+        builder
+            .r#match()
+            .node(Some("p"), vec!["Person"])
+            .r#return()
+            .field("p", "name", Some("ColumnName"))
+            .order_by(name, true);
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT * FROM GRAPH_TABLE (test_graph MATCH (p IS \"Person\") COLUMNS (p.name AS \"ColumnName\")) ORDER BY \"ColumnName\" ASC NULLS LAST"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_quotes_aggregate_alias() {
+        let mut builder = QueryBuilder::new();
+        builder
+            .match_node(Some("p"), vec!["Person"])
+            .select_property_aggregate("p", "age", AggregationFunc::Sum, Some("TotalAge"));
+
+        let (arena, root) = builder.build();
+        let mut emitter = SqlPgqEmitter::new("test_graph");
+        let compiled = emitter.visit_query(&arena, root).unwrap();
+
+        assert_eq!(
+            compiled.statement,
+            "SELECT COALESCE(SUM(\"age\"), 0) AS \"TotalAge\" FROM GRAPH_TABLE (test_graph MATCH (p IS \"Person\") COLUMNS (p.age AS \"age\"))"
         );
     }
 }

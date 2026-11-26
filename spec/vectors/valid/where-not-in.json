@@ -53,7 +53,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE NOT (p.name IN $p0) RETURN p.name $$, %s) AS (name agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WHERE NOT (p.name IN $p0) RETURN p.name $$, %s) AS (\"name\" agtype)",
       "parameters": {
         "p0": [
           "Mallory",

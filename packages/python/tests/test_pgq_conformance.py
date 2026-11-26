@@ -147,7 +147,8 @@ def test_pgq_multi_hop_chain_traversal():
     )
     assert "WHERE a.name = $p0" in compiled.statement
     assert (
-        "COLUMNS (a.name AS person, b.name AS colleague, c.name AS company)" in compiled.statement
+        'COLUMNS (a.name AS "person", b.name AS "colleague", c.name AS "company")'
+        in compiled.statement
     )
 
 
@@ -178,9 +179,9 @@ def test_pgq_scalar_function_mappings():
         split_city=fn.split(p.city, "-"),
     )
     compiled = q.compile("sql_pgq", graph_name="g")
-    assert "LOWER(p.name) AS lower_name" in compiled.statement
-    assert "UPPER(p.city) AS upper_city" in compiled.statement
-    assert "STRING_SPLIT(p.city, $p0) AS split_city" in compiled.statement
+    assert 'LOWER(p.name) AS "lower_name"' in compiled.statement
+    assert 'UPPER(p.city) AS "upper_city"' in compiled.statement
+    assert 'STRING_SPLIT(p.city, $p0) AS "split_city"' in compiled.statement
 
 
 def test_pgq_undirected_and_incoming_traversal():
@@ -222,27 +223,27 @@ def test_pgq_aggregations_and_projections():
     )
     compiled = q.compile("sql_pgq", graph_name="g")
 
-    assert "SELECT city, COUNT(name) AS total_count" in compiled.statement
-    assert "AVG(age) AS avg_age" in compiled.statement
-    assert "COALESCE(SUM(age), 0) AS total_age" in compiled.statement
-    assert "MIN(age) AS min_age" in compiled.statement
-    assert "MAX(age) AS max_age" in compiled.statement
+    assert 'SELECT "city", COUNT("name") AS "total_count"' in compiled.statement
+    assert 'AVG("age") AS "avg_age"' in compiled.statement
+    assert 'COALESCE(SUM("age"), 0) AS "total_age"' in compiled.statement
+    assert 'MIN("age") AS "min_age"' in compiled.statement
+    assert 'MAX("age") AS "max_age"' in compiled.statement
     assert (
-        "COALESCE(ARRAY_AGG(name) FILTER (WHERE name IS NOT NULL), '{}') AS all_names"
+        'COALESCE(ARRAY_AGG("name") FILTER (WHERE "name" IS NOT NULL), \'{}\') AS "all_names"'
         in compiled.statement
     )
     assert 'FROM GRAPH_TABLE (g MATCH (p IS "Person")' in compiled.statement
-    assert "COLUMNS (p.city AS city, p.name AS name, p.age AS age))" in compiled.statement
-    assert "GROUP BY city" in compiled.statement
-    assert "ORDER BY city ASC NULLS LAST LIMIT 10 OFFSET 5" in compiled.statement
+    assert 'COLUMNS (p.city AS "city", p.name AS "name", p.age AS "age"))' in compiled.statement
+    assert 'GROUP BY "city"' in compiled.statement
+    assert 'ORDER BY "city" ASC NULLS LAST LIMIT 10 OFFSET 5' in compiled.statement
 
     # DuckPGQ flavor emits empty list [] instead of PostgreSQL array literal '{}'
     compiled_duck = q.compile("duckpgq", graph_name="g")
     assert (
-        "COALESCE(ARRAY_AGG(name) FILTER (WHERE name IS NOT NULL), []) AS all_names"
+        'COALESCE(ARRAY_AGG("name") FILTER (WHERE "name" IS NOT NULL), []) AS "all_names"'
         in compiled_duck.statement
     )
-    assert "COALESCE(SUM(age), 0) AS total_age" in compiled_duck.statement
+    assert 'COALESCE(SUM("age"), 0) AS "total_age"' in compiled_duck.statement
 
 
 # ---------------------------------------------------------------------------

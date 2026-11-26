@@ -7,11 +7,11 @@ on FalkorDB native backend and compares results with the bridge backend.
 
 from __future__ import annotations
 
-import os
 import socket
 import uuid
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import Field, Node, Relationship, RelationshipTo, Session
 from voyager_ogm.ingestion import BulkIngestionPlan
 
@@ -27,7 +27,7 @@ except ImportError:
 else:
     BATCH_ERRORS = (*BATCH_ERRORS, RedisError)
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 BACKENDS = ["native", "bridge"]
 
 

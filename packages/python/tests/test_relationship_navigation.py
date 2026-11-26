@@ -6,11 +6,11 @@ identity map, sync and async sessions, and live Neo4j/Memgraph execution.
 
 from __future__ import annotations
 
-import os
 import socket
 from typing import Any, cast
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     AsyncSession,
     Field,
@@ -35,7 +35,7 @@ from voyager_ogm.models import (
 )
 from voyager_ogm.relationships import register_model_class
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 
 
 class RecordingMockBridge(MockBridge):
@@ -431,9 +431,9 @@ def test_navigation_projects_scalar_columns_for_sql_pgq_dialects(dialect: str) -
     assert "GRAPH_TABLE" in statement
     assert "COLUMNS (" in statement
     assert "._feat121person_" not in statement
-    assert "AS id" in statement
-    assert "AS name" in statement
-    assert "AS age" in statement
+    assert 'AS "id"' in statement
+    assert 'AS "name"' in statement
+    assert 'AS "age"' in statement
 
 
 def test_export_schema_lists_relationship_attributes_without_changing_keys() -> None:

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import os
-import socket
 from typing import Any
 
 import pytest
+from conftest import get_test_host, is_port_open
 from voyager_ogm import (
     CompiledQuery,
     MockBridge,
@@ -40,7 +39,7 @@ def _with_pagination(**pagination: Any) -> dict[str, Any]:
         (
             "age",
             "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN p.name "
-            "SKIP $s LIMIT $l $$, %s) AS (name agtype)",
+            'SKIP $s LIMIT $l $$, %s) AS ("name" agtype)',
         ),
         ("iso_gql", "MATCH (p:Person) RETURN p.name OFFSET $s LIMIT $l"),
         (
@@ -166,7 +165,7 @@ def test_fluent_pagination_parameters_compile_in_every_dialect() -> None:
 
     assert query.compile("cypher").statement.endswith("SKIP $s LIMIT $l")
     assert query.compile("iso_gql").statement.endswith("OFFSET $s LIMIT $l")
-    assert query.compile("age").statement.endswith("SKIP $s LIMIT $l $$, %s) AS (name agtype)")
+    assert query.compile("age").statement.endswith('SKIP $s LIMIT $l $$, %s) AS ("name" agtype)')
     assert query.compile("sql_pgq").statement.endswith("LIMIT $l OFFSET $s")
     assert query.compile("duckpgq").statement.endswith("LIMIT $l OFFSET $s")
 
@@ -202,15 +201,11 @@ def test_bound_pagination_value_validation_through_session() -> None:
 # Live execution
 # ---------------------------------------------------------------------------
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 
 
 def _port_open(port: int) -> bool:
-    try:
-        with socket.create_connection((HOST, port), timeout=2):
-            return True
-    except OSError:
-        return False
+    return is_port_open(HOST, port, timeout=2.0)
 
 
 def _unwind_spec() -> dict[str, Any]:
@@ -327,7 +322,7 @@ def test_live_apache_age_pagination_parameters() -> None:
                 cur.execute("SELECT ag_catalog.create_graph(%s)", (graph_name,))
         bridge = PostgresBridge(conn, graph_name=graph_name)
         compiled = compile_query_from_spec(_unwind_spec(), "age", graph_name=graph_name)
-        _assert_unwind_rows(compiled, bridge, [{"x": "2"}, {"x": "3"}])
+        _assert_unwind_rows(compiled, bridge)
         with pytest.raises(ValueError, match="Pagination parameter"):
             bridge.execute(compiled["statement"], {**UNWIND_PARAMS, "s": 1.5})
     finally:

@@ -16,6 +16,7 @@ Ingests and validates official Apache AGE regression scenarios:
 from __future__ import annotations
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     Field,
     Node,
@@ -109,7 +110,7 @@ def test_age_operator_transpilations(expr_builder, expected_fragment, expected_p
     compiled = q.compile("apache_age", graph_name="age_graph")
 
     assert f"MATCH (p:Person) WHERE {expected_fragment} RETURN p.name" in compiled.statement
-    assert "AS (name agtype)" in compiled.statement
+    assert 'AS ("name" agtype)' in compiled.statement
     assert compiled.parameters == expected_params
 
 
@@ -141,7 +142,7 @@ def test_age_multi_hop_traversal_chain():
         "RETURN a.name AS person, b.name AS colleague, c.name AS company"
     )
     assert (
-        f"SELECT * FROM cypher('corp_graph', $$ {expected_cypher} $$, %s) AS (person agtype, colleague agtype, company agtype)"
+        f'SELECT * FROM cypher(\'corp_graph\', $$ {expected_cypher} $$, %s) AS ("person" agtype, "colleague" agtype, "company" agtype)'
         == compiled.statement
     )
     assert compiled.parameters == {"p0": "Alice"}
@@ -164,7 +165,7 @@ def test_age_variable_length_paths(min_hops, max_hops, expected_var_hops):
     compiled = q.compile("apache_age", graph_name="age_graph")
 
     assert expected_var_hops in compiled.statement
-    assert "AS (name agtype)" in compiled.statement
+    assert 'AS ("name" agtype)' in compiled.statement
 
 
 def test_age_undirected_and_incoming_traversals():
@@ -179,7 +180,7 @@ def test_age_undirected_and_incoming_traversals():
     q_inc = Query.match(c).from_(WorksAt, "r").node(a).return_(c.name, a.name)
     c_inc = q_inc.compile("apache_age", graph_name="age_graph")
     assert "MATCH (c:Company)<-[r:WORKS_AT]-(a:Person) RETURN c.name, a.name" in c_inc.statement
-    assert "AS (name agtype, name_1 agtype)" in c_inc.statement
+    assert 'AS ("name" agtype, "name_1" agtype)' in c_inc.statement
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +213,7 @@ def test_age_aggregations_and_grouping():
     assert "MAX(p.age) AS max_age" in compiled.statement
     assert "COLLECT(p.name) AS all_names" in compiled.statement
     assert (
-        "AS (city agtype, total_count agtype, avg_age agtype, total_age agtype, min_age agtype, max_age agtype, all_names agtype)"
+        'AS ("city" agtype, "total_count" agtype, "avg_age" agtype, "total_age" agtype, "min_age" agtype, "max_age" agtype, "all_names" agtype)'
         in compiled.statement
     )
 
@@ -231,7 +232,7 @@ def test_age_dml_mutations():
     c_create = q_create.compile("apache_age", graph_name="age_graph")
     assert (
         c_create.statement
-        == "SELECT * FROM cypher('age_graph', $$ CREATE (p:Person) $$) AS (result agtype)"
+        == "SELECT * FROM cypher('age_graph', $$ CREATE (p:Person) $$) AS (\"result\" agtype)"
     )
 
     # MERGE (Upsert)
@@ -251,7 +252,7 @@ def test_age_dml_mutations():
         "MATCH (p:Person) WHERE p.name = $p0 SET p.age = $p1, p.city = $p2 RETURN p.name"
         in c_set.statement
     )
-    assert "AS (name agtype)" in c_set.statement
+    assert 'AS ("name" agtype)' in c_set.statement
     assert c_set.parameters == {"p0": "Dan", "p1": 45, "p2": "Oxford"}
 
     # REMOVE property
@@ -274,16 +275,17 @@ def test_age_dml_mutations():
 @pytest.mark.live
 def test_live_apache_age_database_execution():
     """Verifies live query execution against running Apache AGE instance if available."""
+    host = get_test_host()
     try:
         import psycopg
 
         con = psycopg.connect(
-            "host=127.0.0.1 port=5455 user=postgres password=voyagerpass123 dbname=voyager_graph",
+            f"host={host} port=5455 user=postgres password=voyagerpass123 dbname=voyager_graph",
             autocommit=True,
             connect_timeout=1,
         )
     except Exception:
-        pytest.skip("Apache AGE container not reachable on port 5455")
+        pytest.skip(f"Apache AGE container not reachable on {host}:5455")
 
     with con.cursor() as cur:
         cur.execute("LOAD 'age';")

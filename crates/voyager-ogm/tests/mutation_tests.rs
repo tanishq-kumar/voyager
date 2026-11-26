@@ -416,7 +416,7 @@ fn test_create_relationship_between_matched_nodes_all_dialects() {
     let res_age = age.visit_query(&arena, root).unwrap();
     assert_eq!(
         res_age.statement,
-        "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person) WHERE a.id = $p0 MATCH (b:Person) WHERE b.id = $p1 CREATE (a)-[:KNOWS {since: $p2}]->(b) $$, %s) AS (result agtype)"
+        "SELECT * FROM cypher('test_graph', $$ MATCH (a:Person) WHERE a.id = $p0 MATCH (b:Person) WHERE b.id = $p1 CREATE (a)-[:KNOWS {since: $p2}]->(b) $$, %s) AS (\"result\" agtype)"
     );
     assert_eq!(
         res_age.parameters.get("p2"),

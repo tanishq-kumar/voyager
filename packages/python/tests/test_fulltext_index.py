@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from conftest import is_port_open
+from conftest import get_test_host, is_port_open
 from voyager_ogm import (
     Field,
     FullTextIndex,
@@ -575,19 +575,22 @@ class TestSessionFullTextLifecycle:
         assert res_alias is not None
 
 
+HOST = get_test_host()
+
+
 @pytest.mark.live
 class TestLiveEngineFullTextIntegration:
     """Integration tests against live Neo4j, FalkorDB, and Memgraph instances when reachable."""
 
     @pytest.mark.skipif(
-        not is_port_open("127.0.0.1", 7687),
-        reason="Neo4j container not reachable on port 7687",
+        not is_port_open(HOST, 7687),
+        reason=f"Neo4j container not reachable on {HOST}:7687",
     )
     def test_live_neo4j_rich_multi_doc_and_relationship(self) -> None:
         pytest.importorskip("neo4j")
         from neo4j import GraphDatabase
 
-        neo4j_uri = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
+        neo4j_uri = os.environ.get("NEO4J_URI", f"bolt://{HOST}:7687")
         neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
         neo4j_pass = os.environ.get("NEO4J_PASSWORD", "voyagerpass123")
 
@@ -665,14 +668,14 @@ class TestLiveEngineFullTextIntegration:
             driver.close()
 
     @pytest.mark.skipif(
-        not is_port_open("127.0.0.1", 7688),
-        reason="Memgraph container not reachable on port 7688",
+        not is_port_open(HOST, 7688),
+        reason=f"Memgraph container not reachable on {HOST}:7688",
     )
     def test_live_memgraph_rich_multi_doc_and_relationship(self) -> None:
         pytest.importorskip("neo4j")
         from neo4j import GraphDatabase
 
-        uri = os.environ.get("MEMGRAPH_URI", "bolt://127.0.0.1:7688")
+        uri = os.environ.get("MEMGRAPH_URI", f"bolt://{HOST}:7688")
         driver = GraphDatabase.driver(uri, auth=("", ""))
         try:
             session = Session(driver, dialect="memgraph")
@@ -759,14 +762,14 @@ class TestLiveEngineFullTextIntegration:
             driver.close()
 
     @pytest.mark.skipif(
-        not is_port_open("127.0.0.1", 6379),
-        reason="FalkorDB container not reachable on port 6379",
+        not is_port_open(HOST, 6379),
+        reason=f"FalkorDB container not reachable on {HOST}:6379",
     )
     def test_live_falkordb_rich_multi_doc(self) -> None:
         pytest.importorskip("falkordb")
         from falkordb import FalkorDB
 
-        client = FalkorDB(host="127.0.0.1", port=6379)
+        client = FalkorDB(host=HOST, port=6379)
         g = client.select_graph("voyager_ft_rich_test")
         session = Session(g, dialect="falkordb")
 
@@ -816,14 +819,14 @@ class TestLiveEngineFullTextIntegration:
 
     @pytest.mark.live
     @pytest.mark.skipif(
-        not is_port_open("127.0.0.1", 6379),
-        reason="FalkorDB container not reachable on port 6379",
+        not is_port_open(HOST, 6379),
+        reason=f"FalkorDB container not reachable on {HOST}:6379",
     )
     def test_live_falkordb_lifecycle(self) -> None:
         pytest.importorskip("falkordb")
         from falkordb import FalkorDB
 
-        client = FalkorDB(host="127.0.0.1", port=6379)
+        client = FalkorDB(host=HOST, port=6379)
         g = client.select_graph("voyager_ft_lifecycle_test")
         session = Session(g, dialect="falkordb")
 

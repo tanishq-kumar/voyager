@@ -9,10 +9,10 @@ order by that alias, and select only the returned columns in the outer query.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from conftest import is_port_open as _is_port_open
 from voyager_ogm import (
     Field,
@@ -43,7 +43,7 @@ try:
 except ImportError:
     pass
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 POSTGRES19_URI = f"postgresql://postgres:voyagerpass123@{HOST}:5456/voyager_graph"
 NEO4J_URI = f"bolt://{HOST}:7687"
 GRAPH = "fix319_320_graph"
@@ -99,8 +99,8 @@ def test_order_by_expression_compiles_inside_columns(dialect: str) -> None:
         Query.match(p).return_(p.name, p.age).order_by(p.age + 1).compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f'SELECT name, age FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
-        "COLUMNS (p.name, p.age, p.age + $p0 AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
+        f'SELECT "name", "age" FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
+        'COLUMNS (p.name, p.age, p.age + $p0 AS "_ord_0")) ORDER BY "_ord_0" ASC NULLS LAST'
     )
     assert compiled.statement == expected
     assert compiled.parameters == {"p0": 1}
@@ -111,8 +111,8 @@ def test_order_by_non_returned_property_compiles_inside_columns(dialect: str) ->
     p = Person(alias="p")
     compiled = Query.match(p).return_(p.name).order_by(p.age).compile(dialect, graph_name=GRAPH)
     expected = (
-        f'SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
-        "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST"
+        f'SELECT "name" FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
+        'COLUMNS (p.name, p.age AS "_ord_0")) ORDER BY "_ord_0" ASC NULLS LAST'
     )
     assert compiled.statement == expected
     assert compiled.parameters == {}
@@ -126,7 +126,7 @@ def test_order_by_returned_property_stays_select_star(dialect: str) -> None:
     )
     expected = (
         f'SELECT * FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
-        "COLUMNS (p.name, p.age)) ORDER BY age ASC NULLS LAST"
+        'COLUMNS (p.name, p.age)) ORDER BY "age" ASC NULLS LAST'
     )
     assert compiled.statement == expected
     assert compiled.parameters == {}
@@ -144,9 +144,9 @@ def test_order_by_multiple_mixed_keys_compiles(dialect: str) -> None:
         .compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f'SELECT name, city FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
-        "COLUMNS (p.name, p.city, p.age AS _ord_0, p.age + $p0 AS _ord_1)) "
-        "ORDER BY _ord_0 ASC NULLS LAST, city DESC NULLS FIRST, _ord_1 ASC NULLS LAST"
+        f'SELECT "name", "city" FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
+        'COLUMNS (p.name, p.city, p.age AS "_ord_0", p.age + $p0 AS "_ord_1")) '
+        'ORDER BY "_ord_0" ASC NULLS LAST, "city" DESC NULLS FIRST, "_ord_1" ASC NULLS LAST'
     )
     assert compiled.statement == expected
     assert compiled.parameters == {"p0": 1}
@@ -163,8 +163,8 @@ def test_order_by_duplicate_key_reuses_alias(dialect: str) -> None:
         .compile(dialect, graph_name=GRAPH)
     )
     expected = (
-        f'SELECT name FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
-        "COLUMNS (p.name, p.age AS _ord_0)) ORDER BY _ord_0 ASC NULLS LAST, _ord_0 DESC NULLS FIRST"
+        f'SELECT "name" FROM GRAPH_TABLE ({GRAPH} MATCH (p IS "{LABEL}") '
+        'COLUMNS (p.name, p.age AS "_ord_0")) ORDER BY "_ord_0" ASC NULLS LAST, "_ord_0" DESC NULLS FIRST'
     )
     assert compiled.statement == expected
 

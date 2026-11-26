@@ -39,7 +39,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ LOAD CSV WITH HEADERS FROM $p0 AS row MATCH (row:Person) RETURN row.name $$, %s) AS (name agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ LOAD CSV WITH HEADERS FROM $p0 AS row MATCH (row:Person) RETURN row.name $$, %s) AS (\"name\" agtype)",
       "parameters": {
         "p0": "https://example.com/nodes.csv"
       }

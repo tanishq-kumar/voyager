@@ -72,7 +72,7 @@
       }
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN ((p.age + $p0) > $p1) AND (p.name = $p2) AS flag $$, %s) AS (flag agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) RETURN ((p.age + $p0) > $p1) AND (p.name = $p2) AS flag $$, %s) AS (\"flag\" agtype)",
       "parameters": {
         "p1": 18,
         "p0": 1,
@@ -88,7 +88,7 @@
       }
     },
     "sql_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (((p.age + $p0) > $p1) AND (p.name = $p2) AS flag))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (((p.age + $p0) > $p1) AND (p.name = $p2) AS \"flag\"))",
       "parameters": {
         "p0": 1,
         "p1": 18,
@@ -96,7 +96,7 @@
       }
     },
     "duck_pgq": {
-      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (((p.age + $p0) > $p1) AND (p.name = $p2) AS flag))",
+      "statement": "SELECT * FROM GRAPH_TABLE (graph_table MATCH (p IS \"Person\") COLUMNS (((p.age + $p0) > $p1) AND (p.name = $p2) AS \"flag\"))",
       "parameters": {
         "p0": 1,
         "p2": "Alice",

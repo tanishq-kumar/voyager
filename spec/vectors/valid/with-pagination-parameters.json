@@ -62,7 +62,7 @@
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH p.name AS n SKIP $ws LIMIT $wl RETURN n SKIP $s LIMIT $l $$, %s) AS (n agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person) WITH p.name AS n SKIP $ws LIMIT $wl RETURN n SKIP $s LIMIT $l $$, %s) AS (\"n\" agtype)",
       "parameters": {}
     },
     "iso_gql": {

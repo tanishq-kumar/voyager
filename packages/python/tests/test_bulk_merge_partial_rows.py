@@ -7,11 +7,12 @@ an omitted field became a null parameter and deleted the stored property.
 
 from __future__ import annotations
 
-import socket
 from typing import Any
 
 import polars as pl
 import pytest
+from conftest import get_test_host
+from conftest import is_port_open as _port_open
 from voyager_ogm import (
     Field,
     MockBridge,
@@ -246,14 +247,6 @@ def test_partial_defaulted_and_full_groups_use_age_graph_name() -> None:
         assert f"_bulknullgroupedacct_0.{prop} = row.{prop}" in full_match
 
 
-def _port_open(host: str, port: int) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except OSError:
-        return False
-
-
 def _fetch(session: Session) -> dict[str, Any]:
     rows = session.execute(
         "MATCH (a:BulkNullAcctLive205) RETURN a.acc_no AS acc_no, a.name AS name, a.email AS email"
@@ -311,13 +304,16 @@ def _exercise_partial_merge(uri: str, dialect: str) -> None:
         session.close()
 
 
+HOST = get_test_host()
+
+
 @pytest.mark.live
-@pytest.mark.skipif(not _port_open("127.0.0.1", 6379), reason="FalkorDB is not running")
+@pytest.mark.skipif(not _port_open(HOST, 6379), reason="FalkorDB is not running")
 def test_live_falkordb_partial_bulk_merge_and_flush() -> None:
-    _exercise_partial_merge("falkordb://127.0.0.1:6379", "falkordb")
+    _exercise_partial_merge(f"falkordb://{HOST}:6379", "falkordb")
 
 
 @pytest.mark.live
-@pytest.mark.skipif(not _port_open("127.0.0.1", 7688), reason="Memgraph is not running")
+@pytest.mark.skipif(not _port_open(HOST, 7688), reason="Memgraph is not running")
 def test_live_memgraph_partial_bulk_merge_and_flush() -> None:
-    _exercise_partial_merge("bolt://127.0.0.1:7688", "cypher")
+    _exercise_partial_merge(f"bolt://{HOST}:7688", "cypher")

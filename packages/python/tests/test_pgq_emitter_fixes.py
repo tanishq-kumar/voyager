@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from conftest import is_port_open as _is_port_open
 from voyager_ogm import (
     Field,
@@ -375,7 +376,7 @@ def test_sql_pgq_accepts_alternative_relationship_types() -> None:
     compiled = query.compile("sql_pgq", graph_name="g")
     assert (
         compiled.statement
-        == 'SELECT * FROM GRAPH_TABLE (g MATCH (a IS "Person") -[r IS "KNOWS" | "HATES"]-> (b IS "Person") COLUMNS (a.name, b.name AS name_1))'
+        == 'SELECT * FROM GRAPH_TABLE (g MATCH (a IS "Person") -[r IS "KNOWS" | "HATES"]-> (b IS "Person") COLUMNS (a.name, b.name AS "name_1"))'
     )
 
 
@@ -467,11 +468,12 @@ def test_live_postgres19_supported_forms() -> None:
     """Verifies live PostgreSQL 19 Beta 3 execution with supported single-label, label disjunction, and alternative edge types."""
     if psycopg is None:
         pytest.skip("psycopg is not installed in this environment")
-    if not _is_port_open("127.0.0.1", 5456):
-        pytest.skip("PostgreSQL 19 Beta container not available on port 5456")
+    host = get_test_host()
+    if not _is_port_open(host, 5456):
+        pytest.skip(f"PostgreSQL 19 Beta container not available on {host}:5456")
 
     conn_str = (
-        "host=127.0.0.1 port=5456 user=postgres password=voyagerpass123 "
+        f"host={host} port=5456 user=postgres password=voyagerpass123 "
         "dbname=voyager_graph connect_timeout=3"
     )
 
@@ -521,7 +523,7 @@ def test_live_postgres19_supported_forms() -> None:
                 compiled_edge = query_edge.compile("sql_pgq", graph_name="live_pg19_fix_286_graph")
 
                 assert '-[r IS "KNOWS" | "HATES"]->' in compiled_edge.statement
-                assert "COLUMNS (a.name AS src, b.name AS dst)" in compiled_edge.statement
+                assert 'COLUMNS (a.name AS "src", b.name AS "dst")' in compiled_edge.statement
 
                 cur.execute(f"{compiled_edge.statement} ORDER BY src, dst")
                 rows = cur.fetchall()
@@ -531,7 +533,7 @@ def test_live_postgres19_supported_forms() -> None:
                 query_disj = Query.match_node("n", labels="Person | Company").return_(val="n.name")
                 compiled_disj = query_disj.compile("sql_pgq", graph_name="live_pg19_fix_286_graph")
                 assert '(n IS "Person" | "Company")' in compiled_disj.statement
-                assert "COLUMNS (n.name AS val)" in compiled_disj.statement
+                assert 'COLUMNS (n.name AS "val")' in compiled_disj.statement
 
                 cur.execute(f"{compiled_disj.statement} ORDER BY val")
                 disj_rows = cur.fetchall()

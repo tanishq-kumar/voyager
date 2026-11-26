@@ -60,7 +60,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
-from conftest import community_compatible_ddl, neo4j_edition
+from conftest import community_compatible_ddl, get_test_host, neo4j_edition
 from conftest import is_port_open as _is_port_open
 from neo4j import GraphDatabase
 from voyager_ogm import (
@@ -104,6 +104,8 @@ def _load_env_file() -> None:
 _load_env_file()
 
 pytestmark = pytest.mark.live
+
+HOST = get_test_host()
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +171,9 @@ class WorksAt(Relationship):
 class TestNeo4jLiveMatrix:
     @pytest.fixture
     def neo4j_driver(self):
-        if not _is_port_open("127.0.0.1", 7687):
-            pytest.skip("Neo4j container not available on port 7687")
-        uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+        if not _is_port_open(HOST, 7687):
+            pytest.skip(f"Neo4j container not available on {HOST}:7687")
+        uri = os.getenv("NEO4J_URI", f"bolt://{HOST}:7687")
         user = os.getenv("NEO4J_USER", "neo4j")
         password = os.getenv("NEO4J_PASSWORD", "voyagerpass123")
         auth = (user, password)
@@ -181,7 +183,7 @@ class TestNeo4jLiveMatrix:
             from voyager_ogm import NativeClient
 
             parsed = urlparse(uri)
-            netloc = parsed.netloc or "127.0.0.1:7687"
+            netloc = parsed.netloc or f"{HOST}:7687"
             c = NativeClient(
                 f"bolt://{auth[0]}:{auth[1]}@{netloc}?connect_timeout=2",
                 min_idle=1,
@@ -560,9 +562,9 @@ class TestNeo4jLiveMatrix:
 class TestMemgraphLiveMatrix:
     @pytest.fixture
     def memgraph_driver(self):
-        if not _is_port_open("127.0.0.1", 7688):
-            pytest.skip("Memgraph container not available on port 7688")
-        uri = "bolt://127.0.0.1:7688"
+        if not _is_port_open(HOST, 7688):
+            pytest.skip(f"Memgraph container not available on {HOST}:7688")
+        uri = f"bolt://{HOST}:7688"
         auth = ("", "")
         try:
             from voyager_ogm import NativeClient
@@ -841,9 +843,9 @@ class TestApacheAgeLiveMatrix:
     def age_conn(self):
         if psycopg is None:
             pytest.skip("psycopg is not installed in this environment")
-        if not _is_port_open("127.0.0.1", 5455):
-            pytest.skip("Apache AGE container not available on port 5455")
-        conn_str = "host=127.0.0.1 port=5455 user=postgres password=voyagerpass123 dbname=voyager_graph connect_timeout=2"
+        if not _is_port_open(HOST, 5455):
+            pytest.skip(f"Apache AGE container not available on {HOST}:5455")
+        conn_str = f"host={HOST} port=5455 user=postgres password=voyagerpass123 dbname=voyager_graph connect_timeout=2"
         try:
             conn = psycopg.connect(conn_str, autocommit=True)
         except Exception as e:
@@ -1358,9 +1360,9 @@ class TestPostgres19LiveMatrix:
     def pg19_conn(self):
         if psycopg is None:
             pytest.skip("psycopg is not installed in this environment")
-        if not _is_port_open("127.0.0.1", 5456):
-            pytest.skip("PostgreSQL 19 Beta container not available on port 5456")
-        conn_str = "host=127.0.0.1 port=5456 user=postgres password=voyagerpass123 dbname=voyager_graph connect_timeout=2"
+        if not _is_port_open(HOST, 5456):
+            pytest.skip(f"PostgreSQL 19 Beta container not available on {HOST}:5456")
+        conn_str = f"host={HOST} port=5456 user=postgres password=voyagerpass123 dbname=voyager_graph connect_timeout=2"
         try:
             conn = psycopg.connect(conn_str, autocommit=True)
         except Exception as e:
@@ -1650,12 +1652,12 @@ class TestPostgres19LiveMatrix:
 class TestFalkorDBLiveMatrix:
     @pytest.fixture
     def falkor_client(self):
-        if not _is_port_open("127.0.0.1", 6379):
-            pytest.skip("FalkorDB container not available on port 6379")
+        if not _is_port_open(HOST, 6379):
+            pytest.skip(f"FalkorDB container not available on {HOST}:6379")
         try:
             from falkordb import FalkorDB
 
-            db = FalkorDB(host="127.0.0.1", port=6379)
+            db = FalkorDB(host=HOST, port=6379)
             g = db.select_graph("voyager_matrix_graph")
             g.query("RETURN 1")
         except Exception as e:

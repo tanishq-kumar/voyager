@@ -49,7 +49,7 @@
       "parameters": {}
     },
     "age": {
-      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person)-[:KNOWS]->(f:Person) RETURN p.name $$) AS (name agtype)",
+      "statement": "SELECT * FROM cypher('age_graph', $$ MATCH (p:Person)-[:KNOWS]->(f:Person) RETURN p.name $$) AS (\"name\" agtype)",
       "parameters": {}
     },
     "iso_gql": {

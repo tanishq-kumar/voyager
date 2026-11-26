@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from conftest import get_test_host as test_host
 from jsonschema import Draft202012Validator
 from voyager_ogm.agtype import decode_agtype
 from voyager_ogm.entities import GraphNode, GraphPath, GraphRelationship
@@ -65,9 +66,6 @@ ENGINES: tuple[str, ...] = ("neo4j", "memgraph", "falkordb", "age", "pg19")
 #: Engines that name unaliased columns after the Cypher expression text verbatim.
 CYPHER_COLUMN_ENGINES: frozenset[str] = frozenset({"neo4j", "memgraph", "falkordb"})
 
-#: PostgreSQL-backed engines that fold unquoted SQL column identifiers to lower case.
-SQL_FOLDING_ENGINES: frozenset[str] = frozenset({"age", "pg19"})
-
 
 class EngineUnavailableError(RuntimeError):
     """Raised when a live engine or one of its Python clients is unavailable."""
@@ -80,11 +78,6 @@ class FixtureUnsupportedError(RuntimeError):
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     return int(raw) if raw else default
-
-
-def test_host() -> str:
-    """Return the engine host from ``VOYAGER_TEST_HOST`` (default ``127.0.0.1``)."""
-    return os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
 
 
 def engine_endpoint(engine: str) -> tuple[str, int]:
@@ -205,8 +198,7 @@ def compare_columns(
 
     - When ``expected`` is ``None``, column checking is skipped for backward
       compatibility with legacy ``rows.json`` files without a ``columns`` key.
-    - Explicit aliases (from ``aliases``) are checked on every engine; PostgreSQL-backed
-      engines (``age``, ``pg19``) fold unquoted SQL identifiers to lower case.
+    - Explicit aliases (from ``aliases``) are checked verbatim on every engine.
     - Unaliased columns are checked verbatim on Cypher engines (``neo4j``, ``memgraph``,
       ``falkordb``) and treated as informational on ``age`` and ``pg19``.
     """
@@ -221,13 +213,11 @@ def compare_columns(
         )
 
     check_all = engine in CYPHER_COLUMN_ENGINES
-    fold_case = engine in SQL_FOLDING_ENGINES
     for index, (exp_col, act_col) in enumerate(zip(expected, actual, strict=False)):
         alias = aliases[index] if aliases is not None and index < len(aliases) else None
         if not check_all and alias is None:
             continue
-        matched = act_col in (exp_col, exp_col.lower()) if fold_case else act_col == exp_col
-        if not matched:
+        if act_col != exp_col:
             diffs.append(f"column {index}: expected {exp_col!r}, got {act_col!r}")
     return diffs
 

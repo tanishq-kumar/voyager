@@ -29,7 +29,7 @@ def _entity_aggregate_spec(
 def test_count_nodes_compiles_to_count_star(dialect: str) -> None:
     compiled = compile_query_from_spec(_entity_aggregate_spec(), dialect, graph_name="g")
     assert compiled["statement"] == (
-        'SELECT COUNT(*) AS cnt FROM GRAPH_TABLE (g MATCH (n IS "Person") COLUMNS (1 AS _c0))'
+        'SELECT COUNT(*) AS "cnt" FROM GRAPH_TABLE (g MATCH (n IS "Person") COLUMNS (1 AS "_c0"))'
     )
 
 

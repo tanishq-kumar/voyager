@@ -15,7 +15,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") -[w IS \"WORKS_AT\"]-> (c IS \"Company\") COLUMNS (c.name AS company, count(p) AS total, avg(p.age) AS avg_age, min(p.age) AS min_age, max(p.age) AS max_age))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") -[w IS \"WORKS_AT\"]-> (c IS \"Company\") COLUMNS (c.name AS \"company\", count(p) AS \"total\", avg(p.age) AS \"avg_age\", min(p.age) AS \"min_age\", max(p.age) AS \"max_age\"))",
       "status": "ok"
     }
   },
@@ -35,7 +35,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[]-> (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[]-> (b IS \"Person\") COLUMNS (a.name, b.name AS \"name_1\"))",
       "status": "ok"
     }
   },
@@ -84,7 +84,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") <-[w IS \"WORKS_AT\"]- (c IS \"Company\") COLUMNS (a.name, c.name AS name_1))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") <-[w IS \"WORKS_AT\"]- (c IS \"Company\") COLUMNS (a.name, c.name AS \"name_1\"))",
       "status": "ok"
     }
   },
@@ -104,7 +104,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]-> (b IS \"Person\") COLUMNS (a.name, b.name AS \"name_1\"))",
       "status": "ok"
     }
   },
@@ -395,7 +395,7 @@
         "p1": 10,
         "p2": 5
       },
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.age * $p0 AS doubled, p.age + $p1 AS offset, p.age / $p2 AS ratio))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.age * $p0 AS \"doubled\", p.age + $p1 AS \"offset\", p.age / $p2 AS \"ratio\"))",
       "status": "ok"
     }
   },
@@ -415,7 +415,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\"), (b IS \"Person\") -[r2 IS \"WORKS_AT\"]-> (c IS \"Company\") COLUMNS (a.name, b.name AS name_1, c.name AS name_2))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r1 IS \"KNOWS\"]-> (b IS \"Person\"), (b IS \"Person\") -[r2 IS \"WORKS_AT\"]-> (c IS \"Company\") COLUMNS (a.name, b.name AS \"name_1\", c.name AS \"name_2\"))",
       "status": "ok"
     }
   },
@@ -589,7 +589,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY age DESC NULLS FIRST, name ASC NULLS LAST LIMIT 25 OFFSET 10",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS (p.name, p.age)) ORDER BY \"age\" DESC NULLS FIRST, \"name\" ASC NULLS LAST LIMIT 25 OFFSET 10",
       "status": "ok"
     }
   },
@@ -704,7 +704,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]->{2,2} (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]->{2,2} (b IS \"Person\") COLUMNS (a.name, b.name AS \"name_1\"))",
       "status": "ok"
     }
   },
@@ -724,7 +724,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]->{1,3} (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]->{1,3} (b IS \"Person\") COLUMNS (a.name, b.name AS \"name_1\"))",
       "status": "ok"
     }
   },
@@ -818,7 +818,7 @@
       "parameters": {
         "p0": " lives in "
       },
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS ((p.name + $p0) + p.city AS greeting, UPPER(p.name) AS upper_name, LOWER(p.city) AS lower_city))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (p IS \"Person\") COLUMNS ((p.name + $p0) + p.city AS \"greeting\", UPPER(p.name) AS \"upper_name\", LOWER(p.city) AS \"lower_city\"))",
       "status": "ok"
     }
   },
@@ -870,7 +870,7 @@
     "sql_pgq": {
       "execution_mode": "normal",
       "parameters": {},
-      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]- (b IS \"Person\") COLUMNS (a.name, b.name AS name_1))",
+      "statement": "SELECT * FROM GRAPH_TABLE (g MATCH (a IS \"Person\") -[r IS \"KNOWS\"]- (b IS \"Person\") COLUMNS (a.name, b.name AS \"name_1\"))",
       "status": "ok"
     }
   },
