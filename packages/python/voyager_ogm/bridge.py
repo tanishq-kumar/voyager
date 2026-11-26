@@ -35,6 +35,20 @@ _PAGINATION_PARAMETER_PATTERN = re.compile(
     r"\b(?:SKIP|OFFSET|LIMIT)\s+\$([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE
 )
 
+#: Statements that need the DuckPGQ extension loaded on the DuckDB connection.
+_DUCKPGQ_STATEMENT_PATTERN = re.compile(r"\bGRAPH_TABLE\b|\bPROPERTY\s+GRAPH\b", re.IGNORECASE)
+
+
+def _duckpgq_error_message(cause: BaseException) -> str:
+    """Builds the actionable error shown when DuckPGQ cannot be loaded."""
+    return (
+        "SQL/PGQ queries on DuckDB require the DuckPGQ extension, but it could not be "
+        "loaded. Install it with `INSTALL duckpgq;` and then run `LOAD duckpgq;` on the "
+        "connection (Voyager does the `LOAD` for you once per connection), or create the "
+        "Session with install_duckpgq=True so Voyager installs it first. "
+        f"The DuckDB error was: {cause}"
+    )
+
 
 def validate_pagination_parameters(statement: str, parameters: Mapping[str, Any] | None) -> None:
     """Rejects negative or non-integer values bound to pagination parameters.
@@ -1382,13 +1396,67 @@ def _encode_duckdb_in_tuple(values: Sequence[Any]) -> str:
 class DuckDbBridge:
     """Synchronous DuckDB driver bridge with zero-copy Polars / Arrow output."""
 
-    def __init__(self, connection: Any) -> None:
+    def __init__(self, connection: Any, *, install_duckpgq: bool = False) -> None:
         """Initializes DuckDbBridge.
 
         Args:
             connection: DuckDB connection object.
+            install_duckpgq: Install the DuckPGQ extension when it is not already
+                available before loading it. Off by default because installing
+                downloads the extension from the DuckDB extension repository.
         """
         self.con = connection
+        self._install_duckpgq = install_duckpgq
+        self._duckpgq_loaded = False
+
+    def _duckpgq_is_loaded(self) -> bool:
+        """Returns whether DuckPGQ is already loaded on this connection."""
+        try:
+            row = self.con.execute(
+                "SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'duckpgq'"
+            ).fetchone()
+        except Exception:
+            return False
+        return bool(row and row[0])
+
+    def ensure_duckpgq(self, install: bool | None = None) -> None:
+        """Loads DuckPGQ on this connection once.
+
+        Loading is idempotent: a connection the caller already prepared with
+        ``LOAD duckpgq;`` is detected and left alone, and later calls are no-ops.
+
+        Args:
+            install: Install the extension first when it is missing. Defaults to
+                the ``install_duckpgq`` value passed to the constructor. With
+                ``False``, a missing extension raises an actionable error
+                instead of downloading anything.
+
+        Raises:
+            RuntimeError: If the extension cannot be loaded, naming DuckPGQ and
+                the ``INSTALL duckpgq;`` command.
+        """
+        if self._duckpgq_loaded:
+            return
+        if self._duckpgq_is_loaded():
+            self._duckpgq_loaded = True
+            return
+        should_install = self._install_duckpgq if install is None else install
+        try:
+            self.con.execute("LOAD duckpgq;")
+        except Exception as load_error:
+            if not should_install:
+                raise RuntimeError(_duckpgq_error_message(load_error)) from load_error
+            try:
+                self.con.execute("INSTALL duckpgq;")
+                self.con.execute("LOAD duckpgq;")
+            except Exception as install_error:
+                raise RuntimeError(_duckpgq_error_message(install_error)) from install_error
+        self._duckpgq_loaded = True
+
+    def _ensure_duckpgq_for_statement(self, statement: str) -> None:
+        """Loads DuckPGQ before a statement that needs it."""
+        if not self._duckpgq_loaded and _DUCKPGQ_STATEMENT_PATTERN.search(statement):
+            self.ensure_duckpgq()
 
     def _format_pgq_statement(
         self, statement: str, parameters: dict[str, Any]
@@ -1448,6 +1516,7 @@ class DuckDbBridge:
         Returns:
             List of record dictionaries.
         """
+        self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         rel = self.con.execute(stmt, params)
         if rel.description:
@@ -1468,6 +1537,7 @@ class DuckDbBridge:
         Returns:
             Polars DataFrame.
         """
+        self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         if hasattr(self.con, "pl"):
             return self.con.execute(stmt, params).pl()
@@ -1704,13 +1774,20 @@ class DuckDbBridgeTransaction:
 class AsyncDuckDbBridge:
     """Asynchronous DuckDB driver bridge using asyncio worker threads."""
 
-    def __init__(self, connection: Any) -> None:
+    def __init__(self, connection: Any, *, install_duckpgq: bool = False) -> None:
         """Initializes AsyncDuckDbBridge.
 
         Args:
             connection: DuckDB connection object.
+            install_duckpgq: Install the DuckPGQ extension when it is not already
+                available before loading it. Off by default because installing
+                downloads the extension from the DuckDB extension repository.
         """
-        self.sync_bridge = DuckDbBridge(connection)
+        self.sync_bridge = DuckDbBridge(connection, install_duckpgq=install_duckpgq)
+
+    def ensure_duckpgq(self, install: bool | None = None) -> None:
+        """Loads DuckPGQ on the wrapped connection once; see `DuckDbBridge.ensure_duckpgq`."""
+        self.sync_bridge.ensure_duckpgq(install)
 
     async def execute(
         self, statement: str, parameters: dict[str, Any] | None = None

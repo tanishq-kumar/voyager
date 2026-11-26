@@ -1,1 +1,0 @@
-SELECT COALESCE(ARRAY_AGG(n) FILTER (WHERE n IS NOT NULL), '{}') AS persons FROM GRAPH_TABLE (graph_table MATCH (n IS "Person") COLUMNS (n AS n))
