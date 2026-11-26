@@ -2,7 +2,7 @@
 
 Each engine that supports a label test in a ``WHERE`` clause runs the compiled
 label predicate from Query Spec v1 and the rows are compared with Neo4j. The
-host comes from ``VOYAGER_TEST_HOST`` (default ``127.0.0.1``).
+host comes from ``VOYAGER_TEST_HOST`` (via ``conftest.get_test_host()``).
 """
 
 from __future__ import annotations
@@ -13,11 +13,12 @@ import socket
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import VoyagerError, compile_query_from_spec
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "voyagerpass123")
 AGE_PASSWORD = os.environ.get("AGE_PASSWORD", "voyagerpass123")
 PG_PASSWORD = os.environ.get("PG_PASSWORD", "voyagerpass123")

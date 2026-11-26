@@ -3,7 +3,7 @@ from the URI: `bolt+s://`, `rediss://` and PostgreSQL `sslmode`, with `tls_ca_fi
 `sslrootcert` naming the CA.
 
 The live tests need the TLS test stack (`containers/compose.tls.yaml`). They read the host
-from `VOYAGER_TEST_HOST` (default 127.0.0.1) and the test CA from `VOYAGER_TEST_TLS_CA`
+from `VOYAGER_TEST_HOST` (via `conftest.get_test_host()`) and the test CA from `VOYAGER_TEST_TLS_CA`
 (default `containers/tls/certs/ca.crt`), and skip when either is unavailable.
 """
 
@@ -14,10 +14,11 @@ import socket
 from pathlib import Path
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import NativeClient
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-HOST = os.getenv("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 CA_FILE = Path(os.getenv("VOYAGER_TEST_TLS_CA", REPO_ROOT / "containers/tls/certs/ca.crt"))
 
 

@@ -14,12 +14,13 @@ import uuid
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from spec_corpus_live_lib import canonicalize
 from voyager_ogm import Field, GraphNode, GraphPath, GraphRelationship, Node, Query, Session
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 AGE_PORT = int(os.environ.get("VOYAGER_TEST_AGE_PORT", "5455"))
 PG19_PORT = int(os.environ.get("VOYAGER_TEST_PG19_PORT", "5456"))
 NEO4J_PORT = int(os.environ.get("VOYAGER_TEST_NEO4J_PORT", "7687"))

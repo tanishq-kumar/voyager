@@ -16,6 +16,7 @@ except ImportError:
 
 import polars as pl
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     Field,
     Node,
@@ -27,12 +28,14 @@ from voyager_ogm import (
     reset_alias_counters,
 )
 
+HOST = get_test_host()
+
 # Check if live Neo4j is reachable
 try:
     from neo4j import GraphDatabase
 
     driver = GraphDatabase.driver(
-        "bolt://127.0.0.1:7687", auth=("neo4j", "voyagerpass123"), connection_timeout=0.2
+        f"bolt://{HOST}:7687", auth=("neo4j", "voyagerpass123"), connection_timeout=0.2
     )
     driver.verify_connectivity()
     driver.close()
@@ -238,10 +241,10 @@ def test_multi_dialect_query_compilation_parity():
 
 
 @pytest.mark.live
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j not online on {HOST}:7687")
 def test_live_neo4j_ldbc_multihop_and_aggregations():
     """Test multi-hop relationship traversal and aggregations against real running Neo4j."""
-    driver = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "voyagerpass123"))
+    driver = GraphDatabase.driver(f"bolt://{HOST}:7687", auth=("neo4j", "voyagerpass123"))
 
     try:
         with driver.session() as s:

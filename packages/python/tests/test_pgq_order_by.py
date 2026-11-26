@@ -9,10 +9,10 @@ order by that alias, and select only the returned columns in the outer query.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from conftest import is_port_open as _is_port_open
 from voyager_ogm import (
     Field,
@@ -43,7 +43,7 @@ try:
 except ImportError:
     pass
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 POSTGRES19_URI = f"postgresql://postgres:voyagerpass123@{HOST}:5456/voyager_graph"
 NEO4J_URI = f"bolt://{HOST}:7687"
 GRAPH = "fix319_320_graph"

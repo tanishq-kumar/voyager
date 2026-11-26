@@ -9,8 +9,8 @@ GRAPH`` only describes existing tables), runs it together with the generated
 constraint, index and property-graph DDL, inserts rows, queries through the
 SQL/PGQ emitter, and drops everything afterwards.
 
-Set ``VOYAGER_TEST_HOST`` to run against another machine (default
-``127.0.0.1``); the test is skipped when the port is not reachable.
+Set ``VOYAGER_TEST_HOST`` to run against another machine (via
+``conftest.get_test_host()``); the test is skipped when the port is not reachable.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     Field,
     NativeClient,
@@ -35,7 +36,7 @@ from voyager_ogm.schema import SchemaManager
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 PORT = 5456
 GRAPH = f"fix325b_g_{os.getpid()}"
 

@@ -16,6 +16,7 @@ Ingests and validates official Apache AGE regression scenarios:
 from __future__ import annotations
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     Field,
     Node,
@@ -274,16 +275,17 @@ def test_age_dml_mutations():
 @pytest.mark.live
 def test_live_apache_age_database_execution():
     """Verifies live query execution against running Apache AGE instance if available."""
+    host = get_test_host()
     try:
         import psycopg
 
         con = psycopg.connect(
-            "host=127.0.0.1 port=5455 user=postgres password=voyagerpass123 dbname=voyager_graph",
+            f"host={host} port=5455 user=postgres password=voyagerpass123 dbname=voyager_graph",
             autocommit=True,
             connect_timeout=1,
         )
     except Exception:
-        pytest.skip("Apache AGE container not reachable on port 5455")
+        pytest.skip(f"Apache AGE container not reachable on {host}:5455")
 
     with con.cursor() as cur:
         cur.execute("LOAD 'age';")

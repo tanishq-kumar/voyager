@@ -10,9 +10,8 @@ Verifies:
 7. Any created graph is dropped in finally/fixture teardown only if created by the test.
 """
 
-import socket
-
 import pytest
+from conftest import get_test_host, is_port_open
 from voyager_ogm import (
     Field,
     FullTextIndex,
@@ -23,14 +22,12 @@ from voyager_ogm import (
     create_bridge,
 )
 
+HOST = get_test_host()
 
-def _is_age_reachable(host: str = "127.0.0.1", port: int = 5455) -> bool:
+
+def _is_age_reachable(host: str = HOST, port: int = 5455) -> bool:
     """Checks whether the Apache AGE PostgreSQL port is reachable."""
-    try:
-        with socket.create_connection((host, port), timeout=1.0):
-            return True
-    except OSError:
-        return False
+    return is_port_open(host, port, timeout=1.0)
 
 
 class ArticleDoc(Node):
@@ -63,7 +60,7 @@ def test_live_age_custom_graph_fulltext_index_ddl() -> None:
     except ImportError:
         pytest.skip("psycopg is required for live Apache AGE tests")
 
-    uri = "postgresql://postgres:voyagerpass123@127.0.0.1:5455/voyager_graph"
+    uri = f"postgresql://postgres:voyagerpass123@{HOST}:5455/voyager_graph"
     graph_name = "custom_ddl_graph"
 
     try:
@@ -161,7 +158,7 @@ def test_live_age_custom_graph_vector_index_ddl() -> None:
     except ImportError:
         pytest.skip("psycopg is required for live Apache AGE tests")
 
-    uri = "postgresql://postgres:voyagerpass123@127.0.0.1:5455/voyager_graph"
+    uri = f"postgresql://postgres:voyagerpass123@{HOST}:5455/voyager_graph"
     graph_name = "custom_vec_graph"
 
     try:

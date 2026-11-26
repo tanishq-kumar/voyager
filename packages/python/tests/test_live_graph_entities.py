@@ -11,11 +11,12 @@ from typing import Any
 import polars as pl
 import pyarrow as pa
 import pytest
+from conftest import get_test_host
 from voyager_ogm import GraphNode, GraphPath, GraphRelationship, Session
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 NEO4J_PORT = int(os.environ.get("VOYAGER_TEST_NEO4J_PORT", "7687"))
 MEMGRAPH_PORT = int(os.environ.get("VOYAGER_TEST_MEMGRAPH_PORT", "7688"))
 FALKORDB_PORT = int(os.environ.get("VOYAGER_TEST_FALKORDB_PORT", "6379"))

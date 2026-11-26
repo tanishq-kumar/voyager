@@ -19,7 +19,7 @@ import os
 
 import polars as pl
 import pytest
-from conftest import is_port_open
+from conftest import get_test_host, is_port_open
 from voyager_ogm.bridge import (
     FalkorDBBridge,
     MockBridge,
@@ -389,19 +389,20 @@ def test_falkordb_bridge_parameter_adaptation() -> None:
 # ==============================================================================
 
 
-NEO4J_HOST = os.getenv("NEO4J_HOST", "127.0.0.1")
+HOST = get_test_host()
+NEO4J_HOST = os.getenv("NEO4J_HOST", HOST)
 NEO4J_PORT = int(os.getenv("NEO4J_PORT", "7687"))
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "voyagerpass123")
 NEO4J_URI = os.getenv("NEO4J_URI", f"bolt://{NEO4J_HOST}:{NEO4J_PORT}")
 
-AGE_HOST = os.getenv("AGE_HOST", "127.0.0.1")
+AGE_HOST = os.getenv("AGE_HOST", HOST)
 AGE_PORT = int(os.getenv("AGE_PORT", "5455"))
 AGE_USER = os.getenv("AGE_USER", "postgres")
 AGE_PASSWORD = os.getenv("AGE_PASSWORD", "voyagerpass123")
 AGE_DB = os.getenv("AGE_DB", "voyager_graph")
 
-FALKORDB_HOST = os.getenv("FALKORDB_HOST", "127.0.0.1")
+FALKORDB_HOST = os.getenv("FALKORDB_HOST", HOST)
 FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
 
 

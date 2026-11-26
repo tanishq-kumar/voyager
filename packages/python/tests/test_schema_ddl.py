@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import community_compatible_ddl, is_port_open, neo4j_edition
+from conftest import community_compatible_ddl, get_test_host, is_port_open, neo4j_edition
 from neo4j import GraphDatabase
 from neo4j.exceptions import ConstraintError
 from voyager_ogm import (
@@ -196,7 +196,7 @@ def test_cypher25_composite_facets_and_empty_entities():
 @pytest.mark.live
 def test_live_neo4j_schema_ddl_creation():
     """Verifies applying constraints and indexes live to the running Neo4j database."""
-    uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+    uri = os.getenv("NEO4J_URI", f"bolt://{get_test_host()}:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "voyagerpass123")
     database = os.getenv("NEO4J_DATABASE", "neo4j")
@@ -242,7 +242,7 @@ def test_live_neo4j_schema_ddl_creation():
 @pytest.mark.live
 def test_live_neo4j_enterprise_cypher25_graph_type():
     """Verifies applying declarative Cypher 25 Graph Types to Neo4j Enterprise live."""
-    uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+    uri = os.getenv("NEO4J_URI", f"bolt://{get_test_host()}:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "voyagerpass123")
     database = os.getenv("NEO4J_DATABASE", "neo4j")
@@ -287,7 +287,9 @@ def test_live_neo4j_enterprise_cypher25_graph_type():
 @pytest.mark.live
 def test_live_postgres19_pgq_ddl_execution():
     """Verifies applying generated SQL:2023 PGQ DDL directly to PostgreSQL 19 Beta 3."""
-    uri = os.getenv("PG19_URI", "postgresql://postgres:voyagerpass123@127.0.0.1:5456/postgres")
+    uri = os.getenv(
+        "PG19_URI", f"postgresql://postgres:voyagerpass123@{get_test_host()}:5456/postgres"
+    )
     try:
         import psycopg
 
@@ -1177,8 +1179,9 @@ async def test_async_create_constraints_reraises_unrelated_error_immediately():
 @pytest.mark.live
 def test_live_schema_ddl_multi_engine_integration():
     """Verifies live index and constraint management across live Neo4j, PostgreSQL 19, and FalkorDB engines."""
+    host = get_test_host()
     # 1. Neo4j Live Engine (Bolt port 7687)
-    uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+    uri = os.getenv("NEO4J_URI", f"bolt://{host}:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "voyagerpass123")
     database = os.getenv("NEO4J_DATABASE", "neo4j")
@@ -1203,7 +1206,7 @@ def test_live_schema_ddl_multi_engine_integration():
         pass  # Skip gracefully if Neo4j is unreachable
 
     # 2. PostgreSQL 19 Live Engine (Port 5456)
-    pg_uri = os.getenv("PG19_URI", "postgresql://postgres:voyagerpass123@127.0.0.1:5456/postgres")
+    pg_uri = os.getenv("PG19_URI", f"postgresql://postgres:voyagerpass123@{host}:5456/postgres")
     try:
         import psycopg
 
@@ -1234,7 +1237,7 @@ def test_live_schema_ddl_multi_engine_integration():
         from falkordb import FalkorDB
         from voyager_ogm.bridge import FalkorDBBridge
 
-        f_db = FalkorDB(host="127.0.0.1", port=6379)
+        f_db = FalkorDB(host=host, port=6379)
         f_graph = f_db.select_graph("voyager_ddl_live_test")
         f_graph.query("RETURN 1")
 
@@ -1409,8 +1412,8 @@ def test_dict_spec_routing_in_schema_manager():
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not is_port_open("127.0.0.1", 7687),
-    reason="Neo4j container not reachable on port 7687",
+    not is_port_open(get_test_host(), 7687),
+    reason=f"Neo4j container not reachable on {get_test_host()}:7687",
 )
 def test_live_neo4j_relationship_unique_constraint() -> None:
     """Relationship unique fields emit a uniqueness constraint and reject duplicates live.
@@ -1419,7 +1422,7 @@ def test_live_neo4j_relationship_unique_constraint() -> None:
     relationship whose unique property is absent is still accepted.
     """
     pytest.importorskip("neo4j")
-    uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+    uri = os.getenv("NEO4J_URI", f"bolt://{get_test_host()}:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "voyagerpass123")
 
@@ -1514,13 +1517,13 @@ def _assert_community_constraints_created(session: Session, node_name: str, rel_
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not is_port_open("127.0.0.1", 7687),
-    reason="Neo4j container not reachable on port 7687",
+    not is_port_open(get_test_host(), 7687),
+    reason=f"Neo4j container not reachable on {get_test_host()}:7687",
 )
 def test_live_community_enterprise_only_constraints_are_reported() -> None:
     """On Community, UNIQUE constraints apply and Enterprise-only ones are reported once."""
     pytest.importorskip("neo4j")
-    uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+    uri = os.getenv("NEO4J_URI", f"bolt://{get_test_host()}:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "voyagerpass123")
 
@@ -1598,18 +1601,19 @@ def test_live_community_enterprise_only_constraints_are_reported() -> None:
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not is_port_open("127.0.0.1", 7687),
-    reason="Neo4j container not reachable on port 7687",
+    not is_port_open(get_test_host(), 7687),
+    reason=f"Neo4j container not reachable on {get_test_host()}:7687",
 )
 def test_live_native_community_enterprise_only_constraints_are_reported() -> None:
     """The native voyager-drivers path reports Enterprise-only constraints the same way."""
     pytest.importorskip("neo4j")
-    uri = os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+    host = get_test_host()
+    uri = os.getenv("NEO4J_URI", f"bolt://{host}:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "voyagerpass123")
     native_uri = os.getenv(
         "NEO4J_NATIVE_URI",
-        f"bolt://{user}:{password}@127.0.0.1:7687?connect_timeout=2",
+        f"bolt://{user}:{password}@{host}:7687?connect_timeout=2",
     )
 
     driver = GraphDatabase.driver(uri, auth=(user, password), connection_timeout=1.0)

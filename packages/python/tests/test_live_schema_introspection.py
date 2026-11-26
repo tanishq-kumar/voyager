@@ -7,8 +7,8 @@ The PostgreSQL 19 Beta 3 case builds its tables with the generated naming rule a
 creates the property graph from the generated DDL, then queries it with the
 SQL/PGQ emitter.
 
-Set ``VOYAGER_TEST_HOST`` to run against another machine (default
-``127.0.0.1``); a test is skipped when its port is not reachable.
+Set ``VOYAGER_TEST_HOST`` to run against another machine (via
+``conftest.get_test_host()``); a test is skipped when its port is not reachable.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     Field,
     NativeClient,
@@ -35,7 +36,7 @@ from voyager_ogm.schema import SchemaManager
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 # The label deliberately differs from the class name.
 PERSON = "IxPyHuman"
 COMPANY = "IxPyCompany"

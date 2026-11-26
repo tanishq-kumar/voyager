@@ -16,6 +16,7 @@ import math
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     Field,
     Node,
@@ -27,10 +28,12 @@ from voyager_ogm import (
     reset_alias_counters,
 )
 
+HOST = get_test_host()
+
 try:
     from neo4j import GraphDatabase
 
-    test_driver = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "voyagerpass123"))
+    test_driver = GraphDatabase.driver(f"bolt://{HOST}:7687", auth=("neo4j", "voyagerpass123"))
     test_driver.verify_connectivity()
     test_driver.close()
     NEO4J_ONLINE = True
@@ -114,7 +117,7 @@ def neo4j_session():
         yield None
         return
 
-    driver = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=("neo4j", "voyagerpass123"))
+    driver = GraphDatabase.driver(f"bolt://{HOST}:7687", auth=("neo4j", "voyagerpass123"))
     session = Session(bridge=driver, dialect="cypher")
     try:
         session.execute("MATCH (n) DETACH DELETE n")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import polars as pl
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     AsyncSession,
     Field,
@@ -40,7 +41,8 @@ except ImportError:
     DUCKDB_AVAILABLE = False
 
 
-NEO4J_URI = "bolt://127.0.0.1:7687"
+HOST = get_test_host()
+NEO4J_URI = f"bolt://{HOST}:7687"
 NEO4J_AUTH = ("neo4j", "voyagerpass123")
 
 
@@ -52,7 +54,7 @@ def _is_neo4j_online() -> bool:
         from voyager_ogm import NativeClient
 
         c = NativeClient(
-            f"bolt://{NEO4J_AUTH[0]}:{NEO4J_AUTH[1]}@127.0.0.1:7687?connect_timeout=2",
+            f"bolt://{NEO4J_AUTH[0]}:{NEO4J_AUTH[1]}@{HOST}:7687?connect_timeout=2",
             min_idle=1,
             max_size=2,
         )
@@ -98,7 +100,7 @@ def clean_neo4j():
         yield None
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_sync_crud(clean_neo4j):
     """Test synchronous query compilation, execution, and Polars streaming against real Neo4j."""
     session = Session(bridge=clean_neo4j, dialect="cypher")
@@ -125,7 +127,7 @@ def test_live_neo4j_sync_crud(clean_neo4j):
     assert df["age"].to_list() == [30, 25]
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 @pytest.mark.asyncio
 async def test_live_neo4j_async_crud(clean_neo4j):
     """Test asynchronous non-blocking query execution against real Neo4j."""
@@ -155,7 +157,7 @@ async def test_live_neo4j_async_crud(clean_neo4j):
         await async_driver.close()
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_bulk_ingestion_1000_records(clean_neo4j):
     """Test high-throughput UNWIND bulk ingestion of 1,000 real records into live Neo4j."""
     session = Session(bridge=clean_neo4j, dialect="cypher")
@@ -184,7 +186,7 @@ def test_live_neo4j_bulk_ingestion_1000_records(clean_neo4j):
     assert count_records[0]["count"] == 1000
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_cloud_ingest_parquet_and_csv(clean_neo4j, tmp_path):
     """Test ingest_parquet and ingest_csv end-to-end against live Neo4j."""
     session = Session(bridge=clean_neo4j, dialect="cypher")
@@ -260,7 +262,7 @@ def test_live_neo4j_cloud_ingest_parquet_and_csv(clean_neo4j, tmp_path):
     assert rel_check[0]["since"] == 2024
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_to_networkx_graph_export(clean_neo4j):
     """Test exporting live Neo4j query results directly into NetworkX for analytics."""
     nx = pytest.importorskip("networkx")
@@ -294,7 +296,7 @@ def test_live_neo4j_to_networkx_graph_export(clean_neo4j):
     assert path == [1, 2, 3]
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_official_social_dataset(clean_neo4j):
     """Test loading and querying the official LDBC Social Network dataset on live Neo4j."""
     import pathlib
@@ -326,7 +328,7 @@ def test_live_neo4j_official_social_dataset(clean_neo4j):
     assert "Margaret" in authors
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_official_movies_dataset(clean_neo4j):
     """Test loading and querying the official Movie Graph dataset on live Neo4j."""
     import pathlib
@@ -356,7 +358,7 @@ def test_live_neo4j_official_movies_dataset(clean_neo4j):
     assert "Laurence Fishburne" in actors
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_fluent_builder_with_clause_and_pagination(clean_neo4j):
     """Test fluent query builder with_() pipeline, hybrid chaining, and pagination on live Neo4j."""
     session = Session(bridge=clean_neo4j, dialect="cypher")
@@ -414,7 +416,7 @@ def test_live_duckdb_session_ping_dialect_awareness():
     assert session.ping() is True
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_session_ping_and_parameters_merging(clean_neo4j):
     """Test Session.ping and runtime parameter merging on live Neo4j."""
     session = Session(bridge=clean_neo4j, dialect="cypher")
@@ -434,7 +436,7 @@ def test_live_neo4j_session_ping_and_parameters_merging(clean_neo4j):
     assert names == ["Alice"]
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 @pytest.mark.asyncio
 async def test_live_neo4j_async_session_ping():
     """Test AsyncSession.ping liveness check on live Neo4j."""
@@ -446,7 +448,7 @@ async def test_live_neo4j_async_session_ping():
         await async_driver.close()
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_bulk_create_relationships_string_descriptor(clean_neo4j):
     """Test bulk relationship creation with string type descriptor and inferred properties on live Neo4j."""
     session = Session(bridge=clean_neo4j, dialect="cypher")
@@ -488,7 +490,7 @@ class LiveSimultaneousPerson(Node):
     age: int
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 @pytest.mark.asyncio
 async def test_live_neo4j_async_simultaneous_explain_and_profile():
     """Test 2 simultaneous connections executing explain and profile queries concurrently on live Neo4j."""
@@ -539,7 +541,7 @@ async def test_live_neo4j_async_simultaneous_explain_and_profile():
         await async_driver.close()
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_sync_simultaneous_explain_and_profile():
     """Test 2 simultaneous sync connections executing explain and profile queries concurrently on live Neo4j."""
     import concurrent.futures
@@ -578,7 +580,7 @@ def test_live_neo4j_sync_simultaneous_explain_and_profile():
         driver.close()
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_gql_capabilities():
     """Verifies that GQL label expressions, path variables, LET/FILTER linear clauses, and offset execute against live Neo4j."""
 
@@ -742,7 +744,7 @@ class LiveSpatialPlace(Node):
     location: Point = Field()
 
 
-@pytest.mark.skipif(not NEO4J_ONLINE, reason="Live Neo4j instance not online on localhost:7687")
+@pytest.mark.skipif(not NEO4J_ONLINE, reason=f"Live Neo4j instance not online on {HOST}:7687")
 def test_live_neo4j_geospatial_point_write_read_and_distance(clean_neo4j):
     """Verify end-to-end geospatial Point write, read hydration, and distance queries against live Neo4j."""
     driver = clean_neo4j

@@ -20,6 +20,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import get_test_host
 from conftest import is_port_open as _is_port_open
 from voyager_ogm.bridge import (
     AsyncPostgresBridge,
@@ -421,16 +422,17 @@ class TestPostgres19PgqParameterBindingLive:
     def pg19_conn(self):
         if psycopg is None:
             pytest.skip("psycopg is not installed in this environment")
-        if not _is_port_open("127.0.0.1", 5456):
-            pytest.skip("PostgreSQL 19 Beta container not available on port 5456")
+        host = get_test_host()
+        if not _is_port_open(host, 5456):
+            pytest.skip(f"PostgreSQL 19 Beta container not available on {host}:5456")
         conn_str = (
-            "host=127.0.0.1 port=5456 user=postgres password=voyagerpass123 "
+            f"host={host} port=5456 user=postgres password=voyagerpass123 "
             "dbname=voyager_graph connect_timeout=3"
         )
         try:
             conn = psycopg.connect(conn_str, autocommit=True)
         except Exception as e:
-            pytest.skip(f"PostgreSQL 19 Beta container not available on port 5456: {e}")
+            pytest.skip(f"PostgreSQL 19 Beta container not available on {host}:5456: {e}")
 
         # Setup test schema and Property Graph
         with conn.cursor() as cur:
@@ -540,7 +542,7 @@ class TestPostgres19PgqParameterBindingLive:
 
     def test_pg19_bridge_and_native_parity(self, pg19_conn):
         """Verifies backend='bridge' and backend='native' return identical rows for scalar parameters."""
-        pg_uri = "postgresql://postgres:voyagerpass123@127.0.0.1:5456/voyager_graph"
+        pg_uri = f"postgresql://postgres:voyagerpass123@{get_test_host()}:5456/voyager_graph"
         bridge = PostgresBridge(pg19_conn)
         session_bridge = Session(bridge=bridge, dialect="sql_pgq")
         session_native = Session(pg_uri, backend="native", dialect="sql_pgq")
@@ -588,7 +590,7 @@ class TestPostgres19PgqParameterBindingLive:
         - ints list
         - empty list
         """
-        pg_uri = "postgresql://postgres:voyagerpass123@127.0.0.1:5456/voyager_graph"
+        pg_uri = f"postgresql://postgres:voyagerpass123@{get_test_host()}:5456/voyager_graph"
         bridge = PostgresBridge(pg19_conn)
         session_bridge = Session(bridge=bridge, dialect="sql_pgq")
         session_native = Session(pg_uri, backend="native", dialect="sql_pgq")

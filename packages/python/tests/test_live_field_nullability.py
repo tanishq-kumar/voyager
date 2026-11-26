@@ -1,6 +1,6 @@
 """Live checks for inferred Field nullability (#332).
 
-Set ``VOYAGER_TEST_HOST`` to run against another machine (default 127.0.0.1).
+Set ``VOYAGER_TEST_HOST`` to run against another machine (via ``conftest.get_test_host()``).
 """
 
 from __future__ import annotations
@@ -9,11 +9,12 @@ import os
 import socket
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import Field, NativeClient, Node, SchemaManager, Session, node
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 PID = os.getpid()
 
 

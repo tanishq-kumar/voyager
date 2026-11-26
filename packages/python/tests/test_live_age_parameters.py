@@ -11,20 +11,21 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
 import pytest
+from conftest import get_test_host, is_port_open
 from voyager_ogm import Field, Node, Query, Session
 
 pytestmark = pytest.mark.live
 
-AGE_URI = "age://postgres:voyagerpass123@127.0.0.1:5455/voyager_graph"
+HOST = get_test_host()
+AGE_URI = f"age://postgres:voyagerpass123@{HOST}:5455/voyager_graph"
 AGE_DSN = (
-    "host=127.0.0.1 port=5455 user=postgres password=voyagerpass123 "
+    f"host={HOST} port=5455 user=postgres password=voyagerpass123 "
     "dbname=voyager_graph connect_timeout=2"
 )
 BACKENDS = ("auto", "native", "bridge")
@@ -57,13 +58,9 @@ class ParamValueNode(Node):
     items: list = []
 
 
-def _port_open(host: str = "127.0.0.1", port: int = 5455) -> bool:
+def _port_open(host: str = HOST, port: int = 5455) -> bool:
     """Returns True when the Apache AGE TCP port accepts connections."""
-    try:
-        with socket.create_connection((host, port), timeout=1.0):
-            return True
-    except OSError:
-        return False
+    return is_port_open(host, port, timeout=1.0)
 
 
 def _require_age() -> Any:

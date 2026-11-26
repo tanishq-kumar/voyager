@@ -4,7 +4,7 @@
 explicit null, merging with the default does not change a stored value, and a
 mixed bulk merge only writes the field for the rows that supply it.
 
-Set ``VOYAGER_TEST_HOST`` to run against another machine (default 127.0.0.1).
+Set ``VOYAGER_TEST_HOST`` to run against another machine (via ``conftest.get_test_host()``).
 """
 
 from __future__ import annotations
@@ -13,11 +13,12 @@ import os
 import socket
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import Field, NativeClient, Node, Query, Session, node
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 PID = os.getpid()
 LABEL = f"Zz333NoneDefault{PID}"
 

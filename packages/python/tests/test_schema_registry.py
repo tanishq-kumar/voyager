@@ -6,6 +6,7 @@ import json
 import types
 
 import pytest
+from conftest import get_test_host
 from conftest import is_port_open as _is_port_open
 from neo4j import GraphDatabase
 from voyager_ogm import (
@@ -610,15 +611,16 @@ class LiveContributed(Relationship):
 @pytest.mark.live
 def test_live_schema_registry_with_neo4j() -> None:
     """Verifies NativeSchemaRegistry metadata synchronization and query execution on live Neo4j."""
-    if not _is_port_open("127.0.0.1", 7687):
-        pytest.skip("Neo4j database not reachable on port 7687")
+    host = get_test_host()
+    if not _is_port_open(host, 7687):
+        pytest.skip(f"Neo4j database not reachable on {host}:7687")
 
-    uri = "bolt://127.0.0.1:7687"
+    uri = f"bolt://{host}:7687"
     auth = ("neo4j", "voyagerpass123")
 
     try:
         client = NativeClient(
-            f"bolt://{auth[0]}:{auth[1]}@127.0.0.1:7687?connect_timeout=2",
+            f"bolt://{auth[0]}:{auth[1]}@{host}:7687?connect_timeout=2",
             min_idle=1,
             max_size=2,
         )
@@ -627,7 +629,7 @@ def test_live_schema_registry_with_neo4j() -> None:
         driver = GraphDatabase.driver(uri, auth=auth, connection_timeout=2.0)
         driver.verify_connectivity()
     except Exception as e:
-        pytest.skip(f"Neo4j container not available on port 7687: {e}")
+        pytest.skip(f"Neo4j container not available on {host}:7687: {e}")
 
     session = Session(bridge=driver, dialect="cypher")
 

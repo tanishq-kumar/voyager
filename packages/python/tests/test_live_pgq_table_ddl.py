@@ -8,7 +8,7 @@ Verifies that the full ordered schema DDL emitted by `generate_pgq_schema_ddl`:
 5. Executes end-to-end on embedded DuckPGQ.
 
 Databases:
-- PostgreSQL 19 Beta 3 on VOYAGER_TEST_HOST:5456 (default 127.0.0.1)
+- PostgreSQL 19 Beta 3 on VOYAGER_TEST_HOST:5456 (via conftest.get_test_host())
 - DuckDB / DuckPGQ embedded
 """
 
@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     DuckDbBridge,
     Field,
@@ -36,7 +37,7 @@ from voyager_ogm.schema import SchemaManager
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 PORT = 5456
 PID = os.getpid()
 

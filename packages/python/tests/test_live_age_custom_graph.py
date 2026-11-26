@@ -10,19 +10,16 @@ Reproduction scenario:
 6. Drop "production_graph" during cleanup.
 """
 
-import socket
-
 import pytest
+from conftest import get_test_host, is_port_open
 from voyager_ogm import Field, Node, Query, Session, create_bridge
 
+HOST = get_test_host()
 
-def _is_age_reachable(host: str = "127.0.0.1", port: int = 5455) -> bool:
+
+def _is_age_reachable(host: str = HOST, port: int = 5455) -> bool:
     """Checks whether the Apache AGE PostgreSQL port is reachable."""
-    try:
-        with socket.create_connection((host, port), timeout=1.0):
-            return True
-    except OSError:
-        return False
+    return is_port_open(host, port, timeout=1.0)
 
 
 class LivePerson(Node):
@@ -43,7 +40,7 @@ def test_live_age_custom_graph_name_isolation() -> None:
     except ImportError:
         pytest.skip("psycopg is required for live Apache AGE tests")
 
-    uri = "postgresql://postgres:voyagerpass123@127.0.0.1:5455/voyager_graph"
+    uri = f"postgresql://postgres:voyagerpass123@{HOST}:5455/voyager_graph"
 
     try:
         raw_conn = psycopg.connect(uri, autocommit=True, connect_timeout=2)

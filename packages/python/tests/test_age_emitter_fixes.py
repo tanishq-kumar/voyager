@@ -11,6 +11,7 @@ with alternative types at compile time with UnsupportedFeature.
 from __future__ import annotations
 
 import pytest
+from conftest import get_test_host
 from conftest import is_port_open as _is_port_open
 from voyager_ogm import (
     Field,
@@ -189,11 +190,12 @@ def test_live_age_multiple_entities_in_one_row() -> None:
     """
     if psycopg is None:
         pytest.skip("psycopg is not installed in this environment")
-    if not _is_port_open("127.0.0.1", 5455):
-        pytest.skip("Apache AGE container not reachable on port 5455")
+    host = get_test_host()
+    if not _is_port_open(host, 5455):
+        pytest.skip(f"Apache AGE container not reachable on {host}:5455")
 
     conn_str = (
-        "host=127.0.0.1 port=5455 user=postgres password=voyagerpass123 "
+        f"host={host} port=5455 user=postgres password=voyagerpass123 "
         "dbname=voyager_graph connect_timeout=3"
     )
 

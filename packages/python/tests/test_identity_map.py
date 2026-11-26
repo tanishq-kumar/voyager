@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm.bridge import MockBridge
 from voyager_ogm.models import Field, Node
 from voyager_ogm.session import AsyncSession, Session
@@ -314,15 +315,16 @@ class TestLiveDatabaseIdentityMap:
     @pytest.mark.live
     def test_live_neo4j_batch_identity_map(self) -> None:
         """Tests Batch Identity Map against live Neo4j container."""
+        host = get_test_host()
         try:
             from neo4j import GraphDatabase
 
             driver = GraphDatabase.driver(
-                "bolt://127.0.0.1:7687", auth=("neo4j", "voyagerpass123"), connection_timeout=0.2
+                f"bolt://{host}:7687", auth=("neo4j", "voyagerpass123"), connection_timeout=0.2
             )
             driver.verify_connectivity()
         except Exception:
-            pytest.skip("Neo4j database not reachable at bolt://127.0.0.1:7687")
+            pytest.skip(f"Neo4j database not reachable at bolt://{host}:7687")
 
         session = Session(bridge=driver, dialect="cypher", enable_identity_map=True)
 

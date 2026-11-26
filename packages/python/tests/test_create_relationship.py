@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import socket
-
 import pytest
+from conftest import get_test_host, is_port_open
 from voyager_ogm import (
     Field,
     Query,
@@ -293,12 +292,11 @@ def test_merge_relationship_generates_alias_for_class_and_type_string_sets() -> 
     )
 
 
-def _is_port_open(port: int, host: str = "127.0.0.1") -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except OSError:
-        return False
+HOST = get_test_host()
+
+
+def _is_port_open(port: int, host: str = HOST) -> bool:
+    return is_port_open(host, port, timeout=0.5)
 
 
 def _exercise_create_relationship(session: Session, since: int = 2024) -> None:
@@ -392,11 +390,11 @@ def _exercise_merge_relationship_no_variable(session: Session) -> None:
 @pytest.mark.live
 def test_live_neo4j_create_relationship() -> None:
     if not _is_port_open(7687):
-        pytest.skip("Neo4j container not reachable on port 7687")
+        pytest.skip(f"Neo4j container not reachable on {HOST}:7687")
     from neo4j import GraphDatabase
 
     driver = GraphDatabase.driver(
-        "bolt://127.0.0.1:7687",
+        f"bolt://{HOST}:7687",
         auth=("neo4j", "voyagerpass123"),
         connection_timeout=2.0,
     )
@@ -404,7 +402,7 @@ def test_live_neo4j_create_relationship() -> None:
         driver.verify_connectivity()
     except Exception as exc:  # pragma: no cover - environment dependent
         driver.close()
-        pytest.skip(f"Neo4j container not reachable on port 7687: {exc}")
+        pytest.skip(f"Neo4j container not reachable on {HOST}:7687: {exc}")
 
     session = Session(bridge=driver, dialect="cypher")
     try:
@@ -418,11 +416,11 @@ def test_live_neo4j_create_relationship() -> None:
 @pytest.mark.live
 def test_live_memgraph_create_relationship() -> None:
     if not _is_port_open(7688):
-        pytest.skip("Memgraph container not reachable on port 7688")
+        pytest.skip(f"Memgraph container not reachable on {HOST}:7688")
     from neo4j import GraphDatabase
 
     driver = GraphDatabase.driver(
-        "bolt://127.0.0.1:7688",
+        f"bolt://{HOST}:7688",
         auth=("", ""),
         connection_timeout=2.0,
     )
@@ -430,7 +428,7 @@ def test_live_memgraph_create_relationship() -> None:
         driver.verify_connectivity()
     except Exception as exc:  # pragma: no cover - environment dependent
         driver.close()
-        pytest.skip(f"Memgraph container not reachable on port 7688: {exc}")
+        pytest.skip(f"Memgraph container not reachable on {HOST}:7688: {exc}")
 
     session = Session(bridge=driver, dialect="cypher")
     try:
@@ -443,13 +441,13 @@ def test_live_memgraph_create_relationship() -> None:
 @pytest.mark.live
 def test_live_falkordb_create_relationship() -> None:
     if not _is_port_open(6379):
-        pytest.skip("FalkorDB container not reachable on port 6379")
+        pytest.skip(f"FalkorDB container not reachable on {HOST}:6379")
     try:
         from falkordb import FalkorDB
     except ImportError:
         pytest.skip("falkordb package is required for live FalkorDB tests")
 
-    client = FalkorDB(host="127.0.0.1", port=6379)
+    client = FalkorDB(host=HOST, port=6379)
     graph = client.select_graph("feat192_live")
     session = Session(bridge=create_bridge(graph), dialect="cypher")
     try:
@@ -465,18 +463,18 @@ def test_live_falkordb_create_relationship() -> None:
 @pytest.mark.live
 def test_live_age_create_relationship() -> None:
     if not _is_port_open(5455):
-        pytest.skip("Apache AGE container not reachable on port 5455")
+        pytest.skip(f"Apache AGE container not reachable on {HOST}:5455")
     try:
         import psycopg
     except ImportError:
         pytest.skip("psycopg is required for live Apache AGE tests")
 
-    uri = "postgresql://postgres:voyagerpass123@127.0.0.1:5455/voyager_graph"
+    uri = f"postgresql://postgres:voyagerpass123@{HOST}:5455/voyager_graph"
     graph_name = "feat192_live_graph"
     try:
         raw_conn = psycopg.connect(uri, autocommit=True, connect_timeout=2)
     except Exception as exc:  # pragma: no cover - environment dependent
-        pytest.skip(f"Apache AGE container not reachable on port 5455: {exc}")
+        pytest.skip(f"Apache AGE container not reachable on {HOST}:5455: {exc}")
 
     created_graph = False
     session: Session | None = None
