@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "voyager-cli"
+dynamic = ["version"]
+description = "Command-line interface for Voyager OGM (the voyager and voy binaries)"
+readme = "../../crates/voyager-cli/README.md"
+authors = [{ name = "Tanishq Kumar" }]
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.11"
+keywords = ["graph", "ogm", "cypher", "sql-pgq", "gql", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Software Development :: Compilers",
+]
+
+[project.urls]
+Homepage = "https://github.com/tanishq-kumar/voyager"
+Repository = "https://github.com/tanishq-kumar/voyager"
+Changelog = "https://github.com/tanishq-kumar/voyager/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "../../crates/voyager-cli/Cargo.toml"
+strip = true

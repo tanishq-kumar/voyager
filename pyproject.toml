@@ -51,6 +51,9 @@ sqlalchemy = [
 analytics = [
     "networkx>=3.0.0",
 ]
+cli = [
+    "voyager-cli==0.5.0a0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-benchmark>=4.0.0",
@@ -77,6 +80,9 @@ notebook = [
 
 [tool.uv]
 required-version = ">=0.13.0"
+
+[tool.uv.sources]
+voyager-cli = { path = "packages/cli" }
 
 [tool.maturin]
 features = ["pyo3/extension-module", "pyo3/generate-import-lib"]

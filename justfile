@@ -361,15 +361,16 @@ release-prepare version base="":
 
     echo "=== Running Full CI Suite ==="
     just ci
-    echo "=== Updating Version to {{version}} in Cargo.toml ==="
+    echo "=== Updating Version to {{version}} in Cargo.toml and pyproject.toml ==="
     python3 -c "import pathlib, tomllib; p = pathlib.Path('Cargo.toml'); text = p.read_text(encoding='utf-8'); old = tomllib.loads(text)['workspace']['package']['version']; needle = 'version = \"' + old + '\"'; n = text.count(needle); assert n >= 1, 'workspace version not found'; p.write_text(text.replace(needle, 'version = \"{{version}}\"'), encoding='utf-8'); print(f'Bumped {old} -> {{version}} in {n} places (workspace package + internal path deps)')"
+    python3 scripts/check_version_sync.py --update
     echo "=== Updating Lockfiles ==="
     cargo update -w
     uv lock
     echo "=== Cutting CHANGELOG.md Section ==="
     python3 scripts/check_changelog.py --release "{{version}}" "$(date +%Y-%m-%d)"
     echo "=== Creating Release Commit ==="
-    git add Cargo.toml Cargo.lock uv.lock CHANGELOG.md
+    git add Cargo.toml Cargo.lock pyproject.toml uv.lock CHANGELOG.md
     git commit -m "chore(release): v{{version}}"
     echo ""
     echo "Release commit for v{{version}} created on '$branch' (base: $base_branch)."

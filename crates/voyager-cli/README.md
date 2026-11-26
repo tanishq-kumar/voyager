@@ -19,8 +19,43 @@ ISO GQL or SQL/PGQ text; use the Rust or Python query builders for that.
 
 ## Install
 
+### Prebuilt binaries (GitHub Releases)
+
+Archives for Linux (`x86_64-unknown-linux-gnu`, static `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`), macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`), and Windows (`x86_64-pc-windows-msvc`) are attached to every [GitHub Release](https://github.com/tanishq-kumar/voyager/releases) as `voyager-cli-v<version>-<target>.tar.gz` (or `.zip` on Windows), alongside `SHA256SUMS` and GitHub build provenance attestations. macOS and Windows binaries are not OS code-signed yet. The Linux `-gnu` binaries need glibc 2.28 or newer (Debian 10+, Ubuntu 20.04+, RHEL 8+); the static `musl` binary runs on any x86_64 Linux, including Alpine.
+
+Verify the checksum and attestation before unpacking:
+
+```bash
+# 1. Verify the SHA-256 checksum
+grep "voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz" SHA256SUMS | sha256sum -c -
+
+# 2. Verify GitHub build provenance (requires GitHub CLI)
+gh attestation verify voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz --repo tanishq-kumar/voyager
+
+# 3. Unpack and put `voyager` and `voy` on your PATH
+tar -xzf voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz
+```
+
+### cargo-binstall
+
+```bash
+cargo binstall voyager-cli
+```
+
+### Cargo (from source)
+
 ```bash
 cargo install voyager-cli
+```
+
+### Python (`pip` / `uv`)
+
+Install the standalone CLI wheel or pull it in via the `cli` extra of `voyager-ogm`:
+
+```bash
+pip install "voyager-ogm[cli]"
+# or standalone without the Python SDK:
+pip install voyager-cli
 ```
 
 Both `voyager` and `voy` are installed. Check the installed version with either:
