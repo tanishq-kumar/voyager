@@ -127,9 +127,10 @@ corpus-update:
     uv run python scripts/update_corpus.py
     git diff --stat spec/corpus
 
-# Run the live corpus checks on one engine (neo4j, memgraph, falkordb, age, pg19) or all engines
-corpus-live engine=".":
-    uv run --no-sync python scripts/run_corpus_live.py {{engine}}
+# Run the live corpus checks on one engine (neo4j, memgraph, falkordb, age, pg19) or all engines,
+# through one lane (official, bridge, native) or all lanes
+corpus-live engine="." lane="official":
+    uv run --no-sync python scripts/run_corpus_live.py {{engine}} --lane {{lane}}
 
 # Record rows.json for one or more scenarios from the reference engine (Neo4j); all scenarios when omitted
 corpus-record-rows *scenario:

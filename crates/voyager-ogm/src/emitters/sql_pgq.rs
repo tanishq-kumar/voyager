@@ -48,6 +48,26 @@ fn ast_node_kind(node: &AstNode) -> &'static str {
     }
 }
 
+/// Builds the compile-time rejection message for an aggregate over a whole element.
+///
+/// `COUNT(element)` is rewritten to `COUNT(*)` before this is reached; every
+/// other aggregate is rejected because SQL/PGQ `COLUMNS` can only project
+/// scalar expressions and properties, not a node or relationship value.
+fn whole_entity_aggregate_feature(func: AggregationFunc, var: &str) -> String {
+    let call = match func {
+        AggregationFunc::Count => format!("COUNT({var})"),
+        AggregationFunc::CountDistinct => format!("COUNT(DISTINCT {var})"),
+        AggregationFunc::Sum => format!("SUM({var})"),
+        AggregationFunc::Avg => format!("AVG({var})"),
+        AggregationFunc::Min => format!("MIN({var})"),
+        AggregationFunc::Max => format!("MAX({var})"),
+        AggregationFunc::Collect => format!("COLLECT({var})"),
+    };
+    format!(
+        "Aggregate '{call}' over a whole node or relationship variable - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, so a whole element cannot be aggregated; project a property instead"
+    )
+}
+
 /// Target dialect flavor for SQL:PGQ query emission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SqlPgqFlavor {
@@ -1121,15 +1141,30 @@ impl AstVisitor for SqlPgqEmitter {
             }
 
             for proj in &projections_list {
-                if proj.aggregation.is_none() {
-                    if let Some(var) = self.is_whole_entity_expression(arena, proj.expression)? {
+                if let Some(func) = proj.aggregation {
+                    // An aggregate over a whole element cannot be expressed in
+                    // `COLUMNS (...)`, which projects scalar value expressions only.
+                    // COUNT is the exception: a variable bound by a non-optional
+                    // pattern is never NULL, so COUNT(element) counts matched rows
+                    // and compiles to COUNT(*). Every other aggregate over an
+                    // element (COUNT(DISTINCT ...), SUM, AVG, MIN, MAX, COLLECT)
+                    // has no SQL/PGQ equivalent and is rejected at compile time.
+                    if func != AggregationFunc::Count
+                        && let Some(var) =
+                            self.is_whole_entity_expression(arena, proj.expression)?
+                    {
                         return Err(Error::UnsupportedFeature {
                             dialect: "sql_pgq".to_string(),
-                            feature: format!(
-                                "Whole entity column projection ('{var}') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables"
-                            ),
+                            feature: whole_entity_aggregate_feature(func, &var),
                         });
                     }
+                } else if let Some(var) = self.is_whole_entity_expression(arena, proj.expression)? {
+                    return Err(Error::UnsupportedFeature {
+                        dialect: "sql_pgq".to_string(),
+                        feature: format!(
+                            "Whole entity column projection ('{var}') - SQL:2023 PGQ GRAPH_TABLE COLUMNS clause only supports scalar expressions and properties, not whole node or relationship variables"
+                        ),
+                    });
                 }
             }
 
@@ -1206,9 +1241,27 @@ impl AstVisitor for SqlPgqEmitter {
                 let mut group_by_keys: Vec<String> = Vec::new();
 
                 for (idx, proj) in projections_list.iter().enumerate() {
-                    let expr_sql = self.render_expression_to_string(arena, proj.expression)?;
-                    let fallback_name = self.get_expr_leaf_name(arena, proj.expression);
                     if let Some(func) = proj.aggregation {
+                        if func == AggregationFunc::Count
+                            && self
+                                .is_whole_entity_expression(arena, proj.expression)?
+                                .is_some()
+                        {
+                            // COUNT(element) counts matched rows: the element binding
+                            // from a non-optional pattern is never NULL, so COUNT(*)
+                            // is equivalent. No COLUMNS entry is needed for it.
+                            let func_call = "COUNT(*)".to_string();
+                            if let Some(alias) = &disambiguated[idx].emitted_alias {
+                                outer_select_items
+                                    .push(format!("{func_call} AS {}", quote_sql_ident(alias)));
+                            } else {
+                                outer_select_items.push(func_call);
+                            }
+                            continue;
+                        }
+
+                        let expr_sql = self.render_expression_to_string(arena, proj.expression)?;
+                        let fallback_name = self.get_expr_leaf_name(arena, proj.expression);
                         let inner_col_name = if let Some((_, existing_alias)) =
                             inner_columns.iter().find(|(e, _)| e == &expr_sql)
                         {
@@ -1254,6 +1307,7 @@ impl AstVisitor for SqlPgqEmitter {
                             outer_select_items.push(func_call);
                         }
                     } else {
+                        let expr_sql = self.render_expression_to_string(arena, proj.expression)?;
                         let target_col_name = &disambiguated[idx].name;
 
                         let inner_alias = if let Some((_, existing_alias)) =
@@ -1285,6 +1339,15 @@ impl AstVisitor for SqlPgqEmitter {
                             group_by_keys.push(inner_alias);
                         }
                     }
+                }
+
+                if inner_columns.is_empty() {
+                    // GRAPH_TABLE requires at least one COLUMNS entry. When every
+                    // projection is COUNT(element) (now COUNT(*)), project a
+                    // constant: both PostgreSQL SQL/PGQ and DuckPGQ accept a
+                    // literal value expression here, and the outer query never
+                    // reads it.
+                    inner_columns.push(("1".to_string(), "_c0".to_string()));
                 }
 
                 self.buffer.push_str(prefix);
@@ -1486,6 +1549,117 @@ mod tests {
             Error::UnsupportedFeature { dialect, feature } => {
                 assert_eq!(dialect, "sql_pgq");
                 assert!(feature.contains("Whole entity column projection ('p')"));
+            }
+            other => panic!("Expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    fn count_over_whole_entity(func: AggregationFunc, distinct: bool) -> Result<String> {
+        let mut builder = QueryBuilder::new();
+        let n = builder.ident("n");
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .distinct(distinct)
+            .select_aggregate(n, func, Some("cnt"));
+        let (arena, root) = builder.build();
+        SqlPgqEmitter::new("g")
+            .visit_query(&arena, root)
+            .map(|compiled| compiled.statement)
+    }
+
+    #[test]
+    fn sql_pgq_count_over_whole_entity_rewrites_to_count_star() {
+        assert_eq!(
+            count_over_whole_entity(AggregationFunc::Count, false).unwrap(),
+            "SELECT COUNT(*) AS \"cnt\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS \"_c0\"))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_distinct_count_over_whole_entity_rewrites_to_count_star() {
+        assert_eq!(
+            count_over_whole_entity(AggregationFunc::Count, true).unwrap(),
+            "SELECT DISTINCT COUNT(*) AS \"cnt\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS \"_c0\"))"
+        );
+    }
+
+    #[test]
+    fn duckpgq_count_over_whole_entity_rewrites_to_count_star() {
+        let mut builder = QueryBuilder::new();
+        let n = builder.ident("n");
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_aggregate(n, AggregationFunc::Count, Some("cnt"));
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g")
+            .for_duckpgq()
+            .visit_query(&arena, root)
+            .unwrap();
+        assert_eq!(
+            compiled.statement,
+            "SELECT COUNT(*) AS \"cnt\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (1 AS \"_c0\"))"
+        );
+    }
+
+    #[test]
+    fn sql_pgq_count_over_whole_entity_with_grouping_keeps_columns() {
+        let mut builder = QueryBuilder::new();
+        let n = builder.ident("n");
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .field("n", "city", Some("city"))
+            .select_aggregate(n, AggregationFunc::Count, Some("cnt"));
+        let (arena, root) = builder.build();
+        let compiled = SqlPgqEmitter::new("g").visit_query(&arena, root).unwrap();
+        assert_eq!(
+            compiled.statement,
+            "SELECT \"city\", COUNT(*) AS \"cnt\" FROM GRAPH_TABLE (g MATCH (n IS \"Person\") COLUMNS (n.city AS \"city\")) GROUP BY \"city\""
+        );
+    }
+
+    #[test]
+    fn sql_pgq_rejects_whole_entity_aggregates_without_an_equivalent() {
+        let cases = [
+            (AggregationFunc::CountDistinct, "COUNT(DISTINCT n)"),
+            (AggregationFunc::Sum, "SUM(n)"),
+            (AggregationFunc::Avg, "AVG(n)"),
+            (AggregationFunc::Min, "MIN(n)"),
+            (AggregationFunc::Max, "MAX(n)"),
+            (AggregationFunc::Collect, "COLLECT(n)"),
+        ];
+        for (func, expected) in cases {
+            for distinct in [false, true] {
+                let err = count_over_whole_entity(func, distinct).unwrap_err();
+                match err {
+                    Error::UnsupportedFeature { dialect, feature } => {
+                        assert_eq!(dialect, "sql_pgq");
+                        assert!(
+                            feature.contains(expected),
+                            "expected {expected:?} in {feature:?}"
+                        );
+                        assert!(feature.contains("whole node or relationship"));
+                    }
+                    other => panic!("Expected UnsupportedFeature for {func:?}, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duckpgq_rejects_whole_entity_aggregates_without_an_equivalent() {
+        let mut builder = QueryBuilder::new();
+        let n = builder.ident("n");
+        builder
+            .match_node(Some("n"), vec!["Person"])
+            .select_aggregate(n, AggregationFunc::Collect, Some("collected"));
+        let (arena, root) = builder.build();
+        let err = SqlPgqEmitter::new("g")
+            .for_duckpgq()
+            .visit_query(&arena, root)
+            .unwrap_err();
+        match err {
+            Error::UnsupportedFeature { feature, .. } => {
+                assert!(feature.contains("COLLECT(n)"), "{feature}");
             }
             other => panic!("Expected UnsupportedFeature, got {other:?}"),
         }

@@ -1,0 +1,56 @@
+[
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p0-match-return/return-multiple-properties",
+    "reason": "The native PostgreSQL wire client returns an array column as its text literal (for example \"{1,2,3,4,5,6,7}\") instead of a list; the bridge (psycopg) decodes it to [1,2,3,4,5,6,7]."
+  },
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p3-aggregation/collect-nullable-property",
+    "reason": "ARRAY_AGG over a text column comes back from the native PostgreSQL wire client as the array literal string \"{London,Paris,Berlin,London}\" instead of a list; psycopg decodes it on the bridge."
+  },
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p3-aggregation/collect-property",
+    "reason": "ARRAY_AGG over a text column comes back from the native PostgreSQL wire client as the array literal string \"{Alice,Bob,Carol,Dave,Eve}\" instead of a list; psycopg decodes it on the bridge."
+  },
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p3-aggregation/empty-input-avg",
+    "reason": "The native PostgreSQL wire client sends the compiler-extracted boolean filter parameter ($p0) without a parameter type, so PostgreSQL rejects the bare WHERE $1 with SQLSTATE 42P18 'could not determine data type of parameter $1'; psycopg binds a Python bool on the bridge."
+  },
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p3-aggregation/empty-input-collect",
+    "reason": "The native PostgreSQL wire client sends the compiler-extracted boolean filter parameter ($p0) without a parameter type, so PostgreSQL rejects the bare WHERE $1 with SQLSTATE 42P18 'could not determine data type of parameter $1'; psycopg binds a Python bool on the bridge."
+  },
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p3-aggregation/empty-input-count",
+    "reason": "The native PostgreSQL wire client sends the compiler-extracted boolean filter parameter ($p0) without a parameter type, so PostgreSQL rejects the bare WHERE $1 with SQLSTATE 42P18 'could not determine data type of parameter $1'; psycopg binds a Python bool on the bridge."
+  },
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p3-aggregation/empty-input-implicit-grouping",
+    "reason": "The native PostgreSQL wire client sends the compiler-extracted boolean filter parameter ($p0) without a parameter type, so PostgreSQL rejects the bare WHERE $1 with SQLSTATE 42P18 'could not determine data type of parameter $1'; psycopg binds a Python bool on the bridge."
+  },
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p3-aggregation/empty-input-min-max",
+    "reason": "The native PostgreSQL wire client sends the compiler-extracted boolean filter parameter ($p0) without a parameter type, so PostgreSQL rejects the bare WHERE $1 with SQLSTATE 42P18 'could not determine data type of parameter $1'; psycopg binds a Python bool on the bridge."
+  },
+  {
+    "engine": "pg19",
+    "lane": "native",
+    "scenario": "p3-aggregation/empty-input-sum",
+    "reason": "The native PostgreSQL wire client sends the compiler-extracted boolean filter parameter ($p0) without a parameter type, so PostgreSQL rejects the bare WHERE $1 with SQLSTATE 42P18 'could not determine data type of parameter $1'; psycopg binds a Python bool on the bridge."
+  }
+]

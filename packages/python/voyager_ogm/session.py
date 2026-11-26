@@ -704,9 +704,11 @@ class _SessionBase:
         circuit_failure_threshold: int = 1,
         fallback: str | None = None,
         graph_name: str | None = None,
+        install_duckpgq: bool = False,
     ) -> None:
         cfg = get_config()
         self._dialect = dialect or cfg.default_dialect
+        self._install_duckpgq = install_duckpgq
         self._enable_identity_map = (
             cfg.enable_identity_map if enable_identity_map is None else enable_identity_map
         )
@@ -833,6 +835,15 @@ class _SessionBase:
 
         if dialect is None and isinstance(self._bridge, (DuckDbBridge, AsyncDuckDbBridge)):
             self._dialect = "duckpgq"
+
+        if (self._dialect or "").lower() in ("duckpgq", "duck_pgq") and isinstance(
+            self._bridge, (DuckDbBridge, AsyncDuckDbBridge)
+        ):
+            # The bridge loads DuckPGQ lazily, before the first SQL/PGQ statement
+            # (GRAPH_TABLE, CREATE PROPERTY GRAPH), so a session that only runs
+            # plain SQL never needs the extension. Pass on the install opt-in.
+            if self._install_duckpgq:
+                self._bridge.set_install_duckpgq(True)
 
         if resolved_graph is not None:
             validate_graph_name(resolved_graph)
@@ -1479,6 +1490,7 @@ class Session(_SessionBase):
         circuit_failure_threshold: int = 1,
         fallback: str | None = None,
         graph_name: str | None = None,
+        install_duckpgq: bool = False,
     ) -> None:
         """Initializes a new Voyager Session.
 
@@ -1505,6 +1517,11 @@ class Session(_SessionBase):
             graph_name: Apache AGE or SQL:2023 PGQ graph name to target for queries, bulk ingestion,
                 transactions, and session flushes. Serves as the single source of truth for this session,
                 overriding any bridge or URI graph name. For Apache AGE, defaults to "age_graph".
+            install_duckpgq: For a DuckDB session with the ``duck_pgq``/``duckpgq`` dialect,
+                install the DuckPGQ extension before loading it when it is not already
+                available. Off by default because installing downloads the extension;
+                without it a missing extension raises an error naming ``INSTALL duckpgq;``.
+                A connection that already ran ``LOAD duckpgq;`` is left untouched.
         """
         super().__init__(
             bridge=bridge,
@@ -1519,6 +1536,7 @@ class Session(_SessionBase):
             circuit_failure_threshold=circuit_failure_threshold,
             fallback=fallback,
             graph_name=graph_name,
+            install_duckpgq=install_duckpgq,
         )
 
     @property
@@ -2360,6 +2378,7 @@ class AsyncSession(_SessionBase):
         circuit_failure_threshold: int = 1,
         fallback: str | None = None,
         graph_name: str | None = None,
+        install_duckpgq: bool = False,
     ) -> None:
         """Initializes a new asynchronous Voyager Session.
 
@@ -2384,6 +2403,11 @@ class AsyncSession(_SessionBase):
             graph_name: Apache AGE or SQL:2023 PGQ graph name to target for queries, bulk ingestion,
                 transactions, and session flushes. Serves as the single source of truth for this session,
                 overriding any bridge or URI graph name. For Apache AGE, defaults to "age_graph".
+            install_duckpgq: For a DuckDB session with the ``duck_pgq``/``duckpgq`` dialect,
+                install the DuckPGQ extension before loading it when it is not already
+                available. Off by default because installing downloads the extension;
+                without it a missing extension raises an error naming ``INSTALL duckpgq;``.
+                A connection that already ran ``LOAD duckpgq;`` is left untouched.
         """
         super().__init__(
             bridge=bridge,
@@ -2398,6 +2422,7 @@ class AsyncSession(_SessionBase):
             circuit_failure_threshold=circuit_failure_threshold,
             fallback=fallback,
             graph_name=graph_name,
+            install_duckpgq=install_duckpgq,
         )
 
     @property
