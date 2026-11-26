@@ -51,6 +51,10 @@ class _AgtypeParser:
             return False
         if char == "n" and self._consume_keyword("null"):
             return None
+        if char == "N" and self._consume_keyword("NaN"):
+            return float("nan")
+        if char == "I" and self._consume_keyword("Infinity"):
+            return float("inf")
         if char in "-+0123456789":
             return self.parse_number()
         remainder = self.text[self.pos :]
@@ -84,7 +88,11 @@ class _AgtypeParser:
         return True
 
     def parse_number(self) -> Any:
-        """Parses an integer or float, ignoring a ``::numeric`` annotation."""
+        """Parses an integer, float (including Inf/-Inf), or ``::numeric`` scalar."""
+        if self.text.startswith("-Infinity", self.pos) and self._consume_keyword("-Infinity"):
+            return float("-inf")
+        if self.text.startswith("+Infinity", self.pos) and self._consume_keyword("+Infinity"):
+            return float("inf")
         start = self.pos
         while self.pos < self.length and self.text[self.pos] in "-+0123456789.eE":
             self.pos += 1

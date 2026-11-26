@@ -10,6 +10,7 @@ use crate::config::PoolConfig;
 use crate::engine::{AsyncConnection, QueryResult};
 use crate::error::{NetError, Result};
 use crate::native_transaction::NativeTransaction;
+use crate::params::ParamValue;
 use crate::pool::ConnectionPool;
 #[cfg(feature = "postgres")]
 use crate::postgres::PostgresConnection;
@@ -152,7 +153,7 @@ impl NativeClient {
     pub async fn execute(
         &self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         let mut conn = self.pool.acquire().await?;
         conn.execute(query, params).await

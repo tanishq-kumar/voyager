@@ -24,12 +24,15 @@ import polars as pl
 
 from voyager_ogm.agtype import decode_agtype
 from voyager_ogm.entities import (
+    GraphNode,
+    GraphPath,
+    GraphRelationship,
     convert_driver_value,
     serialize_records_for_arrow,
     serialize_value_for_arrow,
 )
 from voyager_ogm.ingestion import BulkIngestionPlan
-from voyager_ogm.types import unwrap_spatial_param
+from voyager_ogm.types import Duration, parse_pg_interval_text, unwrap_spatial_param
 
 _PAGINATION_PARAMETER_PATTERN = re.compile(
     r"\b(?:SKIP|OFFSET|LIMIT)\s+\$([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE
@@ -718,12 +721,29 @@ class AsyncMockBridge:
 
 
 def _adapt_bolt_value(val: Any) -> Any:
-    """Adapts tagged spatial values to Bolt driver spatial objects (WGS84Point / CartesianPoint)."""
+    """Adapts Voyager Duration and tagged spatial values to Bolt driver objects."""
+    if isinstance(val, Duration):
+        try:
+            from neo4j.time import Duration as Neo4jDuration
+
+            return Neo4jDuration(
+                months=val.months,
+                days=val.days,
+                seconds=val.seconds,
+                nanoseconds=val.nanoseconds,
+            )
+        except ImportError:
+            return val.to_iso()
+
     try:
         from neo4j.spatial import CartesianPoint, WGS84Point
     except ImportError:
-        if isinstance(val, dict) and "__voyager_spatial__" in val:
-            return val["__voyager_spatial__"]
+        if isinstance(val, dict):
+            if "__voyager_spatial__" in val:
+                return val["__voyager_spatial__"]
+            return {k: _adapt_bolt_value(v) for k, v in val.items()}
+        if isinstance(val, (list, tuple)):
+            return [_adapt_bolt_value(x) for x in val]
         return val
 
     from voyager_ogm.types import WGS_84_2D, WGS_84_3D, Point
@@ -1604,6 +1624,16 @@ class DuckDbBridge:
     ) -> list[dict[str, Any]]:
         """Executes query on DuckDB.
 
+        Preserves exact calendar ``months``, ``days``, ``seconds``, and
+        ``nanoseconds`` on ``INTERVAL`` columns by reading Arrow
+        ``month_day_nano_interval`` when a ``TIMEDELTA`` column is present in
+        ``rel.description``. Queries without any top-level ``INTERVAL`` column
+        decode via ``rel.fetchall()`` (preserving native Python ``int`` for
+        ``HUGEINT`` and ``uuid.UUID`` inside ``UUID[]``), so ``INTERVAL`` values
+        nested solely inside ``LIST``/``STRUCT``/``MAP`` without a top-level
+        ``INTERVAL`` column are approximated as ``datetime.timedelta`` by
+        DuckDB's DBAPI.
+
         Args:
             statement: Query statement.
             parameters: Query parameters.
@@ -1614,16 +1644,21 @@ class DuckDbBridge:
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         rel = self.con.execute(stmt, params)
-        if rel.description:
-            cols = [str(d[0]) for d in rel.description]
-            rows = rel.fetchall()
-            return BridgeResult([dict(zip(cols, row, strict=False)) for row in rows], columns=cols)
-        return BridgeResult([], columns=())
+        if not rel.description:
+            return BridgeResult([], columns=())
+        has_timedelta = any(
+            len(d) > 1 and str(d[1]).upper() == "TIMEDELTA" for d in rel.description
+        )
+        if has_timedelta and hasattr(rel, "fetch_arrow_table"):
+            arrow_table = rel.fetch_arrow_table()
+            if arrow_table is not None:
+                return _records_from_duckdb_arrow(rel.description, arrow_table)
+        return _records_from_duckdb_rows(rel.description, rel.fetchall())
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
-        """Executes query and streams to Polars DataFrame using zero-copy extraction.
+        """Executes query and streams to Polars DataFrame without re-executing.
 
         Args:
             statement: Query statement.
@@ -1634,9 +1669,23 @@ class DuckDbBridge:
         """
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
-        if hasattr(self.con, "pl"):
-            return self.con.execute(stmt, params).pl()
-        return _records_to_polars(self.execute(stmt, params))
+        rel = self.con.execute(stmt, params)
+        if not rel.description:
+            return pl.DataFrame()
+        if hasattr(rel, "fetch_arrow_table"):
+            arrow_table = rel.fetch_arrow_table()
+            if arrow_table is not None:
+                return _duckdb_arrow_table_to_polars(arrow_table)
+        if hasattr(self.con, "pl") and hasattr(rel, "pl"):
+            try:
+                return rel.pl()
+            except Exception as exc:
+                if "month_day_nano_interval" not in str(exc):
+                    raise
+                return _records_to_polars(
+                    _records_from_duckdb_rows(rel.description, rel.fetchall())
+                )
+        return _records_to_polars(_records_from_duckdb_rows(rel.description, rel.fetchall()))
 
     def execute_bulk(
         self,
@@ -2131,6 +2180,286 @@ def setup_postgres_age(conn: Any, force: bool = False) -> None:
             pass
 
 
+def _duckdb_mdn_to_duration(val: Any) -> Duration:
+    """Converts a PyArrow ``MonthDayNano`` value to an exact :class:`Duration`."""
+    total_ns = int(val.nanoseconds)
+    sign = -1 if total_ns < 0 else 1
+    abs_ns = abs(total_ns)
+    secs = sign * (abs_ns // 1_000_000_000)
+    ns = sign * (abs_ns % 1_000_000_000)
+    return Duration(
+        months=int(val.months),
+        days=int(val.days),
+        seconds=secs,
+        nanoseconds=ns,
+    )
+
+
+def _is_month_day_nano_interval(arrow_type: Any) -> bool:
+    """Returns whether ``arrow_type`` is PyArrow's ``month_day_nano_interval``."""
+    import pyarrow as pa
+
+    return bool(arrow_type == pa.month_day_nano_interval())
+
+
+def _normalize_duckdb_arrow_value(val: Any, arrow_type: Any) -> Any:
+    """Normalizes a Python value extracted from a DuckDB PyArrow table."""
+    import pyarrow as pa
+
+    if val is None:
+        return None
+    if _is_month_day_nano_interval(arrow_type):
+        return _duckdb_mdn_to_duration(val)
+    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        elem_type = arrow_type.value_type
+        return [_normalize_duckdb_arrow_value(item, elem_type) for item in val]
+    if pa.types.is_map(arrow_type):
+        key_type = arrow_type.key_type
+        item_type = arrow_type.item_type
+        return {
+            _normalize_duckdb_arrow_value(k, key_type): _normalize_duckdb_arrow_value(v, item_type)
+            for k, v in val
+        }
+    if pa.types.is_struct(arrow_type):
+        field_map = {field.name: field.type for field in arrow_type}
+        return {
+            k: _normalize_duckdb_arrow_value(v, field_map[k]) if k in field_map else v
+            for k, v in val.items()
+        }
+    return _normalize_duckdb_value(val)
+
+
+def _records_from_duckdb_rows(
+    description: Sequence[Any], rows: Sequence[Sequence[Any]]
+) -> BridgeResult:
+    """Builds a :class:`BridgeResult` from an already-fetched DuckDB cursor."""
+    cols = [str(d[0]) for d in description]
+    json_cols = {
+        idx for idx, d in enumerate(description) if len(d) > 1 and str(d[1]).upper() == "JSON"
+    }
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        rec: dict[str, Any] = {}
+        for idx, (col, val) in enumerate(zip(cols, row, strict=False)):
+            if idx in json_cols and isinstance(val, str):
+                val = json.loads(val)
+            rec[col] = _normalize_duckdb_value(val)
+        records.append(rec)
+    return BridgeResult(records, columns=cols)
+
+
+def _records_from_duckdb_arrow(description: Sequence[Any], arrow_table: Any) -> BridgeResult:
+    """Builds a :class:`BridgeResult` from a DuckDB PyArrow table, preserving interval months."""
+    import uuid as _uuid
+
+    cols = [str(d[0]) for d in description]
+    json_cols = {
+        idx for idx, d in enumerate(description) if len(d) > 1 and str(d[1]).upper() == "JSON"
+    }
+    uuid_cols = {
+        idx for idx, d in enumerate(description) if len(d) > 1 and str(d[1]).upper() == "UUID"
+    }
+    schema = arrow_table.schema
+    col_lists = [arrow_table.column(idx).to_pylist() for idx in range(len(cols))]
+    num_rows = arrow_table.num_rows
+    records: list[dict[str, Any]] = []
+    for row_idx in range(num_rows):
+        rec: dict[str, Any] = {}
+        for col_idx, col in enumerate(cols):
+            val = col_lists[col_idx][row_idx]
+            if val is not None:
+                if col_idx in json_cols and isinstance(val, str):
+                    val = json.loads(val)
+                elif col_idx in uuid_cols and isinstance(val, str):
+                    val = _uuid.UUID(val)
+                else:
+                    val = _normalize_duckdb_arrow_value(val, schema.field(col_idx).type)
+            rec[col] = val
+        records.append(rec)
+    return BridgeResult(records, columns=cols)
+
+
+def _arrow_has_month_day_nano_interval(arrow_type: Any) -> bool:
+    """Returns whether ``arrow_type`` is or contains ``month_day_nano_interval``."""
+    import pyarrow as pa
+
+    if _is_month_day_nano_interval(arrow_type):
+        return True
+    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        return _arrow_has_month_day_nano_interval(arrow_type.value_type)
+    if pa.types.is_struct(arrow_type):
+        return any(_arrow_has_month_day_nano_interval(f.type) for f in arrow_type)
+    if pa.types.is_map(arrow_type):
+        return _arrow_has_month_day_nano_interval(
+            arrow_type.key_type
+        ) or _arrow_has_month_day_nano_interval(arrow_type.item_type)
+    return False
+
+
+def _duckdb_mdn_column_to_arrow(col: Any) -> Any:
+    """Converts a scalar ``month_day_nano_interval`` Arrow column to Polars-safe Arrow."""
+    import pyarrow as pa
+
+    values = col.to_pylist()
+    can_duration_us = True
+    can_duration_ns = True
+    for val in values:
+        if val is None:
+            continue
+        if val.months != 0 or val.days != 0:
+            can_duration_us = False
+            can_duration_ns = False
+            break
+        ns = int(val.nanoseconds)
+        if ns % 1_000 != 0 or not (-(2**63) <= ns // 1_000 < 2**63):
+            can_duration_us = False
+        if not (-(2**63) <= ns < 2**63):
+            can_duration_ns = False
+
+    if can_duration_us:
+        converted = [None if v is None else int(v.nanoseconds) // 1_000 for v in values]
+        return pa.array(converted, type=pa.duration("us"))
+    if can_duration_ns:
+        converted = [None if v is None else int(v.nanoseconds) for v in values]
+        return pa.array(converted, type=pa.duration("ns"))
+
+    struct_type = pa.struct(
+        [
+            pa.field("months", pa.int64(), nullable=False),
+            pa.field("days", pa.int64(), nullable=False),
+            pa.field("seconds", pa.int64(), nullable=False),
+            pa.field("nanoseconds", pa.int64(), nullable=False),
+        ]
+    )
+    struct_vals: list[dict[str, int] | None] = []
+    for v in values:
+        if v is None:
+            struct_vals.append(None)
+        else:
+            dur = _duckdb_mdn_to_duration(v)
+            struct_vals.append(
+                {
+                    "months": dur.months,
+                    "days": dur.days,
+                    "seconds": dur.seconds,
+                    "nanoseconds": dur.nanoseconds,
+                }
+            )
+    return pa.array(struct_vals, type=struct_type)
+
+
+def _ensure_polars_df(val: Any) -> pl.DataFrame:
+    """Narrows ``pl.from_arrow(...)`` to a ``pl.DataFrame``."""
+    if isinstance(val, pl.DataFrame):
+        return val
+    return val.to_frame()
+
+
+def _duckdb_arrow_table_to_polars(arrow_table: Any) -> pl.DataFrame:
+    """Converts a DuckDB Arrow table to Polars without re-executing, avoiding Polars interval panics."""
+    import pyarrow as pa
+
+    schema = arrow_table.schema
+    if not any(_arrow_has_month_day_nano_interval(f.type) for f in schema):
+        return _ensure_polars_df(pl.from_arrow(arrow_table))
+
+    new_cols = []
+    new_fields = []
+    for idx, field in enumerate(schema):
+        col = arrow_table.column(idx)
+        if _is_month_day_nano_interval(field.type):
+            arr = _duckdb_mdn_column_to_arrow(col)
+            new_cols.append(arr)
+            meta = dict(field.metadata) if field.metadata else {}
+            if pa.types.is_struct(arr.type):
+                meta[b"voyager.type"] = b"duration"
+            new_fields.append(
+                pa.field(field.name, arr.type, nullable=field.nullable, metadata=meta or None)
+            )
+        elif _arrow_has_month_day_nano_interval(field.type):
+            py_vals = [_normalize_duckdb_arrow_value(v, field.type) for v in col.to_pylist()]
+            converted_vals = [serialize_value_for_arrow(v) for v in py_vals]
+            arr = pa.array(converted_vals)
+            new_cols.append(arr)
+            new_fields.append(pa.field(field.name, arr.type, nullable=field.nullable))
+        else:
+            new_cols.append(col)
+            new_fields.append(field)
+
+    return _ensure_polars_df(
+        pl.from_arrow(pa.Table.from_arrays(new_cols, schema=pa.schema(new_fields)))
+    )
+
+
+def _normalize_duckdb_value(val: Any) -> Any:
+    """Normalizes DuckDB Python values (converting ``timedelta`` to :class:`Duration`)."""
+    if isinstance(val, datetime.timedelta):
+        return Duration.from_timedelta(val)
+    if isinstance(val, list):
+        return [_normalize_duckdb_value(item) for item in val]
+    if isinstance(val, dict):
+        return {k: _normalize_duckdb_value(v) for k, v in val.items()}
+    return val
+
+
+def _format_pg_duration_text(dur: Duration) -> str:
+    """Formats a :class:`Duration` into PostgreSQL ``interval`` text syntax."""
+    total_us = dur.seconds * 1_000_000 + dur.nanoseconds // 1_000
+    if dur.months == 0 and dur.days == 0 and total_us == 0:
+        return "0 seconds"
+    sign = "-" if total_us < 0 else ""
+    abs_us = abs(total_us)
+    secs, us = divmod(abs_us, 1_000_000)
+    return f"{dur.months} mons {dur.days} days {sign}{secs}.{us:06d} seconds"
+
+
+def _configure_pg_adapters(cursor: Any) -> bool:
+    """Registers per-cursor ``interval`` loader and ``Duration`` dumper on psycopg 3 cursors."""
+    adapters = getattr(cursor, "adapters", None)
+    if adapters is None:
+        return False
+    try:
+        from psycopg.adapt import Dumper, Loader
+    except ImportError:
+        return False
+
+    class _VoyagerIntervalLoader(Loader):
+        def load(self, data: Any) -> Any:
+            text = bytes(data).decode("utf-8")
+            try:
+                return parse_pg_interval_text(text)
+            except ValueError:
+                try:
+                    from psycopg.types.datetime import IntervalLoader
+
+                    return Duration.from_timedelta(
+                        IntervalLoader(self.oid, self.connection).load(data)
+                    )
+                except Exception:
+                    return text
+
+    class _VoyagerDurationDumper(Dumper):
+        oid = 1186  # PostgreSQL INTERVAL OID
+
+        def dump(self, obj: Duration) -> bytes:
+            return _format_pg_duration_text(obj).encode("utf-8")
+
+    adapters.register_loader("interval", _VoyagerIntervalLoader)
+    adapters.register_dumper(Duration, _VoyagerDurationDumper)
+    return True
+
+
+def _normalize_pg_fallback_value(val: Any) -> Any:
+    """Converts ``datetime.timedelta`` values to :class:`Duration` when cursor adapters are absent."""
+    if isinstance(val, datetime.timedelta):
+        return Duration.from_timedelta(val)
+    if isinstance(val, list):
+        return [_normalize_pg_fallback_value(item) for item in val]
+    if isinstance(val, dict):
+        return {k: _normalize_pg_fallback_value(v) for k, v in val.items()}
+    return val
+
+
 class PostgresBridge:
     """Synchronous PostgreSQL driver bridge (psycopg 3 / psycopg2) with zero-copy Polars output."""
 
@@ -2153,21 +2482,27 @@ class PostgresBridge:
             else None
         )
 
-    def _decode_row(self, cursor: Any, row: Sequence[Any]) -> tuple[Any, ...]:
-        """Decodes only values from PostgreSQL columns whose type is ``agtype``."""
-        if self._agtype_oid is None or not cursor.description:
-            return tuple(row)
-        agtype_indices = [
-            index
-            for index, description in enumerate(cursor.description)
-            if _description_type_oid(description) == self._agtype_oid
-        ]
-        if not agtype_indices:
+    def _decode_row(
+        self, cursor: Any, row: Sequence[Any], *, convert_timedelta: bool = False
+    ) -> tuple[Any, ...]:
+        """Decodes PostgreSQL ``agtype`` columns and normalizes fallback intervals."""
+        agtype_indices: list[int] = []
+        if self._agtype_oid is not None and cursor.description:
+            agtype_indices = [
+                index
+                for index, description in enumerate(cursor.description)
+                if _description_type_oid(description) == self._agtype_oid
+            ]
+        if not agtype_indices and not convert_timedelta:
             return tuple(row)
         decoded = list(row)
         for index in agtype_indices:
             if index < len(decoded) and decoded[index] is not None:
                 decoded[index] = decode_agtype(decoded[index])
+        if convert_timedelta:
+            for index, val in enumerate(decoded):
+                if index not in agtype_indices:
+                    decoded[index] = _normalize_pg_fallback_value(val)
         return tuple(decoded)
 
     @property
@@ -2207,12 +2542,15 @@ class PostgresBridge:
         return stmt, ordered_params
 
     def _execute_cursor(self, cursor: Any, stmt: str, params: Any) -> BridgeResult:
-        """Executes a formatted statement on a psycopg cursor and decodes AGE columns."""
+        """Executes a formatted statement on a psycopg cursor and decodes AGE/interval columns."""
+        has_adapters = _configure_pg_adapters(cursor)
         cursor.execute(stmt, params or None)
         if cursor.description:
             cols = [str(d[0]) for d in cursor.description]
             rows = cursor.fetchall()
-            decoded = [self._decode_row(cursor, row) for row in rows]
+            decoded = [
+                self._decode_row(cursor, row, convert_timedelta=not has_adapters) for row in rows
+            ]
             return BridgeResult(
                 [dict(zip(cols, row, strict=False)) for row in decoded],
                 columns=cols,
@@ -2221,12 +2559,16 @@ class PostgresBridge:
 
     def _execute_cursor_polars(self, cursor: Any, stmt: str, params: Any) -> pl.DataFrame:
         """Executes a formatted statement on a psycopg cursor and returns a Polars DataFrame."""
+        has_adapters = _configure_pg_adapters(cursor)
         cursor.execute(stmt, params or None)
         if cursor.description:
             cols = [str(d[0]) for d in cursor.description]
             rows = cursor.fetchall()
             decoded = [
-                tuple(serialize_value_for_arrow(v) for v in self._decode_row(cursor, row))
+                tuple(
+                    serialize_value_for_arrow(v)
+                    for v in self._decode_row(cursor, row, convert_timedelta=not has_adapters)
+                )
                 for row in rows
             ]
             return pl.DataFrame(decoded, schema=cols, orient="row")
@@ -2678,13 +3020,15 @@ class AsyncPostgresBridgeTransaction:
 
 
 def _adapt_falkordb_value(val: Any) -> Any:
-    """Adapts rich parameter values (temporal types, Point, etc.) for FalkorDB query execution."""
+    """Adapts rich parameter values (temporal types, Duration, Point, etc.) for FalkorDB query execution."""
     if isinstance(val, (datetime.date, datetime.time, datetime.datetime)):
         return val.isoformat()
     if isinstance(val, datetime.timedelta):
         from voyager_ogm.types import to_iso_duration
 
         return to_iso_duration(val)
+    if isinstance(val, Duration):
+        return val.to_iso()
     if isinstance(val, dict):
         if "__voyager_spatial__" in val:
             sp = val["__voyager_spatial__"]
@@ -2694,6 +3038,40 @@ def _adapt_falkordb_value(val: Any) -> Any:
     if isinstance(val, (list, tuple)):
         return [_adapt_falkordb_value(x) for x in val]
     return val
+
+
+def _strip_falkordb_utc(value: Any) -> Any:
+    """Removes the spurious UTC tzinfo falkordb-py attaches to localdatetime values."""
+    if isinstance(value, datetime.datetime) and value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    if isinstance(value, GraphNode):
+        return GraphNode._from_trusted(
+            node_id=value.id,
+            element_id=value.element_id,
+            labels=value.labels,
+            properties={k: _strip_falkordb_utc(v) for k, v in value.properties.items()},
+        )
+    if isinstance(value, GraphRelationship):
+        return GraphRelationship._from_trusted(
+            rel_id=value.id,
+            element_id=value.element_id,
+            rel_type=value.type,
+            start_id=value.start_id,
+            end_id=value.end_id,
+            properties={k: _strip_falkordb_utc(v) for k, v in value.properties.items()},
+            start_element_id=value.start_element_id,
+            end_element_id=value.end_element_id,
+        )
+    if isinstance(value, GraphPath):
+        return GraphPath._from_trusted(
+            tuple(_strip_falkordb_utc(n) for n in value.nodes),
+            tuple(_strip_falkordb_utc(r) for r in value.relationships),
+        )
+    if isinstance(value, list):
+        return [_strip_falkordb_utc(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _strip_falkordb_utc(v) for k, v in value.items()}
+    return value
 
 
 def _adapt_falkordb_parameters(params: dict[str, Any]) -> dict[str, Any]:
@@ -2778,7 +3156,7 @@ class FalkorDBBridge:
         for row in result_set:
             rec: dict[str, Any] = {}
             for col, val in zip(col_names, row, strict=False):
-                rec[col] = convert_driver_value(val)
+                rec[col] = _strip_falkordb_utc(convert_driver_value(val))
             records.append(rec)
         return BridgeResult(records, columns=col_names)
 

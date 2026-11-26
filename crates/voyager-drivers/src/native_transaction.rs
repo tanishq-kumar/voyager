@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
+use crate::params::ParamValue;
 use crate::pool::PooledConnection;
 
 /// Lifecycle state of a native transaction.
@@ -119,7 +120,7 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
     pub async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         let conn = self.active_conn()?;
         match conn.execute(query, params).await {

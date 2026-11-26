@@ -19,6 +19,7 @@ pub mod introspect;
 #[cfg(feature = "testkit")]
 pub mod mock;
 pub mod native_transaction;
+pub mod params;
 pub mod pool;
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -53,6 +54,7 @@ pub use introspect::{GraphSchema, IntrospectOptions, introspect};
 #[cfg(feature = "testkit")]
 pub use mock::{MockConnection, MockConnectionFactory, MockEngine};
 pub use native_transaction::{NativeTransaction, NativeTransactionState};
+pub use params::{ParamTimezone, ParamValue};
 pub use pool::{ConnectionPool, PoolMetricsSnapshot, PooledConnection};
 #[cfg(feature = "postgres")]
 pub use postgres::{

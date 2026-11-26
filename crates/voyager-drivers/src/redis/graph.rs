@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::bolt::{
-    BoltNode, BoltPath, BoltPoint2D, BoltRelationship, BoltUnboundRelationship, BoltValue,
-    build_bolt_record_batch,
+    BoltDate, BoltDuration, BoltLocalDateTime, BoltLocalTime, BoltNode, BoltPath, BoltPoint2D,
+    BoltRelationship, BoltUnboundRelationship, BoltValue, build_bolt_record_batch,
 };
 use crate::engine::{QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
@@ -781,7 +781,16 @@ impl FalkorCompactResult {
         }
 
         let batch = build_bolt_record_batch(&self.columns, &bolt_rows)?;
-        Ok(QueryResult::new(self.columns.clone(), vec![batch], summary))
+        let result = QueryResult::new(self.columns.clone(), vec![batch], summary);
+        if result
+            .batches
+            .iter()
+            .any(crate::bolt::canonical::batch_needs_bolt_rows)
+        {
+            Ok(result.with_bolt_rows(bolt_rows))
+        } else {
+            Ok(result)
+        }
     }
 }
 
@@ -1104,6 +1113,44 @@ pub fn decode_compact_cell(cell: &RespValue, schema: &FalkorGraphSchema) -> Resu
                 }
             }
             Ok(BoltValue::List(floats))
+        }
+        13 => {
+            let secs = val.as_i64().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected integer payload for FalkorDB DATETIME cell (tag 13), got {val:?}"
+                ))
+            })?;
+            Ok(BoltValue::LocalDateTime(BoltLocalDateTime::new(secs, 0)))
+        }
+        14 => {
+            let secs = val.as_i64().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected integer payload for FalkorDB DATE cell (tag 14), got {val:?}"
+                ))
+            })?;
+            Ok(BoltValue::Date(BoltDate::new(secs.div_euclid(86_400))))
+        }
+        15 => {
+            let raw_secs = val.as_i64().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected integer payload for FalkorDB TIME cell (tag 15), got {val:?}"
+                ))
+            })?;
+            Ok(BoltValue::LocalTime(BoltLocalTime::new(
+                raw_secs.rem_euclid(86_400).saturating_mul(1_000_000_000),
+            )))
+        }
+        16 => {
+            let total_secs = val.as_i64().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected integer payload for FalkorDB DURATION cell (tag 16), got {val:?}"
+                ))
+            })?;
+            // Euclidean split so negative totals match falkordb-py's timedelta
+            // normalisation (-93600 s -> -2 days + 79200 s).
+            let days = total_secs.div_euclid(86_400);
+            let secs = total_secs.rem_euclid(86_400);
+            Ok(BoltValue::Duration(BoltDuration::new(0, days, secs, 0)))
         }
         _ => Ok(resp_to_bolt_value(val)),
     }

@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import math
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from voyager_ogm.expressions import (
@@ -696,14 +697,14 @@ def unwrap_spatial_param(val: Any) -> Any:
 
 _ISO_DURATION_REGEX = re.compile(
     r"^(?P<sign>[+-])?P"
-    r"(?:(?P<years>\d+(?:\.\d+)?)Y)?"
-    r"(?:(?P<months>\d+(?:\.\d+)?)M)?"
-    r"(?:(?P<weeks>\d+(?:\.\d+)?)W)?"
-    r"(?:(?P<days>\d+(?:\.\d+)?)D)?"
+    r"(?:(?P<years>[+-]?\d+(?:\.\d+)?)Y)?"
+    r"(?:(?P<months>[+-]?\d+(?:\.\d+)?)M)?"
+    r"(?:(?P<weeks>[+-]?\d+(?:\.\d+)?)W)?"
+    r"(?:(?P<days>[+-]?\d+(?:\.\d+)?)D)?"
     r"(?:T"
-    r"(?:(?P<hours>\d+(?:\.\d+)?)H)?"
-    r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?"
-    r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?"
+    r"(?:(?P<hours>[+-]?\d+(?:\.\d+)?)H)?"
+    r"(?:(?P<minutes>[+-]?\d+(?:\.\d+)?)M)?"
+    r"(?:(?P<seconds>[+-]?\d+(?:\.\d+)?)S)?"
     r")?$"
 )
 
@@ -796,6 +797,316 @@ def to_iso_duration(td: datetime.timedelta) -> str:
         parts.append("T0S")
 
     return "".join(parts)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Duration:
+    """Calendar and nanosecond-resolution duration returned by graph and SQL queries.
+
+    Represents ``(months, days, seconds, nanoseconds)`` without lossy month-to-day
+    approximation or sub-microsecond truncation. When ``months == 0`` and
+    ``nanoseconds % 1000 == 0``, :meth:`to_timedelta` converts losslessly to
+    :class:`datetime.timedelta`.
+
+    Equality and hashing compare ``(months, days, seconds, nanoseconds)``
+    component-wise after normalizing only ``seconds``/``nanoseconds`` carry (for
+    example ``Duration(seconds=1, nanoseconds=-500_000_000) == Duration(nanoseconds=500_000_000)``),
+    without folding ``days`` into ``seconds``, matching how Neo4j and PostgreSQL
+    preserve ``days`` separately from ``seconds``.
+    """
+
+    months: int = 0
+    days: int = 0
+    seconds: int = 0
+    nanoseconds: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "months", int(self.months))
+        object.__setattr__(self, "days", int(self.days))
+        object.__setattr__(self, "seconds", int(self.seconds))
+        object.__setattr__(self, "nanoseconds", int(self.nanoseconds))
+
+    @property
+    def total_nanoseconds(self) -> int:
+        """Total nanoseconds of the ``(days, seconds, nanoseconds)`` part (excluding ``months``)."""
+        return (self.days * 86_400 + self.seconds) * 1_000_000_000 + self.nanoseconds
+
+    def _normalized_subday(self) -> tuple[int, int]:
+        """Normalizes ``seconds`` and ``nanoseconds`` carry with shared sign toward zero."""
+        total_ns = self.seconds * 1_000_000_000 + self.nanoseconds
+        if total_ns == 0:
+            return (0, 0)
+        sign = -1 if total_ns < 0 else 1
+        abs_ns = abs(total_ns)
+        return (sign * (abs_ns // 1_000_000_000), sign * (abs_ns % 1_000_000_000))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Duration):
+            return NotImplemented
+        return (
+            self.months == other.months
+            and self.days == other.days
+            and self._normalized_subday() == other._normalized_subday()
+        )
+
+    def __hash__(self) -> int:
+        norm_secs, norm_ns = self._normalized_subday()
+        return hash((self.months, self.days, norm_secs, norm_ns))
+
+    def to_timedelta(self) -> datetime.timedelta:
+        """Converts to :class:`datetime.timedelta` when ``months == 0`` and microsecond-exact."""
+        if self.months != 0:
+            raise ValueError(
+                f"Cannot losslessly convert calendar Duration with months={self.months} to datetime.timedelta"
+            )
+        if self.nanoseconds % 1_000 != 0:
+            raise ValueError(
+                f"Cannot losslessly convert Duration with sub-microsecond nanoseconds={self.nanoseconds} to datetime.timedelta"
+            )
+        return datetime.timedelta(
+            days=self.days,
+            seconds=self.seconds,
+            microseconds=self.nanoseconds // 1_000,
+        )
+
+    @classmethod
+    def from_timedelta(cls, td: datetime.timedelta) -> Duration:
+        """Constructs an exact :class:`Duration` from a :class:`datetime.timedelta`."""
+        return cls(
+            months=0,
+            days=td.days,
+            seconds=td.seconds,
+            nanoseconds=td.microseconds * 1_000,
+        )
+
+    def to_iso(self) -> str:
+        """Formats this duration as an ISO-8601 duration string."""
+        total_ns = self.seconds * 1_000_000_000 + self.nanoseconds
+        if self.months == 0 and self.days == 0 and total_ns == 0:
+            return "PT0S"
+
+        all_non_pos = self.months <= 0 and self.days <= 0 and total_ns <= 0
+        if all_non_pos:
+            m_val = abs(self.months)
+            d_val = abs(self.days)
+            ns_val = abs(total_ns)
+            parts = ["-P"]
+        else:
+            m_val = self.months
+            d_val = self.days
+            ns_val = total_ns
+            parts = ["P"]
+
+        if m_val:
+            years = int(m_val / 12)
+            rem_months = m_val - years * 12
+            if years:
+                parts.append(f"{years}Y")
+            if rem_months:
+                parts.append(f"{rem_months}M")
+        if d_val:
+            parts.append(f"{d_val}D")
+        if ns_val:
+            parts.append("T")
+            t_sign = "-" if ns_val < 0 else ""
+            abs_ns = abs(ns_val)
+            total_secs, sub_ns = divmod(abs_ns, 1_000_000_000)
+            h, rem_s = divmod(total_secs, 3_600)
+            m, s = divmod(rem_s, 60)
+            if h:
+                parts.append(f"{t_sign}{h}H")
+            if m:
+                parts.append(f"{t_sign}{m}M")
+            if s or sub_ns:
+                if sub_ns:
+                    frac = f"{sub_ns:09d}".rstrip("0")
+                    parts.append(f"{t_sign}{s}.{frac}S")
+                else:
+                    parts.append(f"{t_sign}{s}S")
+        return "".join(parts)
+
+    @classmethod
+    def from_iso(cls, val: str) -> Duration:
+        """Parses an ISO-8601 duration string into a :class:`Duration`."""
+        text = val.strip().upper()
+        match = _ISO_DURATION_REGEX.match(text)
+        if not match:
+            raise ValueError(f"Invalid ISO-8601 duration format: {val}")
+        parts = match.groupdict()
+        if not any(
+            parts[k] is not None
+            for k in ("years", "months", "weeks", "days", "hours", "minutes", "seconds")
+        ):
+            raise ValueError(
+                f"Invalid ISO-8601 duration format: {val} (must contain at least one designator)"
+            )
+        sign = -1 if parts["sign"] == "-" else 1
+        years = int(float(parts["years"])) if parts["years"] is not None else 0
+        months = int(float(parts["months"])) if parts["months"] is not None else 0
+        weeks = int(float(parts["weeks"])) if parts["weeks"] is not None else 0
+        days = int(float(parts["days"])) if parts["days"] is not None else 0
+        hours = int(float(parts["hours"])) if parts["hours"] is not None else 0
+        minutes = int(float(parts["minutes"])) if parts["minutes"] is not None else 0
+        sec_str = parts["seconds"]
+        if sec_str is None:
+            whole_secs = 0
+            nanos = 0
+            sec_sign = 1
+        else:
+            sec_sign = -1 if sec_str.startswith("-") else 1
+            unsigned_sec = sec_str.lstrip("+-")
+            if "." in unsigned_sec:
+                whole_part, frac_part = unsigned_sec.split(".", 1)
+                whole_secs = int(whole_part)
+                padded = (frac_part + "000000000")[:9]
+                nanos = int(padded)
+            else:
+                whole_secs = int(unsigned_sec)
+                nanos = 0
+        total_months = sign * (years * 12 + months)
+        total_days = sign * (weeks * 7 + days)
+        total_seconds = sign * (hours * 3600 + minutes * 60 + sec_sign * whole_secs)
+        total_nanos = sign * sec_sign * nanos
+        return cls(
+            months=total_months, days=total_days, seconds=total_seconds, nanoseconds=total_nanos
+        )
+
+    def __str__(self) -> str:
+        return self.to_iso()
+
+
+_PG_INTERVAL_UNITS = frozenset(
+    {
+        "year",
+        "years",
+        "yr",
+        "yrs",
+        "y",
+        "mon",
+        "mons",
+        "month",
+        "months",
+        "day",
+        "days",
+        "d",
+        "hour",
+        "hours",
+        "hr",
+        "hrs",
+        "h",
+        "min",
+        "mins",
+        "minute",
+        "minutes",
+        "m",
+        "sec",
+        "secs",
+        "second",
+        "seconds",
+        "s",
+    }
+)
+
+
+def _parse_pg_decimal_seconds(raw: str) -> tuple[int, int]:
+    """Parses a signed decimal seconds token into ``(seconds, nanoseconds)``."""
+    sign = -1 if raw.startswith("-") else 1
+    unsigned = raw.lstrip("+-")
+    if "." in unsigned:
+        whole_part, frac_part = unsigned.split(".", 1)
+        whole = int(whole_part) if whole_part else 0
+        nanos = int((frac_part + "000000000")[:9])
+    else:
+        whole = int(unsigned)
+        nanos = 0
+    return (sign * whole, sign * nanos)
+
+
+def parse_pg_interval_text(raw: str) -> Duration:
+    """Parses PostgreSQL ``interval`` text output into a :class:`Duration`.
+
+    Supports all four PostgreSQL ``IntervalStyle`` formats: ``postgres``,
+    ``postgres_verbose``, ``sql_standard``, and ``iso_8601``.
+    """
+    text = raw.strip()
+    if not text:
+        raise ValueError("Empty PostgreSQL interval string")
+    if text[0] in ("P", "p") or text.startswith(("-P", "-p", "+P", "+p")):
+        return Duration.from_iso(text)
+
+    if text.startswith("@"):
+        text = text[1:].strip()
+
+    months = 0
+    days = 0
+    seconds = 0
+    nanoseconds = 0
+
+    tokens = text.split()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if ":" in tok:
+            sign = -1 if tok.startswith("-") else 1
+            hms = tok.lstrip("+-")
+            hms_parts = hms.split(":")
+            if len(hms_parts) != 3:
+                raise ValueError(f"Invalid PostgreSQL interval time part: {tok!r}")
+            h = int(hms_parts[0])
+            m = int(hms_parts[1])
+            sec_part = hms_parts[2]
+            if "." in sec_part:
+                s_whole, s_frac = sec_part.split(".", 1)
+                sec_int = int(s_whole)
+                ns_int = int((s_frac + "000000000")[:9])
+            else:
+                sec_int = int(sec_part)
+                ns_int = 0
+            seconds += sign * (h * 3600 + m * 60 + sec_int)
+            nanoseconds += sign * ns_int
+            i += 1
+        elif tok.lower() == "ago":
+            months = -months
+            days = -days
+            seconds = -seconds
+            nanoseconds = -nanoseconds
+            i += 1
+        elif "-" in tok.lstrip("+-") and "." not in tok:
+            ym_sign = -1 if tok.startswith("-") else 1
+            ym_body = tok.lstrip("+-")
+            y_str, m_str = ym_body.split("-", 1)
+            if not (y_str.isdigit() and m_str.isdigit()):
+                raise ValueError(
+                    f"Invalid PostgreSQL sql_standard year-month token {tok!r} in {raw!r}"
+                )
+            months += ym_sign * (int(y_str) * 12 + int(m_str))
+            i += 1
+        elif i + 1 < len(tokens) and tokens[i + 1].lower() in _PG_INTERVAL_UNITS:
+            unit = tokens[i + 1].lower().rstrip("s")
+            if unit in ("year", "yr", "y"):
+                months += int(tok) * 12
+            elif unit in ("mon", "month"):
+                months += int(tok)
+            elif unit in ("day", "d"):
+                days += int(tok)
+            elif unit in ("hour", "hr", "h"):
+                seconds += int(tok) * 3600
+            elif unit in ("min", "minute", "m"):
+                seconds += int(tok) * 60
+            elif unit in ("sec", "second"):
+                s_int, ns_int = _parse_pg_decimal_seconds(tok)
+                seconds += s_int
+                nanoseconds += ns_int
+            else:
+                raise ValueError(f"Unknown PostgreSQL interval unit {tokens[i + 1]!r} in {raw!r}")
+            i += 2
+        elif i + 1 >= len(tokens) or tokens[i + 1][0] in "+-0123456789" or ":" in tokens[i + 1]:
+            days += int(tok)
+            i += 1
+        else:
+            raise ValueError(f"Unknown PostgreSQL interval unit {tokens[i + 1]!r} in {raw!r}")
+
+    return Duration(months=months, days=days, seconds=seconds, nanoseconds=nanoseconds)
 
 
 def _hydrate_date(val: Any) -> Any:

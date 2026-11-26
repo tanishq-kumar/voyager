@@ -150,7 +150,7 @@ async fn test_live_falkordb_parameterized_and_ro_query() {
 
     // Parameterized MATCH
     let mut params = HashMap::new();
-    params.insert("target_name".to_string(), serde_json::json!("Ada"));
+    params.insert("target_name".to_string(), serde_json::json!("Ada").into());
 
     let res = conn
         .graph_query(
@@ -354,7 +354,7 @@ async fn test_live_falkordb_fluent_builder_with_clause_and_pagination() {
     let mut query_params = HashMap::new();
     for (k, v) in &compiled.parameters {
         if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-            query_params.insert(k.clone(), serde_json::json!(i));
+            query_params.insert(k.clone(), serde_json::json!(i).into());
         }
     }
 

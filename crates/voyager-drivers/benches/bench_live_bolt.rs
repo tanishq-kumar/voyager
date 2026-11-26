@@ -153,7 +153,7 @@ async fn setup_dataset(conn: &mut BoltConnection) -> voyager_drivers::Result<()>
         }
 
         let mut params = HashMap::new();
-        params.insert("batch".to_string(), serde_json::Value::Array(batch));
+        params.insert("batch".to_string(), serde_json::Value::Array(batch).into());
 
         let query = "
             UNWIND $batch AS row
@@ -197,7 +197,10 @@ async fn setup_dataset(conn: &mut BoltConnection) -> voyager_drivers::Result<()>
         }
 
         let mut params = HashMap::new();
-        params.insert("batch".to_string(), serde_json::Value::Array(rel_batch));
+        params.insert(
+            "batch".to_string(),
+            serde_json::Value::Array(rel_batch).into(),
+        );
 
         let query = "
             UNWIND $batch AS row
@@ -272,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut params = HashMap::new();
                 params.insert(
                     "id".to_string(),
-                    serde_json::Value::Number((id as i64).into()),
+                    serde_json::Value::Number((id as i64).into()).into(),
                 );
                 let res = conn.execute(query, &params).await.expect("Query failed");
                 assert_eq!(res.row_count(), 1);
@@ -323,7 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut params = HashMap::new();
                 params.insert(
                     "id".to_string(),
-                    serde_json::Value::Number((id as i64).into()),
+                    serde_json::Value::Number((id as i64).into()).into(),
                 );
                 let res = conn.execute(query, &params).await.expect("Query failed");
                 assert!(res.row_count() > 0);
@@ -428,7 +431,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut params = HashMap::new();
-            params.insert("batch".to_string(), serde_json::Value::Array(batch));
+            params.insert("batch".to_string(), serde_json::Value::Array(batch).into());
 
             let q_start = Instant::now();
             let mut conn = pool.acquire().await.expect("Acquire failed");
@@ -477,7 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut params = HashMap::new();
                 params.insert(
                     "val".to_string(),
-                    serde_json::Value::Number((i as i64).into()),
+                    serde_json::Value::Number((i as i64).into()).into(),
                 );
                 let res = conn.execute(query, &params).await.expect("Query failed");
                 assert_eq!(res.row_count(), 1);
@@ -555,7 +558,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let concurrency = 1;
         let jumbo_str = "V".repeat(5 * 1024 * 1024); // 5 Megabytes across 80+ chunks
         let mut params = HashMap::new();
-        params.insert("payload".to_string(), serde_json::Value::String(jumbo_str));
+        params.insert(
+            "payload".to_string(),
+            serde_json::Value::String(jumbo_str).into(),
+        );
         let query = "RETURN $payload AS jumbo_str, size($payload) AS len";
 
         let start = Instant::now();

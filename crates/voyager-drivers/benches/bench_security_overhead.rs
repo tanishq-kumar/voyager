@@ -76,11 +76,14 @@ async fn main() {
     // 3. PostgreSQL Parameter Binding Preparation Benchmark (100,000 queries)
     {
         let mut params = HashMap::new();
-        params.insert("p1".to_string(), serde_json::json!(42));
-        params.insert("p2".to_string(), serde_json::json!("O'Reilly"));
-        params.insert("p10".to_string(), serde_json::json!(100));
-        params.insert("p11".to_string(), serde_json::json!(true));
-        params.insert("p12".to_string(), serde_json::json!("escaped'value'here"));
+        params.insert("p1".to_string(), serde_json::json!(42).into());
+        params.insert("p2".to_string(), serde_json::json!("O'Reilly").into());
+        params.insert("p10".to_string(), serde_json::json!(100).into());
+        params.insert("p11".to_string(), serde_json::json!(true).into());
+        params.insert(
+            "p12".to_string(),
+            serde_json::json!("escaped'value'here").into(),
+        );
 
         let query =
             "SELECT * FROM t WHERE a = $p10 AND b = $p1 AND c = $p2 AND d = $p11 AND e = $p12;";
@@ -102,14 +105,14 @@ async fn main() {
     // 4. FalkorDB Double Escaping Benchmark (100,000 queries)
     {
         let mut params = HashMap::new();
-        params.insert("p1".to_string(), serde_json::json!(42));
+        params.insert("p1".to_string(), serde_json::json!(42).into());
         params.insert(
             "name".to_string(),
-            serde_json::json!(r#"Alice \"The Great\""#),
+            serde_json::json!(r#"Alice \"The Great\""#).into(),
         );
         params.insert(
             "path".to_string(),
-            serde_json::json!(r#"C:\Data\graph_store"#),
+            serde_json::json!(r#"C:\Data\graph_store"#).into(),
         );
         let query = "MATCH (n:Person {name: $name, path: $path}) RETURN n;";
 

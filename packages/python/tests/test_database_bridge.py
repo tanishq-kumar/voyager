@@ -700,3 +700,93 @@ async def test_async_session_ping_bridge_exception_contract():
     bridge = AsyncRaisingBridge()
     session = AsyncSession(bridge=bridge, dialect="cypher")
     assert await session.ping() is False
+
+
+def test_duckdb_execute_preserves_months_and_polars_never_reexecutes():
+    """DuckDbBridge preserves calendar months and executes INSERT...RETURNING only once in execute_to_polars."""
+    if duckdb is None:
+        pytest.skip("duckdb is not installed in this environment")
+    from voyager_ogm.types import Duration
+
+    con = duckdb.connect(":memory:")
+    bridge = DuckDbBridge(con)
+    con.execute("CREATE TABLE t_iv (id INT, iv INTERVAL)")
+
+    df = bridge.execute_to_polars(
+        "INSERT INTO t_iv VALUES (1, INTERVAL '1 year 2 months 3 days 4.5 seconds') RETURNING id, iv"
+    )
+    assert con.execute("SELECT count(*) FROM t_iv").fetchone() == (1,)
+    assert df.shape == (1, 2)
+    assert df["id"].to_list() == [1]
+    assert df["iv"].to_list() == [
+        {"months": 14, "days": 3, "seconds": 4, "nanoseconds": 500_000_000}
+    ]
+
+    rows = bridge.execute("SELECT id, iv FROM t_iv")
+    assert rows == [
+        {"id": 1, "iv": Duration(months=14, days=3, seconds=4, nanoseconds=500_000_000)}
+    ]
+
+
+def test_duckdb_polars_mock_fallback_does_not_reexecute():
+    """DuckDbBridge.execute_to_polars builds from rel.fetchall/description without calling execute twice."""
+    import datetime
+
+    import polars as pl
+
+    class _FakeRel:
+        description = [("id", "NUMBER"), ("iv", "TIMEDELTA")]
+
+        def pl(self):
+            raise pl.exceptions.ComputeError("month_day_nano_interval unsupported")
+
+        def fetchall(self):
+            return [(1, datetime.timedelta(days=2, seconds=5))]
+
+    class _FakeCon:
+        def __init__(self):
+            self.calls = 0
+
+        def pl(self):
+            return None
+
+        def execute(self, _stmt, _params=None):
+            self.calls += 1
+            return _FakeRel()
+
+    con = _FakeCon()
+    bridge = DuckDbBridge(con)
+    df = bridge.execute_to_polars("INSERT INTO t VALUES (1) RETURNING id, iv")
+    assert con.calls == 1
+    assert df["id"].to_list() == [1]
+    assert df["iv"].to_list() == [{"months": 0, "days": 2, "seconds": 5, "nanoseconds": 0}]
+
+
+def test_postgres_interval_loader_handles_all_styles_and_fallback():
+    """_configure_pg_adapters handles postgres_verbose, sql_standard, and unparseable fallback."""
+    pytest.importorskip("psycopg")
+    from voyager_ogm.bridge import _configure_pg_adapters
+    from voyager_ogm.types import Duration
+
+    class _FakeAdapters:
+        def __init__(self):
+            self.loaders = {}
+
+        def register_loader(self, name, cls):
+            self.loaders[name] = cls
+
+        def register_dumper(self, _tp, _cls):
+            pass
+
+    class _FakeCursor:
+        def __init__(self):
+            self.adapters = _FakeAdapters()
+
+    cur = _FakeCursor()
+    assert _configure_pg_adapters(cur) is True
+    loader = cur.adapters.loaders["interval"](1186, None)
+    assert loader.load(b"@ 0") == Duration()
+    assert loader.load(b"+1-2 +3 +4:05:06.5") == Duration(
+        months=14, days=3, seconds=14_706, nanoseconds=500_000_000
+    )
+    assert loader.load(b"unexpected-format") == "unexpected-format"

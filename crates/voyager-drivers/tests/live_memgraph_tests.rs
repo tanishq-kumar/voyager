@@ -49,9 +49,12 @@ async fn test_live_memgraph_bolt_crud_and_arrow() {
     let mut create_params = HashMap::new();
     create_params.insert(
         "name1".to_string(),
-        serde_json::Value::String("Charlie".to_string()),
+        serde_json::Value::String("Charlie".to_string()).into(),
     );
-    create_params.insert("score".to_string(), serde_json::Value::Number(95.into()));
+    create_params.insert(
+        "score".to_string(),
+        serde_json::Value::Number(95.into()).into(),
+    );
 
     let insert_query = "
         CREATE (a:MemgraphTest:Student {name: $name1, score: $score})
@@ -151,7 +154,7 @@ async fn test_live_memgraph_fluent_builder_with_clause_and_pagination() {
     let mut query_params = HashMap::new();
     for (k, v) in &compiled.parameters {
         if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-            query_params.insert(k.clone(), serde_json::json!(i));
+            query_params.insert(k.clone(), serde_json::json!(i).into());
         }
     }
 
@@ -304,14 +307,14 @@ async fn test_live_memgraph_simultaneous_explain_and_profile_connections() {
     let mut exp_params = HashMap::new();
     for (k, v) in &compiled_exp.parameters {
         if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-            exp_params.insert(k.clone(), serde_json::json!(i));
+            exp_params.insert(k.clone(), serde_json::json!(i).into());
         }
     }
 
     let mut prof_params = HashMap::new();
     for (k, v) in &compiled_prof.parameters {
         if let voyager_ogm::ast::LiteralValue::Int64(i) = v {
-            prof_params.insert(k.clone(), serde_json::json!(i));
+            prof_params.insert(k.clone(), serde_json::json!(i).into());
         }
     }
 

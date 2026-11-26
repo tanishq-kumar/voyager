@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 use crate::config::Auth;
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
+use crate::params::ParamValue;
 use crate::redis::codec::{read_resp_value, write_command};
 use crate::redis::graph::{FalkorCompactResult, FalkorGraphSchema, FalkorQueryResult};
 use crate::redis::resp::RespValue;
@@ -291,7 +292,7 @@ impl RedisConnection {
         &mut self,
         graph: &str,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<FalkorQueryResult> {
         let formatted = format_cypher_with_params(query, params)?;
         let resp = self
@@ -305,7 +306,7 @@ impl RedisConnection {
         &mut self,
         graph: &str,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<FalkorCompactResult> {
         let formatted = format_cypher_with_params(query, params)?;
         let resp = self
@@ -365,7 +366,7 @@ impl RedisConnection {
         &mut self,
         graph: &str,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<FalkorQueryResult> {
         let formatted = format_cypher_with_params(query, params)?;
         let resp = self
@@ -413,7 +414,7 @@ impl AsyncConnection for RedisConnection {
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         let graph = self.default_graph.clone();
         match self.graph_query_compact(&graph, query, params).await {

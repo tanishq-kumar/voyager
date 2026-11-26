@@ -47,8 +47,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut params = HashMap::new();
-            params.insert("num".to_string(), serde_json::json!(42));
-            params.insert("msg".to_string(), serde_json::json!("Hello from Rust!"));
+            params.insert("num".to_string(), serde_json::json!(42).into());
+            params.insert(
+                "msg".to_string(),
+                serde_json::json!("Hello from Rust!").into(),
+            );
 
             let query = "RETURN $num AS answer, $msg AS greeting";
             println!("Executing parameterized query: {}", query);
@@ -91,8 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Successfully connected and pinged Memgraph via NativeClient pool!");
 
             let mut params = HashMap::new();
-            params.insert("service".to_string(), serde_json::json!("auth-gateway"));
-            params.insert("latency_ms".to_string(), serde_json::json!(4.25));
+            params.insert(
+                "service".to_string(),
+                serde_json::json!("auth-gateway").into(),
+            );
+            params.insert("latency_ms".to_string(), serde_json::json!(4.25).into());
 
             let query = "RETURN $service AS name, $latency_ms AS latency";
             let res = client.execute(query, &params).await?;

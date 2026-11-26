@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut params = HashMap::new();
     params.insert(
         "payload".to_string(),
-        serde_json::Value::String(large_string.clone()),
+        serde_json::Value::String(large_string.clone()).into(),
     );
 
     let t0 = std::time::Instant::now();

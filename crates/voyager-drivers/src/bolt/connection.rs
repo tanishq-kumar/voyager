@@ -11,11 +11,12 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use super::messages::{BoltRequest, BoltResponse};
-use super::packstream::BoltValue;
+use super::packstream::{BoltValue, param_to_bolt_value};
 use super::stream::{encode_chunks, read_message_frame_buffered, write_message_frame};
 use crate::config::{Auth, ConnectionConfig};
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
+use crate::params::ParamValue;
 use crate::tls::{NetStream, TlsVerification};
 use crate::uri::ParsedUri;
 
@@ -736,7 +737,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
     async fn execute_inner(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         if !self.is_valid {
             return Err(NetError::Closed(
@@ -744,11 +745,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             ));
         }
 
-        // Convert JSON params to BoltValue
-        let bolt_params: HashMap<String, BoltValue> = params
-            .iter()
-            .map(|(k, v)| (k.clone(), BoltValue::from(v)))
-            .collect();
+        // Convert typed ParamValue params to BoltValue matching the negotiated Bolt version.
+        let mut bolt_params = HashMap::with_capacity(params.len());
+        for (k, v) in params {
+            bolt_params.insert(k.clone(), param_to_bolt_value(v, self.version.major)?);
+        }
 
         let mut extra = HashMap::new();
         if let Some(db) = self.auto_commit_database() {
@@ -857,7 +858,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             Vec::new()
         };
 
-        Ok(QueryResult::new(columns, batches, summary))
+        let result = QueryResult::new(columns, batches, summary);
+        if result
+            .batches
+            .iter()
+            .any(super::canonical::batch_needs_bolt_rows)
+        {
+            Ok(result.with_bolt_rows(records))
+        } else {
+            Ok(result)
+        }
     }
 }
 
@@ -866,7 +876,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         if let Some(to) = self.query_timeout {
             match timeout(to, self.execute_inner(query, params)).await {

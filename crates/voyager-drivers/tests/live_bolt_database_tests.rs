@@ -69,7 +69,7 @@ async fn database_status(conn: &mut BoltConnection, name: &str) -> Option<String
     let mut params = HashMap::new();
     params.insert(
         "name".to_string(),
-        serde_json::Value::String(name.to_string()),
+        voyager_drivers::ParamValue::Json(serde_json::Value::String(name.to_string())),
     );
     let result = conn
         .execute(

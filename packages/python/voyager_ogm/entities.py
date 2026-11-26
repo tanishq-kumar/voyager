@@ -7,10 +7,16 @@ Python bridges and native Rust client) returns whole-entity projections as
 
 from __future__ import annotations
 
+import datetime
 import json
+import uuid
+import zoneinfo
 from collections.abc import Iterable, Iterator, Mapping
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Any
+
+from voyager_ogm.types import Duration, to_iso_duration
 
 
 class GraphNode(Mapping[str, Any]):
@@ -418,6 +424,18 @@ def json_default(obj: Any) -> Any:
         return obj.to_dict()
     if isinstance(obj, MappingProxyType):
         return dict(obj)
+    if isinstance(obj, Duration):
+        return obj.to_iso()
+    if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
+        return obj.isoformat()
+    if isinstance(obj, datetime.timedelta):
+        return to_iso_duration(obj)
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        return list(obj)
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
@@ -441,16 +459,127 @@ def _extract_properties(obj: Any) -> dict[str, Any]:
     return {}
 
 
+def _convert_neo4j_temporal(value: Any) -> Any:
+    """Converts ``neo4j.time.*`` objects to stdlib ``datetime`` or :class:`Duration`.
+
+    Values that Python cannot represent without data loss (sub-microsecond
+    nanoseconds, years outside ``1..=9999``, or unknown IANA timezone names)
+    fall back to their exact ISO-8601 string representation.
+    """
+    type_name = type(value).__name__
+    if type_name == "Date":
+        year = value.year
+        if 1 <= year <= 9999:
+            return datetime.date(year, value.month, value.day)
+        return str(value.iso_format())
+
+    if type_name == "Time":
+        nanos = int(getattr(value, "nanosecond", 0))
+        if nanos % 1_000 != 0:
+            return str(value.iso_format())
+        tzinfo = getattr(value, "tzinfo", None)
+        if tzinfo is None:
+            return datetime.time(value.hour, value.minute, value.second, nanos // 1_000)
+        offset = value.utcoffset()
+        if (
+            offset is not None
+            and abs(offset) < datetime.timedelta(days=1)
+            and offset.microseconds == 0
+        ):
+            tz = datetime.UTC if offset == datetime.timedelta(0) else datetime.timezone(offset)
+            return datetime.time(value.hour, value.minute, value.second, nanos // 1_000, tzinfo=tz)
+        return str(value.iso_format())
+
+    if type_name == "DateTime":
+        year = value.year
+        nanos = int(getattr(value, "nanosecond", 0))
+        if not (1 <= year <= 9999) or nanos % 1_000 != 0:
+            return str(value.iso_format())
+        tzinfo = getattr(value, "tzinfo", None)
+        if tzinfo is None:
+            return datetime.datetime(
+                year, value.month, value.day, value.hour, value.minute, value.second, nanos // 1_000
+            )
+        zone_name = getattr(tzinfo, "zone", None) or getattr(tzinfo, "key", None)
+        offset = value.utcoffset()
+        if isinstance(zone_name, str) and zone_name:
+            try:
+                zi = zoneinfo.ZoneInfo(zone_name)
+                if isinstance(offset, datetime.timedelta):
+                    base_utc = datetime.datetime(
+                        year,
+                        value.month,
+                        value.day,
+                        value.hour,
+                        value.minute,
+                        value.second,
+                        nanos // 1_000,
+                        tzinfo=datetime.UTC,
+                    )
+                    utc_dt = base_utc + (-offset)
+                    return utc_dt.astimezone(zi)
+                return datetime.datetime(
+                    year,
+                    value.month,
+                    value.day,
+                    value.hour,
+                    value.minute,
+                    value.second,
+                    nanos // 1_000,
+                    tzinfo=zi,
+                )
+            except Exception:
+                return str(value.iso_format())
+        if isinstance(offset, datetime.timedelta) and abs(offset) < datetime.timedelta(days=1):
+            tz = datetime.UTC if offset == datetime.timedelta(0) else datetime.timezone(offset)
+            return datetime.datetime(
+                year,
+                value.month,
+                value.day,
+                value.hour,
+                value.minute,
+                value.second,
+                nanos // 1_000,
+                tzinfo=tz,
+            )
+        return str(value.iso_format())
+
+    if type_name == "Duration":
+        return Duration(
+            months=int(value.months),
+            days=int(value.days),
+            seconds=int(value.seconds),
+            nanoseconds=int(value.nanoseconds),
+        )
+
+    return value
+
+
 def convert_driver_value(value: Any) -> Any:
     """Converts a driver result value into Voyager's unified entity/value representation.
 
     Handles Neo4j/Memgraph Bolt driver entities, FalkorDB entities, Relate
-    entities, and recurses through lists and dicts while preserving spatial and
-    scalar driver objects (such as ``neo4j.spatial.WGS84Point``).
+    entities, temporal types (``neo4j.time.*``, ``relativedelta``, Relate
+    ``Duration``), and recurses through lists and dicts while preserving spatial
+    tuple subclasses (such as ``neo4j.spatial.WGS84Point``).
     """
-    if isinstance(value, (GraphNode, GraphRelationship, GraphPath)):
+    if isinstance(value, (GraphNode, GraphRelationship, GraphPath, Duration)):
         return value
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+    if value is None or isinstance(
+        value,
+        (
+            bool,
+            int,
+            float,
+            str,
+            bytes,
+            datetime.date,
+            datetime.time,
+            datetime.datetime,
+            Decimal,
+            uuid.UUID,
+        ),
+    ):
         return value
 
     # 1. Paths: Neo4j/Relate (.nodes + .relationships) or FalkorDB (.nodes() + .edges())
@@ -544,8 +673,14 @@ def convert_driver_value(value: Any) -> Any:
             properties=_extract_properties(value),
         )
 
-    # 5. Relate spatial Point and Duration (must not intercept neo4j.spatial.* or neo4j.time.*)
+    # 5. Temporal driver objects (neo4j.time.*, dateutil.relativedelta, Relate Duration) & Relate Point
     mod = type(value).__module__
+    if mod.startswith("neo4j.time"):
+        return _convert_neo4j_temporal(value)
+    if mod.startswith("dateutil.relativedelta"):
+        epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
+        td = (epoch + value) - epoch
+        return Duration.from_timedelta(td)
     if not mod.startswith("neo4j"):
         if hasattr(value, "srid") and hasattr(value, "x") and hasattr(value, "y"):
             from voyager_ogm.types import Point
@@ -557,12 +692,12 @@ def convert_driver_value(value: Any) -> Any:
                 srid=value.srid,
             )
         if hasattr(value, "months") and hasattr(value, "seconds") and hasattr(value, "nanoseconds"):
-            to_td = getattr(value, "to_timedelta", None)
-            if callable(to_td):
-                try:
-                    return to_td()
-                except Exception:
-                    return str(value)
+            return Duration(
+                months=int(value.months),
+                days=int(getattr(value, "days", 0)),
+                seconds=int(value.seconds),
+                nanoseconds=int(value.nanoseconds),
+            )
 
     # 6. Plain mappings and lists/tuples (preserving tuple subclasses such as neo4j.spatial.Point)
     if isinstance(value, Mapping):
@@ -584,9 +719,22 @@ def _contains_graph_entity(value: Any) -> bool:
 
 
 def serialize_value_for_arrow(value: Any) -> Any:
-    """Serializes a single cell to kind-tagged JSON text when it contains entities."""
+    """Serializes graph entity cells to JSON text and adapts Duration for Arrow/Polars."""
     if _contains_graph_entity(value):
         return json.dumps(value, default=json_default)
+    if isinstance(value, Duration):
+        if value.months == 0 and value.days == 0 and value.nanoseconds % 1_000 == 0:
+            return value.to_timedelta()
+        return {
+            "months": value.months,
+            "days": value.days,
+            "seconds": value.seconds,
+            "nanoseconds": value.nanoseconds,
+        }
+    if isinstance(value, list):
+        return [serialize_value_for_arrow(item) for item in value]
+    if isinstance(value, Mapping):
+        return {k: serialize_value_for_arrow(v) for k, v in value.items()}
     return value
 
 

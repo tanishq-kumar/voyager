@@ -48,7 +48,7 @@ let client = NativeClient::new("bolt://127.0.0.1:7687", None)?;
 client.ping().await?;
 
 let mut params = HashMap::new();
-params.insert("name".to_string(), serde_json::json!("Alice"));
+params.insert("name".to_string(), serde_json::json!("Alice").into());
 let result = client.execute(
     "MATCH (p:Person {name: $name}) RETURN p.name AS name",
     &params,

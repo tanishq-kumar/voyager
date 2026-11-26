@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::engine::{AsyncConnection, AsyncTransaction, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
+use crate::params::ParamValue;
 use crate::postgres::connection::{PostgresConnection, validate_savepoint_name};
 
 /// Asynchronous transaction wrapper managing a leased [`PostgresConnection`].
@@ -29,7 +30,7 @@ impl<'a> PostgresTransaction<'a> {
     pub async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         if !self.is_active {
             return Err(NetError::TransactionError(
@@ -135,7 +136,7 @@ impl<'a> AsyncTransaction for PostgresTransaction<'a> {
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         if !self.is_active {
             return Err(NetError::TransactionError(

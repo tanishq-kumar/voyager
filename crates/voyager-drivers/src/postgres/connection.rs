@@ -11,7 +11,8 @@ use tracing::debug;
 use crate::config::Auth;
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
-use crate::postgres::agtype::rows_to_record_batch_with_column_types;
+use crate::params::ParamValue;
+use crate::postgres::agtype::rows_to_record_batch_with_column_metadata;
 use crate::postgres::auth::{ScramClient, compute_md5_password};
 use crate::postgres::codec::{
     read_backend_message, write_frontend_message, write_frontend_messages, write_startup_message,
@@ -507,6 +508,7 @@ impl PostgresConnection {
 
         let mut columns = Vec::new();
         let mut field_types: Vec<i32> = Vec::new();
+        let mut field_type_modifiers: Vec<i32> = Vec::new();
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         let mut summary = QuerySummary::empty();
         let mut query_error = None;
@@ -516,6 +518,7 @@ impl PostgresConnection {
             match msg {
                 BackendMessage::RowDescription(fields) => {
                     field_types = fields.iter().map(|f| f.type_oid).collect();
+                    field_type_modifiers = fields.iter().map(|f| f.type_modifier).collect();
                     columns = fields.into_iter().map(|f| f.name).collect();
                 }
                 BackendMessage::DataRow(vals) => {
@@ -560,8 +563,13 @@ impl PostgresConnection {
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
         let age_cols = self.age_columns(&field_types);
-        let batch =
-            rows_to_record_batch_with_column_types(&columns, &rows, &age_cols, &field_types)?;
+        let batch = rows_to_record_batch_with_column_metadata(
+            &columns,
+            &rows,
+            &age_cols,
+            &field_types,
+            &field_type_modifiers,
+        )?;
         let batches = if batch.num_rows() > 0 || !columns.is_empty() {
             vec![batch]
         } else {
@@ -626,11 +634,12 @@ impl PostgresConnection {
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
         let age_cols = self.age_columns(&response.field_types);
-        let batch = rows_to_record_batch_with_column_types(
+        let batch = rows_to_record_batch_with_column_metadata(
             &response.columns,
             &response.rows,
             &age_cols,
             &response.field_types,
+            &response.field_type_modifiers,
         )?;
         let batches = if batch.num_rows() > 0 || !response.columns.is_empty() {
             vec![batch]
@@ -698,7 +707,7 @@ impl AsyncConnection for PostgresConnection {
     async fn execute(
         &mut self,
         query: &str,
-        params: &HashMap<String, serde_json::Value>,
+        params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         let prepared = prepare_postgres_statement(query, params)?;
         if !prepared.is_parameterized() {
@@ -817,6 +826,7 @@ pub(crate) fn validate_savepoint_name(name: &str) -> Result<()> {
 struct ExtendedResponse {
     columns: Vec<String>,
     field_types: Vec<i32>,
+    field_type_modifiers: Vec<i32>,
     rows: Vec<Vec<Option<String>>>,
     summary: QuerySummary,
     command_tag: Option<String>,
@@ -833,6 +843,7 @@ where
     let mut response = ExtendedResponse {
         columns: Vec::new(),
         field_types: Vec::new(),
+        field_type_modifiers: Vec::new(),
         rows: Vec::new(),
         summary: QuerySummary::empty(),
         command_tag: None,
@@ -851,6 +862,7 @@ where
             | BackendMessage::EmptyQueryResponse => {}
             BackendMessage::RowDescription(fields) => {
                 response.field_types = fields.iter().map(|f| f.type_oid).collect();
+                response.field_type_modifiers = fields.iter().map(|f| f.type_modifier).collect();
                 response.columns = fields.into_iter().map(|f| f.name).collect();
             }
             BackendMessage::DataRow(vals) => {
