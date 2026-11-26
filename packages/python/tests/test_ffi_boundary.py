@@ -10,6 +10,7 @@ from decimal import Decimal
 import polars as pl
 import pyarrow as pa
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     AsyncSession,
     NativeClient,
@@ -21,8 +22,9 @@ from voyager_ogm import (
 )
 from voyager_ogm._voyager_rs import NativeQueryBuilder, compile_query_from_spec
 
-FALKORDB_URI = "redis://127.0.0.1:6379?connect_timeout=2"
-NEO4J_URI = "bolt://neo4j:voyagerpass123@127.0.0.1:7687?connect_timeout=2"
+HOST = get_test_host()
+FALKORDB_URI = f"redis://{HOST}:6379?connect_timeout=2"
+NEO4J_URI = f"bolt://neo4j:voyagerpass123@{HOST}:7687?connect_timeout=2"
 
 
 def _is_falkordb_online() -> bool:

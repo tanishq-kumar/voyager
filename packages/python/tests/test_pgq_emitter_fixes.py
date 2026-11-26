@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from conftest import is_port_open as _is_port_open
 from voyager_ogm import (
     Field,
@@ -467,11 +468,12 @@ def test_live_postgres19_supported_forms() -> None:
     """Verifies live PostgreSQL 19 Beta 3 execution with supported single-label, label disjunction, and alternative edge types."""
     if psycopg is None:
         pytest.skip("psycopg is not installed in this environment")
-    if not _is_port_open("127.0.0.1", 5456):
-        pytest.skip("PostgreSQL 19 Beta container not available on port 5456")
+    host = get_test_host()
+    if not _is_port_open(host, 5456):
+        pytest.skip(f"PostgreSQL 19 Beta container not available on {host}:5456")
 
     conn_str = (
-        "host=127.0.0.1 port=5456 user=postgres password=voyagerpass123 "
+        f"host={host} port=5456 user=postgres password=voyagerpass123 "
         "dbname=voyager_graph connect_timeout=3"
     )
 

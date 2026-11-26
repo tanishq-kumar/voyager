@@ -6,11 +6,11 @@ identity map, sync and async sessions, and live Neo4j/Memgraph execution.
 
 from __future__ import annotations
 
-import os
 import socket
 from typing import Any, cast
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import (
     AsyncSession,
     Field,
@@ -35,7 +35,7 @@ from voyager_ogm.models import (
 )
 from voyager_ogm.relationships import register_model_class
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 
 
 class RecordingMockBridge(MockBridge):

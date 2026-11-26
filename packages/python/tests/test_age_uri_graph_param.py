@@ -15,12 +15,13 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import Field, NativeClient, Node, Query, Session, VoyagerError, create_bridge
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-AGE_HOST = "127.0.0.1"
+AGE_HOST = get_test_host()
 AGE_PORT = 5455
 AGE_DATABASE_URI = f"postgresql://postgres:voyagerpass123@{AGE_HOST}:{AGE_PORT}/voyager_graph"
 

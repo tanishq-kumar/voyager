@@ -17,9 +17,10 @@ import socket
 import uuid
 
 import pytest
+from conftest import get_test_host
 from voyager_ogm import Field, Node, Query, Relationship, Session, node, relationship
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 PG19_PORT = int(os.environ.get("VOYAGER_TEST_PG19_PORT", "5456"))
 PG19_URI = f"postgresql://postgres:voyagerpass123@{HOST}:{PG19_PORT}/voyager_graph"
 

@@ -8,10 +8,10 @@ in Cypher. A NULL property or NULL search value still excludes the row.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
+from conftest import get_test_host
 from conftest import is_port_open as _is_port_open
 from voyager_ogm import Field, Node, Query, node, reset_alias_counters
 from voyager_ogm.bridge import DuckDbBridge, PostgresBridge
@@ -29,7 +29,7 @@ try:
 except ImportError:
     pass
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 POSTGRES19_URI = f"postgresql://postgres:voyagerpass123@{HOST}:5456/voyager_graph"
 GRAPH = "fix318_graph"
 PERSON = "fix318_person"

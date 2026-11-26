@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import socket
+
+
+def get_test_host() -> str:
+    """Return the database host from ``VOYAGER_TEST_HOST`` (default ``localhost``)."""
+    return os.environ.get("VOYAGER_TEST_HOST") or "localhost"
 
 
 def is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
     """Fast socket probe to detect whether a database or container port is actively listening.
 
     Args:
-        host: Hostname or IP address (e.g. '127.0.0.1').
+        host: Hostname or IP address (e.g. 'localhost').
         port: TCP port number.
         timeout: Socket connect timeout in seconds.
 

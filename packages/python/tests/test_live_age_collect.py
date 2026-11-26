@@ -9,17 +9,17 @@ covered, and entities must still be recognised by their ::vertex / ::edge /
 
 from __future__ import annotations
 
-import os
 import socket
 import uuid
 
 import pytest
+from conftest import get_test_host
 from spec_corpus_live_lib import _parse_age_scalar
 from voyager_ogm import Session, create_bridge
 
 pytestmark = pytest.mark.live
 
-HOST = os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
+HOST = get_test_host()
 PORT = 5455
 AGE_URI = f"postgresql://postgres:voyagerpass123@{HOST}:{PORT}/voyager_graph"
 

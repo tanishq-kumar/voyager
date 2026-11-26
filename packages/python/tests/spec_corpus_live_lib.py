@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from conftest import get_test_host as test_host
 from jsonschema import Draft202012Validator
 from voyager_ogm.agtype import decode_agtype
 
@@ -79,11 +80,6 @@ class FixtureUnsupportedError(RuntimeError):
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     return int(raw) if raw else default
-
-
-def test_host() -> str:
-    """Return the engine host from ``VOYAGER_TEST_HOST`` (default ``127.0.0.1``)."""
-    return os.environ.get("VOYAGER_TEST_HOST", "127.0.0.1")
 
 
 def engine_endpoint(engine: str) -> tuple[str, int]:

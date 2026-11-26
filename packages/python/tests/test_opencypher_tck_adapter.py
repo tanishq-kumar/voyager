@@ -116,7 +116,9 @@ def test_tck_topology_nodes_and_edges_integrity():
 @pytest.mark.live
 def test_tck_tier3_live_neo4j_execution():
     """Tier 3: Executes official openCypher Match1 scenarios on live Neo4j."""
-    neo4j_host = os.getenv("NEO4J_HOST", "127.0.0.1")
+    from conftest import get_test_host
+
+    neo4j_host = os.getenv("NEO4J_HOST", get_test_host())
     neo4j_port = int(os.getenv("NEO4J_PORT", "7687"))
     if not _check_port(neo4j_host, neo4j_port):
         pytest.skip(f"Neo4j not available on {neo4j_host}:{neo4j_port}")
@@ -164,7 +166,9 @@ def test_tck_tier3_live_neo4j_execution():
 @pytest.mark.live
 def test_tck_tier3_live_falkordb_execution():
     """Tier 3: Executes official openCypher Match1 scenarios on live FalkorDB."""
-    falkor_host = os.getenv("FALKORDB_HOST", "127.0.0.1")
+    from conftest import get_test_host
+
+    falkor_host = os.getenv("FALKORDB_HOST", get_test_host())
     falkor_port = int(os.getenv("FALKORDB_PORT", "6379"))
     if not _check_port(falkor_host, falkor_port):
         pytest.skip(f"FalkorDB container not available on {falkor_host}:{falkor_port}")
