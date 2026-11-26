@@ -10,9 +10,7 @@ import zoneinfo
 from decimal import Decimal
 from typing import Any
 
-import duckdb
 import pytest
-from dateutil.relativedelta import relativedelta
 from voyager_ogm import Duration, GraphNode, GraphPath, GraphRelationship, Session
 from voyager_ogm.agtype import decode_agtype
 from voyager_ogm.bridge import DuckDbBridge, _strip_falkordb_utc
@@ -205,7 +203,7 @@ def test_parse_pg_interval_text_formats() -> None:
 
 
 def test_convert_driver_value_temporals_relativedelta_and_fallbacks() -> None:
-    """Bridge converter normalizes neo4j.time.*, relativedelta, entities, and out-of-range fallbacks."""
+    """Bridge converter normalizes neo4j.time.*, entities, and out-of-range fallbacks."""
     _FakeNeo4jDate.__module__ = "neo4j.time"
     _FakeNeo4jTime.__module__ = "neo4j.time"
     _FakeNeo4jDateTime.__module__ = "neo4j.time"
@@ -229,12 +227,6 @@ def test_convert_driver_value_temporals_relativedelta_and_fallbacks() -> None:
         2024, 1, 2, 3, 4, 5, tzinfo=zoneinfo.ZoneInfo("Europe/Berlin")
     )
     assert convert_driver_value(dur) == Duration(14, 3, 4, 500_000_000)
-    assert convert_driver_value(relativedelta(days=2, hours=1, minutes=1, seconds=1)) == Duration(
-        0, 2, 3661, 0
-    )
-    assert convert_driver_value(relativedelta(years=1, months=2, days=3, hours=4)) == Duration(
-        0, 427, 14_400, 0
-    )
 
     # Fallbacks for values Python cannot represent cleanly
     sub_us_dt = _FakeNeo4jDateTime(
@@ -255,6 +247,17 @@ def test_convert_driver_value_temporals_relativedelta_and_fallbacks() -> None:
         iso="2024-01-02T03:04:05Z[Mars/Olympus_Mons]",
     )
     assert convert_driver_value(bad_zone) == "2024-01-02T03:04:05Z[Mars/Olympus_Mons]"
+
+
+def test_convert_driver_value_relativedelta() -> None:
+    """relativedelta conversion when python-dateutil is installed (it is absent on Python 3.14)."""
+    relativedelta = pytest.importorskip("dateutil.relativedelta").relativedelta
+    assert convert_driver_value(relativedelta(days=2, hours=1, minutes=1, seconds=1)) == Duration(
+        0, 2, 3661, 0
+    )
+    assert convert_driver_value(relativedelta(years=1, months=2, days=3, hours=4)) == Duration(
+        0, 427, 14_400, 0
+    )
 
 
 def test_strip_falkordb_utc_recursive() -> None:
@@ -326,6 +329,7 @@ def test_agtype_python_float_specials_and_nested() -> None:
 
 def test_duckdb_bridge_embedded_result_types() -> None:
     """DuckDbBridge decodes temporal, Duration, UUID, Decimal, bytes, JSON, NaN/Inf, HUGEINT, lists."""
+    duckdb = pytest.importorskip("duckdb")
     con = duckdb.connect(":memory:")
     sess = Session(bridge=DuckDbBridge(con), dialect="duckpgq")
     try:
