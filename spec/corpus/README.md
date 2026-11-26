@@ -13,6 +13,7 @@ spec/corpus/
 ├── fixture.schema.json              # Draft 2020-12 schema for fixture files
 ├── fixtures/                        # Engine-neutral setup graphs shared by scenarios
 │   └── <name>.json
+├── known-lane-differences.json      # Reviewed official-vs-Voyager lane differences (#297)
 ├── NOTICE                           # Attribution notice for openCypher TCK
 ├── README.md                        # Format documentation and developer guide
 └── <pack>/                          # e.g. p0-match-return
@@ -113,38 +114,94 @@ dropped (Neo4j/Memgraph: delete nodes with `__corpus_254`; FalkorDB:
 `GRAPH.DELETE voyager_corpus_<token>`; AGE: `drop_graph`; PostgreSQL: `DROP
 SCHEMA ... CASCADE`).
 
-## Execution checks
+## Execution lanes
 
 `packages/python/tests/test_spec_corpus_live.py` parameterizes every scenario
-against every engine whose target status is `supported`. For each case it:
+against every engine whose target status is `supported`, once per execution
+lane:
+
+| Lane | Execution path | Purpose |
+| --- | --- | --- |
+| `official` | The engine's own Python client (`neo4j` for Neo4j and Memgraph, `falkordb`, `psycopg`), or Voyager's `Session`/`PostgresBridge` for Apache AGE and SQL/PGQ where the raw agtype/row result needs Voyager's decoder. | The reference lane. `rows.json` is recorded here, so this lane catches compiler regressions. |
+| `bridge` | `Session` over the Python bridge: `Neo4jBoltBridge`, `FalkorDBBridge`, `PostgresBridge` (AGE and SQL/PGQ). | Catches result-conversion bugs in the bridge users run. |
+| `native` | `Session(uri, dialect=..., backend="native")` over `voyager-drivers`: Bolt for Neo4j and Memgraph, RESP for FalkorDB, PostgreSQL wire for AGE and SQL/PGQ. | Catches Arrow/result-conversion bugs in the native Rust client. |
+
+Every engine has all three lanes. The fixture is loaded by the same official
+loader in every lane; only the statement execution differs. For each case the
+harness:
 
 1. loads the scenario fixture into the engine's dedicated namespace;
 2. compiles `query.spec.json` for the engine's dialect (with the dedicated graph
    name for SQL/PGQ and AGE, so the checked-in `expected.*` files are untouched);
 3. merges compiler-extracted parameters with `scenario.json` `params`;
-4. executes the compiled statement through Voyager's execution path (the
-   `Session`/`PostgresBridge` path for Apache AGE and PostgreSQL 19 Beta 3) or the
-   engine's own client where entity labels/types must survive (Neo4j, Memgraph,
-   FalkorDB, whose Voyager bridge normalizes entities to property maps);
-5. canonicalizes the rows and compares them with `rows.json` under the rules
-   below.
+4. executes the compiled statement through the selected lane;
+5. canonicalizes the rows, nodes, relationships and paths, then compares them
+   with `rows.json` under the rules below.
 
-A mismatch fails with the scenario id, the engine, the statement, the
-parameters, the expected and actual columns, and a row-level diff.
+A mismatch fails with the scenario, the lane, the engine, the column, the
+expected and actual values, the statement, the parameters, and the columns.
+The `native` lane sets `search_path` to the scenario schema before running a
+SQL/PGQ statement, because a new native connection does not inherit the
+loader's session setting.
 
-Run one engine or all engines (the host defaults to `127.0.0.1`):
+Run one engine or all engines, through one lane or all lanes (the host defaults
+to `127.0.0.1`):
 
 ```bash
-VOYAGER_TEST_HOST=192.168.1.12 just corpus-live neo4j
-VOYAGER_TEST_HOST=192.168.1.12 just corpus-live "age or pg19"
-VOYAGER_TEST_HOST=192.168.1.12 just corpus-live
+VOYAGER_TEST_HOST=192.168.1.12 just corpus-live                         # official lane, all engines
+VOYAGER_TEST_HOST=192.168.1.12 just corpus-live neo4j                   # official lane, Neo4j
+VOYAGER_TEST_HOST=192.168.1.12 just corpus-live neo4j bridge            # bridge lane, Neo4j
+VOYAGER_TEST_HOST=192.168.1.12 just corpus-live "age or pg19" native    # native lane, AGE and PG19
+VOYAGER_TEST_HOST=192.168.1.12 just corpus-live all                     # official lane, all engines
+VOYAGER_TEST_HOST=192.168.1.12 just corpus-live "." all                 # every lane, all engines
 ```
 
-`just corpus-live` prints a per-engine pass/fail/skip summary. Engine ports can
-be overridden with `VOYAGER_TEST_NEO4J_PORT`, `VOYAGER_TEST_MEMGRAPH_PORT`,
+The default is the `official` lane, preserving the previous behaviour. Running
+every lane takes three times as long, so it is opt-in. Never run two live corpus
+processes at the same time: they share databases and some scenarios count across
+the whole graph.
+
+`just corpus-live` prints a per-lane, per-engine pass/fail/skip summary
+(`scripts/run_corpus_live.py`). Engine ports can be overridden with
+`VOYAGER_TEST_NEO4J_PORT`, `VOYAGER_TEST_MEMGRAPH_PORT`,
 `VOYAGER_TEST_FALKORDB_PORT`, `VOYAGER_TEST_AGE_PORT` and
 `VOYAGER_TEST_PG19_PORT`; the PostgreSQL user, password and database with
 `VOYAGER_TEST_PG_USER`, `VOYAGER_TEST_PG_PASSWORD` and `VOYAGER_TEST_PG_DB`.
+
+## Known lane differences
+
+`spec/corpus/known-lane-differences.json` lists reviewed, understood
+differences between `rows.json` (recorded through the official lane and Neo4j)
+and the Voyager lanes. Start from an empty array:
+
+```json
+[
+  {
+    "engine": "memgraph",
+    "lane": "native",
+    "scenario": "p0-match-return/match-all-nodes",
+    "column": "n.age",
+    "reason": "Concrete cause of the difference."
+  }
+]
+```
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `engine` | yes | One of `neo4j`, `memgraph`, `falkordb`, `age`, `pg19`. |
+| `lane` | yes | `official`, `bridge` or `native`. Differences are normally `bridge` or `native`, because `official` is the reference. |
+| `scenario` | yes | Scenario id (`<pack>/<scenario>`). |
+| `column` | no | Column name. Omit to cover every difference in that scenario. |
+| `reason` | yes | Concrete cause, not an issue number. |
+
+An observed difference that matches an entry is treated as known and does not
+fail the run. An observed difference that matches no entry fails. An entry that
+matches no observed difference fails with "known lane difference is fixed, remove
+from known-lane-differences.json", so the list cannot go stale. Offline tests
+also reject unknown engines, lanes or scenarios, unsupported engine/scenario
+pairs, duplicate entries and empty reasons. Add an entry only after observing
+the difference and identifying its cause; the harness never adds entries
+automatically.
 
 ## Comparison rules
 
