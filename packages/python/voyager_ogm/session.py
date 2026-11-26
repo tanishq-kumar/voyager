@@ -1279,6 +1279,25 @@ class _SessionBase:
         params = {k: serialize_param_value(v) for k, v in params.items()}
         return stmt, params, q_obj
 
+    def _bulk_dialect(self, dialect: str | None) -> str:
+        """Returns the dialect bulk plans are compiled for.
+
+        An explicit ``dialect`` is used as given. Otherwise the session dialect is
+        used, except on DuckDB: the DuckDB bridge ingests bulk plans relationally
+        (it creates or extends a table per label and inserts the batch rows) and
+        reads the label from the openCypher plan, so DuckDB sessions compile bulk
+        plans as openCypher. SQL/PGQ itself has no bulk statement form.
+        """
+        if dialect is not None:
+            return dialect
+        from voyager_ogm.bridge import AsyncDuckDbBridge, DuckDbBridge
+
+        if isinstance(self._bridge, (DuckDbBridge, AsyncDuckDbBridge)) and (
+            self._dialect or ""
+        ).lower() in ("duckpgq", "duck_pgq", "sql_pgq", "pgq"):
+            return "cypher"
+        return self._dialect
+
     def bulk_create(
         self,
         model: type[Node],
@@ -1288,7 +1307,7 @@ class _SessionBase:
         graph_name: str | None = None,
     ) -> BulkIngestionPlan:
         """Prepares a high-throughput bulk node creation execution plan."""
-        target_dialect = dialect or self._dialect
+        target_dialect = self._bulk_dialect(dialect)
         target_graph_name = graph_name if graph_name is not None else self._graph_name
         return create_bulk_create_plan(
             model=model,
@@ -1313,7 +1332,7 @@ class _SessionBase:
         ``defaulted_fields`` optionally marks per-record values that were filled
         from a declared default so they are written only on the create path.
         """
-        target_dialect = dialect or self._dialect
+        target_dialect = self._bulk_dialect(dialect)
         target_graph_name = graph_name if graph_name is not None else self._graph_name
         return create_bulk_merge_plan(
             model=model,
@@ -1339,7 +1358,7 @@ class _SessionBase:
         graph_name: str | None = None,
     ) -> BulkIngestionPlan:
         """Prepares a high-throughput bulk relationship creation execution plan."""
-        target_dialect = dialect or self._dialect
+        target_dialect = self._bulk_dialect(dialect)
         target_graph_name = graph_name if graph_name is not None else self._graph_name
         return create_bulk_create_rel_plan(
             rel_model=rel_model,

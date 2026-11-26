@@ -3584,7 +3584,7 @@ fn compile_bulk_create<'py>(
         dialect,
         graph_name.as_deref(),
     )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    .map_err(|e| make_voyager_err(e.code(), e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("statement", compiled.statement)?;
@@ -3620,7 +3620,7 @@ fn compile_bulk_merge<'py>(
         dialect,
         graph_name.as_deref(),
     )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    .map_err(|e| make_voyager_err(e.code(), e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("statement", compiled.statement)?;
@@ -3657,7 +3657,7 @@ fn compile_bulk_merge_create_only<'py>(
             dialect,
             graph_name: graph_name.as_deref(),
         })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e| make_voyager_err(e.code(), e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("statement", compiled.statement)?;
@@ -3700,7 +3700,7 @@ fn compile_bulk_create_rel<'py>(
         graph_name: graph_name.as_deref(),
     };
     let compiled = voyager_ogm::bulk::compile_bulk_create_rel_with_config(&config)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        .map_err(|e| make_voyager_err(e.code(), e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("statement", compiled.statement)?;
