@@ -242,20 +242,20 @@ class Transaction:
         """Executes a statement and returns a Polars DataFrame."""
         self._ensure_can_execute()
         if self.backend == "native":
-            import polars as pl
+            from voyager_ogm.session import _stream_to_polars
 
             result = self._driver_tx.execute_sync(statement, parameters)
-            return pl.DataFrame(result.stream)
+            return _stream_to_polars(result.stream)
         return self._driver_tx.execute_to_polars(statement, parameters)
 
     def _execute_to_arrow_sync(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement and returns an Arrow Table."""
         self._ensure_can_execute()
         if self.backend == "native":
-            import pyarrow as pa
+            from voyager_ogm.session import _stream_to_arrow
 
             result = self._driver_tx.execute_sync(statement, parameters)
-            return pa.RecordBatchReader.from_stream(result.stream).read_all()
+            return _stream_to_arrow(result.stream)
         return self._driver_tx.execute_to_polars(statement, parameters).to_arrow()
 
     def _execute_bulk_sync(self, plan: Any) -> BulkExecutionResult:
@@ -552,10 +552,10 @@ class AsyncTransaction:
         self._ensure_can_execute()
         try:
             if self.backend == "native":
-                import polars as pl
+                from voyager_ogm.session import _stream_to_polars
 
                 result = await self._driver_tx.execute(statement, parameters)
-                return pl.DataFrame(result.stream)
+                return _stream_to_polars(result.stream)
             return await self._driver_tx.execute_to_polars(statement, parameters)
         except asyncio.CancelledError:
             self._release()
@@ -566,10 +566,10 @@ class AsyncTransaction:
         self._ensure_can_execute()
         try:
             if self.backend == "native":
-                import pyarrow as pa
+                from voyager_ogm.session import _stream_to_arrow
 
                 result = await self._driver_tx.execute(statement, parameters)
-                return pa.RecordBatchReader.from_stream(result.stream).read_all()
+                return _stream_to_arrow(result.stream)
             return (await self._driver_tx.execute_to_polars(statement, parameters)).to_arrow()
         except asyncio.CancelledError:
             self._release()

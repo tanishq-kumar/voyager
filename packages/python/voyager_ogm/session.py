@@ -17,6 +17,7 @@ from voyager_ogm.bridge import (
     BulkExecutionResult,
     DatabaseBridge,
     MockBridge,
+    _infer_record_columns,
     create_bridge,
     validate_graph_name,
     validate_pagination_parameters,
@@ -62,11 +63,47 @@ class SessionHealth(TypedDict):
     latency_ms: float
 
 
+def _stream_to_polars(stream: Any) -> pl.DataFrame:
+    """Converts a native ArrowStream into a Polars DataFrame, handling empty schemas."""
+    import polars as pl
+
+    if getattr(stream, "num_columns", None) == 0:
+        return pl.DataFrame()
+    return pl.DataFrame(stream)
+
+
+def _stream_to_arrow(stream: Any) -> pa.Table:
+    """Converts a native ArrowStream into a PyArrow Table, handling empty schemas."""
+    import pyarrow as pa
+
+    if getattr(stream, "num_columns", None) == 0:
+        return pa.Table.from_pylist([])
+    reader = pa.RecordBatchReader.from_stream(stream)
+    return reader.read_all()
+
+
 class MappingsResult(Sequence[dict[str, Any]]):
     """SQLAlchemy-compatible dictionary mapping sequence."""
 
-    def __init__(self, records: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        records: list[dict[str, Any]],
+        columns: Sequence[str] | None = None,
+    ) -> None:
         self._records = records
+        if columns is not None:
+            self._columns: tuple[str, ...] = tuple(str(col) for col in columns)
+        else:
+            self._columns = _infer_record_columns(records)
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """Read-only tuple of projected column names in projection order."""
+        return self._columns
+
+    def keys(self) -> list[str]:
+        """Returns projected column names in order as a list."""
+        return list(self._columns)
 
     def all(self) -> list[dict[str, Any]]:
         """Returns all records mapped as dictionaries."""
@@ -137,6 +174,8 @@ class ExecutionResult(list[dict[str, Any]]):
 
     Subclasses `list[dict[str, Any]]` for 100% backwards compatibility with standard
     Python list operations, while offering SQLAlchemy-like and Neo4j Browser-grade capabilities:
+    - `.columns`: Read-only tuple of projected column names (`tuple[str, ...]`), populated even for zero-row results and empty for non-returning write statements.
+    - `.keys()`: Returns the same projected column names as a `list[str]`.
     - `.mappings()`: Dictionary mapping views (`result.mappings().all()`).
     - `.scalars()`: Single-column scalar extraction (`result.scalars().all()`).
     - `.all()` / `.fetchall()`: All result records.
@@ -156,6 +195,7 @@ class ExecutionResult(list[dict[str, Any]]):
         dialect: str = "cypher",
         stream: Any = None,
         summary: Any = None,
+        columns: Sequence[str] | None = None,
     ) -> None:
         self._stream = stream
         self._summary = summary
@@ -167,8 +207,23 @@ class ExecutionResult(list[dict[str, Any]]):
         self._cached_df: pl.DataFrame | None = None
         self._cached_table: pa.Table | None = None
 
+        if columns is not None:
+            self._columns: tuple[str, ...] = tuple(str(col) for col in columns)
+        elif records is not None:
+            record_cols = getattr(records, "columns", None)
+            if record_cols is not None:
+                self._columns = tuple(str(col) for col in record_cols)
+            else:
+                self._columns = _infer_record_columns(records)
+        elif stream is not None and hasattr(stream, "columns"):
+            self._columns = tuple(str(col) for col in stream.columns)
+        elif summary is not None and hasattr(summary, "columns"):
+            self._columns = tuple(str(col) for col in summary.columns)
+        else:
+            self._columns = ()
+
         if records is not None:
-            self._records: list[dict[str, Any]] | None = records
+            self._records: list[dict[str, Any]] | None = list(records)
             super().__init__(records)
         else:
             self._records = None
@@ -279,9 +334,23 @@ class ExecutionResult(list[dict[str, Any]]):
         """The active query dialect for this result."""
         return self._dialect
 
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """Read-only tuple of projected column names in projection order.
+
+        Populated from driver metadata (or the native Arrow schema) even when
+        zero rows are returned, and empty ``()`` for write statements without a
+        ``RETURN`` / ``RETURNING`` clause.
+        """
+        return self._columns
+
+    def keys(self) -> list[str]:
+        """Returns the projected column names in projection order as a list."""
+        return list(self._columns)
+
     def mappings(self) -> MappingsResult:
         """Provides an SQLAlchemy-style dictionary mapping view over the result rows."""
-        return MappingsResult(self._ensure_records())
+        return MappingsResult(self._ensure_records(), columns=self._columns)
 
     def scalars(self) -> ScalarsResult:
         """Provides an SQLAlchemy-style single-column scalar extraction view."""
@@ -321,14 +390,19 @@ class ExecutionResult(list[dict[str, Any]]):
 
         if self._stream is not None and not getattr(self._stream, "is_consumed", False):
             try:
-                df = pl.DataFrame(self._stream)
+                df = _stream_to_polars(self._stream)
                 self._cached_df = df
                 return df
             except Exception:
                 pass
 
         records = serialize_records_for_arrow(self._ensure_records())
-        df = pl.DataFrame(records) if records else pl.DataFrame()
+        if records:
+            df = pl.DataFrame(records)
+        elif self._columns:
+            df = pl.DataFrame(schema=list(self._columns))
+        else:
+            df = pl.DataFrame()
         self._cached_df = df
         return df
 
@@ -349,15 +423,20 @@ class ExecutionResult(list[dict[str, Any]]):
 
         if self._stream is not None and not getattr(self._stream, "is_consumed", False):
             try:
-                reader = pa.RecordBatchReader.from_stream(self._stream)
-                tbl = reader.read_all()
+                tbl = _stream_to_arrow(self._stream)
                 self._cached_table = tbl
                 return tbl
             except Exception:
                 pass
 
         records = serialize_records_for_arrow(self._ensure_records())
-        tbl = pa.Table.from_pylist(records) if records else pa.Table.from_pylist([])
+        if records:
+            tbl = pa.Table.from_pylist(records)
+        elif self._columns:
+            schema = pa.schema([(col, pa.string()) for col in self._columns])
+            tbl = pa.Table.from_pylist([], schema=schema)
+        else:
+            tbl = pa.Table.from_pylist([])
         self._cached_table = tbl
         return tbl
 
@@ -781,20 +860,26 @@ class _SessionBase:
         query: Query | CompiledQuery | None,
     ) -> ExecutionResult:
         """Builds an ExecutionResult from a native result, decoding AGE values."""
+        stream = getattr(result, "stream", None)
+        stream_cols = getattr(stream, "columns", None)
+        columns = stream_cols if stream_cols is not None else getattr(result, "columns", None)
         if bool(getattr(result, "has_age_columns", False)):
             return ExecutionResult(
                 records=result.to_dicts(),
                 statement=statement,
                 query=query,
                 dialect=self._dialect,
+                summary=getattr(result, "summary", None),
+                columns=columns,
             )
         return ExecutionResult(
             records=None,
             statement=statement,
             query=query,
             dialect=self._dialect,
-            stream=result.stream,
-            summary=result.summary,
+            stream=stream,
+            summary=getattr(result, "summary", None),
+            columns=columns,
         )
 
     @property
@@ -1560,9 +1645,7 @@ class Session(_SessionBase):
             try:
                 native_res = self._native_client.execute_sync(stmt, params)
                 self._record_native_success()
-                import polars as pl
-
-                return pl.DataFrame(native_res.stream)
+                return _stream_to_polars(native_res.stream)
             except Exception as e:
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
@@ -1610,10 +1693,7 @@ class Session(_SessionBase):
             try:
                 native_res = self._native_client.execute_sync(stmt, params)
                 self._record_native_success()
-                import pyarrow as pa
-
-                reader = pa.RecordBatchReader.from_stream(native_res.stream)
-                return reader.read_all()
+                return _stream_to_arrow(native_res.stream)
             except Exception as e:
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
@@ -2442,9 +2522,7 @@ class AsyncSession(_SessionBase):
             try:
                 native_res = await self._native_client.execute(stmt, params)
                 self._record_native_success()
-                import polars as pl
-
-                return pl.DataFrame(native_res.stream)
+                return _stream_to_polars(native_res.stream)
             except Exception as e:
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
@@ -2492,10 +2570,7 @@ class AsyncSession(_SessionBase):
             try:
                 native_res = await self._native_client.execute(stmt, params)
                 self._record_native_success()
-                import pyarrow as pa
-
-                reader = pa.RecordBatchReader.from_stream(native_res.stream)
-                return reader.read_all()
+                return _stream_to_arrow(native_res.stream)
             except Exception as e:
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise

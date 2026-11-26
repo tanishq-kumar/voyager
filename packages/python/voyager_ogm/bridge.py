@@ -88,6 +88,48 @@ class BulkExecutionResult:
     statement: str
 
 
+def _infer_record_columns(records: Sequence[Any]) -> tuple[str, ...]:
+    """Extracts ordered column names from the first mapping record, if present."""
+    if records and isinstance(records[0], Mapping):
+        return tuple(str(key) for key in records[0].keys())
+    return ()
+
+
+class BridgeResult(list[dict[str, Any]]):
+    """List of record dictionaries carrying driver-reported projection column names.
+
+    Subclasses ``list[dict[str, Any]]`` so bridges preserve their existing list
+    return contract while forwarding column metadata on zero-row results.
+    """
+
+    def __init__(
+        self,
+        records: Sequence[dict[str, Any]] = (),
+        columns: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(records)
+        if columns is not None:
+            self._columns: tuple[str, ...] = tuple(str(col) for col in columns)
+        else:
+            self._columns = _infer_record_columns(records)
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """Ordered projection column names from the driver metadata."""
+        return self._columns
+
+
+def _records_to_polars(raw_records: list[dict[str, Any]]) -> pl.DataFrame:
+    """Converts bridge records (preserving empty-result ``.columns``) to a Polars DataFrame."""
+    columns = getattr(raw_records, "columns", None)
+    records = serialize_records_for_arrow(raw_records)
+    if records:
+        return pl.DataFrame(records)
+    if columns:
+        return pl.DataFrame(schema=list(columns))
+    return pl.DataFrame()
+
+
 @runtime_checkable
 class DatabaseBridge(Protocol):
     """Synchronous Database Bridge Protocol."""
@@ -370,15 +412,33 @@ class MockBridge:
             validate_graph_name(graph_name)
         self.graph_name = graph_name
         self.executed_queries: list[tuple[str, dict[str, Any]]] = []
-        self._canned_results: list[list[dict[str, Any]] | pl.DataFrame] = []
+        self._canned_results: list[
+            tuple[list[dict[str, Any]] | pl.DataFrame, tuple[str, ...] | None]
+        ] = []
 
-    def queue_result(self, result: list[dict[str, Any]] | pl.DataFrame) -> None:
+    def queue_result(
+        self,
+        result: list[dict[str, Any]] | pl.DataFrame,
+        columns: Sequence[str] | None = None,
+    ) -> None:
         """Queues a canned result to be returned by future execute() calls.
 
         Args:
             result: Result records or DataFrame to return.
+            columns: Optional explicit column names (useful when queueing an empty list).
         """
-        self._canned_results.append(result)
+        resolved_cols: tuple[str, ...] | None
+        if columns is not None:
+            resolved_cols = tuple(str(c) for c in columns)
+        elif isinstance(result, pl.DataFrame):
+            resolved_cols = tuple(str(c) for c in result.columns)
+        else:
+            existing_cols = getattr(result, "columns", None)
+            if existing_cols is not None:
+                resolved_cols = tuple(str(c) for c in existing_cols)
+            else:
+                resolved_cols = _infer_record_columns(result) or None
+        self._canned_results.append((result, resolved_cols))
 
     def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -396,11 +456,14 @@ class MockBridge:
         params = unwrap_spatial_param(parameters or {})
         self.executed_queries.append((statement, params))
         if self._canned_results:
-            res = self._canned_results.pop(0)
+            res, cols = self._canned_results.pop(0)
             if isinstance(res, pl.DataFrame):
-                return res.to_dicts()
-            return res
-        return []
+                return BridgeResult(
+                    res.to_dicts(),
+                    columns=cols if cols is not None else tuple(str(c) for c in res.columns),
+                )
+            return BridgeResult(res, columns=cols)
+        return BridgeResult([], columns=())
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -418,10 +481,10 @@ class MockBridge:
         params = unwrap_spatial_param(parameters or {})
         self.executed_queries.append((statement, params))
         if self._canned_results:
-            res = self._canned_results.pop(0)
+            res, cols = self._canned_results.pop(0)
             if isinstance(res, pl.DataFrame):
                 return res
-            return pl.DataFrame(res)
+            return _records_to_polars(BridgeResult(res, columns=cols))
         return pl.DataFrame()
 
     def execute_bulk(
@@ -570,13 +633,18 @@ class AsyncMockBridge:
         """Returns history of executed queries."""
         return self.sync_mock.executed_queries
 
-    def queue_result(self, result: list[dict[str, Any]] | pl.DataFrame) -> None:
+    def queue_result(
+        self,
+        result: list[dict[str, Any]] | pl.DataFrame,
+        columns: Sequence[str] | None = None,
+    ) -> None:
         """Queues canned result for future executions.
 
         Args:
             result: Result records or DataFrame.
+            columns: Optional explicit column names (useful when queueing an empty list).
         """
-        self.sync_mock.queue_result(result)
+        self.sync_mock.queue_result(result, columns=columns)
 
     async def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -717,6 +785,20 @@ def _normalize_bolt_record(record: Any) -> dict[str, Any]:
     return {k: convert_driver_value(v) for k, v in raw.items()}
 
 
+def _bolt_result_keys(result: Any) -> tuple[str, ...]:
+    """Extracts ordered column keys from a Bolt Result if exposed by the driver."""
+    keys_fn = getattr(result, "keys", None)
+    if callable(keys_fn):
+        return tuple(str(k) for k in keys_fn())
+    return ()
+
+
+def _bolt_bridge_result(keys: tuple[str, ...], records: list[dict[str, Any]]) -> BridgeResult:
+    """Packages Bolt records with driver keys, falling back to first-row keys for test doubles."""
+    cols = keys if keys else _infer_record_columns(records)
+    return BridgeResult(records, columns=cols)
+
+
 class Neo4jBoltBridge:
     """Synchronous Neo4j / Memgraph Bolt protocol driver bridge."""
 
@@ -747,7 +829,9 @@ class Neo4jBoltBridge:
         session_kwargs = {"database": self.database} if self.database else {}
         with self.driver.session(**session_kwargs) as session:
             result = session.run(statement, params)
-            return [_normalize_bolt_record(record) for record in result]
+            keys = _bolt_result_keys(result)
+            records = [_normalize_bolt_record(record) for record in result]
+            return _bolt_bridge_result(keys, records)
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -761,8 +845,7 @@ class Neo4jBoltBridge:
         Returns:
             Polars DataFrame.
         """
-        records = serialize_records_for_arrow(self.execute(statement, parameters))
-        return pl.DataFrame(records) if records else pl.DataFrame()
+        return _records_to_polars(self.execute(statement, parameters))
 
     def execute_bulk(
         self,
@@ -901,7 +984,9 @@ class Neo4jBoltTransaction:
         validate_pagination_parameters(statement, parameters)
         try:
             result = self._tx.run(statement, _adapt_bolt_parameters(parameters or {}))
-            return [_normalize_bolt_record(record) for record in result]
+            keys = _bolt_result_keys(result)
+            records = [_normalize_bolt_record(record) for record in result]
+            return _bolt_bridge_result(keys, records)
         except BaseException:
             self._mark_failed()
             raise
@@ -910,8 +995,7 @@ class Neo4jBoltTransaction:
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
         """Runs a Cypher statement and returns a Polars DataFrame."""
-        records = serialize_records_for_arrow(self.execute(statement, parameters))
-        return pl.DataFrame(records) if records else pl.DataFrame()
+        return _records_to_polars(self.execute(statement, parameters))
 
     def execute_bulk(
         self,
@@ -1035,13 +1119,15 @@ class AsyncNeo4jBoltBridge:
         session_kwargs = {"database": self.database} if self.database else {}
         async with self.driver.session(**session_kwargs) as session:
             result = await session.run(statement, params)
+            keys = _bolt_result_keys(result)
             if hasattr(result, "__aiter__"):
                 records = []
                 async for record in result:
                     records.append(_normalize_bolt_record(record))
-                return records
+                return _bolt_bridge_result(keys, records)
             raw = await result.data()
-            return [_normalize_bolt_record(r) for r in raw]
+            records = [_normalize_bolt_record(r) for r in raw]
+            return _bolt_bridge_result(keys, records)
 
     async def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -1055,8 +1141,7 @@ class AsyncNeo4jBoltBridge:
         Returns:
             Polars DataFrame.
         """
-        records = serialize_records_for_arrow(await self.execute(statement, parameters))
-        return pl.DataFrame(records) if records else pl.DataFrame()
+        return _records_to_polars(await self.execute(statement, parameters))
 
     async def execute_bulk(
         self,
@@ -1202,13 +1287,15 @@ class AsyncNeo4jBoltTransaction:
             raise ValueError("Cannot execute query on inactive transaction")
         try:
             result = await self._tx.run(statement, _adapt_bolt_parameters(parameters or {}))
+            keys = _bolt_result_keys(result)
             if hasattr(result, "__aiter__"):
                 records = []
                 async for record in result:
                     records.append(_normalize_bolt_record(record))
-                return records
+                return _bolt_bridge_result(keys, records)
             raw = await result.data()
-            return [_normalize_bolt_record(r) for r in raw]
+            records = [_normalize_bolt_record(r) for r in raw]
+            return _bolt_bridge_result(keys, records)
         except BaseException:
             self._mark_failed()
             raise
@@ -1217,8 +1304,7 @@ class AsyncNeo4jBoltTransaction:
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
         """Runs a Cypher statement and returns a Polars DataFrame."""
-        records = serialize_records_for_arrow(await self.execute(statement, parameters))
-        return pl.DataFrame(records) if records else pl.DataFrame()
+        return _records_to_polars(await self.execute(statement, parameters))
 
     async def execute_bulk(
         self,
@@ -1451,10 +1537,10 @@ class DuckDbBridge:
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         rel = self.con.execute(stmt, params)
         if rel.description:
-            cols = [d[0] for d in rel.description]
+            cols = [str(d[0]) for d in rel.description]
             rows = rel.fetchall()
-            return [dict(zip(cols, row, strict=False)) for row in rows]
-        return []
+            return BridgeResult([dict(zip(cols, row, strict=False)) for row in rows], columns=cols)
+        return BridgeResult([], columns=())
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -1471,8 +1557,7 @@ class DuckDbBridge:
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         if hasattr(self.con, "pl"):
             return self.con.execute(stmt, params).pl()
-        records = self.execute(stmt, params)
-        return pl.DataFrame(records) if records else pl.DataFrame()
+        return _records_to_polars(self.execute(stmt, params))
 
     def execute_bulk(
         self,
@@ -2031,6 +2116,32 @@ class PostgresBridge:
             return statement, ()
         return stmt, ordered_params
 
+    def _execute_cursor(self, cursor: Any, stmt: str, params: Any) -> BridgeResult:
+        """Executes a formatted statement on a psycopg cursor and decodes AGE columns."""
+        cursor.execute(stmt, params or None)
+        if cursor.description:
+            cols = [str(d[0]) for d in cursor.description]
+            rows = cursor.fetchall()
+            decoded = [self._decode_row(cursor, row) for row in rows]
+            return BridgeResult(
+                [dict(zip(cols, row, strict=False)) for row in decoded],
+                columns=cols,
+            )
+        return BridgeResult([], columns=())
+
+    def _execute_cursor_polars(self, cursor: Any, stmt: str, params: Any) -> pl.DataFrame:
+        """Executes a formatted statement on a psycopg cursor and returns a Polars DataFrame."""
+        cursor.execute(stmt, params or None)
+        if cursor.description:
+            cols = [str(d[0]) for d in cursor.description]
+            rows = cursor.fetchall()
+            decoded = [
+                tuple(serialize_value_for_arrow(v) for v in self._decode_row(cursor, row))
+                for row in rows
+            ]
+            return pl.DataFrame(decoded, schema=cols, orient="row")
+        return pl.DataFrame()
+
     def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
@@ -2045,13 +2156,7 @@ class PostgresBridge:
         """
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         with self.conn.cursor() as cur:
-            cur.execute(stmt, params or None)
-            if cur.description:
-                cols = [d[0] for d in cur.description]
-                rows = cur.fetchall()
-                decoded = [self._decode_row(cur, row) for row in rows]
-                return [dict(zip(cols, row, strict=False)) for row in decoded]
-            return []
+            return self._execute_cursor(cur, stmt, params)
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -2067,16 +2172,7 @@ class PostgresBridge:
         """
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         with self.conn.cursor() as cur:
-            cur.execute(stmt, params or None)
-            if cur.description:
-                cols = [d[0] for d in cur.description]
-                rows = cur.fetchall()
-                decoded = [
-                    tuple(serialize_value_for_arrow(v) for v in self._decode_row(cur, row))
-                    for row in rows
-                ]
-                return pl.DataFrame(decoded, schema=cols, orient="row")
-            return pl.DataFrame()
+            return self._execute_cursor_polars(cur, stmt, params)
 
     def execute_bulk(
         self,
@@ -2228,13 +2324,7 @@ class PostgresBridgeTransaction:
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
-                cur.execute(stmt, params or None)
-                if cur.description:
-                    cols = [d[0] for d in cur.description]
-                    rows = cur.fetchall()
-                    decoded = [self._bridge._decode_row(cur, row) for row in rows]
-                    return [dict(zip(cols, row, strict=False)) for row in decoded]
-                return []
+                return self._bridge._execute_cursor(cur, stmt, params)
         except BaseException:
             self._mark_failed()
             raise
@@ -2247,18 +2337,7 @@ class PostgresBridgeTransaction:
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
-                cur.execute(stmt, params or None)
-                if cur.description:
-                    cols = [d[0] for d in cur.description]
-                    rows = cur.fetchall()
-                    decoded = [
-                        tuple(
-                            serialize_value_for_arrow(v) for v in self._bridge._decode_row(cur, row)
-                        )
-                        for row in rows
-                    ]
-                    return pl.DataFrame(decoded, schema=cols, orient="row")
-                return pl.DataFrame()
+                return self._bridge._execute_cursor_polars(cur, stmt, params)
         except BaseException:
             self._mark_failed()
             raise
@@ -2592,27 +2671,26 @@ class FalkorDBBridge:
             )
             err_msg = str(e).lower()
             if is_index_ddl and ("already indexed" in err_msg or "no such index" in err_msg):
-                return []
+                return BridgeResult([], columns=())
             raise
 
-        if (
-            not hasattr(res, "header")
-            or not res.header
-            or not hasattr(res, "result_set")
-            or not res.result_set
-        ):
-            return []
+        if not hasattr(res, "header") or not res.header:
+            return BridgeResult([], columns=())
 
         col_names = [
-            h[1] if isinstance(h, (list, tuple)) and len(h) > 1 else str(h) for h in res.header
+            str(h[1]) if isinstance(h, (list, tuple)) and len(h) > 1 else str(h) for h in res.header
         ]
+        result_set = getattr(res, "result_set", None)
+        if not result_set:
+            return BridgeResult([], columns=col_names)
+
         records: list[dict[str, Any]] = []
-        for row in res.result_set:
+        for row in result_set:
             rec: dict[str, Any] = {}
             for col, val in zip(col_names, row, strict=False):
                 rec[col] = convert_driver_value(val)
             records.append(rec)
-        return records
+        return BridgeResult(records, columns=col_names)
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -2626,8 +2704,7 @@ class FalkorDBBridge:
         Returns:
             Polars DataFrame.
         """
-        records = serialize_records_for_arrow(self.execute(statement, parameters))
-        return pl.DataFrame(records) if records else pl.DataFrame()
+        return _records_to_polars(self.execute(statement, parameters))
 
     def execute_bulk(
         self,
@@ -2822,6 +2899,17 @@ def _adapt_relate_parameters(params: dict[str, Any]) -> dict[str, Any]:
     return {k: _adapt_relate_value(v) for k, v in params.items()}
 
 
+def _relate_result_columns(res: Any) -> tuple[str, ...]:
+    """Extracts projection column names from a Relate cursor/result object."""
+    res_cols = getattr(res, "columns", None)
+    if res_cols:
+        return tuple(str(c) for c in res_cols)
+    desc = getattr(res, "description", None)
+    if desc:
+        return tuple(str(d[0]) for d in desc)
+    return ()
+
+
 class RelateBridge:
     """Synchronous Relate embedded graph database driver bridge (https://relatedb.ai).
 
@@ -2853,13 +2941,17 @@ class RelateBridge:
         validate_pagination_parameters(statement, parameters)
         params = _adapt_relate_parameters(parameters or {})
         res = self.con.execute(statement, params)
+        cols = _relate_result_columns(res)
         if hasattr(res, "fetchall"):
             rows = res.fetchall()
         elif hasattr(res, "data"):
             rows = res.data
         else:
             rows = list(res)
-        return [_normalize_relate_record(row) for row in rows]
+        normalized = [_normalize_relate_record(row) for row in rows]
+        if not cols:
+            cols = _infer_record_columns(normalized)
+        return BridgeResult(normalized, columns=cols)
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -2885,9 +2977,10 @@ class RelateBridge:
                     return pl.DataFrame(df_out)
                 except Exception:
                     pass
+            cols = _relate_result_columns(res)
             records = getattr(res, "fetchall", lambda: getattr(res, "data", []))()
-            normalized = serialize_records_for_arrow([_normalize_relate_record(r) for r in records])
-            return pl.DataFrame(normalized) if normalized else pl.DataFrame()
+            normalized = [_normalize_relate_record(r) for r in records]
+            return _records_to_polars(BridgeResult(normalized, columns=cols))
         return pl.DataFrame()
 
     def execute_bulk(
