@@ -764,6 +764,7 @@ def test_duckdb_polars_mock_fallback_does_not_reexecute():
 
 def test_postgres_interval_loader_handles_all_styles_and_fallback():
     """_configure_pg_adapters handles postgres_verbose, sql_standard, and unparseable fallback."""
+    pytest.importorskip("psycopg")
     from voyager_ogm.bridge import _configure_pg_adapters
     from voyager_ogm.types import Duration
 

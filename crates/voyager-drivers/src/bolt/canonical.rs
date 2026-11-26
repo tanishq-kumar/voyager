@@ -1,7 +1,6 @@
 //! Canonical JSON representation and Arrow RecordBatch construction for Bolt/graph values.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -10,6 +9,7 @@ use arrow_array::builder::{
     LargeBinaryBuilder, ListBuilder, StringBuilder, StructBuilder, Time64MicrosecondBuilder,
     Time64NanosecondBuilder, TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
 };
+use arrow_array::timezone::Tz;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
     DurationMicrosecondArray, DurationNanosecondArray, FixedSizeBinaryArray, Float64Array,
@@ -256,23 +256,12 @@ pub fn bolt_value_to_canonical_json(value: &BoltValue) -> serde_json::Value {
     }
 }
 
-/// Checks whether `zone_id` is safe to attach as an Arrow/Polars `Timestamp` timezone.
+/// Checks whether `zone_id` can be resolved as an Arrow/Polars `Timestamp` timezone.
+///
+/// Uses the same `chrono-tz`-backed parser as Arrow rather than the host's
+/// `/usr/share/zoneinfo`, so validation works on Windows and hosts without tzdata.
 pub(crate) fn is_valid_arrow_tz(zone_id: &str) -> bool {
-    if zone_id == "UTC" {
-        return true;
-    }
-    if zone_id.is_empty()
-        || zone_id.starts_with('/')
-        || zone_id.contains("..")
-        || !zone_id.contains('/')
-    {
-        return false;
-    }
-    let zoneinfo_dir = Path::new("/usr/share/zoneinfo");
-    if zoneinfo_dir.is_dir() {
-        return zoneinfo_dir.join(zone_id).is_file();
-    }
-    true
+    zone_id.parse::<Tz>().is_ok()
 }
 
 fn timestamp_micros(seconds: i64, nanoseconds: i64) -> Option<i64> {
