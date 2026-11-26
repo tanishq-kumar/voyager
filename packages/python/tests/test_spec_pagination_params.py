@@ -1,4 +1,4 @@
-"""Parameterised ``skip`` / ``offset`` / ``limit`` in Query Spec v1 (issue #321)."""
+"""Parameterised ``skip`` / ``limit`` in Query Spec v1 (issue #321)."""
 
 from __future__ import annotations
 
@@ -85,12 +85,16 @@ def test_consumer_accepts_parameter_inside_with() -> None:
     )
 
 
-def test_consumer_offset_parameter_strips_one_dollar() -> None:
-    """offset is the skip alias and follows the same parameter-name rule."""
-    compiled = compile_query_from_spec(
-        _with_pagination(offset=["param", "$o"], limit=["param", "l"]), "cypher"
-    )
-    assert compiled["statement"] == "MATCH (p:Person) RETURN p.name SKIP $o LIMIT $l"
+def test_consumer_rejects_offset_in_favour_of_skip() -> None:
+    """offset is no longer an alias; the error names the canonical key."""
+    with pytest.raises(VoyagerError) as exc_info:
+        compile_query_from_spec(
+            _with_pagination(offset=["param", "$o"], limit=["param", "l"]), "cypher"
+        )
+    error = exc_info.value
+    assert error.code == "INVALID_SPEC"
+    assert error.path == "/offset"
+    assert 'use "skip" instead of "offset"' in str(error)
 
 
 @pytest.mark.parametrize(

@@ -25,7 +25,11 @@ AstExpr: Any = getattr(_native_module, "AstExpr", None)
 VoyagerError: Any = getattr(_native_module, "VoyagerError", ValueError)
 
 
-SPEC_VERSION: int = 1
+# Query Spec version facts come from the native extension so the Rust core is
+# the single source of truth. The fallbacks keep documentation tooling that
+# imports this module without a built extension working.
+SPEC_VERSION: int = int(getattr(_native_module, "QUERY_SPEC_VERSION", 1))
+SPEC_REVISION: int = int(getattr(_native_module, "QUERY_SPEC_REVISION", 1))
 
 AGGREGATION_CONTEXT_MESSAGE = (
     "aggregations are only valid in WITH/RETURN projections; "
@@ -54,6 +58,7 @@ class Expression:
         """Converts this expression into a versioned AST spec dictionary."""
         return {
             "spec_version": SPEC_VERSION,
+            "spec_revision": SPEC_REVISION,
             "expr": self.to_spec(),
         }
 

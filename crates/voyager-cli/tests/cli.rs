@@ -212,6 +212,26 @@ fn validate_accepts_valid_and_reports_each_invalid_path() {
 }
 
 #[test]
+fn validate_rejects_a_newer_spec_revision() {
+    let document = valid_vector("basic-match-return.json");
+    let mut spec = document["spec"].clone();
+    spec["spec_revision"] = Value::from(2);
+
+    let output = run_with_stdin(&["validate", "-"], spec.to_string().as_bytes());
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let errors = stderr(&output);
+    assert!(errors.contains("/spec_revision:"), "{errors}");
+    assert!(
+        errors.contains("requires Query Spec revision 2"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("this Voyager supports up to revision 1"),
+        "{errors}"
+    );
+}
+
+#[test]
 fn validate_reads_stdin_and_rejects_malformed_json() {
     let document = valid_vector("basic-match-return.json");
     let spec = serde_json::to_vec(&document["spec"]).expect("serialize spec");
@@ -269,6 +289,7 @@ fn doctor_without_uri_reports_only_build_facts() {
         text.contains("supported dialects: cypher, age, iso_gql, sql_pgq, duck_pgq"),
         "{text}"
     );
+    assert!(text.contains("query spec: v1 revision 1"), "{text}");
     assert!(!text.contains("latency:"), "no connection was made: {text}");
 }
 

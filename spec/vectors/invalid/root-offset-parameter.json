@@ -1,0 +1,42 @@
+{
+  "description": "Root 'offset' is not canonical, even with a parameter; use 'skip'.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ],
+    "offset": [
+      "param",
+      "o"
+    ],
+    "limit": [
+      "param",
+      "l"
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/offset"
+  }
+}
