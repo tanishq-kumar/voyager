@@ -52,6 +52,14 @@ class QueryResult:
         """Returns the total number of columns in the result stream."""
         return self._stream.num_columns
 
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """Returns the ordered column names from the result stream schema."""
+        cols = getattr(self._stream, "columns", None)
+        if cols is not None:
+            return tuple(str(c) for c in cols)
+        return ()
+
     def to_arrow(self) -> pa.Table:
         """Zero-copy export into an Apache Arrow Table.
 
