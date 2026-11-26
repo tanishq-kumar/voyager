@@ -3228,6 +3228,17 @@ impl PyArrowStream {
         self.batch.num_columns()
     }
 
+    /// Ordered list of column names from the Arrow batch schema.
+    #[getter]
+    fn columns(&self) -> Vec<String> {
+        self.batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
     /// Returns whether this stream has already been consumed via `__arrow_c_stream__`.
     #[getter]
     fn is_consumed(&self) -> bool {
@@ -3881,6 +3892,19 @@ impl PyNativeQueryResult {
     }
 }
 
+fn empty_batch_for_columns(columns: &[String]) -> arrow_array::RecordBatch {
+    if columns.is_empty() {
+        return arrow_array::RecordBatch::new_empty(std::sync::Arc::new(
+            arrow_schema::Schema::empty(),
+        ));
+    }
+    let fields: Vec<arrow_schema::Field> = columns
+        .iter()
+        .map(|name| arrow_schema::Field::new(name, arrow_schema::DataType::Utf8, true))
+        .collect();
+    arrow_array::RecordBatch::new_empty(std::sync::Arc::new(arrow_schema::Schema::new(fields)))
+}
+
 fn query_result_to_py(query_result: voyager_drivers::QueryResult) -> PyResult<PyNativeQueryResult> {
     let columns = query_result.columns.clone();
     let summary = query_result.summary.clone();
@@ -3888,9 +3912,7 @@ fn query_result_to_py(query_result: voyager_drivers::QueryResult) -> PyResult<Py
     let batch = query_result
         .into_single_batch()
         .map_err(|e| PyValueError::new_err(e.to_string()))?
-        .unwrap_or_else(|| {
-            arrow_array::RecordBatch::new_empty(std::sync::Arc::new(arrow_schema::Schema::empty()))
-        });
+        .unwrap_or_else(|| empty_batch_for_columns(&columns));
 
     Ok(PyNativeQueryResult {
         stream: PyArrowStream::from_batch(batch),
@@ -4013,24 +4035,7 @@ impl PyNativeClient {
             })
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        let columns = query_result.columns.clone();
-        let summary = query_result.summary.clone();
-        let age_columns = query_result.age_columns.clone();
-        let batch = query_result
-            .into_single_batch()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-            .unwrap_or_else(|| {
-                arrow_array::RecordBatch::new_empty(std::sync::Arc::new(
-                    arrow_schema::Schema::empty(),
-                ))
-            });
-
-        Ok(PyNativeQueryResult {
-            stream: PyArrowStream::from_batch(batch),
-            columns,
-            summary,
-            age_columns,
-        })
+        query_result_to_py(query_result)
     }
 
     /// Asynchronously executes a query returning a Python asyncio Future.
@@ -4050,24 +4055,7 @@ impl PyNativeClient {
                 .await
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-            let columns = query_result.columns.clone();
-            let summary = query_result.summary.clone();
-            let age_columns = query_result.age_columns.clone();
-            let batch = query_result
-                .into_single_batch()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?
-                .unwrap_or_else(|| {
-                    arrow_array::RecordBatch::new_empty(std::sync::Arc::new(
-                        arrow_schema::Schema::empty(),
-                    ))
-                });
-
-            Ok(PyNativeQueryResult {
-                stream: PyArrowStream::from_batch(batch),
-                columns,
-                summary,
-                age_columns,
-            })
+            query_result_to_py(query_result)
         })
     }
 

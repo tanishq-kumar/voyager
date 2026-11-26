@@ -1043,11 +1043,6 @@ class PG19Engine(BaseEngine):
         )
 
 
-_MUTATION_KEYWORDS = re.compile(
-    r"\b(CREATE|MERGE|SET|DELETE|REMOVE|INSERT|UPDATE)\b", re.IGNORECASE
-)
-
-
 def _postgres_session_execute(
     conn: Any,
     statement: str,
@@ -1058,28 +1053,17 @@ def _postgres_session_execute(
     engine: str,
     parse_age: bool,
 ) -> tuple[list[str], list[list[Any]]]:
-    """Execute via Session/PostgresBridge and fall back to cursor metadata when 0 rows return."""
+    """Execute via Session/PostgresBridge and return columns and canonical rows."""
     from voyager_ogm import Session
     from voyager_ogm.bridge import PostgresBridge
 
     bridge = PostgresBridge(conn, graph_name=graph_name)
     session = Session(bridge=bridge, dialect=dialect)
     result = session.execute(statement, parameters)
-    records = result.all()
-    if records:
-        columns = list(records[0].keys())
-    elif _MUTATION_KEYWORDS.search(statement):
-        # Session results carry no column names when they are empty, and running a
-        # write a second time to read cursor metadata would apply it twice.
-        columns = []
-    else:
-        stmt, params = bridge._format_pgq_statement(statement, parameters)
-        with conn.cursor() as cur:
-            cur.execute(stmt, params or None)
-            columns = [d[0] for d in cur.description] if cur.description else []
+    columns = list(result.columns)
     rows = [
         [canonicalize(value, engine, parse_age=parse_age) for value in record.values()]
-        for record in records
+        for record in result.all()
     ]
     return columns, rows
 
