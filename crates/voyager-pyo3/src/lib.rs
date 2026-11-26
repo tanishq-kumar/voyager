@@ -3084,6 +3084,80 @@ enum Utf8ColMode {
     AgeAgtype,
 }
 
+/// Converts one Arrow array element to the corresponding Python value.
+///
+/// Supports the scalar types the native PostgreSQL client emits and nested
+/// `List` values, so PostgreSQL array columns arrive as Python lists.
+fn arrow_array_value_to_py<'py>(
+    array: &dyn arrow_array::Array,
+    index: usize,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+
+    if array.is_null(index) {
+        return Ok(py.None().into_bound(py));
+    }
+
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::Float64 => {
+            let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::Float32 => {
+            let values = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            Ok((values.value(index) as f64)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any())
+        }
+        DataType::Boolean => {
+            let values = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.to_owned().into_any())
+        }
+        DataType::Utf8 => {
+            let values = array.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.into_any())
+        }
+        DataType::LargeUtf8 => {
+            let values = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            Ok(values.value(index).into_pyobject(py)?.into_any())
+        }
+        DataType::List(_) => {
+            let values = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let child = values.value(index);
+            arrow_array_values_to_py(child.as_ref(), py)
+        }
+        DataType::LargeList(_) => {
+            let values = array.as_any().downcast_ref::<LargeListArray>().unwrap();
+            let child = values.value(index);
+            arrow_array_values_to_py(child.as_ref(), py)
+        }
+        _ => Ok(py.None().into_bound(py)),
+    }
+}
+
+/// Converts a whole Arrow array into a Python list.
+fn arrow_array_values_to_py<'py>(
+    array: &dyn arrow_array::Array,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let list = PyList::empty(py);
+    for index in 0..array.len() {
+        list.append(arrow_array_value_to_py(array, index, py)?)?;
+    }
+    Ok(list.into_any())
+}
+
 fn record_batch_to_py_dicts<'py>(
     batch: &arrow_array::RecordBatch,
     age_columns: &[bool],
@@ -3185,6 +3259,9 @@ fn record_batch_to_py_dicts<'py>(
                             dict.set_item(field_name, value)?;
                         }
                     }
+                }
+                DataType::List(_) | DataType::LargeList(_) => {
+                    dict.set_item(field_name, arrow_array_value_to_py(col.as_ref(), row, py)?)?;
                 }
                 _ => {
                     dict.set_item(field_name, py.None())?;

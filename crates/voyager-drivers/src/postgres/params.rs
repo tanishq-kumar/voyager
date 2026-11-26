@@ -88,17 +88,118 @@ pub fn prepare_postgres_statement(
         }
     }
 
-    let (statement, values) = rewrite_named_placeholders(query, params);
-    if values.is_empty() {
+    let (statement, bound) = rewrite_named_placeholders(query, params);
+    if bound.is_empty() {
         return Ok(unparameterized(query));
     }
 
+    let (parameter_values, parameter_oids) = bound.into_iter().unzip();
     Ok(PreparedPostgresStatement {
         statement,
-        parameter_oids: vec![0; values.len()],
-        parameter_values: values,
+        parameter_oids,
+        parameter_values,
         placeholder_style: ParameterPlaceholderStyle::Named,
     })
+}
+
+/// PostgreSQL type OID constants needed to type parameter values.
+mod parameter_oids {
+    pub(super) const BOOL: i32 = 16;
+    pub(super) const INT8: i32 = 20;
+    pub(super) const FLOAT8: i32 = 701;
+
+    pub(super) const BOOL_ARRAY: i32 = 1000;
+    pub(super) const INT8_ARRAY: i32 = 1016;
+    pub(super) const FLOAT8_ARRAY: i32 = 1022;
+}
+
+/// Chooses a PostgreSQL type OID for a parameter value.
+///
+/// `0` means "untyped, let the server infer". Only booleans, numbers and lists
+/// of them are typed: PostgreSQL cannot infer a bare parameter used as a
+/// `GRAPH_TABLE` predicate, and these types compare and assign cleanly against
+/// any integer, numeric or float column. Strings stay untyped because dates,
+/// timestamps, UUIDs and other values arrive here as text: typing them `text`
+/// would break `date = $1` or `uuid = $1`, which the server resolves from the
+/// column when the parameter is untyped. Maps stay untyped for the same reason
+/// (json, jsonb or text columns). SQL NULL, empty lists and mixed lists stay
+/// untyped too.
+fn value_oid(value: &Value) -> i32 {
+    use parameter_oids as oid;
+
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => oid::BOOL,
+        Value::Number(number) => {
+            if number.as_i64().is_some() || number.as_u64().is_some() {
+                oid::INT8
+            } else {
+                oid::FLOAT8
+            }
+        }
+        Value::String(_) | Value::Object(_) => 0,
+        Value::Array(items) => array_oid(items).unwrap_or(0),
+    }
+}
+
+/// Chooses the array type OID for a JSON list, or `None` when ambiguous.
+///
+/// Nested lists are PostgreSQL multi-dimensional arrays, so they reuse the
+/// base element's array OID. A list with no non-null elements, or with mixed
+/// element types, stays untyped and lets the server infer from context.
+fn array_oid(items: &[Value]) -> Option<i32> {
+    use parameter_oids as oid;
+
+    let mut element_oid: Option<i32> = None;
+    for item in items {
+        let candidate = match item {
+            Value::Null => continue,
+            Value::Array(nested) => base_array_element_oid(nested)?,
+            other => scalar_element_oid(other)?,
+        };
+        match element_oid {
+            None => element_oid = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return None,
+        }
+    }
+
+    element_oid.map(|element| match element {
+        oid::BOOL => oid::BOOL_ARRAY,
+        oid::INT8 => oid::INT8_ARRAY,
+        oid::FLOAT8 => oid::FLOAT8_ARRAY,
+        _ => element,
+    })
+}
+
+/// Returns the scalar element OID nested inside a JSON list.
+fn base_array_element_oid(items: &[Value]) -> Option<i32> {
+    for item in items {
+        match item {
+            Value::Null => continue,
+            Value::Array(nested) => return base_array_element_oid(nested),
+            other => return scalar_element_oid(other),
+        }
+    }
+    None
+}
+
+/// Returns the PostgreSQL type OID for a non-null scalar JSON value.
+fn scalar_element_oid(value: &Value) -> Option<i32> {
+    use parameter_oids as oid;
+
+    match value {
+        Value::Bool(_) => Some(oid::BOOL),
+        Value::Number(number) => {
+            if number.as_i64().is_some() || number.as_u64().is_some() {
+                Some(oid::INT8)
+            } else {
+                Some(oid::FLOAT8)
+            }
+        }
+        // Strings and maps keep the whole list untyped (see `value_oid`).
+        Value::String(_) | Value::Object(_) | Value::Null | Value::Array(_) => None,
+    }
 }
 
 /// Returns `true` for statements emitted by [`voyager_ogm::emitters::AgeEmitter`].
@@ -174,14 +275,17 @@ fn rewrite_age_parameter_placeholders(query: &str) -> (String, usize) {
     (out, count)
 }
 
+/// A bound value and its chosen PostgreSQL type OID (`0` means untyped).
+type BoundParameter = (Option<Vec<u8>>, i32);
+
 /// Rewrites named `$name` placeholders to positional `$1`, `$2`, ... values.
 fn rewrite_named_placeholders(
     query: &str,
     params: &HashMap<String, Value>,
-) -> (String, Vec<Option<Vec<u8>>>) {
+) -> (String, Vec<BoundParameter>) {
     let bytes = query.as_bytes();
     let mut out = String::with_capacity(query.len());
-    let mut values: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut bound: Vec<BoundParameter> = Vec::new();
     let mut indices: HashMap<String, usize> = HashMap::new();
     let mut i = 0usize;
 
@@ -235,9 +339,9 @@ fn rewrite_named_placeholders(
                         let index = match indices.get(name) {
                             Some(index) => *index,
                             None => {
-                                let index = values.len() + 1;
+                                let index = bound.len() + 1;
                                 indices.insert(name.to_string(), index);
-                                values.push(value_to_text(value));
+                                bound.push((value_to_text(value), value_oid(value)));
                                 index
                             }
                         };
@@ -259,7 +363,7 @@ fn rewrite_named_placeholders(
         }
     }
 
-    (out, values)
+    (out, bound)
 }
 
 /// Encodes a JSON parameter as PostgreSQL text-format `Bind` bytes.
@@ -535,7 +639,7 @@ mod tests {
                 Some(b"O'Reilly".to_vec()),
             ]
         );
-        assert_eq!(prepared.parameter_oids, vec![0, 0, 0]);
+        assert_eq!(prepared.parameter_oids, vec![20, 20, 0]);
         assert_eq!(prepared.placeholder_style, ParameterPlaceholderStyle::Named);
     }
 
@@ -572,6 +676,66 @@ mod tests {
                 Some(br#"{"k":"v"}"#.to_vec()),
                 Some(b"{1,2,3}".to_vec()),
             ]
+        );
+        // NULL and maps stay untyped; integer lists are int8[].
+        assert_eq!(prepared.parameter_oids, vec![0, 0, 1016]);
+    }
+
+    #[test]
+    fn parameter_oids_are_derived_from_values() {
+        let query = "SELECT $bool, $int, $float, $text, $null, $map, $list, $empty, $mixed";
+        let prepared = prepare_postgres_statement(
+            query,
+            &params(&[
+                ("bool", json!(false)),
+                ("int", json!(42)),
+                ("float", json!(3.5)),
+                ("text", json!("hello")),
+                ("null", Value::Null),
+                ("map", json!({"k": [1, 2]})),
+                ("list", json!(["a", "b"])),
+                ("empty", json!([])),
+                ("mixed", json!([1, "two"])),
+            ]),
+        )
+        .expect("prepare should succeed");
+
+        assert_eq!(prepared.parameter_oids, vec![16, 20, 701, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn parameter_oids_cover_arrays_of_each_scalar_type() {
+        let query = "SELECT $bools, $ints, $floats, $objects, $nested, $nulls";
+        let prepared = prepare_postgres_statement(
+            query,
+            &params(&[
+                ("bools", json!([true, false])),
+                ("ints", json!([1, 2, null])),
+                ("floats", json!([1.5, 2.5])),
+                ("objects", json!([{"a": 1}])),
+                ("nested", json!([[1, 2], [3, 4]])),
+                ("nulls", json!([null, null])),
+            ]),
+        )
+        .expect("prepare should succeed");
+
+        assert_eq!(prepared.parameter_oids, vec![1000, 1016, 1022, 0, 1016, 0]);
+    }
+
+    #[test]
+    fn age_parameter_map_remains_untyped_for_agtype_resolution() {
+        let query = "SELECT * FROM cypher('g', $$ RETURN $p0 $$, %s) AS (v agtype)";
+        let prepared = prepare_postgres_statement(query, &params(&[("p0", json!(true))]))
+            .expect("prepare should succeed");
+
+        assert_eq!(
+            prepared.placeholder_style,
+            ParameterPlaceholderStyle::AgeParameterMap
+        );
+        assert_eq!(prepared.parameter_oids, vec![0]);
+        assert_eq!(
+            prepared.parameter_values,
+            vec![Some(br#"{"p0":true}"#.to_vec())]
         );
     }
 

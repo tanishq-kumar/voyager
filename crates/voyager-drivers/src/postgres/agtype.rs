@@ -752,6 +752,328 @@ pub fn parse_agtype(raw: &str) -> Result<AgeValue> {
     Ok(val)
 }
 
+/// Element representation for a decoded PostgreSQL array column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgArrayElement {
+    /// 16/32/64-bit integers are widened to Arrow `Int64`.
+    Int64,
+    /// `real`, `double precision` and `numeric` are widened to Arrow `Float64`.
+    Float64,
+    /// Boolean elements (`t` / `f` in text output).
+    Boolean,
+    /// Text and temporal elements stay as their PostgreSQL text representation.
+    Utf8,
+}
+
+/// Maps a PostgreSQL array type OID to the element representation used for decoding.
+///
+/// Only the array OIDs whose element types are supported are listed. An array
+/// column with any other OID keeps the previous text-literal behaviour.
+fn pg_array_element(oid: i32) -> Option<PgArrayElement> {
+    match oid {
+        1000 => Some(PgArrayElement::Boolean),               // _bool
+        1005 | 1007 | 1016 => Some(PgArrayElement::Int64),   // _int2, _int4, _int8
+        1021 | 1022 | 1231 => Some(PgArrayElement::Float64), // _float4, _float8, _numeric
+        1003 | 1009 | 1014 | 1015 | 1041 => Some(PgArrayElement::Utf8), // _name, _text, _bpchar, _varchar, _inet
+        1182 | 1183 | 1185 | 1187 | 1270 | 1115 => Some(PgArrayElement::Utf8), // date/time arrays
+        199 | 3807 | 2951 => Some(PgArrayElement::Utf8),                // _json, _jsonb, _uuid
+        _ => None,
+    }
+}
+
+/// Parses one PostgreSQL text-format array literal into elements.
+///
+/// Returns `None` for SQL `NULL` elements and rejects multi-dimensional
+/// arrays and malformed literals with a clear protocol error.
+fn parse_pg_array_literal(raw: &str) -> Result<Vec<Option<String>>> {
+    let trimmed = raw.trim();
+    let body = strip_array_dimensions(trimmed)?;
+    if !body.starts_with('{') || !body.ends_with('}') {
+        return Err(NetError::ProtocolError(format!(
+            "Malformed PostgreSQL array literal: {raw:?}"
+        )));
+    }
+    let inner = &body[1..body.len() - 1];
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut elements = Vec::new();
+    let mut i = 0usize;
+    let bytes = inner.as_bytes();
+
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Err(NetError::ProtocolError(format!(
+                "Malformed PostgreSQL array literal: {raw:?}"
+            )));
+        }
+
+        let mut element = String::new();
+        if bytes[i] == b'"' {
+            i += 1;
+            loop {
+                if i >= bytes.len() {
+                    return Err(NetError::ProtocolError(format!(
+                        "Unterminated quoted PostgreSQL array element: {raw:?}"
+                    )));
+                }
+                let ch = inner[i..].chars().next().expect("char boundary");
+                match ch {
+                    '\\' => {
+                        i += 1;
+                        if i >= bytes.len() {
+                            return Err(NetError::ProtocolError(format!(
+                                "Trailing backslash in PostgreSQL array element: {raw:?}"
+                            )));
+                        }
+                        let escaped = inner[i..].chars().next().expect("char boundary");
+                        element.push(escaped);
+                        i += escaped.len_utf8();
+                    }
+                    '"' => {
+                        i += 1;
+                        // PostgreSQL accepts a doubled quote inside a quoted element.
+                        if i < bytes.len() && bytes[i] == b'"' {
+                            element.push('"');
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    other => {
+                        element.push(other);
+                        i += other.len_utf8();
+                    }
+                }
+            }
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            elements.push(Some(element));
+        } else {
+            while i < bytes.len() && bytes[i] != b',' {
+                let ch = inner[i..].chars().next().expect("char boundary");
+                match ch {
+                    '{' | '}' => {
+                        return Err(NetError::ProtocolError(
+                            "Multi-dimensional PostgreSQL array columns are not supported"
+                                .to_string(),
+                        ));
+                    }
+                    '\\' => {
+                        i += 1;
+                        if i >= bytes.len() {
+                            return Err(NetError::ProtocolError(format!(
+                                "Trailing backslash in PostgreSQL array element: {raw:?}"
+                            )));
+                        }
+                        let escaped = inner[i..].chars().next().expect("char boundary");
+                        element.push(escaped);
+                        i += escaped.len_utf8();
+                    }
+                    other => {
+                        element.push(other);
+                        i += other.len_utf8();
+                    }
+                }
+            }
+            let trimmed_element = element.trim();
+            if trimmed_element.is_empty() || trimmed_element.eq_ignore_ascii_case("NULL") {
+                elements.push(None);
+            } else {
+                elements.push(Some(trimmed_element.to_string()));
+            }
+        }
+
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b',' {
+            return Err(NetError::ProtocolError(format!(
+                "Malformed PostgreSQL array literal: {raw:?}"
+            )));
+        }
+        i += 1;
+        if i >= bytes.len() {
+            return Err(NetError::ProtocolError(format!(
+                "Malformed PostgreSQL array literal: {raw:?}"
+            )));
+        }
+    }
+
+    Ok(elements)
+}
+
+/// Removes a single dimension decoration such as `[0:2]=` from an array literal.
+///
+/// PostgreSQL only emits this prefix for non-default lower bounds. More than
+/// one decoration means a multi-dimensional array, which is rejected.
+fn strip_array_dimensions(raw: &str) -> Result<&str> {
+    if !raw.starts_with('[') {
+        return Ok(raw);
+    }
+    let Some(eq) = raw.find('=') else {
+        return Err(NetError::ProtocolError(format!(
+            "Malformed PostgreSQL array literal: {raw:?}"
+        )));
+    };
+    let prefix = &raw[..eq];
+    if prefix.matches('[').count() > 1 {
+        return Err(NetError::ProtocolError(
+            "Multi-dimensional PostgreSQL array columns are not supported".to_string(),
+        ));
+    }
+    if !prefix.ends_with(']') {
+        return Err(NetError::ProtocolError(format!(
+            "Malformed PostgreSQL array literal: {raw:?}"
+        )));
+    }
+    Ok(&raw[eq + 1..])
+}
+
+fn parse_int_element(value: &str, column: &str) -> Result<i64> {
+    value.parse::<i64>().map_err(|_| {
+        NetError::ProtocolError(format!(
+            "Invalid integer array element {value:?} in column {column:?}"
+        ))
+    })
+}
+
+fn parse_float_element(value: &str, column: &str) -> Result<f64> {
+    value.parse::<f64>().map_err(|_| {
+        NetError::ProtocolError(format!(
+            "Invalid numeric array element {value:?} in column {column:?}"
+        ))
+    })
+}
+
+fn parse_bool_element(value: &str, column: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "t" | "true" => Ok(true),
+        "f" | "false" => Ok(false),
+        _ => Err(NetError::ProtocolError(format!(
+            "Invalid boolean array element {value:?} in column {column:?}"
+        ))),
+    }
+}
+
+fn list_field(name: &str, element: &DataType) -> Field {
+    Field::new(
+        name,
+        DataType::List(Arc::new(Field::new("item", element.clone(), true))),
+        true,
+    )
+}
+
+fn build_int64_list(parsed: &[Option<Vec<Option<String>>>], name: &str) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::ListBuilder::new(Int64Builder::new());
+    for cell in parsed {
+        match cell {
+            None => builder.append_null(),
+            Some(elements) => {
+                for element in elements {
+                    match element {
+                        Some(value) => builder
+                            .values()
+                            .append_value(parse_int_element(value, name)?),
+                        None => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_float64_list(parsed: &[Option<Vec<Option<String>>>], name: &str) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::ListBuilder::new(Float64Builder::new());
+    for cell in parsed {
+        match cell {
+            None => builder.append_null(),
+            Some(elements) => {
+                for element in elements {
+                    match element {
+                        Some(value) => builder
+                            .values()
+                            .append_value(parse_float_element(value, name)?),
+                        None => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_bool_list(parsed: &[Option<Vec<Option<String>>>], name: &str) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::ListBuilder::new(BooleanBuilder::new());
+    for cell in parsed {
+        match cell {
+            None => builder.append_null(),
+            Some(elements) => {
+                for element in elements {
+                    match element {
+                        Some(value) => builder
+                            .values()
+                            .append_value(parse_bool_element(value, name)?),
+                        None => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_utf8_list(parsed: &[Option<Vec<Option<String>>>]) -> Result<ArrayRef> {
+    let mut builder = arrow_array::builder::ListBuilder::new(StringBuilder::new());
+    for cell in parsed {
+        match cell {
+            None => builder.append_null(),
+            Some(elements) => {
+                for element in elements {
+                    match element {
+                        Some(value) => builder.values().append_value(value),
+                        None => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn array_column_batch(
+    name: &str,
+    element: PgArrayElement,
+    rows: &[Vec<Option<String>>],
+    col_idx: usize,
+) -> Result<(Field, ArrayRef)> {
+    let mut parsed: Vec<Option<Vec<Option<String>>>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row.get(col_idx).and_then(|value| value.as_deref()) {
+            Some(raw) => parsed.push(Some(parse_pg_array_literal(raw)?)),
+            None => parsed.push(None),
+        }
+    }
+
+    let (data_type, array) = match element {
+        PgArrayElement::Int64 => (DataType::Int64, build_int64_list(&parsed, name)?),
+        PgArrayElement::Float64 => (DataType::Float64, build_float64_list(&parsed, name)?),
+        PgArrayElement::Boolean => (DataType::Boolean, build_bool_list(&parsed, name)?),
+        PgArrayElement::Utf8 => (DataType::Utf8, build_utf8_list(&parsed)?),
+    };
+    Ok((list_field(name, &data_type), array))
+}
+
 /// Dynamically transforms tabular row values into an Apache Arrow [`RecordBatch`].
 pub fn rows_to_record_batch(
     column_names: &[String],
@@ -771,6 +1093,21 @@ pub fn rows_to_record_batch_with_age_columns(
     column_names: &[String],
     rows: &[Vec<Option<String>>],
     age_columns: &[bool],
+) -> Result<RecordBatch> {
+    rows_to_record_batch_with_column_types(column_names, rows, age_columns, &[])
+}
+
+/// Like [`rows_to_record_batch_with_age_columns`], but also decodes PostgreSQL
+/// array columns using the type OIDs reported in `RowDescription`.
+///
+/// `column_types` holds one PostgreSQL type OID per column. Array columns whose
+/// element type is supported become Arrow `List` columns; other columns keep
+/// the dynamic inference used by [`rows_to_record_batch_with_age_columns`].
+pub fn rows_to_record_batch_with_column_types(
+    column_names: &[String],
+    rows: &[Vec<Option<String>>],
+    age_columns: &[bool],
+    column_types: &[i32],
 ) -> Result<RecordBatch> {
     if column_names.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -940,6 +1277,16 @@ pub fn rows_to_record_batch_with_age_columns(
             continue;
         }
 
+        if let Some(element) = column_types
+            .get(col_idx)
+            .and_then(|oid| pg_array_element(*oid))
+        {
+            let (field, array) = array_column_batch(name, element, rows, col_idx)?;
+            fields.push(field);
+            columns.push(array);
+            continue;
+        }
+
         let mut has_non_null = false;
         let mut can_be_int = true;
         let mut can_be_float = true;
@@ -1045,4 +1392,141 @@ pub fn rows_to_record_batch_with_age_columns(
 
     let schema = Arc::new(Schema::new(fields));
     RecordBatch::try_new(schema, columns).map_err(NetError::ArrowError)
+}
+
+#[cfg(test)]
+mod pg_array_tests {
+    use super::*;
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+
+    fn batch_for(oid: i32, rows: &[Option<&str>]) -> RecordBatch {
+        let columns = vec!["value".to_string()];
+        let rows: Vec<Vec<Option<String>>> = rows
+            .iter()
+            .map(|value| vec![value.map(str::to_string)])
+            .collect();
+        rows_to_record_batch_with_column_types(&columns, &rows, &[false], &[oid])
+            .expect("array column should decode")
+    }
+
+    #[test]
+    fn decodes_integer_arrays_with_nulls_and_empty_arrays() {
+        let batch = batch_for(1016, &[Some("{1,2,NULL}"), Some("{}"), None]);
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        );
+        let list = batch.column(0).as_list::<i32>();
+        let values = list.value(0);
+        let values = values.as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(1), 2);
+        assert!(values.is_null(2));
+        assert_eq!(list.value(1).len(), 0);
+        assert!(list.is_null(2));
+    }
+
+    #[test]
+    fn decodes_each_supported_element_type() {
+        let ints = batch_for(1007, &[Some("{42,-7}")]);
+        assert_eq!(
+            ints.column(0)
+                .as_list::<i32>()
+                .value(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            42
+        );
+
+        let floats = batch_for(1022, &[Some("{1.5,-2.25}")]);
+        assert_eq!(
+            floats
+                .column(0)
+                .as_list::<i32>()
+                .value(0)
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .value(1),
+            -2.25
+        );
+
+        let bools = batch_for(1000, &[Some("{t,f,true,false}")]);
+        let bool_list = bools.column(0).as_list::<i32>();
+        let bool_values = bool_list.value(0);
+        let bool_values = bool_values.as_boolean();
+        assert!(bool_values.value(0));
+        assert!(!bool_values.value(1));
+        assert!(bool_values.value(2));
+        assert!(!bool_values.value(3));
+
+        let nums = batch_for(1231, &[Some("{1.25,2}")]);
+        assert_eq!(
+            nums.column(0)
+                .as_list::<i32>()
+                .value(0)
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .value(1),
+            2.0
+        );
+
+        let texts = batch_for(
+            1009,
+            &[Some(
+                r#"{alpha,"beta,gamma","NULL","quote\"d","back\\slash"}"#,
+            )],
+        );
+        let text_list = texts.column(0).as_list::<i32>();
+        let text_values = text_list.value(0);
+        let values = text_values.as_string::<i32>();
+        assert_eq!(values.value(0), "alpha");
+        assert_eq!(values.value(1), "beta,gamma");
+        assert_eq!(values.value(2), "NULL");
+        assert_eq!(values.value(3), "quote\"d");
+        assert_eq!(values.value(4), "back\\slash");
+    }
+
+    #[test]
+    fn decodes_date_and_timestamp_arrays_as_text() {
+        let dates = batch_for(1182, &[Some("{2026-01-15,2026-02-20}")]);
+        let date_list = dates.column(0).as_list::<i32>();
+        let date_values = date_list.value(0);
+        assert_eq!(date_values.as_string::<i32>().value(1), "2026-02-20");
+
+        let timestamps = batch_for(
+            1115,
+            &[Some(r#"{"2026-01-15 10:11:12","2026-01-16 00:00:00"}"#)],
+        );
+        let timestamp_list = timestamps.column(0).as_list::<i32>();
+        let timestamp_values = timestamp_list.value(0);
+        assert_eq!(
+            timestamp_values.as_string::<i32>().value(0),
+            "2026-01-15 10:11:12"
+        );
+    }
+
+    #[test]
+    fn decodes_single_dimension_with_explicit_lower_bound() {
+        let batch = batch_for(1007, &[Some("[0:2]={10,20,30}")]);
+        let list = batch.column(0).as_list::<i32>();
+        assert_eq!(list.value(0).len(), 3);
+    }
+
+    #[test]
+    fn rejects_multi_dimensional_arrays_with_a_clear_error() {
+        let columns = vec!["value".to_string()];
+        let rows = vec![vec![Some("{{1,2},{3,4}}".to_string())]];
+        let error = rows_to_record_batch_with_column_types(&columns, &rows, &[false], &[1007])
+            .expect_err("multi-dimensional arrays are rejected");
+        assert!(error.to_string().contains("Multi-dimensional"));
+    }
+
+    #[test]
+    fn unknown_array_oids_keep_text_fallback() {
+        let columns = vec!["value".to_string()];
+        let rows = vec![vec![Some("{x,y}".to_string())]];
+        let batch = rows_to_record_batch_with_column_types(&columns, &rows, &[false], &[999999])
+            .expect("unknown array OID should fall back");
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+    }
 }
