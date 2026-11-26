@@ -14,7 +14,10 @@ use crate::ast::{
 use std::fmt;
 
 /// The major Query Spec version produced by this serialiser.
-pub const SPEC_VERSION: i64 = 1;
+pub use crate::spec::SPEC_VERSION;
+
+/// The Query Spec v1 revision produced by this serialiser.
+pub use crate::spec::SPEC_REVISION;
 
 /// One JSON-shaped Query Spec v1 value.
 ///
@@ -287,7 +290,16 @@ pub fn spec_from_ast(arena: &QueryAstArena, root: NodeHandle) -> SpecExportResul
         });
     };
 
-    let mut members = vec![("spec_version".to_string(), SpecValue::Int(SPEC_VERSION))];
+    let mut members = vec![
+        (
+            "spec_version".to_string(),
+            SpecValue::Int(i64::from(SPEC_VERSION)),
+        ),
+        (
+            "spec_revision".to_string(),
+            SpecValue::Int(i64::from(SPEC_REVISION)),
+        ),
+    ];
     let mut produced = false;
 
     if let Some(handle) = load_csv {
@@ -1155,7 +1167,14 @@ fn export_subquery_payload(
         AstNode::QueryStatement { .. } => spec_from_ast(arena, handle),
         AstNode::NodePattern { .. } | AstNode::PathChain { .. } => export_path(arena, handle),
         AstNode::MatchClause { .. } => Ok(SpecValue::Object(vec![
-            ("spec_version".to_string(), SpecValue::Int(SPEC_VERSION)),
+            (
+                "spec_version".to_string(),
+                SpecValue::Int(i64::from(SPEC_VERSION)),
+            ),
+            (
+                "spec_revision".to_string(),
+                SpecValue::Int(i64::from(SPEC_REVISION)),
+            ),
             (
                 "matches".to_string(),
                 SpecValue::Array(vec![export_match(arena, handle)?]),

@@ -44,6 +44,7 @@ use crate::cache::global_query_cache;
 use crate::emitters::{AgeEmitter, CypherEmitter, DEFAULT_AGE_GRAPH, IsoGqlEmitter, SqlPgqEmitter};
 use crate::error::ErrorCode;
 use crate::optimizer::{AstOptimizer, OptimizationLevel};
+use crate::spec::{SPEC_REVISION, SPEC_VERSION};
 use crate::visitor::{AstVisitor, CompiledQuery};
 
 /// Maximum expression recursion depth accepted by the consumer.
@@ -287,6 +288,41 @@ fn extract_u32(val: &Value, path: &SpecPath, expected: &str) -> Result<u32, Spec
         }
         _ => Err(expected_error(val, path, expected)),
     }
+}
+
+/// Validates an optional `spec_revision` against the supported v1 revision.
+///
+/// A missing key (or `null`, which means omitted) is revision 1. The revision
+/// must be an integer of at least 1; a value above [`SPEC_REVISION`] is
+/// rejected because it may use additions this build does not understand.
+fn validate_spec_revision(
+    revision: Option<&Value>,
+    path: &SpecPath,
+    what: &str,
+) -> Result<(), SpecError> {
+    let Some(revision) = revision else {
+        return Ok(());
+    };
+    if revision.is_null() {
+        return Ok(());
+    }
+    let revision_path = path.key("spec_revision");
+    let revision = extract_u32(revision, &revision_path, "an integer spec revision")?;
+    if revision < 1 {
+        return Err(make_spec_err(
+            &revision_path,
+            format!("Invalid {what} spec_revision: {revision}. The minimum revision is 1."),
+        ));
+    }
+    if revision > SPEC_REVISION {
+        return Err(make_spec_err(
+            &revision_path,
+            format!(
+                "{what} requires Query Spec revision {revision}; this Voyager supports up to revision {SPEC_REVISION}."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Extracts an optional JSON string (a string or `null`).
@@ -767,6 +803,7 @@ fn handle_fn_tuple(
     array: &[Value],
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     check_spec_arity_bounded(array, path, "expression 'fn'", 3, 3, "[fn, name, args]")?;
     let name = extract_string(&array[1], &path.index(1), "a string name")?;
@@ -774,11 +811,12 @@ fn handle_fn_tuple(
     let args = expect_spec_array(&array[2], &args_path, "fn args")?;
     let mut arg_handles = Vec::with_capacity(args.len());
     for (idx, arg) in args.iter().enumerate() {
-        arg_handles.push(value_to_node_handle(
+        arg_handles.push(value_to_node_handle_with_alias(
             builder,
             arg,
             depth + 1,
             &args_path.index(idx),
+            allow_alias,
         )?);
     }
     Ok(builder.function(name, arg_handles))
@@ -790,6 +828,7 @@ fn handle_case_tuple(
     array: &[Value],
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     check_spec_arity_bounded(
         array,
@@ -802,11 +841,12 @@ fn handle_case_tuple(
     let operand = if array[1].is_null() {
         None
     } else {
-        Some(value_to_node_handle(
+        Some(value_to_node_handle_with_alias(
             builder,
             &array[1],
             depth + 1,
             &path.index(1),
+            allow_alias,
         )?)
     };
     let branches_path = path.index(2);
@@ -816,18 +856,31 @@ fn handle_case_tuple(
         let branch_path = branches_path.index(idx);
         let branch = expect_spec_array(item, &branch_path, "case branch")?;
         check_spec_arity_bounded(branch, &branch_path, "case branch", 2, 2, "[when, then]")?;
-        let when = value_to_node_handle(builder, &branch[0], depth + 1, &branch_path.index(0))?;
-        let then = value_to_node_handle(builder, &branch[1], depth + 1, &branch_path.index(1))?;
+        let when = value_to_node_handle_with_alias(
+            builder,
+            &branch[0],
+            depth + 1,
+            &branch_path.index(0),
+            allow_alias,
+        )?;
+        let then = value_to_node_handle_with_alias(
+            builder,
+            &branch[1],
+            depth + 1,
+            &branch_path.index(1),
+            allow_alias,
+        )?;
         parsed_branches.push((when, then));
     }
     let else_branch = if array[3].is_null() {
         None
     } else {
-        Some(value_to_node_handle(
+        Some(value_to_node_handle_with_alias(
             builder,
             &array[3],
             depth + 1,
             &path.index(3),
+            allow_alias,
         )?)
     };
     Ok(builder.case_when(operand, parsed_branches, else_branch))
@@ -839,6 +892,7 @@ fn handle_list_comp_tuple(
     array: &[Value],
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     check_spec_arity_bounded(
         array,
@@ -849,25 +903,33 @@ fn handle_list_comp_tuple(
         "[list_comp, variable, list_expr, where_filter, map_expr]",
     )?;
     let var = extract_string(&array[1], &path.index(1), "a string variable")?;
-    let list = value_to_node_handle(builder, &array[2], depth + 1, &path.index(2))?;
+    let list = value_to_node_handle_with_alias(
+        builder,
+        &array[2],
+        depth + 1,
+        &path.index(2),
+        allow_alias,
+    )?;
     let where_filter = if array[3].is_null() {
         None
     } else {
-        Some(value_to_node_handle(
+        Some(value_to_node_handle_with_alias(
             builder,
             &array[3],
             depth + 1,
             &path.index(3),
+            allow_alias,
         )?)
     };
     let map_expr = if array[4].is_null() {
         None
     } else {
-        Some(value_to_node_handle(
+        Some(value_to_node_handle_with_alias(
             builder,
             &array[4],
             depth + 1,
             &path.index(4),
+            allow_alias,
         )?)
     };
     Ok(builder.list_comprehension(var, list, where_filter, map_expr))
@@ -879,6 +941,7 @@ fn handle_pattern_comp_tuple(
     array: &[Value],
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     check_spec_arity_bounded(
         array,
@@ -892,14 +955,21 @@ fn handle_pattern_comp_tuple(
     let where_filter = if array[2].is_null() {
         None
     } else {
-        Some(value_to_node_handle(
+        Some(value_to_node_handle_with_alias(
             builder,
             &array[2],
             depth + 1,
             &path.index(2),
+            allow_alias,
         )?)
     };
-    let projection = value_to_node_handle(builder, &array[3], depth + 1, &path.index(3))?;
+    let projection = value_to_node_handle_with_alias(
+        builder,
+        &array[3],
+        depth + 1,
+        &path.index(3),
+        allow_alias,
+    )?;
     Ok(builder.pattern_comprehension(path_handle, where_filter, projection))
 }
 
@@ -947,17 +1017,19 @@ fn handle_list_literal_tuple(
     array: &[Value],
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     check_spec_arity_bounded(array, path, "expression 'list'", 2, 2, "[list, items]")?;
     let items_path = path.index(1);
     let items = expect_spec_array(&array[1], &items_path, "list items")?;
     let mut item_handles = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
-        item_handles.push(value_to_node_handle(
+        item_handles.push(value_to_node_handle_with_alias(
             builder,
             item,
             depth + 1,
             &items_path.index(idx),
+            allow_alias,
         )?);
     }
     Ok(builder.list_literal(item_handles))
@@ -1011,6 +1083,7 @@ fn handle_bin_tuple(
     array: &[Value],
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     check_spec_arity_bounded(
         array,
@@ -1023,8 +1096,20 @@ fn handle_bin_tuple(
     let op_path = path.index(1);
     let op_str = extract_string(&array[1], &op_path, "a string operator")?;
     let op = parse_binary_op(&op_str).map_err(|message| make_spec_err(&op_path, message))?;
-    let left = value_to_node_handle(builder, &array[2], depth + 1, &path.index(2))?;
-    let right = value_to_node_handle(builder, &array[3], depth + 1, &path.index(3))?;
+    let left = value_to_node_handle_with_alias(
+        builder,
+        &array[2],
+        depth + 1,
+        &path.index(2),
+        allow_alias,
+    )?;
+    let right = value_to_node_handle_with_alias(
+        builder,
+        &array[3],
+        depth + 1,
+        &path.index(3),
+        allow_alias,
+    )?;
     Ok(builder.binary_expr(left, op, right))
 }
 
@@ -1034,6 +1119,7 @@ fn handle_unary_tuple(
     array: &[Value],
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     check_spec_arity_bounded(
         array,
@@ -1046,7 +1132,13 @@ fn handle_unary_tuple(
     let op_path = path.index(1);
     let op_str = extract_string(&array[1], &op_path, "a string operator")?;
     let op = parse_unary_op(&op_str).map_err(|message| make_spec_err(&op_path, message))?;
-    let operand = value_to_node_handle(builder, &array[2], depth + 1, &path.index(2))?;
+    let operand = value_to_node_handle_with_alias(
+        builder,
+        &array[2],
+        depth + 1,
+        &path.index(2),
+        allow_alias,
+    )?;
     Ok(builder.unary_expr(op, operand))
 }
 
@@ -1056,6 +1148,7 @@ fn handle_expr_sequence(
     array: &[Value],
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     let tag = expression_tag(array, path)?;
     match tag.as_str() {
@@ -1064,16 +1157,22 @@ fn handle_expr_sequence(
         "param" => handle_param_tuple(builder, array, path),
         "lit" => handle_lit_tuple(builder, array, path),
         "label" => handle_label_tuple(builder, array, path),
-        "bin" => handle_bin_tuple(builder, array, depth, path),
-        "unary" => handle_unary_tuple(builder, array, depth, path),
-        "fn" => handle_fn_tuple(builder, array, depth, path),
-        "case" => handle_case_tuple(builder, array, depth, path),
-        "list_comp" => handle_list_comp_tuple(builder, array, depth, path),
-        "pattern_comp" => handle_pattern_comp_tuple(builder, array, depth, path),
+        "bin" => handle_bin_tuple(builder, array, depth, path, allow_alias),
+        "unary" => handle_unary_tuple(builder, array, depth, path, allow_alias),
+        "fn" => handle_fn_tuple(builder, array, depth, path, allow_alias),
+        "case" => handle_case_tuple(builder, array, depth, path, allow_alias),
+        "list_comp" => handle_list_comp_tuple(builder, array, depth, path, allow_alias),
+        "pattern_comp" => handle_pattern_comp_tuple(builder, array, depth, path, allow_alias),
         "exists" => handle_exists_tuple(builder, array, depth, path),
         "count" => handle_count_tuple(builder, array, depth, path),
-        "list" => handle_list_literal_tuple(builder, array, depth, path),
+        "list" => handle_list_literal_tuple(builder, array, depth, path, allow_alias),
         "alias" => {
+            if !allow_alias {
+                return Err(make_spec_err(
+                    path,
+                    "Invalid expression 'alias': the alias wrapper is only accepted inside a projection item; write the inner expression directly here.",
+                ));
+            }
             check_spec_arity_bounded(
                 array,
                 path,
@@ -1083,7 +1182,7 @@ fn handle_expr_sequence(
                 "[alias, expression, name]",
             )?;
             let _ = extract_string(&array[2], &path.index(2), "a string alias name")?;
-            value_to_node_handle(builder, &array[1], depth + 1, &path.index(1))
+            value_to_node_handle_in_projection(builder, &array[1], depth + 1, &path.index(1))
         }
         other => Err(make_spec_err(
             path,
@@ -1100,22 +1199,35 @@ fn handle_dict_expr(
     dict: &Map<String, Value>,
     depth: usize,
     path: &SpecPath,
+    allow_alias: bool,
 ) -> Result<NodeHandle, SpecError> {
     if let Some(version) = dict.get("spec_version") {
         let version_path = path.key("spec_version");
         let version = extract_u32(version, &version_path, "an integer major version")?;
-        if version != 1 {
+        if version != SPEC_VERSION {
             return Err(make_spec_err(
                 &version_path,
                 format!(
-                    "Unsupported expression spec_version: {version}. Supported major versions: 1."
+                    "Unsupported expression spec_version: {version}. Supported major versions: {SPEC_VERSION}."
                 ),
             ));
         }
     }
+    validate_spec_revision(dict.get("spec_revision"), path, "The expression")?;
     if let Some(inner) = dict.get("expr") {
-        reject_unknown_keys(dict, path, &["spec_version", "expr"], "expression object")?;
-        return value_to_node_handle(builder, inner, depth + 1, &path.key("expr"));
+        reject_unknown_keys(
+            dict,
+            path,
+            &["spec_version", "spec_revision", "expr"],
+            "expression object",
+        )?;
+        return value_to_node_handle_with_alias(
+            builder,
+            inner,
+            depth + 1,
+            &path.key("expr"),
+            allow_alias,
+        );
     }
     Err(make_spec_err(
         path,
@@ -1130,6 +1242,29 @@ fn value_to_node_handle(
     depth: usize,
     path: &SpecPath,
 ) -> Result<NodeHandle, SpecError> {
+    value_to_node_handle_with_alias(builder, val, depth, path, false)
+}
+
+/// Parses an expression in a projection item, where an `["alias", ...]`
+/// wrapper is allowed.
+#[inline(never)]
+fn value_to_node_handle_in_projection(
+    builder: &mut QueryBuilder,
+    val: &Value,
+    depth: usize,
+    path: &SpecPath,
+) -> Result<NodeHandle, SpecError> {
+    value_to_node_handle_with_alias(builder, val, depth, path, true)
+}
+
+#[inline(never)]
+fn value_to_node_handle_with_alias(
+    builder: &mut QueryBuilder,
+    val: &Value,
+    depth: usize,
+    path: &SpecPath,
+    allow_alias: bool,
+) -> Result<NodeHandle, SpecError> {
     if depth > MAX_AST_DEPTH {
         return Err(make_spec_err(
             path,
@@ -1139,7 +1274,7 @@ fn value_to_node_handle(
         ));
     }
     if let Some(dict) = val.as_object() {
-        return handle_dict_expr(builder, dict, depth, path);
+        return handle_dict_expr(builder, dict, depth, path, allow_alias);
     }
     // In an expression position a JSON array is always a tagged expression:
     // there is no implicit literal-list spelling. The binary and unary tags get
@@ -1148,9 +1283,9 @@ fn value_to_node_handle(
     // 1 MB caller stack.
     if let Some(array) = val.as_array() {
         match array.first().and_then(Value::as_str) {
-            Some("bin") => return handle_bin_tuple(builder, array, depth, path),
-            Some("unary") => return handle_unary_tuple(builder, array, depth, path),
-            _ => return handle_expr_sequence(builder, array, depth, path),
+            Some("bin") => return handle_bin_tuple(builder, array, depth, path, allow_alias),
+            Some("unary") => return handle_unary_tuple(builder, array, depth, path, allow_alias),
+            _ => return handle_expr_sequence(builder, array, depth, path, allow_alias),
         }
     }
     Err(make_spec_err(
@@ -1164,11 +1299,20 @@ fn value_to_node_handle(
 
 fn parse_direction(dir_str: &str) -> Result<Direction, String> {
     match dir_str {
-        "out" | "outgoing" | "->" => Ok(Direction::Outgoing),
-        "in" | "incoming" | "<-" => Ok(Direction::Incoming),
-        "undirected" | "both" | "-" | "--" => Ok(Direction::Undirected),
+        "outgoing" => Ok(Direction::Outgoing),
+        "incoming" => Ok(Direction::Incoming),
+        "undirected" => Ok(Direction::Undirected),
+        "out" | "->" => Err(format!(
+            "Invalid edge direction '{dir_str}': use \"outgoing\" instead of \"{dir_str}\"."
+        )),
+        "in" | "<-" => Err(format!(
+            "Invalid edge direction '{dir_str}': use \"incoming\" instead of \"{dir_str}\"."
+        )),
+        "both" | "-" | "--" => Err(format!(
+            "Invalid edge direction '{dir_str}': use \"undirected\" instead of \"{dir_str}\"."
+        )),
         other => Err(format!(
-            "Invalid edge direction '{other}'. Expected 'outgoing' ('out', '->'), 'incoming' ('in', '<-'), or 'undirected' ('both', '-', '--')."
+            "Invalid edge direction '{other}'. Use 'outgoing', 'incoming', or 'undirected'; the spelling is case-sensitive."
         )),
     }
 }
@@ -3268,6 +3412,7 @@ fn build_subquery(
 
 const ROOT_SPEC_KEYS: &[&str] = &[
     "spec_version",
+    "spec_revision",
     "load_csv",
     "unwinds",
     "matches",
@@ -3277,7 +3422,6 @@ const ROOT_SPEC_KEYS: &[&str] = &[
     "distinct",
     "order_by",
     "skip",
-    "offset",
     "limit",
     "execution_mode",
     // Supported by the consumer and exercised by the round-trip suite, but not
@@ -3287,6 +3431,7 @@ const ROOT_SPEC_KEYS: &[&str] = &[
 
 const MATCH_SPEC_KEYS: &[&str] = &[
     "spec_version",
+    "spec_revision",
     "optional",
     "path_mode",
     "path_variable",
@@ -3296,6 +3441,7 @@ const MATCH_SPEC_KEYS: &[&str] = &[
 
 const WITH_SPEC_KEYS: &[&str] = &[
     "spec_version",
+    "spec_revision",
     "distinct",
     "projections",
     "where",
@@ -3502,7 +3648,7 @@ fn build_projection_item(
             if alias.is_none() {
                 alias = extract_alias_from_expr_spec(expr_spec, &expr_path)?;
             }
-            let handle = value_to_node_handle(builder, expr_spec, depth, &expr_path)?;
+            let handle = value_to_node_handle_in_projection(builder, expr_spec, depth, &expr_path)?;
             builder.select_expr(handle, alias);
         }
         other => {
@@ -3529,10 +3675,12 @@ fn build_query_internal(
     match spec.get("spec_version") {
         Some(ver_item) => {
             let ver = extract_u32(ver_item, &version_path, "an integer major version number")?;
-            if ver != 1 {
+            if ver != SPEC_VERSION {
                 return Err(make_spec_err(
                     &version_path,
-                    format!("Unsupported query spec_version: {ver}. Supported major versions: 1."),
+                    format!(
+                        "Unsupported query spec_version: {ver}. Supported major versions: {SPEC_VERSION}."
+                    ),
                 ));
             }
         }
@@ -3540,10 +3688,20 @@ fn build_query_internal(
             if require_version {
                 return Err(make_spec_err(
                     &version_path,
-                    "Missing required 'spec_version' in query spec dictionary. Expected 'spec_version': 1.",
+                    format!(
+                        "Missing required 'spec_version' in query spec dictionary. Expected 'spec_version': {SPEC_VERSION}."
+                    ),
                 ));
             }
         }
+    }
+    validate_spec_revision(spec.get("spec_revision"), path, "The query spec")?;
+
+    if spec.contains_key("offset") {
+        return Err(make_spec_err(
+            &path.key("offset"),
+            "Unknown top-level query spec key 'offset': use \"skip\" instead of \"offset\".",
+        ));
     }
 
     reject_unknown_keys(spec, path, ROOT_SPEC_KEYS, "top-level query spec")?;
@@ -3611,15 +3769,16 @@ fn build_query_internal(
                 let version_path = m_path.key("spec_version");
                 let m_ver =
                     extract_u32(m_ver_item, &version_path, "an integer major version number")?;
-                if m_ver != 1 {
+                if m_ver != SPEC_VERSION {
                     return Err(make_spec_err(
                         &version_path,
                         format!(
-                            "Unsupported match clause spec_version: {m_ver}. Supported major versions: 1."
+                            "Unsupported match clause spec_version: {m_ver}. Supported major versions: {SPEC_VERSION}."
                         ),
                     ));
                 }
             }
+            validate_spec_revision(m_dict.get("spec_revision"), &m_path, "The match clause")?;
             let paths_item = m_dict.get("paths").ok_or_else(|| {
                 make_spec_err(
                     &m_path.key("paths"),
@@ -3917,15 +4076,20 @@ fn build_query_internal(
                 let version_path = item_path.key("spec_version");
                 let w_ver =
                     extract_u32(w_ver_item, &version_path, "an integer major version number")?;
-                if w_ver != 1 {
+                if w_ver != SPEC_VERSION {
                     return Err(make_spec_err(
                         &version_path,
                         format!(
-                            "Unsupported with clause spec_version: {w_ver}. Supported major versions: 1."
+                            "Unsupported with clause spec_version: {w_ver}. Supported major versions: {SPEC_VERSION}."
                         ),
                     ));
                 }
             }
+            validate_spec_revision(
+                with_dict.get("spec_revision"),
+                &item_path,
+                "The with clause",
+            )?;
             let proj_item = with_dict.get("projections").ok_or_else(|| {
                 make_spec_err(
                     &item_path.key("projections"),
@@ -4028,7 +4192,7 @@ fn build_query_internal(
     // would either be dropped or fold into the last pending WITH, silently
     // changing the query's meaning, so reject them at the first offending key.
     if !has_root_projections {
-        for key in ["distinct", "order_by", "skip", "offset", "limit"] {
+        for key in ["distinct", "order_by", "skip", "limit"] {
             if let Some(item) = spec.get(key)
                 && !item.is_null()
             {
@@ -4075,30 +4239,6 @@ fn build_query_internal(
         }
     }
 
-    // `skip` and `offset` are aliases of the same pagination position. Accepting
-    // both used to let the later one win silently, so a document that sets both
-    // is rejected at the second key in document order.
-    if let (Some(skip_item), Some(offset_item)) = (spec.get("skip"), spec.get("offset"))
-        && !skip_item.is_null()
-        && !offset_item.is_null()
-    {
-        let mut seen = 0usize;
-        let mut second_key: Option<&str> = None;
-        for key in spec.keys() {
-            if key == "skip" || key == "offset" {
-                seen += 1;
-                if seen == 2 {
-                    second_key = Some(key);
-                }
-            }
-        }
-        let second_key = second_key.unwrap_or("offset");
-        return Err(make_spec_err(
-            &path.key(second_key),
-            "conflicting pagination keys: 'skip' and 'offset' are aliases; provide only one of them.",
-        ));
-    }
-
     if let Some(skip_item) = spec.get("skip")
         && !skip_item.is_null()
     {
@@ -4108,19 +4248,6 @@ fn build_query_internal(
             }
             PaginationValue::Parameter(name) => {
                 builder.skip_param(name);
-            }
-        }
-    }
-
-    if let Some(offset_item) = spec.get("offset")
-        && !offset_item.is_null()
-    {
-        match parse_pagination(offset_item, &path.key("offset"), "offset")? {
-            PaginationValue::Count(offset) => {
-                builder.offset(offset);
-            }
-            PaginationValue::Parameter(name) => {
-                builder.offset_param(name);
             }
         }
     }
@@ -5117,6 +5244,188 @@ mod tests {
         let error = compile_cypher(&where_spec).unwrap_err();
         assert_eq!(error.code(), ErrorCode::InvalidSpec);
         assert_eq!(error.path(), Some("/with_clauses/0/where/0/2/1"));
+    }
+
+    #[test]
+    fn missing_spec_revision_means_revision_one() {
+        let spec = base_spec();
+        assert_eq!(spec.get("spec_revision"), None);
+        let compiled = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            compiled.compiled.statement,
+            "MATCH (p:Person) RETURN p.name AS n"
+        );
+    }
+
+    #[test]
+    fn current_spec_revision_is_accepted_at_every_nested_level() {
+        let spec = json!({
+            "spec_version": 1,
+            "spec_revision": 1,
+            "matches": [{
+                "spec_version": 1,
+                "spec_revision": 1,
+                "paths": [[["node", "p", ["Person"]]]],
+                "where": [["bin", "gt", ["prop", "p", "age"], ["lit", 21]]]
+            }],
+            "with_clauses": [{
+                "spec_version": 1,
+                "spec_revision": 1,
+                "projections": [["field", "p", "name", "n"]]
+            }],
+            "projections": [["expr", {"spec_version": 1, "spec_revision": 1, "expr": ["ident", "n"]}, null]]
+        });
+        let compiled = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            compiled.compiled.statement,
+            "MATCH (p:Person) WHERE p.age > $p0 WITH p.name AS n RETURN n"
+        );
+    }
+
+    #[test]
+    fn newer_spec_revision_is_rejected_with_the_supported_revision() {
+        let mut spec = base_spec();
+        spec["spec_revision"] = json!(2);
+        let error = compile_cypher(&spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidSpec);
+        assert_eq!(error.path(), Some("/spec_revision"));
+        assert!(
+            error
+                .message()
+                .contains("requires Query Spec revision 2; this Voyager supports up to revision 1"),
+            "{}",
+            error.message()
+        );
+
+        let nested = json!({
+            "spec_version": 1,
+            "matches": [{
+                "spec_revision": 2,
+                "paths": [[["node", "p", ["Person"]]]]
+            }],
+            "projections": [["field", "p", "name", null]]
+        });
+        let error = compile_cypher(&nested).unwrap_err();
+        assert_eq!(error.path(), Some("/matches/0/spec_revision"));
+        assert!(error.message().contains("requires Query Spec revision 2"));
+    }
+
+    #[test]
+    fn non_integer_or_smaller_spec_revision_is_rejected() {
+        for revision in [json!(0), json!(-1), json!(1.5), json!("1"), json!(true)] {
+            let mut spec = base_spec();
+            spec["spec_revision"] = revision.clone();
+            let error = compile_cypher(&spec).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidSpec, "{revision}");
+            assert_eq!(error.path(), Some("/spec_revision"), "{revision}");
+        }
+    }
+
+    #[test]
+    fn non_canonical_edge_directions_are_rejected_with_the_canonical_form() {
+        let aliases = [
+            ("out", "outgoing"),
+            ("->", "outgoing"),
+            ("in", "incoming"),
+            ("<-", "incoming"),
+            ("both", "undirected"),
+            ("-", "undirected"),
+            ("--", "undirected"),
+        ];
+        for (alias, canonical) in aliases {
+            let spec = json!({
+                "spec_version": 1,
+                "matches": [{"paths": [[
+                    ["node", "a", ["Person"]],
+                    ["edge", alias, ["KNOWS"]],
+                    ["node", "b", ["Person"]]
+                ]]}],
+                "projections": [["field", "a", "name", null]]
+            });
+            let error = compile_cypher(&spec).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidSpec, "{alias}");
+            assert_eq!(error.path(), Some("/matches/0/paths/0/1/1"), "{alias}");
+            assert!(
+                error
+                    .message()
+                    .contains(&format!("use \"{canonical}\" instead of \"{alias}\"")),
+                "{alias}: {}",
+                error.message()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_edge_directions_still_compile() {
+        for direction in ["outgoing", "incoming", "undirected"] {
+            let spec = json!({
+                "spec_version": 1,
+                "matches": [{"paths": [[
+                    ["node", "a", ["Person"]],
+                    ["edge", direction, ["KNOWS"]],
+                    ["node", "b", ["Person"]]
+                ]]}],
+                "projections": [["field", "a", "name", null]]
+            });
+            compile_cypher(&spec).unwrap_or_else(|error| panic!("{direction}: {error}"));
+        }
+    }
+
+    #[test]
+    fn root_offset_is_rejected_in_favour_of_skip() {
+        let mut spec = base_spec();
+        spec["offset"] = json!(2);
+        let error = compile_cypher(&spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidSpec);
+        assert_eq!(error.path(), Some("/offset"));
+        assert!(
+            error
+                .message()
+                .contains("use \"skip\" instead of \"offset\""),
+            "{}",
+            error.message()
+        );
+
+        let mut spec = base_spec();
+        spec["skip"] = json!(2);
+        let compiled = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            compiled.compiled.statement,
+            "MATCH (p:Person) RETURN p.name AS n SKIP 2"
+        );
+    }
+
+    #[test]
+    fn alias_is_rejected_outside_projections_but_accepted_inside_them() {
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{
+                "paths": [[["node", "p", ["Person"]]]],
+                "where": ["bin", "eq", ["alias", ["lit", 1], "one"], ["lit", 1]]
+            }],
+            "projections": [["field", "p", "name", null]]
+        });
+        let error = compile_cypher(&spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidSpec);
+        assert_eq!(error.path(), Some("/matches/0/where/2"));
+        assert!(
+            error
+                .message()
+                .contains("only accepted inside a projection"),
+            "{}",
+            error.message()
+        );
+
+        let spec = json!({
+            "spec_version": 1,
+            "matches": [{"paths": [[["node", "p", ["Person"]]]]}],
+            "projections": [["expr", ["alias", ["lit", 1], "one"], null]]
+        });
+        let compiled = compile_cypher(&spec).unwrap();
+        assert_eq!(
+            compiled.compiled.statement,
+            "MATCH (p:Person) RETURN $p0 AS one"
+        );
     }
 
     #[test]

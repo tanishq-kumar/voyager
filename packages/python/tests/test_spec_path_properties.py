@@ -186,7 +186,7 @@ def test_bare_scalar_property_value_is_rejected_with_expression_hint() -> None:
         ('[["node", "b", ["Person"], "Alice"]]', "/matches/0/paths/0/0/3"),
         (
             '[["node", "b", ["Person"]], '
-            '["edge", "out", ["KNOWS"], null, null, null, ["since", 2020]]]',
+            '["edge", "outgoing", ["KNOWS"], null, null, null, ["since", 2020]]]',
             "/matches/0/paths/0/1/6",
         ),
     ],
@@ -205,7 +205,7 @@ def test_non_object_properties_are_rejected(path_json: str, path: str) -> None:
         ),
         (
             '[["node", "b", ["Person"]], '
-            '["edge", "out", ["KNOWS"], null, null, null, '
+            '["edge", "outgoing", ["KNOWS"], null, null, null, '
             '{"since": ["lit", 2020]}, 1]]',
             "/matches/0/paths/0/1/7",
         ),

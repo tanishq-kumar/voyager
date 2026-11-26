@@ -49,7 +49,7 @@ def _base_age_spec() -> dict:
                 "paths": [
                     [
                         ("node", "a", ["Person"], None),
-                        ("edge", "->", ["KNOWS"], "r", None, None, None),
+                        ("edge", "outgoing", ["KNOWS"], "r", None, None, None),
                         ("node", "b", ["Person"], None),
                     ]
                 ]
@@ -160,7 +160,7 @@ def test_age_spec_rejects_alternative_relationship_types() -> None:
                 "paths": [
                     [
                         ("node", "a", ["Person"], None),
-                        ("edge", "->", ["KNOWS", "FOLLOWS"], "r", None, None, None),
+                        ("edge", "outgoing", ["KNOWS", "FOLLOWS"], "r", None, None, None),
                         ("node", "b", ["Person"], None),
                     ]
                 ]

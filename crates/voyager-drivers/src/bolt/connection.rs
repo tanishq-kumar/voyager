@@ -45,6 +45,8 @@ pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = NetS
     stream: S,
     read_buf: BytesMut,
     version: BoltVersion,
+    /// Database selected in the URI or connection config, sent in `RUN` and `BEGIN` on Bolt 4.0+.
+    database: Option<String>,
     is_valid: bool,
     in_transaction: bool,
     server_agent: Option<String>,
@@ -173,6 +175,7 @@ impl BoltConnection<NetStream> {
             stream,
             read_buf: BytesMut::with_capacity(65536),
             version,
+            database: db.map(str::to_string),
             is_valid: true,
             in_transaction: false,
             server_agent: None,
@@ -295,6 +298,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             stream,
             read_buf: BytesMut::with_capacity(65536),
             version,
+            database: None,
             is_valid: true,
             in_transaction: false,
             server_agent: None,
@@ -307,6 +311,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
     /// Returns the negotiated Bolt protocol version.
     pub fn version(&self) -> BoltVersion {
         self.version
+    }
+
+    /// Returns the database selected in the URI or connection config, if any.
+    pub fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
+    /// Returns the database to send in auto-commit `RUN` metadata.
+    ///
+    /// Bolt names the database per transaction; a `RUN` inside an explicit
+    /// transaction must rely on the database named by `BEGIN` instead.
+    fn auto_commit_database(&self) -> Option<&str> {
+        if self.version.major >= 4 && !self.in_transaction {
+            self.database.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Returns the server agent string if reported by the database server.
@@ -731,6 +752,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         }
 
         let mut extra = HashMap::new();
+        if let Some(db) = self.auto_commit_database() {
+            extra.insert("db".to_string(), BoltValue::String(db.to_string()));
+        }
         if let Some(to) = self.query_timeout {
             extra.insert(
                 "tx_timeout".to_string(),
@@ -920,7 +944,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
     }
 
     async fn begin_transaction(&mut self) -> Result<()> {
-        self.begin_tx(None).await
+        // Bolt 4.0+ names the database on BEGIN; older versions only had it in HELLO.
+        let database = if self.version.major >= 4 {
+            self.database.clone()
+        } else {
+            None
+        };
+        self.begin_tx(database.as_deref()).await
     }
 
     async fn commit_transaction(&mut self) -> Result<()> {

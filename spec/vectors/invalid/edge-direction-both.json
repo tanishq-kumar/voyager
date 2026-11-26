@@ -1,0 +1,48 @@
+{
+  "description": "The 'both' direction alias is not canonical; use 'undirected'.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ],
+            [
+              "edge",
+              "both",
+              [
+                "KNOWS"
+              ]
+            ],
+            [
+              "node",
+              "f",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/paths/0/1/1"
+  }
+}

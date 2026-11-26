@@ -15,14 +15,16 @@ data.  The marker is stripped from every result value before comparison.
 
 from __future__ import annotations
 
+import contextlib
 import decimal
 import json
 import os
 import re
 import socket
+import tempfile
 import uuid
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -299,6 +301,24 @@ def spec_projection_aliases(spec: dict[str, Any]) -> list[str | None]:
     return aliases
 
 
+def spec_unordered_list_columns(spec: dict[str, Any]) -> frozenset[int]:
+    """Return 0-based projection indices whose list element order is unspecified.
+
+    ``collect(...)`` aggregations without a preceding ``WITH ... ORDER BY``
+    produce a list whose element order is unspecified across Cypher, ISO GQL,
+    and SQL/PGQ, so those columns must be compared as multisets rather than
+    order-sensitive lists.
+    """
+    with_clauses = spec.get("with_clauses") or ()
+    if any(isinstance(clause, dict) and clause.get("order_by") for clause in with_clauses):
+        return frozenset()
+    indices: set[int] = set()
+    for index, item in enumerate(spec.get("projections", [])):
+        if isinstance(item, list) and len(item) >= 4 and item[0] == "agg" and item[3] == "collect":
+            indices.add(index)
+    return frozenset(indices)
+
+
 def compare_columns(
     expected: Sequence[str] | None,
     actual: Sequence[str],
@@ -501,12 +521,13 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def values_equal(expected: Any, actual: Any) -> bool:
+def values_equal(expected: Any, actual: Any, *, unordered_lists: bool = False) -> bool:
     """Compare canonical values with the documented corpus rules.
 
     Numbers compare numerically (``1`` equals ``1.0``), booleans only equal
-    booleans, null only equals null, lists are order-sensitive, maps compare by
-    key set, and entities compare labels/type plus properties without identity.
+    booleans, null only equals null, lists are order-sensitive unless
+    ``unordered_lists`` is true, maps compare by key set, and entities compare
+    labels/type plus properties without identity.
     """
     if expected is None or actual is None:
         return expected is None and actual is None
@@ -517,12 +538,15 @@ def values_equal(expected: Any, actual: Any) -> bool:
     if isinstance(expected, str) or isinstance(actual, str):
         return isinstance(expected, str) and isinstance(actual, str) and expected == actual
     if isinstance(expected, list) or isinstance(actual, list):
-        return (
-            isinstance(expected, list)
-            and isinstance(actual, list)
-            and len(expected) == len(actual)
-            and all(values_equal(e, a) for e, a in zip(expected, actual, strict=True))
-        )
+        if not (
+            isinstance(expected, list) and isinstance(actual, list) and len(expected) == len(actual)
+        ):
+            return False
+        if unordered_lists:
+            return Counter(_row_key(item) for item in expected) == Counter(
+                _row_key(item) for item in actual
+            )
+        return all(values_equal(e, a) for e, a in zip(expected, actual, strict=True))
     if isinstance(expected, dict) or isinstance(actual, dict):
         return (
             isinstance(expected, dict)
@@ -533,14 +557,17 @@ def values_equal(expected: Any, actual: Any) -> bool:
     return expected == actual
 
 
-def _row_key(value: Any) -> Any:
+def _row_key(value: Any, *, unordered_list: bool = False) -> Any:
     """Build a hashable key where numeric types are interchangeable."""
     if isinstance(value, bool) or value is None or isinstance(value, str):
         return (type(value).__name__, value)
     if _is_number(value):
         return ("number", float(value))
     if isinstance(value, list):
-        return ("list", tuple(_row_key(item) for item in value))
+        items = tuple(_row_key(item) for item in value)
+        if unordered_list:
+            return ("unordered_list", tuple(sorted(items)))
+        return ("list", items)
     if isinstance(value, dict):
         return ("dict", tuple(sorted((k, _row_key(v)) for k, v in value.items())))
     return (type(value).__name__, repr(value))
@@ -557,8 +584,10 @@ def compare_rows(
     ordered: bool,
     scenario_id: str = "",
     engine: str = "",
+    unordered_list_columns: Iterable[int] = (),
 ) -> list[str]:
     """Return a list of human-readable differences; an empty list means a match."""
+    unordered_cols = frozenset(unordered_list_columns)
     diffs: list[str] = []
     if len(expected) != len(actual):
         diffs.append(f"row count: expected {len(expected)}, got {len(actual)}")
@@ -567,14 +596,27 @@ def compare_rows(
         for index, (exp_row, act_row) in enumerate(zip(expected, actual, strict=False)):
             if len(exp_row) != len(act_row):
                 diffs.append(f"row {index}: expected {len(exp_row)} columns, got {len(act_row)}")
-            elif not all(values_equal(e, a) for e, a in zip(exp_row, act_row, strict=True)):
+            elif not all(
+                values_equal(e, a, unordered_lists=(col_index in unordered_cols))
+                for col_index, (e, a) in enumerate(zip(exp_row, act_row, strict=True))
+            ):
                 diffs.append(
                     f"row {index}: expected {_render_row(exp_row)}, got {_render_row(act_row)}"
                 )
         return diffs
 
-    expected_keys = Counter(tuple(_row_key(v) for v in row) for row in expected)
-    actual_keys = Counter(tuple(_row_key(v) for v in row) for row in actual)
+    expected_keys = Counter(
+        tuple(
+            _row_key(v, unordered_list=(col_idx in unordered_cols)) for col_idx, v in enumerate(row)
+        )
+        for row in expected
+    )
+    actual_keys = Counter(
+        tuple(
+            _row_key(v, unordered_list=(col_idx in unordered_cols)) for col_idx, v in enumerate(row)
+        )
+        for row in actual
+    )
     missing = expected_keys - actual_keys
     extra = actual_keys - expected_keys
     if missing:
@@ -592,7 +634,7 @@ def _render_key(key: tuple[Any, ...]) -> str:
 
 def _key_to_json(value: Any) -> Any:
     kind, payload = value
-    if kind == "list":
+    if kind in ("list", "unordered_list"):
         return [_key_to_json(item) for item in payload]
     if kind == "dict":
         return {name: _key_to_json(item) for name, item in payload}
@@ -661,6 +703,7 @@ def compare_execution(
     lane: str,
     ordered: bool,
     aliases: Sequence[str | None] | None = None,
+    unordered_list_columns: Iterable[int] = (),
 ) -> list[ResultDifference]:
     """Compare one execution with ``rows.json`` and return structured differences.
 
@@ -710,6 +753,7 @@ def compare_execution(
                     f"column {index}: expected {expected_name!r}, got {actual_name!r}",
                 )
 
+    unordered_cols = frozenset(unordered_list_columns)
     expected_rows = expected_doc["rows"]
     actual_rows = list(execution.rows)
     if len(expected_rows) != len(actual_rows):
@@ -735,7 +779,11 @@ def compare_execution(
             for column_index, (expected_value, actual_value) in enumerate(
                 zip(expected_row, actual_row, strict=True)
             ):
-                if values_equal(expected_value, actual_value):
+                if values_equal(
+                    expected_value,
+                    actual_value,
+                    unordered_lists=(column_index in unordered_cols),
+                ):
                     continue
                 if expected_columns is not None and column_index < len(expected_columns):
                     column = expected_columns[column_index]
@@ -752,8 +800,20 @@ def compare_execution(
                 )
         return differences
 
-    expected_keys = Counter(tuple(_row_key(value) for value in row) for row in expected_rows)
-    actual_keys = Counter(tuple(_row_key(value) for value in row) for row in actual_rows)
+    expected_keys = Counter(
+        tuple(
+            _row_key(value, unordered_list=(col_idx in unordered_cols))
+            for col_idx, value in enumerate(row)
+        )
+        for row in expected_rows
+    )
+    actual_keys = Counter(
+        tuple(
+            _row_key(value, unordered_list=(col_idx in unordered_cols))
+            for col_idx, value in enumerate(row)
+        )
+        for row in actual_rows
+    )
     for key, count in (expected_keys - actual_keys).items():
         rendered = _render_key(key)
         add(None, rendered, None, f"missing row x{count}: {rendered}")
@@ -849,6 +909,16 @@ class BoltEngine(BaseEngine):
                 raise EngineUnavailableError(
                     f"{self.name} already contains {unmarked} unmarked node(s); "
                     "refusing to mix corpus data with another suite's data"
+                )
+            foreign = session.run(
+                f"MATCH (n) WHERE n.{MARKER_KEY} IS NOT NULL AND n.{MARKER_KEY} <> $token "
+                "RETURN count(n) AS c",
+                {"token": marker},
+            ).single()["c"]
+            if foreign:
+                raise RuntimeError(
+                    f"{self.name} already contains {foreign} corpus node(s) from another run; "
+                    "refusing to mix fixtures across concurrent or dirty corpus runs"
                 )
             try:
                 session.run(
@@ -1481,6 +1551,85 @@ def _execute_with_session(
 def new_token() -> str:
     """Return a short unique token used for dedicated graph/schema names."""
     return uuid.uuid4().hex[:12]
+
+
+_ACTIVE_CORPUS_LOCKS: dict[Path, tuple[Any, int]] = {}
+
+
+def _corpus_lock_path(host: str | None = None, lock_dir: Path | None = None) -> Path:
+    target = (host or test_host()).strip() or "localhost"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", target)
+    base = lock_dir if lock_dir is not None else Path(tempfile.gettempdir())
+    return base / f"voyager-corpus-live-{safe}.lock"
+
+
+@contextlib.contextmanager
+def live_corpus_lock(
+    host: str | None = None,
+    *,
+    lock_dir: Path | None = None,
+) -> Iterator[Path]:
+    """Acquire an exclusive non-blocking process lock for live corpus runs.
+
+    Neo4j Community and Memgraph expose a single shared database, and several
+    corpus scenarios match across the whole graph (for example ``MATCH (n)``).
+    This lock ensures overlapping local corpus runs fail immediately instead
+    of corrupting each other's fixture data.  Re-entrant within one process.
+    """
+    lock_path = _corpus_lock_path(host=host, lock_dir=lock_dir)
+    if lock_path in _ACTIVE_CORPUS_LOCKS:
+        handle, count = _ACTIVE_CORPUS_LOCKS[lock_path]
+        _ACTIVE_CORPUS_LOCKS[lock_path] = (handle, count + 1)
+        try:
+            yield lock_path
+        finally:
+            cur_handle, cur_count = _ACTIVE_CORPUS_LOCKS[lock_path]
+            if cur_count <= 1:
+                _ACTIVE_CORPUS_LOCKS.pop(lock_path, None)
+            else:
+                _ACTIVE_CORPUS_LOCKS[lock_path] = (cur_handle, cur_count - 1)
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            pass
+        except OSError as err:
+            target = (host or test_host()).strip() or "localhost"
+            raise RuntimeError(
+                f"Another live corpus run is already active for host {target!r} "
+                f"(lock {lock_path}); refusing to share single-database engines concurrently"
+            ) from err
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        _ACTIVE_CORPUS_LOCKS[lock_path] = (handle, 1)
+        try:
+            yield lock_path
+        finally:
+            cur_handle, cur_count = _ACTIVE_CORPUS_LOCKS.get(lock_path, (handle, 1))
+            if cur_count <= 1:
+                _ACTIVE_CORPUS_LOCKS.pop(lock_path, None)
+                try:
+                    import fcntl
+
+                    fcntl.flock(cur_handle.fileno(), fcntl.LOCK_UN)
+                except ImportError:
+                    pass
+                cur_handle.close()
+            else:
+                _ACTIVE_CORPUS_LOCKS[lock_path] = (cur_handle, cur_count - 1)
+    except BaseException:
+        if lock_path not in _ACTIVE_CORPUS_LOCKS:
+            handle.close()
+        raise
 
 
 # ---------------------------------------------------------------------------

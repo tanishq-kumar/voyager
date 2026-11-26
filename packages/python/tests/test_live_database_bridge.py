@@ -503,40 +503,41 @@ async def test_live_neo4j_async_simultaneous_explain_and_profile():
 
         # 1. Seed data
         await session1.execute("MATCH (n:LiveSimultaneousPerson) DETACH DELETE n")
-        await session1.execute(
-            "CREATE (:LiveSimultaneousPerson {id: 1, name: 'Alice', age: 30}), "
-            "(:LiveSimultaneousPerson {id: 2, name: 'Bob', age: 25})"
-        )
+        try:
+            await session1.execute(
+                "CREATE (:LiveSimultaneousPerson {id: 1, name: 'Alice', age: 30}), "
+                "(:LiveSimultaneousPerson {id: 2, name: 'Bob', age: 25})"
+            )
 
-        p = LiveSimultaneousPerson()
+            p = LiveSimultaneousPerson()
 
-        # Build explain query (Query.explain())
-        q_explain = Query.match(p).where(p.age >= 20).return_(p.name).order_by(p.age).explain()
-        assert q_explain.execution_mode == "explain"
+            # Build explain query (Query.explain())
+            q_explain = Query.match(p).where(p.age >= 20).return_(p.name).order_by(p.age).explain()
+            assert q_explain.execution_mode == "explain"
 
-        # Build profile query (Query.profile())
-        q_profile = Query.match(p).where(p.age >= 20).return_(p.name).order_by(p.age).profile()
-        assert q_profile.execution_mode == "profile"
+            # Build profile query (Query.profile())
+            q_profile = Query.match(p).where(p.age >= 20).return_(p.name).order_by(p.age).profile()
+            assert q_profile.execution_mode == "profile"
 
-        # 2. Run both queries simultaneously across two separate sessions / connections
-        res_explain, res_profile = await asyncio.gather(
-            session1.execute(q_explain),
-            session2.execute(q_profile),
-        )
+            # 2. Run both queries simultaneously across two separate sessions / connections
+            res_explain, res_profile = await asyncio.gather(
+                session1.execute(q_explain),
+                session2.execute(q_profile),
+            )
 
-        assert res_explain is not None
-        assert res_profile is not None
+            assert res_explain is not None
+            assert res_profile is not None
 
-        # In Neo4j Bolt, EXPLAIN plans without returning data records
-        assert len(res_explain.all()) == 0
+            # In Neo4j Bolt, EXPLAIN plans without returning data records
+            assert len(res_explain.all()) == 0
 
-        # In Neo4j Bolt, PROFILE plans and returns data records
-        names = res_profile.scalars().all()
-        assert len(names) == 2
-        assert names == ["Bob", "Alice"]
-
-        # 3. Clean up
-        await session1.execute("MATCH (n:LiveSimultaneousPerson) DETACH DELETE n")
+            # In Neo4j Bolt, PROFILE plans and returns data records
+            names = res_profile.scalars().all()
+            assert len(names) == 2
+            assert names == ["Bob", "Alice"]
+        finally:
+            # 3. Clean up
+            await session1.execute("MATCH (n:LiveSimultaneousPerson) DETACH DELETE n")
     finally:
         await async_driver.close()
 
@@ -550,32 +551,33 @@ def test_live_neo4j_sync_simultaneous_explain_and_profile():
     try:
         session_setup = Session(bridge=driver, dialect="cypher")
         session_setup.execute("MATCH (n:LiveSimultaneousPerson) DETACH DELETE n")
-        session_setup.execute(
-            "CREATE (:LiveSimultaneousPerson {id: 1, name: 'Alice', age: 30}), "
-            "(:LiveSimultaneousPerson {id: 2, name: 'Bob', age: 25})"
-        )
+        try:
+            session_setup.execute(
+                "CREATE (:LiveSimultaneousPerson {id: 1, name: 'Alice', age: 30}), "
+                "(:LiveSimultaneousPerson {id: 2, name: 'Bob', age: 25})"
+            )
 
-        p = LiveSimultaneousPerson()
-        q_explain = Query.match(p).where(p.age >= 20).return_(p.name).order_by(p.age).explain()
-        q_profile = Query.match(p).where(p.age >= 20).return_(p.name).order_by(p.age).profile()
+            p = LiveSimultaneousPerson()
+            q_explain = Query.match(p).where(p.age >= 20).return_(p.name).order_by(p.age).explain()
+            q_profile = Query.match(p).where(p.age >= 20).return_(p.name).order_by(p.age).profile()
 
-        def run_query(query):
-            s = Session(bridge=driver, dialect="cypher")
-            return s.execute(query)
+            def run_query(query):
+                s = Session(bridge=driver, dialect="cypher")
+                return s.execute(query)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            fut_explain = executor.submit(run_query, q_explain)
-            fut_profile = executor.submit(run_query, q_profile)
-            res_explain = fut_explain.result()
-            res_profile = fut_profile.result()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                fut_explain = executor.submit(run_query, q_explain)
+                fut_profile = executor.submit(run_query, q_profile)
+                res_explain = fut_explain.result()
+                res_profile = fut_profile.result()
 
-        assert len(res_explain.all()) == 0
-        names = res_profile.scalars().all()
-        assert len(names) == 2
-        assert names == ["Bob", "Alice"]
-
-        p_del = LiveSimultaneousPerson(alias="n")
-        session_setup.execute(Query.match(p_del).detach_delete(p_del))
+            assert len(res_explain.all()) == 0
+            names = res_profile.scalars().all()
+            assert len(names) == 2
+            assert names == ["Bob", "Alice"]
+        finally:
+            p_del = LiveSimultaneousPerson(alias="n")
+            session_setup.execute(Query.match(p_del).detach_delete(p_del))
     finally:
         driver.close()
 
@@ -602,138 +604,139 @@ def test_live_neo4j_gql_capabilities():
 
         # 1. Clean up before seeding
         n_p = LiveGqlPerson(alias="n")
-        session.execute(Query.match(n_p).detach_delete(n_p))
         n_c = LiveGqlCompany(alias="c")
+        session.execute(Query.match(n_p).detach_delete(n_p))
         session.execute(Query.match(n_c).detach_delete(n_c))
 
-        # 2. Seed data via pure Query builder mutations
-        q_seed1 = (
-            Query.merge()
-            .node("p1", labels=["LiveGqlPerson"])
-            .on_create_set(
-                **{
-                    "p1.name": "Alice Smith",
-                    "p1.first_name": "Alice",
-                    "p1.last_name": "Smith",
-                    "p1.age": 30,
-                    "p1.status": "Active",
-                }
+        try:
+            # 2. Seed data via pure Query builder mutations
+            q_seed1 = (
+                Query.merge()
+                .node("p1", labels=["LiveGqlPerson"])
+                .on_create_set(
+                    **{
+                        "p1.name": "Alice Smith",
+                        "p1.first_name": "Alice",
+                        "p1.last_name": "Smith",
+                        "p1.age": 30,
+                        "p1.status": "Active",
+                    }
+                )
             )
-        )
-        session.execute(q_seed1)
+            session.execute(q_seed1)
 
-        q_seed2 = (
-            Query.merge()
-            .node("p2", labels=["LiveGqlPerson", "Inactive"])
-            .on_create_set(
-                **{
-                    "p2.name": "Bob Jones",
-                    "p2.first_name": "Bob",
-                    "p2.last_name": "Jones",
-                    "p2.age": 65,
-                    "p2.status": "Retired",
-                }
+            q_seed2 = (
+                Query.merge()
+                .node("p2", labels=["LiveGqlPerson", "Inactive"])
+                .on_create_set(
+                    **{
+                        "p2.name": "Bob Jones",
+                        "p2.first_name": "Bob",
+                        "p2.last_name": "Jones",
+                        "p2.age": 65,
+                        "p2.status": "Retired",
+                    }
+                )
             )
-        )
-        session.execute(q_seed2)
+            session.execute(q_seed2)
 
-        q_seed3 = (
-            Query.merge()
-            .node("c1", labels=["LiveGqlCompany"])
-            .on_create_set(**{"c1.name": "Acme Corp"})
-        )
-        session.execute(q_seed3)
+            q_seed3 = (
+                Query.merge()
+                .node("c1", labels=["LiveGqlCompany"])
+                .on_create_set(**{"c1.name": "Acme Corp"})
+            )
+            session.execute(q_seed3)
 
-        # Connect Alice to Acme
-        q_rel = (
-            Query.match(LiveGqlPerson(alias="p"))
-            .where(LiveGqlPerson("p").name == "Alice Smith")
-            .match(LiveGqlCompany(alias="c"))
-            .where(LiveGqlCompany("c").name == "Acme Corp")
-            .create()
-            .node("p")
-            .to("LIVE_EMPLOYED_AT")
-            .node("c")
-        )
-        session.execute(q_rel)
+            # Connect Alice to Acme
+            q_rel = (
+                Query.match(LiveGqlPerson(alias="p"))
+                .where(LiveGqlPerson("p").name == "Alice Smith")
+                .match(LiveGqlCompany(alias="c"))
+                .where(LiveGqlCompany("c").name == "Acme Corp")
+                .create()
+                .node("p")
+                .to("LIVE_EMPLOYED_AT")
+                .node("c")
+            )
+            session.execute(q_rel)
 
-        # 3. Label expressions: (LiveGqlPerson | LiveGqlCompany) & !Inactive
-        q_labels = (
-            Query.match()
-            .node("n", labels=["LiveGqlPerson | LiveGqlCompany", "!Inactive"])
-            .return_("n.name")
-            .order_by("n.name")
-        )
-        res_labels = session.execute(q_labels)
-        names = [row["n.name"] for row in res_labels.all()]
-        assert names == ["Acme Corp", "Alice Smith"]
-
-        # 4. Traversal path variable with trail() and warning surface
-        # Note: Cypher relationship traversal is trail by default. Dialect "cypher" omits the
-        # TRAIL keyword to avoid syntax errors in Neo4j, while retaining path variable binding
-        # 'path_var = (...)'. It emits a UserWarning to alert the user about mode degradation.
-        with pytest.warns(UserWarning, match="does not support explicit path search modes"):
-            q_trail = (
+            # 3. Label expressions: (LiveGqlPerson | LiveGqlCompany) & !Inactive
+            q_labels = (
                 Query.match()
-                .trail("path_var")
+                .node("n", labels=["LiveGqlPerson | LiveGqlCompany", "!Inactive"])
+                .return_("n.name")
+                .order_by("n.name")
+            )
+            res_labels = session.execute(q_labels)
+            names = [row["n.name"] for row in res_labels.all()]
+            assert names == ["Acme Corp", "Alice Smith"]
+
+            # 4. Traversal path variable with trail() and warning surface
+            # Note: Cypher relationship traversal is trail by default. Dialect "cypher" omits the
+            # TRAIL keyword to avoid syntax errors in Neo4j, while retaining path variable binding
+            # 'path_var = (...)'. It emits a UserWarning to alert the user about mode degradation.
+            with pytest.warns(UserWarning, match="does not support explicit path search modes"):
+                q_trail = (
+                    Query.match()
+                    .trail("path_var")
+                    .node("a", labels=["LiveGqlPerson"])
+                    .to("LIVE_EMPLOYED_AT")
+                    .node("b", labels=["LiveGqlCompany"])
+                    .return_("a.name", "b.name")
+                )
+                res_trail = session.execute(q_trail)
+            records = res_trail.all()
+            assert len(records) == 1
+            assert records[0]["a.name"] == "Alice Smith"
+            assert records[0]["b.name"] == "Acme Corp"
+
+            # Traversal with path_variable() directly without warning
+            q_path_var = (
+                Query.match()
+                .path_variable("p_direct")
                 .node("a", labels=["LiveGqlPerson"])
                 .to("LIVE_EMPLOYED_AT")
                 .node("b", labels=["LiveGqlCompany"])
                 .return_("a.name", "b.name")
             )
-            res_trail = session.execute(q_trail)
-        records = res_trail.all()
-        assert len(records) == 1
-        assert records[0]["a.name"] == "Alice Smith"
-        assert records[0]["b.name"] == "Acme Corp"
+            res_path_var = session.execute(q_path_var)
+            assert len(res_path_var.all()) == 1
 
-        # Traversal with path_variable() directly without warning
-        q_path_var = (
-            Query.match()
-            .path_variable("p_direct")
-            .node("a", labels=["LiveGqlPerson"])
-            .to("LIVE_EMPLOYED_AT")
-            .node("b", labels=["LiveGqlCompany"])
-            .return_("a.name", "b.name")
-        )
-        res_path_var = session.execute(q_path_var)
-        assert len(res_path_var.all()) == 1
-
-        # 5. Linear LET and FILTER clauses, plus OFFSET
-        p = LiveGqlPerson(alias="p")
-        q_linear = (
-            Query.match(p)
-            .let_(fullName=p.first_name + " " + p.last_name)
-            .filter_(p.age >= 25)
-            .return_("fullName")
-            .order_by("fullName")
-            .offset(0)
-            .limit(10)
-        )
-        res_linear = session.execute(q_linear)
-        rows_linear = res_linear.all()
-        assert len(rows_linear) == 2
-        assert [r["fullName"] for r in rows_linear] == ["Alice Smith", "Bob Jones"]
-
-        # 6. Function helpers: .upper(), .lower(), .char_length()
-        q_helpers = (
-            Query.match(p)
-            .where(p.name == "Alice Smith")
-            .return_(
-                u_first=p.first_name.upper(),
-                l_last=p.last_name.lower(),
-                c_len=p.first_name.char_length(),
+            # 5. Linear LET and FILTER clauses, plus OFFSET
+            p = LiveGqlPerson(alias="p")
+            q_linear = (
+                Query.match(p)
+                .let_(fullName=p.first_name + " " + p.last_name)
+                .filter_(p.age >= 25)
+                .return_("fullName")
+                .order_by("fullName")
+                .offset(0)
+                .limit(10)
             )
-        )
-        res_helpers = session.execute(q_helpers)
-        row = res_helpers.all()[0]
-        assert row["u_first"] == "ALICE"
-        assert row["l_last"] == "smith"
-        assert row["c_len"] == 5
+            res_linear = session.execute(q_linear)
+            rows_linear = res_linear.all()
+            assert len(rows_linear) == 2
+            assert [r["fullName"] for r in rows_linear] == ["Alice Smith", "Bob Jones"]
 
-        # 7. Clean up
-        session.execute(Query.match(n_p).detach_delete(n_p))
-        session.execute(Query.match(n_c).detach_delete(n_c))
+            # 6. Function helpers: .upper(), .lower(), .char_length()
+            q_helpers = (
+                Query.match(p)
+                .where(p.name == "Alice Smith")
+                .return_(
+                    u_first=p.first_name.upper(),
+                    l_last=p.last_name.lower(),
+                    c_len=p.first_name.char_length(),
+                )
+            )
+            res_helpers = session.execute(q_helpers)
+            row = res_helpers.all()[0]
+            assert row["u_first"] == "ALICE"
+            assert row["l_last"] == "smith"
+            assert row["c_len"] == 5
+        finally:
+            # 7. Clean up
+            session.execute(Query.match(n_p).detach_delete(n_p))
+            session.execute(Query.match(n_c).detach_delete(n_c))
     finally:
         driver.close()
 

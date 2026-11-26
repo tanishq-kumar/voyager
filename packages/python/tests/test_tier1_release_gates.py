@@ -254,37 +254,15 @@ def test_subquery_spec_error_propagation() -> None:
     assert exc_info.value.code == "INVALID_SPEC"
 
 
-def test_edge_direction_aliases_and_validation() -> None:
-    """Edge direction aliases must compile, and invalid directions must fail loudly."""
-    valid_dirs = ["outgoing", "incoming", "undirected", "out", "in", "->", "<-", "-", "--", "both"]
-    for valid_dir in valid_dirs:
-        spec = {
-            "spec_version": 1,
-            "matches": [
-                {
-                    "paths": [
-                        [
-                            ("node", "a", ["Person"], None),
-                            ("edge", valid_dir, ["KNOWS"], "r", None, None),
-                            ("node", "b", ["Person"], None),
-                        ]
-                    ]
-                }
-            ],
-            "projections": [("field", "a", "name", None)],
-        }
-        res = compile_query_from_spec(spec, "cypher")
-        assert "statement" in res
-
-    # Invalid direction string must raise VoyagerError with INVALID_SPEC
-    invalid_spec = {
+def _direction_spec(direction: str) -> dict:
+    return {
         "spec_version": 1,
         "matches": [
             {
                 "paths": [
                     [
                         ("node", "a", ["Person"], None),
-                        ("edge", "invalid_direction", ["KNOWS"], "r", None, None),
+                        ("edge", direction, ["KNOWS"], "r", None, None),
                         ("node", "b", ["Person"], None),
                     ]
                 ]
@@ -292,8 +270,31 @@ def test_edge_direction_aliases_and_validation() -> None:
         ],
         "projections": [("field", "a", "name", None)],
     }
+
+
+def test_edge_direction_canonical_spellings_and_validation() -> None:
+    """Only outgoing/incoming/undirected compile; aliases fail and name the canonical form."""
+    for direction in ("outgoing", "incoming", "undirected"):
+        res = compile_query_from_spec(_direction_spec(direction), "cypher")
+        assert "statement" in res
+
+    for alias, canonical in (
+        ("out", "outgoing"),
+        ("->", "outgoing"),
+        ("in", "incoming"),
+        ("<-", "incoming"),
+        ("both", "undirected"),
+        ("-", "undirected"),
+        ("--", "undirected"),
+    ):
+        with pytest.raises(VoyagerError) as exc_info:
+            compile_query_from_spec(_direction_spec(alias), "cypher")
+        assert exc_info.value.code == "INVALID_SPEC"
+        assert exc_info.value.path == "/matches/0/paths/0/1/1"
+        assert f'use "{canonical}" instead of "{alias}"' in str(exc_info.value)
+
     with pytest.raises(VoyagerError) as exc_info:
-        compile_query_from_spec(invalid_spec, "cypher")
+        compile_query_from_spec(_direction_spec("invalid_direction"), "cypher")
     assert exc_info.value.code == "INVALID_SPEC"
     assert exc_info.value.path == "/matches/0/paths/0/1/1"
 

@@ -65,7 +65,6 @@ def projection_spec(expression: Any) -> dict[str, Any]:
         ("distinct", True),
         ("order_by", [("p", "age", False)]),
         ("skip", 0),
-        ("offset", 0),
         ("limit", 5),
     ],
 )
@@ -406,8 +405,8 @@ def test_fixed_arity_arrays_reject_extra_items(spec: dict[str, Any], path: str) 
 
 def test_non_string_alias_name_is_rejected() -> None:
     error = assert_invalid_spec(
-        where_spec([("bin", "eq", ("alias", ("lit", 1), 42), ("lit", 1))]),
-        "/matches/0/where/0/2/2",
+        {**BASE, "projections": [("expr", ("alias", ("lit", 1), 42), None)]},
+        "/projections/0/1/2",
     )
     assert "alias name" in str(error)
 
@@ -419,9 +418,12 @@ def test_alias_name_takes_effect_in_an_expr_projection() -> None:
     assert compiled["statement"] == "MATCH (p:Person) RETURN $p0 AS one"
 
 
-def test_alias_name_outside_projection_uses_the_inner_expression() -> None:
-    compiled = compile_cypher(where_spec([("bin", "eq", ("alias", ("lit", 1), "one"), ("lit", 1))]))
-    assert "AS one" not in compiled["statement"]
+def test_alias_name_outside_projection_is_rejected() -> None:
+    error = assert_invalid_spec(
+        where_spec([("bin", "eq", ("alias", ("lit", 1), "one"), ("lit", 1))]),
+        "/matches/0/where/0/2",
+    )
+    assert "only accepted inside a projection" in str(error)
 
 
 # --- F16: an object in an expression position needs the wrapped form

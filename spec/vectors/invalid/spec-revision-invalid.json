@@ -1,0 +1,35 @@
+{
+  "description": "spec_revision must be an integer of at least 1.",
+  "spec": {
+    "spec_version": 1,
+    "spec_revision": 0,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": false,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/spec_revision"
+  }
+}

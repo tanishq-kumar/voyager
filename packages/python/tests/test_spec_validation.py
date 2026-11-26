@@ -111,7 +111,7 @@ def test_issue_187_empty_spec_is_rejected() -> None:
         (
             {
                 "spec_version": 1,
-                "matches": [{"paths": [[("node", "p", ["Person"]), ("edge", "out")]]}],
+                "matches": [{"paths": [[("node", "p", ["Person"]), ("edge", "outgoing")]]}],
             },
             "/matches/0/paths/0/1",
         ),
@@ -209,7 +209,7 @@ def test_error_path_is_a_json_pointer() -> None:
             "matches": [
                 {
                     "paths": [
-                        [("node", "a", ["A"]), ("edge", "out", ["R"], None, None, None)],
+                        [("node", "a", ["A"]), ("edge", "outgoing", ["R"], None, None, None)],
                         [("node", "b", ["B"]), ("edge", "sideways", ["R"], None, None, None)],
                     ]
                 }
@@ -573,13 +573,6 @@ RAW_VALUE_POSITIONS: dict[str, tuple[str, str, str]] = {
         "cypher",
         "SKIP 0 LIMIT 50",
     ),
-    "pagination[offset,limit]": (
-        '{"spec_version": 1, "matches": [{"paths": [[["node", "p", ["Person"]]]]}], '
-        '"projections": [["field", "p", "name", null]], '
-        '"offset": 2, "limit": 50}',
-        "cypher",
-        "SKIP 2 LIMIT 50",
-    ),
     "execution_mode": (
         '{"spec_version": 1, "matches": [{"paths": [[["node", "p", ["Person"]]]]}], '
         '"projections": [["field", "p", "name", null]], "execution_mode": "explain"}',
@@ -865,16 +858,18 @@ def test_node_step_trailing_null_is_still_accepted() -> None:
 
 
 def test_edge_step_short_form_matches_full_form() -> None:
-    short = compile_query_from_spec(_match_spec('["edge", "out", ["KNOWS"]]'), "cypher")
+    short = compile_query_from_spec(_match_spec('["edge", "outgoing", ["KNOWS"]]'), "cypher")
     full = compile_query_from_spec(
-        _match_spec('["edge", "out", ["KNOWS"], null, null, null]'), "cypher"
+        _match_spec('["edge", "outgoing", ["KNOWS"], null, null, null]'), "cypher"
     )
     assert short["statement"] == full["statement"]
 
 
 def test_edge_step_extra_item_is_rejected() -> None:
     error = assert_invalid_spec(
-        _match_spec('["edge", "out", ["KNOWS"], "r", null, null, {"since": ["lit", 2020]}, 1]'),
+        _match_spec(
+            '["edge", "outgoing", ["KNOWS"], "r", null, null, {"since": ["lit", 2020]}, 1]'
+        ),
         "/matches/0/paths/0/1/7",
     )
     assert "accepts no further items" in str(error)
@@ -882,7 +877,7 @@ def test_edge_step_extra_item_is_rejected() -> None:
 
 def test_edge_step_properties_must_be_an_object_or_null() -> None:
     error = assert_invalid_spec(
-        _match_spec('["edge", "out", ["KNOWS"], "r", null, null, ["since", 2020]]'),
+        _match_spec('["edge", "outgoing", ["KNOWS"], "r", null, null, ["since", 2020]]'),
         "/matches/0/paths/0/1/6",
     )
     assert "expected a JSON object" in str(error)

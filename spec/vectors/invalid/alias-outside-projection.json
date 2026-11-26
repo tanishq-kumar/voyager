@@ -1,0 +1,50 @@
+{
+  "description": "The alias wrapper is only accepted inside projections; the schema cannot express that rule.",
+  "spec": {
+    "spec_version": 1,
+    "matches": [
+      {
+        "paths": [
+          [
+            [
+              "node",
+              "p",
+              [
+                "Person"
+              ]
+            ]
+          ]
+        ],
+        "where": [
+          "bin",
+          "eq",
+          [
+            "alias",
+            [
+              "lit",
+              1
+            ],
+            "one"
+          ],
+          [
+            "lit",
+            1
+          ]
+        ]
+      }
+    ],
+    "projections": [
+      [
+        "field",
+        "p",
+        "name",
+        null
+      ]
+    ]
+  },
+  "schema_valid": true,
+  "expected": {
+    "error": "INVALID_SPEC",
+    "path": "/matches/0/where/2"
+  }
+}

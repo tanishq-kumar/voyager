@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Any
 
 from voyager_ogm import expressions, fn, types
 from voyager_ogm._voyager_rs import (
+    QUERY_SPEC_REVISION,
+    QUERY_SPEC_VERSION,
     ArrowStream,
     AstExpr,
     NativeCircuitRouter,
@@ -277,6 +279,8 @@ __all__ = [
     "PostgresBridge",
     "PredicateExpr",
     "PropExpr",
+    "QUERY_SPEC_REVISION",
+    "QUERY_SPEC_VERSION",
     "Query",
     "QueryResult",
     "RelateBridge",

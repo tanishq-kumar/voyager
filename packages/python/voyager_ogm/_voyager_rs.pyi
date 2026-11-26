@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+QUERY_SPEC_VERSION: int
+QUERY_SPEC_REVISION: int
+
 class NativeQueryBuilder:
     """Native Rust Query Builder arena wrapper."""
 

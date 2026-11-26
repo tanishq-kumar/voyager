@@ -13,12 +13,21 @@ This formal ABI contract guarantees cross-language stability and deterministic t
 
 ---
 
-## 1. Specification Versioning (`spec_version: 1`)
+## 1. Specification Versioning (`spec_version` and `spec_revision`)
 
 Every query spec document **must** carry a top-level integer attribute:
 ```json
 {
   "spec_version": 1
+}
+```
+
+Documents may also carry an optional integer `spec_revision` (minimum `1`):
+
+```json
+{
+  "spec_version": 1,
+  "spec_revision": 1
 }
 ```
 
@@ -28,13 +37,57 @@ Every query spec document **must** carry a top-level integer attribute:
 declare it, it must be `1`; any other value is rejected at that nested
 `spec_version` key.
 
+`spec_revision` is optional everywhere, root and nested alike, and JSON `null`
+means the same as omitting it. A missing revision is revision `1`, today's v1
+format. The consumer rejects a value below `1`, a non-integer value, and a
+value above the revision it supports, at the containing object's
+`/spec_revision` pointer.
+
+### Compatibility and versioning
+
+Query Spec uses **major + revision** versioning:
+
+- **Major** (`spec_version`) changes only for a break: anything that would
+  change how an existing valid v1 document compiles moves to `spec_version: 2`.
+- **Revision** (`spec_revision`) increments for every backwards-compatible
+  addition to v1: a new optional key, a new optional tag or enum value, or a
+  new optional position in an existing shape. A document that does not use the
+  addition compiles exactly as before.
+- **Consumers report the revision they support.** This build accepts
+  `spec_version: 1` up to revision `1`. The Rust crate exports
+  `voyager_ogm::spec::SPEC_VERSION` and `voyager_ogm::spec::SPEC_REVISION`,
+  Python exposes `voyager_ogm.QUERY_SPEC_VERSION` and
+  `voyager_ogm.QUERY_SPEC_REVISION`, and `voyager doctor` prints
+  `query spec: v1 revision 1`.
+- **Newer documents are rejected, never guessed.** A document whose
+  `spec_revision` is newer than the consumer supports fails with
+  `INVALID_SPEC` at `/spec_revision` and a message like
+  `The query spec requires Query Spec revision 2; this Voyager supports up to
+  revision 1.` An older consumer therefore refuses a document instead of
+  silently dropping a construct it does not understand.
+- **The guarantee takes effect with Voyager 1.0.0.** Until then (0.x releases),
+  v1 may still change in breaking ways. Each such change bumps the revision and
+  is listed as **Breaking** in `CHANGELOG.md`; the alternative spellings
+  removed in this revision are an example.
+- **`Query.to_spec_dict()` exports the query before optimisation.** It
+  serialises the fluent query as built, not the optimised AST, so
+  `compile(..., optimize=True)` may emit a different statement.
+- **To bump the revision**, change `SPEC_REVISION` in
+  `crates/voyager-ogm/src/spec/mod.rs`, update `x-spec-revision` and the
+  `spec_revision` descriptions in `spec/query_spec.v1.schema.json`, add or
+  update the reference vectors under `spec/vectors/`, and add a `CHANGELOG.md`
+  entry. The schema `$id` stays
+  `https://voyager-ogm.org/schemas/query-spec/v1.json` for every v1 revision;
+  the `x-spec-revision` annotation and the description identify the revision,
+  so existing v1 links keep resolving while the revision stays visible.
+
 ### Compatibility Rules
 1. **Major Version Invariance**: The native Rust compiler (`compile_query_from_spec`) and internal builders strictly reject unknown major versions:
    - Any payload missing a root `"spec_version"` is rejected immediately with:
      `Missing required 'spec_version' in query spec dictionary. Expected 'spec_version': 1.`
    - Any payload with an unsupported version (`spec_version: 2`) is rejected with:
      `Unsupported query spec_version: 2. Supported major versions: 1.`
-2. **Clause Versioning**: A nested clause or expression object (`matches[i]`, `with_clauses[i]`, an `exists`/`count` subquery spec and an object-wrapped expression) may optionally declare `"spec_version": 1`. If present, unknown values are rejected at that nested key.
+2. **Clause Versioning**: A nested clause or expression object (`matches[i]`, `with_clauses[i]`, an `exists`/`count` subquery spec and an object-wrapped expression) may optionally declare `"spec_version": 1` and `"spec_revision"`. If present, unknown versions are rejected at that nested key, and a newer revision is rejected at that nested `/spec_revision`.
 
 ---
 
@@ -68,16 +121,17 @@ Examples:
 | `{"spec_version": 1, "matches": 42}` | `/matches` |
 | `{"spec_version": 1, "matches": [{"paths": [[["node","n",["N"],"extra"]]]}]}` (non-object node properties) | `/matches/0/paths/0/0/3` |
 | `{"spec_version": 1, "matches": [{"paths": [[["node","n",["N"],{"name":"x"}]]]}]}` (bare scalar property value) | `/matches/0/paths/0/0/3/name` |
-| `{"spec_version": 1, "matches": [{"paths": [[["node","n",["N"]],["edge","out",["E"],null,null,null,{},1]]]}]}` (8th edge item) | `/matches/0/paths/0/1/7` |
+| `{"spec_version": 1, "matches": [{"paths": [[["node","n",["N"]],["edge","outgoing",["E"],null,null,null,{},1]]]}]}` (8th edge item) | `/matches/0/paths/0/1/7` |
 | `{"spec_version": 1, "skip": -1, ...}` | `/skip` |
 
 ### `null` means omitted
 
 At every optional key and optional array position, JSON `null` means the same as
-omitting the key. This covers root `load_csv`, `projections`, `distinct`,
-`order_by`, `skip`, `offset`, `limit` and `execution_mode`; match `optional`,
-`path_mode`, `path_variable` and `where`; with-clause `distinct`, `where`,
-`order_by`, `skip` and `limit`; the optional node and edge path-step items; and
+omitting the key. This covers root `spec_revision`, `load_csv`, `projections`,
+`distinct`, `order_by`, `skip`, `limit` and `execution_mode`; match
+`spec_revision`, `optional`, `path_mode`, `path_variable` and `where`;
+with-clause `spec_revision`, `distinct`, `where`, `order_by`, `skip` and
+`limit`; the optional node and edge path-step items; and
 the nullable expression positions (`case` operand and else branch, `list_comp`
 where and map expressions, and `pattern_comp` where). Required keys do not accept
 `null`: root `spec_version`, `matches[i].paths`, `with_clauses[i].projections`,
@@ -85,7 +139,7 @@ and the `expr` key of an object-wrapped expression.
 
 ### Pagination values
 
-`skip`, `offset` and `limit` accept either a non-negative integral JSON number
+`skip` and `limit` accept either a non-negative integral JSON number
 or a parameter reference `["param", name]`, at the document root and inside a
 `with_clauses[i]` object. The parameter name follows the same rule as every
 other `param` expression: one leading `$` is stripped, and an empty name is
@@ -128,20 +182,21 @@ The following are rejected:
   merge set lists.
 - Unknown or wrongly spelled enum values. `path_mode` (`trail`, `simple`,
   `acyclic`, `walk`, `none`), `execution_mode` (`normal`, `explain`, `profile`,
-  `explain_and_profile`), edge `direction` (`outgoing`/`out`/`->`,
-  `incoming`/`in`/`<-`, `undirected`/`both`/`-`/`--`) and aggregation function
-  names (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `collect`) are
-  exact and case-sensitive. So are the mutation, path-step, projection and
+  `explain_and_profile`), edge `direction` (`outgoing`, `incoming`,
+  `undirected`) and aggregation function names (`count`, `count_distinct`,
+  `sum`, `avg`, `min`, `max`, `collect`) are exact and case-sensitive. The
+  former direction aliases `out`/`->` (for `outgoing`), `in`/`<-` (for
+  `incoming`) and `both`/`-`/`--` (for `undirected`) are rejected; the error
+  names the canonical spelling. So are the mutation, path-step, projection and
   `linear_clauses` tags.
 - The undocumented tag aliases `literal` (for `lit`) and `func` / `call` (for
   `fn`). They are rejected as unknown expression tags; write the canonical `lit`
   and `fn` tags.
-- Boolean, negative or non-integral `skip` / `offset` / `limit` literals. An
+- Boolean, negative or non-integral `skip` / `limit` literals. An
   integral JSON number such as `0.0` or `3.0` is accepted (the schema's
-  `integer` type accepts it). `skip` and `offset` are aliases of the same
-  position, so providing both is rejected at the second key in document order.
-  A malformed parameter array, such as `["param"]` or `["param", 7]`, is
-  rejected at its own JSON Pointer.
+  `integer` type accepts it). Root `offset` is rejected at `/offset` with a
+  message that names `skip`; it is not an alias. A malformed parameter array,
+  such as `["param"]` or `["param", 7]`, is rejected at its own JSON Pointer.
 - Negative `min_hops` / `max_hops` values. `min_hops` has minimum 0; `max_hops`
   has minimum 0 or may be `"unbounded"` for open upper bounds. When
   `max_hops` is `null`, the traversal is exactly `min_hops` hops. When
@@ -165,7 +220,7 @@ The following are rejected:
   with content. `{"spec_version": 1}` and `{"spec_version": 1, "matches": []}`
   are both empty. Pagination and `execution_mode` alone do not make a spec
   non-empty.
-- Root `distinct`, `order_by`, `skip`, `offset` or `limit` without a non-empty
+- Root `distinct`, `order_by`, `skip` or `limit` without a non-empty
   root `projections` list. These belong to the final `RETURN`: without one they
   would be dropped, or (when `with_clauses` are present) fold into the last
   `WITH`, silently changing the query. The error is at the first offending key,
@@ -211,11 +266,12 @@ Parameter names may be written with or without one leading `$`: `["param",
 "$name"]` and `["param", "name"]` both bind `$name`, and an `unwinds` entry
 `["$batch", "row"]` compiles to `UNWIND $batch AS row`, matching the Python
 SDK's `param()`. Exactly one `$` is stripped. An `["alias", expression, name]`
-expression is only meaningful in a projection: an `expr` projection uses the
+expression is accepted only inside a projection: an `expr` projection uses the
 name when its own alias is `null`, and the `alias` expression inside a
 projection item is the same as carrying that name. In every other expression
-position (`where`, `set`, function arguments, and so on) the name is validated
-as a string and the inner expression is used; no alias is emitted there.
+position (`where`, `set`, function arguments, `order_by`, and so on) the alias
+wrapper is rejected with `INVALID_SPEC` at the wrapper's own pointer; write the
+inner expression directly instead.
 
 `INVALID_CLAUSE` remains the code for non-spec callers, such as the fluent
 Python/Rust builder API.
@@ -305,7 +361,7 @@ Paths within `matches[i].paths` or `create`/`merge` mutations are sequences of s
 | Step Type | Shape | Description |
 | :--- | :--- | :--- |
 | **Node** | `["node", variable, labels, properties]` | Node pattern, e.g. `["node", "u", ["User", "Admin"]]`. `variable` can be `null` for anonymous nodes. `properties` is optional: an object mapping property names to [expressions](#4-expression-ast-descriptors), for example `{"name": ["lit", "Alice"]}`. Omitted, `null`, and `{}` all mean no properties; any other non-object is rejected. |
-| **Edge** | `["edge", dir, types, variable, min_hops, max_hops, properties]` | Directed or undirected relationship traversal. `dir` accepts exactly `"outgoing"` (`"out"`, `"->"`), `"incoming"` (`"in"`, `"<-"`), and `"undirected"` (`"both"`, `"-"`, `"--"`); the spelling is case-sensitive. `min_hops` has minimum 0. `max_hops` has minimum 0, or accepts `"unbounded"` to represent an unbounded upper bound (e.g. `*2..` in Cypher, `{2,}` in ISO GQL/PGQ). `max_hops: null` means exactly `min_hops` hops; when `min_hops` is omitted or `null` and `max_hops` is set, the lower bound is 1 (e.g. `*1..3` in Cypher, `{1,3}` in ISO GQL/PGQ). `variable`, `min_hops`, `max_hops` and `properties` may be omitted (`["edge", dir, types]`) and default to `null`. `properties` follows the same rules as the node step. A non-null item after `properties` is rejected. |
+| **Edge** | `["edge", dir, types, variable, min_hops, max_hops, properties]` | Directed or undirected relationship traversal. `dir` accepts exactly `"outgoing"`, `"incoming"`, and `"undirected"`; the spelling is case-sensitive, and the former aliases (`"out"`, `"->"`, `"in"`, `"<-"`, `"both"`, `"-"`, `"--"`) are rejected with an error naming the canonical form. `min_hops` has minimum 0. `max_hops` has minimum 0, or accepts `"unbounded"` to represent an unbounded upper bound (e.g. `*2..` in Cypher, `{2,}` in ISO GQL/PGQ). `max_hops: null` means exactly `min_hops` hops; when `min_hops` is omitted or `null` and `max_hops` is set, the lower bound is 1 (e.g. `*1..3` in Cypher, `{1,3}` in ISO GQL/PGQ). `variable`, `min_hops`, `max_hops` and `properties` may be omitted (`["edge", dir, types]`) and default to `null`. `properties` follows the same rules as the node step. A non-null item after `properties` is rejected. |
 
 Property values follow the same strict rule as every other expression
 position: each value must be a tagged expression such as `["lit", "Alice"]` or
@@ -435,9 +491,10 @@ items with one of three exact shapes:
 | `["agg", variable, property, func, alias]` | Aggregate `variable.property`. `func` is one of `count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `collect`. A `property` of `"*"` (or `""`) aggregates the variable itself, so `["agg", "p", "*", "count", "n"]` compiles to `COUNT(p) AS n`. |
 
 An `["alias", expression, name]` name takes effect in an `expr` projection (or
-as the projection's explicit alias); in any other expression position the name
-is validated and the inner expression is used. Every shape above is exact: an
-item past the documented length is `INVALID_SPEC` at the extra item's path.
+as the projection's explicit alias). The wrapper is accepted only inside a
+projection; in any other expression position it is `INVALID_SPEC` at the
+wrapper's path. Every shape above is exact: an item past the documented length
+is `INVALID_SPEC` at the extra item's path.
 
 ### Aggregations are projection items only
 
@@ -487,7 +544,7 @@ The emission order is:
 4. `linear_clauses` (`let` and `filter`, in list order)
 5. `with_clauses` (in list order)
 6. `mutations` (in list order)
-7. the final `RETURN`: `projections`, then `order_by`, then `skip`/`offset` and
+7. the final `RETURN`: `projections`, then `order_by`, then `skip` and
    `limit`
 
 The scope rules follow that order:
