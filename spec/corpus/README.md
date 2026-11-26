@@ -159,7 +159,9 @@ VOYAGER_TEST_HOST=192.168.1.12 just corpus-live "." all                 # every 
 The default is the `official` lane, preserving the previous behaviour. Running
 every lane takes three times as long, so it is opt-in. Never run two live corpus
 processes at the same time: they share databases and some scenarios count across
-the whole graph.
+the whole graph. Both `scripts/run_corpus_live.py` and `test_spec_corpus_live.py`
+hold an advisory per-host lock (`corpus.live_corpus_lock`) and `BoltEngine.load`
+refuses to proceed if corpus nodes from another run are already present.
 
 `just corpus-live` prints a per-lane, per-engine pass/fail/skip summary
 (`scripts/run_corpus_live.py`). Engine ports can be overridden with
@@ -243,7 +245,10 @@ automatically.
 - **Numbers**: integers and floats compare numerically, so `1` equals `1.0`.
   Booleans are not numbers.
 - **Nulls**: `null` equals only `null`.
-- **Lists**: order-sensitive, element by element.
+- **Lists**: order-sensitive, element by element, except top-level `collect(...)`
+  aggregation columns without a preceding `WITH ... ORDER BY` (whose element
+  order is unspecified by Cypher, ISO GQL, and SQL/PGQ, so they compare as
+  multisets).
 - **Maps**: compare by key set and then value; key order is irrelevant.
 - **Nodes**: compare the sorted label set and the property map. Node identity is
   not compared.
