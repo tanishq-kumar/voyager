@@ -1505,6 +1505,15 @@ class DuckDbBridge:
             return False
         return bool(row and row[0])
 
+    def set_install_duckpgq(self, install: bool) -> None:
+        """Sets whether a missing DuckPGQ extension may be installed when it is first needed.
+
+        Args:
+            install: When ``True``, ``INSTALL duckpgq;`` (which downloads the extension)
+                is attempted if ``LOAD duckpgq;`` fails.
+        """
+        self._install_duckpgq = install
+
     def ensure_duckpgq(self, install: bool | None = None) -> None:
         """Loads DuckPGQ on this connection once.
 
@@ -1869,6 +1878,10 @@ class AsyncDuckDbBridge:
                 downloads the extension from the DuckDB extension repository.
         """
         self.sync_bridge = DuckDbBridge(connection, install_duckpgq=install_duckpgq)
+
+    def set_install_duckpgq(self, install: bool) -> None:
+        """Sets the DuckPGQ install opt-in; see `DuckDbBridge.set_install_duckpgq`."""
+        self.sync_bridge.set_install_duckpgq(install)
 
     def ensure_duckpgq(self, install: bool | None = None) -> None:
         """Loads DuckPGQ on the wrapped connection once; see `DuckDbBridge.ensure_duckpgq`."""

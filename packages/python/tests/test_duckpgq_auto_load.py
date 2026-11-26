@@ -157,11 +157,35 @@ def test_missing_extension_error_names_duckpgq_and_install_command(tmp_path) -> 
         },
     )
     try:
+        session = Session(bridge=con, dialect="duck_pgq")
         with pytest.raises(RuntimeError) as exc_info:
-            Session(bridge=con, dialect="duck_pgq")
+            session.execute("CREATE PROPERTY GRAPH zz_missing_pg VERTEX TABLES (person)")
         message = str(exc_info.value)
         assert "DuckPGQ" in message
         assert "INSTALL duckpgq;" in message
+    finally:
+        con.close()
+
+
+def test_plain_sql_session_does_not_need_duckpgq(tmp_path) -> None:
+    """Creating a DuckDB session and running plain SQL never loads DuckPGQ."""
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(
+        ":memory:",
+        config={
+            "extension_directory": str(tmp_path),
+            "autoinstall_known_extensions": "false",
+            "autoload_known_extensions": "false",
+        },
+    )
+    try:
+        session = Session(bridge=con)
+        session.execute("CREATE TABLE zz_plain (id INTEGER)")
+        session.execute("INSERT INTO zz_plain VALUES (1), (2)")
+        assert [row["id"] for row in session.execute("SELECT id FROM zz_plain ORDER BY id")] == [
+            1,
+            2,
+        ]
     finally:
         con.close()
 

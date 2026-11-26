@@ -839,11 +839,11 @@ class _SessionBase:
         if (self._dialect or "").lower() in ("duckpgq", "duck_pgq") and isinstance(
             self._bridge, (DuckDbBridge, AsyncDuckDbBridge)
         ):
-            # DuckPGQ is required for the SQL/PGQ statements this session emits.
-            # Loading here makes a fresh connection work without the caller
-            # running `LOAD duckpgq;` first, and is a no-op when it is already
-            # loaded (or when the caller set the connection up themselves).
-            self._bridge.ensure_duckpgq(install=self._install_duckpgq)
+            # The bridge loads DuckPGQ lazily, before the first SQL/PGQ statement
+            # (GRAPH_TABLE, CREATE PROPERTY GRAPH), so a session that only runs
+            # plain SQL never needs the extension. Pass on the install opt-in.
+            if self._install_duckpgq:
+                self._bridge.set_install_duckpgq(True)
 
         if resolved_graph is not None:
             validate_graph_name(resolved_graph)
