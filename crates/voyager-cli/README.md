@@ -6,8 +6,9 @@
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/tanishq-kumar/voyager/blob/main/LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://github.com/tanishq-kumar/voyager/blob/main/Cargo.toml)
 
-The command-line interface for Voyager OGM. It installs two identical binaries,
-`voyager` and the short alias `voy`, and provides four subcommands:
+The command-line interface for Voyager OGM. It is a single binary, `voyager`
+(the release archives also include the short alias `voy`), and provides four
+subcommands:
 
 - `doctor` reports build facts, or checks a database connection with `--uri`.
 - `introspect` prints a live database's graph schema.
@@ -32,7 +33,7 @@ grep "voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz" SHA256SUMS | sha2
 # 2. Verify GitHub build provenance (requires GitHub CLI)
 gh attestation verify voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz --repo tanishq-kumar/voyager
 
-# 3. Unpack and put `voyager` and `voy` on your PATH
+# 3. Unpack and put the directory (with `voyager` and its `voy` alias) on your PATH
 tar -xzf voyager-cli-v<version>-x86_64-unknown-linux-musl.tar.gz
 ```
 
@@ -58,11 +59,25 @@ pip install "voyager-ogm[cli]"
 pip install voyager-cli
 ```
 
-Both `voyager` and `voy` are installed. Check the installed version with either:
+Check the installed version:
 
 ```bash
 voyager --version
-voy --version
+```
+
+### The `voy` alias
+
+`voy` is a short alias for `voyager`. The release archives include it: a symlink
+on Linux and macOS, and a `voy.cmd` shim on Windows. `cargo install`,
+`cargo binstall` and `pip` install only `voyager`; add the alias yourself if you
+want it:
+
+```bash
+alias voy=voyager                # bash / zsh
+```
+
+```powershell
+Set-Alias voy voyager            # PowerShell
 ```
 
 ## Exit codes

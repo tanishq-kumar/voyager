@@ -1,6 +1,6 @@
 [package]
 name = "voyager-cli"
-description = "Command-line interface for Voyager OGM (the `voyager` and `voy` binaries)"
+description = "Command-line interface for Voyager OGM (the `voyager` command)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,9 +16,6 @@ default-run = "voyager"
 name = "voyager"
 path = "src/main.rs"
 
-[[bin]]
-name = "voy"
-path = "src/bin/voy.rs"
 
 [lints]
 workspace = true

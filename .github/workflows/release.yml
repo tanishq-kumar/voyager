@@ -293,7 +293,7 @@ jobs:
           "${RUNNER_TEMP}/voyager-base/bin/python" -I scripts/smoke_base_install.py
 
   # =========================================================================
-  # 3c. Build Multi-Platform CLI Binaries (voyager + voy)
+  # 3c. Build Multi-Platform CLI Binaries (voyager; voy is an alias in the archive)
   # =========================================================================
   build-cli:
     name: Build CLI Binaries (${{ matrix.target }})
@@ -361,11 +361,9 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          for bin in voyager voy; do
-            newest=$(readelf --dyn-syms -W "target/${TARGET}/release/${bin}" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
-            echo "${bin}: newest glibc symbol ${newest}"
-            [[ "$(printf '%s\n' "${newest#GLIBC_}" 2.28 | sort -V | tail -1)" == "2.28" ]]
-          done
+          newest=$(readelf --dyn-syms -W "target/${TARGET}/release/voyager" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "voyager: newest glibc symbol ${newest}"
+          [[ "$(printf '%s\n' "${newest#GLIBC_}" 2.28 | sort -V | tail -1)" == "2.28" ]]
 
       - name: Verify Static Linking (Linux musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -374,9 +372,7 @@ jobs:
         run: |
           set -euo pipefail
           file "target/${TARGET}/release/voyager"
-          file "target/${TARGET}/release/voy"
           file "target/${TARGET}/release/voyager" | grep -q 'static'
-          file "target/${TARGET}/release/voy" | grep -q 'static'
 
       - name: Package CLI Archive (Unix)
         if: runner.os != 'Windows'
@@ -389,7 +385,9 @@ jobs:
           PKG_DIR="voyager-cli-v${VERSION}-${TARGET}"
           STAGE="stage/${PKG_DIR}"
           mkdir -p "${STAGE}"
-          cp "target/${TARGET}/release/voyager" "target/${TARGET}/release/voy" "${STAGE}/"
+          cp "target/${TARGET}/release/voyager" "${STAGE}/"
+          # One binary: `voy` is a relative symlink, which tar keeps as a link.
+          ln -s voyager "${STAGE}/voy"
           cp LICENSE-MIT LICENSE-APACHE "${STAGE}/"
           cp crates/voyager-cli/README.md "${STAGE}/README.md"
           tar -C stage -czf "dist/${PKG_DIR}.tar.gz" "${PKG_DIR}"
@@ -406,7 +404,10 @@ jobs:
           $pkgDir = "voyager-cli-v$env:VERSION-$env:TARGET"
           $stage = "stage\$pkgDir"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target\$env:TARGET\release\voyager.exe", "target\$env:TARGET\release\voy.exe", "LICENSE-MIT", "LICENSE-APACHE" -Destination $stage
+          Copy-Item "target\$env:TARGET\release\voyager.exe", "LICENSE-MIT", "LICENSE-APACHE" -Destination $stage
+          # One binary: zip has no symlinks, so `voy` is a shim that runs the
+          # voyager.exe next to it with the same arguments and exit code.
+          Set-Content -Path "$stage\voy.cmd" -Value "@`"%~dp0voyager.exe`" %*`r`n" -NoNewline -Encoding ascii
           Copy-Item "crates\voyager-cli\README.md" -Destination "$stage\README.md"
           Compress-Archive -Path $stage -DestinationPath "dist\$pkgDir.zip" -Force
 
@@ -479,10 +480,13 @@ jobs:
 
           if [[ "${TARGET}" == "x86_64-apple-darwin" ]] && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
             echo "::notice::Rosetta is not available on this macOS arm64 runner; skipping x86_64 execution."
-            file "${BIN_DIR}/voyager" "${BIN_DIR}/voy"
+            file "${BIN_DIR}/voyager"
+            test -L "${BIN_DIR}/voy"
             exit 0
           fi
 
+          test -L "${BIN_DIR}/voy"
+          [[ "$(readlink "${BIN_DIR}/voy")" == "voyager" ]]
           VOYAGER_VER=$(run_bin "${BIN_DIR}/voyager" --version)
           VOY_VER=$(run_bin "${BIN_DIR}/voy" --version)
           echo "voyager --version: ${VOYAGER_VER}"
@@ -502,11 +506,11 @@ jobs:
           $pkgDir = "voyager-cli-v$env:VERSION-$env:TARGET"
           Expand-Archive -Path "dist\$pkgDir.zip" -DestinationPath unpack -Force
           $binDir = "unpack\$pkgDir"
-          foreach ($req in @("voyager.exe", "voy.exe", "LICENSE-MIT", "LICENSE-APACHE", "README.md")) {
+          foreach ($req in @("voyager.exe", "voy.cmd", "LICENSE-MIT", "LICENSE-APACHE", "README.md")) {
             if (-not (Test-Path "$binDir\$req")) { throw "Missing $req in unpacked archive" }
           }
           $voyagerVer = (& "$binDir\voyager.exe" --version).Trim()
-          $voyVer = (& "$binDir\voy.exe" --version).Trim()
+          $voyVer = (& "$binDir\voy.cmd" --version).Trim()
           Write-Host "voyager --version: $voyagerVer"
           Write-Host "voy --version: $voyVer"
           if ($voyagerVer -ne "voyager $env:VERSION") { throw "Unexpected voyager version: $voyagerVer" }
@@ -645,9 +649,7 @@ jobs:
           uv venv --python 3.12 "${RUNNER_TEMP}/voyager-cli-venv"
           uv pip install --python "${RUNNER_TEMP}/voyager-cli-venv/bin/python" --find-links dist "voyager-ogm[cli]"
           VOYAGER_VER=$("${RUNNER_TEMP}/voyager-cli-venv/bin/voyager" --version)
-          VOY_VER=$("${RUNNER_TEMP}/voyager-cli-venv/bin/voy" --version)
           [[ "${VOYAGER_VER}" == "voyager ${VERSION}" ]]
-          [[ "${VOY_VER}" == "voyager ${VERSION}" ]]
           "${RUNNER_TEMP}/voyager-cli-venv/bin/voyager" --help >/dev/null
 
   # =========================================================================

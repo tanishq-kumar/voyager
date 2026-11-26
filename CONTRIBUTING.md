@@ -188,7 +188,7 @@ Voyager is structured as a monorepo:
 
 * `crates/voyager-ogm`: Core query compiler — fluent builder, AST arena, optimizer, multi-dialect emitters (openCypher, SQL:2023 PGQ, ISO GQL, Apache AGE), schema registry, Arrow bridge.
 * `crates/voyager-drivers`: Native async driver layer — Bolt (Neo4j, Memgraph), PostgreSQL wire (Apache AGE, PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)), Redis RESP (FalkorDB), connection pooling, native transactions.
-* `crates/voyager-cli`: The `voyager` binary — diagnostics (`doctor`), plus early `compile`/`bench` placeholders (planned short alias: `voy`).
+* `crates/voyager-cli`: The `voyager` binary — diagnostics (`doctor`), plus early `compile`/`bench` placeholders (the release archives add the short alias `voy`).
 * `crates/voyager-pyo3`: PyO3 native extension for the Python package (not published to crates.io; built into the wheel by maturin).
 * `packages/python/voyager_ogm`: Python SDK — sessions, models, bridges, Polars streaming, graph viewer.
 * `examples/`: Progressive Python learning path (01-31) plus a README cross-indexing the Rust examples in `crates/*/examples/`.

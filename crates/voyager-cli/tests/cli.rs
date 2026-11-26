@@ -1,4 +1,4 @@
-//! Integration tests for the `voyager` and `voy` binaries.
+//! Integration tests for the `voyager` binary (also run as its `voy` alias).
 //!
 //! The parity test compiles every `spec/vectors/valid` document with the CLI and
 //! compares the statement and parameters with the vector's recorded `expected`
@@ -361,17 +361,25 @@ fn introspect_postgres_without_a_username_exits_three() {
     );
 }
 
+/// The release archives install `voy` as a symlink to `voyager`; the program
+/// must behave the same when started under that name.
+#[cfg(unix)]
 #[test]
-fn voy_alias_is_installed_with_the_same_version() {
-    let output = Command::new(env!("CARGO_BIN_EXE_voy"))
+fn voy_symlink_runs_the_same_program() {
+    let dir = std::env::temp_dir().join(format!("voyager-cli-voy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let voy = dir.join("voy");
+    let _ = std::fs::remove_file(&voy);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_voyager"), &voy).expect("create voy symlink");
+    let output = Command::new(&voy)
         .arg("--version")
         .output()
-        .expect("run voy binary");
+        .expect("run voy symlink");
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(
-        stdout(&output).starts_with("voyager "),
-        "{}",
-        stdout(&output)
+    assert_eq!(
+        stdout(&output).trim(),
+        format!("voyager {}", env!("CARGO_PKG_VERSION"))
     );
 }
 
