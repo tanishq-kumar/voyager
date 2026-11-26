@@ -21,8 +21,7 @@
       "status": "supported"
     },
     "sqlpgq": {
-      "status": "known-diff",
-      "reason": "PostgreSQL SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds) rejects returning or aggregating a whole node (COLUMNS (n AS n)) with column \"n\" does not exist; see #286."
+      "status": "supported"
     }
   }
 }
