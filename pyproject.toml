@@ -52,7 +52,7 @@ analytics = [
     "networkx>=3.0.0",
 ]
 cli = [
-    "voyager-cli==0.5.0a0",
+    "voyager-cli==0.5.0a1",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -134,6 +134,7 @@ dev = [
     "traitlets>=5.0.0",
     "ty>=0.0.78",
     "jsonschema>=4.26.0",
+    "hypothesis>=6.170.17",
 ]
 
 [tool.ty.environment]

@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-alpha.1] - 2026-11-27
+
+First alpha of the 0.5 line. The theme is a portable query interchange format and the same values everywhere: Query Spec v1 with a JSON Schema, reference vectors and a conformance corpus, a working `voyager` CLI, live schema introspection, and native backends that return the same Python types as the bridges and the official clients.
+
+Highlights of 0.5.0-alpha.1:
+- **Query Spec v1**: a Rust consumer (#289) with a JSON Schema, reference vectors (#188), strict validation with `INVALID_SPEC` and a JSON Pointer (#187), a revision and compatibility policy (#292), and serialisation from the fluent API (#189).
+- **Conformance corpus**: packs P0-P4 (#253-#258) run live on Neo4j, Memgraph, FalkorDB, Apache AGE and PostgreSQL 19 through three lanes, official clients, Voyager bridges and native (#297). A generated value conformance pack (#299) compares values and Python types across every path.
+- **CLI v1**: `voyager doctor`, `compile`, `validate` and `introspect` (#119, #265), released as binaries for six targets, through `cargo binstall` and as the `voyager-cli` wheel, with `voy` as a short alias (#133).
+- **Same values on every backend**: typed native parameters (#391) and stdlib result types with the new `voyager_ogm.Duration` (#395); `GraphNode`, `GraphRelationship` and `GraphPath` results (#372); decoded Apache AGE results (#353).
+- **Models and schema**: field value constraints (#282), declarative relationship navigation (#121), model schema export (#125), table DDL for SQL/PGQ (#327).
+- **TLS for the native drivers** (#219).
+
+Breaking changes (details in the entries below):
+- Result values: native backends return stdlib Python types and `Duration` instead of strings (#395); native PostgreSQL parameters are typed, so comparing a text column with a `UUID` or `datetime` parameter needs a cast (#391); Rust `QueryResult` is `#[non_exhaustive]`.
+- Entities: whole nodes, relationships and paths come back as `GraphNode` / `GraphRelationship` / `GraphPath` on every engine (#372); Apache AGE results are decoded (#353) and a single whole entity is keyed by its variable (#285); AGE and SQL/PGQ column aliases keep their case (#377).
+- Query Spec v1 is strict: one spelling per construct (#292), invalid, dropped or misattached clauses raise `INVALID_SPEC` (#187), and references the emission order cannot honour are rejected (#271).
+- Fluent API: variable scope is checked before compiling (#287) and aggregations must sit in a projection (#272).
+- Models: `Field` nullability is inferred from the type annotation (#332).
+- SQL/PGQ property-graph DDL names tables and edge keys consistently (#325); SQL/PGQ on PostgreSQL is experimental (#373).
+- The FalkorDB driver bridge honours the graph name from `graph_name=` or the URI (#339).
+
 ### Added
+- **Value Conformance Pack (#299)**: a live, Hypothesis-generated differential test pack (`packages/python/tests/values/`) runs 19 value kinds through every engine (Neo4j, Memgraph, FalkorDB, Apache AGE, PostgreSQL 19, DuckDB) and compares value and Python type across the official client, the bridge, the native backend and native `execute_to_arrow()` / `execute_to_polars()`, as a parameter, stored as a property or column, nested in lists and maps, as node and relationship properties, and inside a transaction. `just values-live [engine] [--seed N] [--examples N] [--exploratory]` runs it (fixed seed by default, an opt-in exploratory profile), a failure prints a per-stage trace (Python value, Voyager parameter, wire encoding, server type, Arrow type, Python result), every run writes an engine x backend x value-kind matrix to `target/values-conformance/`, and `known_differences.json` records each accepted difference with a reason (and issue number for bugs); an entry that stops occurring fails the run. Adds the diagnostic `voyager_ogm._voyager_rs.inspect_native_wire()` and the `hypothesis` dev dependency.
 - **Query Spec v1 Revisioning and Compatibility Policy (#292)**: Query Spec v1 now has a revision alongside its major version. Documents may carry an optional integer `spec_revision` (minimum 1) at the root and in nested specs; a missing or `null` value means revision 1, today's format. The Rust core is the source of truth through `voyager_ogm::spec::SPEC_VERSION` and `voyager_ogm::spec::SPEC_REVISION`, Python exposes `voyager_ogm.QUERY_SPEC_VERSION` / `voyager_ogm.QUERY_SPEC_REVISION`, and `voyager doctor` prints the supported `query spec: v1 revision 1`. A document that requires a newer revision is rejected with `INVALID_SPEC` at `/spec_revision` and a message naming the supported revision. `Query.to_spec_dict()` and `Expression.to_spec_dict()` now emit `spec_revision`, so exported documents are self-describing. The schema keeps its stable v1 `$id` and records the revision in a new `x-spec-revision` annotation; `spec/README.md` gains a "Compatibility and versioning" section covering the major + revision rule, what counts as an addition versus a break, the 1.0.0 guarantee (0.x may still break, with each change bumping the revision and listed as breaking), the pre-optimisation export guarantee, and the revision-bump checklist.
 - **Multi-Platform CLI Release Binaries, `cargo-binstall` Metadata, and `voyager-cli` Python Wheel (#133)**: `.github/workflows/release.yml` now builds, smoke-tests, and attests standalone `voyager` archives (`voyager-cli-v<version>-<target>.tar.gz` / `.zip`) across six targets (`x86_64-unknown-linux-gnu`, static `x86_64-unknown-linux-musl` with rustls/ring, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, and `x86_64-pc-windows-msvc`), attaches them with `SHA256SUMS` and `actions/attest-build-provenance` provenance to the GitHub Release, adds `[package.metadata.binstall]` to `crates/voyager-cli/Cargo.toml` for `cargo binstall voyager-cli`, and builds/publishes the lockstep `voyager-cli` Python wheel (`packages/cli/pyproject.toml`, `bindings = "bin"`) wired into `voyager-ogm[cli]` and verified by `scripts/check_version_sync.py`. The Linux `-gnu` binaries are linked against glibc 2.28, the same baseline as the manylinux_2_28 wheels. The CLI is a single `voyager` binary: the archives add the short alias `voy` as a symlink (a `voy.cmd` shim on Windows), while `cargo install`, `cargo binstall` and the wheel install `voyager` only.
 - **Live Corpus Voyager Lanes (#297)**: the live conformance corpus now runs each scenario through three lanes: `official` (today's engine clients and the AGE/SQL-PGQ `Session` reference path), `bridge` (`Session` over the Python bridges) and `native` (`Session(..., backend="native")` over `voyager-drivers` for Neo4j, Memgraph, FalkorDB, Apache AGE and PostgreSQL 19 SQL/PGQ). Fixtures load through the same official loaders, so only statement execution differs. `just corpus-live [engine] [lane]` selects one engine/lane or all, defaults to the previous `official`-only behaviour, and prints a per-lane/per-engine pass/fail/skip summary. Differences are compared structurally (scenario, lane, engine, column, expected, actual) against canonical `rows.json` values including node labels and relationship types. Reviewed differences live in `spec/corpus/known-lane-differences.json`; an unexplained difference fails, and an entry that no longer matches fails with "known lane difference is fixed, remove from ...". `spec/corpus/README.md` documents the lanes, the list and the commands.
@@ -505,7 +527,9 @@ Breaking changes in the 0.4 line are marked **Breaking** in the sections below (
 
 
 
-[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.4.3...HEAD
+
+[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.5.0-alpha.1...HEAD
+[0.5.0-alpha.1]: https://github.com/tanishq-kumar/voyager/compare/v0.4.3...v0.5.0-alpha.1
 [0.4.3]: https://github.com/tanishq-kumar/voyager/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tanishq-kumar/voyager/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tanishq-kumar/voyager/compare/v0.4.0...v0.4.1
