@@ -154,20 +154,23 @@ impl BoltConnection<NetStream> {
 
         let major = version_resp[3];
         let minor = version_resp[2];
+        let is_proposed = version_resp[0] == 0
+            && version_resp[1] == 0
+            && ((major == 5 && (0..=4).contains(&minor))
+                || (major == 4 && (2..=4).contains(&minor)));
+        if !is_proposed {
+            return Err(NetError::ProtocolError(format!(
+                "Bolt server returned invalid or unproposed protocol version bytes: {:02x?}",
+                version_resp
+            )));
+        }
         let version = BoltVersion { major, minor };
         debug!("Negotiated Bolt protocol version v{}.{}", major, minor);
 
         // 3. Send HELLO / Auth Handshake
-        let auth_pair = match &config.auth {
-            Auth::Basic {
-                username, password, ..
-            } => Some((username.as_str(), password.as_str())),
-            _ => match &uri.auth {
-                Auth::Basic {
-                    username, password, ..
-                } => Some((username.as_str(), password.as_str())),
-                _ => None,
-            },
+        let auth: &Auth = match &config.auth {
+            Auth::None => &uri.auth,
+            other => other,
         };
 
         let db = config.database.as_deref().or(uri.database.as_deref());
@@ -229,7 +232,7 @@ impl BoltConnection<NetStream> {
             }
 
             // 3b. Send LOGON
-            let logon_req = BoltRequest::logon(auth_pair);
+            let logon_req = BoltRequest::logon_with_auth(auth);
             conn.send_request(&logon_req).await?;
             let resp = conn.receive_response().await?;
 
@@ -262,9 +265,9 @@ impl BoltConnection<NetStream> {
             } else {
                 &[]
             };
-            let hello_req = BoltRequest::hello_legacy_with_patches(
+            let hello_req = BoltRequest::hello_legacy_with_auth(
                 concat!("Voyager-OGM/", env!("CARGO_PKG_VERSION")),
-                auth_pair,
+                auth,
                 db,
                 patches,
             );
@@ -531,6 +534,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         QuerySummary,
         Option<(String, String)>,
     )> {
+        if !self.is_valid {
+            return Err(NetError::Closed(
+                "Bolt connection is closed or broken".to_string(),
+            ));
+        }
+
         // 1. Pipeline RUN + PULL
         let run_req = BoltRequest::Run {
             query: query.to_string(),
@@ -548,6 +557,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         pull_req.encode(&mut pull_payload);
         encode_chunks(&pull_payload, &mut write_buf);
 
+        self.is_valid = false;
         write_message_frame(&mut self.stream, &write_buf).await?;
 
         let mut collected_metadata = HashMap::new();
@@ -576,8 +586,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Query failed");
-                let _ = self.receive_response().await;
-                let _ = self.reset().await;
+                self.receive_response().await?;
+                self.reset_inner().await?;
                 return Err(NetError::ProtocolError(format!("{}: {}", code, msg)));
             }
             other => {
@@ -607,6 +617,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     }
                     collected_metadata.extend(metadata.clone());
                     self.last_metadata = Some(collected_metadata);
+                    self.is_valid = true;
                     break Self::parse_summary_metrics(&metadata);
                 }
                 BoltResponse::Failure { metadata } => {
@@ -618,7 +629,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Stream record failed");
-                    let _ = self.reset().await;
+                    self.reset_inner().await?;
                     stream_err = Some((code.to_string(), msg.to_string()));
                     break QuerySummary::default();
                 }
@@ -647,6 +658,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         timeout_ms: Option<i64>,
         bookmarks: Option<Vec<String>>,
     ) -> Result<()> {
+        if !self.is_valid {
+            return Err(NetError::Closed(
+                "Bolt connection is closed or broken".to_string(),
+            ));
+        }
+
         let mut extra = HashMap::new();
         if let Some(db) = database {
             extra.insert("db".to_string(), BoltValue::String(db.to_string()));
@@ -661,11 +678,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             let bm_vals: Vec<BoltValue> = bms.into_iter().map(BoltValue::String).collect();
             extra.insert("bookmarks".to_string(), BoltValue::List(bm_vals));
         }
+        self.is_valid = false;
         self.send_request(&BoltRequest::Begin { extra }).await?;
         let resp = self.receive_response().await?;
         match resp {
             BoltResponse::Success { .. } => {
                 self.in_transaction = true;
+                self.is_valid = true;
                 Ok(())
             }
             BoltResponse::Failure { metadata } => {
@@ -677,7 +696,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Begin transaction failed");
-                let _ = self.reset().await;
+                self.reset_inner().await?;
                 Err(NetError::ProtocolError(format!("{}: {}", code, msg)))
             }
             other => Err(NetError::ProtocolError(format!(
@@ -689,11 +708,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
 
     /// Commits an open explicit transaction.
     pub async fn commit_tx(&mut self) -> Result<()> {
+        if !self.is_valid {
+            return Err(NetError::Closed(
+                "Bolt connection is closed or broken".to_string(),
+            ));
+        }
+
+        self.is_valid = false;
         self.send_request(&BoltRequest::Commit).await?;
         let resp = self.receive_response().await?;
         match resp {
             BoltResponse::Success { metadata } => {
                 self.in_transaction = false;
+                self.is_valid = true;
                 if let Some(BoltValue::String(bm)) = metadata.get("bookmark") {
                     self.last_bookmark = Some(bm.clone());
                 } else if let Some(BoltValue::List(bms)) = metadata.get("bookmarks")
@@ -713,7 +740,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Commit transaction failed");
-                let _ = self.reset().await;
+                self.reset_inner().await?;
                 Err(NetError::ProtocolError(format!("{}: {}", code, msg)))
             }
             other => {
@@ -728,11 +755,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
 
     /// Aborts and rolls back an open explicit transaction.
     pub async fn rollback_tx(&mut self) -> Result<()> {
+        if !self.is_valid {
+            return Err(NetError::Closed(
+                "Bolt connection is closed or broken".to_string(),
+            ));
+        }
+
+        self.is_valid = false;
         self.send_request(&BoltRequest::Rollback).await?;
         let resp = self.receive_response().await?;
         match resp {
             BoltResponse::Success { .. } => {
                 self.in_transaction = false;
+                self.is_valid = true;
                 Ok(())
             }
             BoltResponse::Failure { metadata } => {
@@ -745,7 +780,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Rollback transaction failed");
-                let _ = self.reset().await;
+                self.reset_inner().await?;
                 Err(NetError::ProtocolError(format!("{}: {}", code, msg)))
             }
             other => {
@@ -809,7 +844,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         pull_req.encode(&mut pull_payload);
         encode_chunks(&pull_payload, &mut write_buf);
 
-        // Send pipelined requests
+        // Send pipelined requests with sticky invalidation until terminal response
+        self.is_valid = false;
         write_message_frame(&mut self.stream, &write_buf).await?;
 
         // 2. Receive RUN response (Expect SUCCESS with column fields)
@@ -834,9 +870,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Query failed");
                 // Consume in-flight IGNORED response from pipelined PULL
-                let _ = self.receive_response().await;
+                self.receive_response().await?;
                 // Issue RESET to clear failure state
-                let _ = self.reset().await;
+                self.reset_inner().await?;
                 return Err(NetError::ProtocolError(format!("{}: {}", code, msg)));
             }
             other => {
@@ -857,6 +893,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     records.push(fields);
                 }
                 BoltResponse::Success { metadata } => {
+                    self.is_valid = true;
                     break Self::parse_summary_metrics(&metadata);
                 }
                 BoltResponse::Failure { metadata } => {
@@ -868,7 +905,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Stream record failed");
-                    let _ = self.reset().await;
+                    self.reset_inner().await?;
                     return Err(NetError::ProtocolError(format!("{}: {}", code, msg)));
                 }
                 other => {
@@ -897,6 +934,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             Ok(result.with_bolt_rows(records))
         } else {
             Ok(result)
+        }
+    }
+    /// Sends `RESET` without requiring `is_valid == true`, used for failure recovery inside
+    /// an already-locked in-flight request while keeping `is_valid` false if recovery fails.
+    async fn reset_inner(&mut self) -> Result<()> {
+        self.is_valid = false;
+        self.send_request(&BoltRequest::Reset).await?;
+        let resp = self.receive_response().await?;
+        match resp {
+            BoltResponse::Success { .. } => {
+                self.in_transaction = false;
+                self.is_valid = true;
+                Ok(())
+            }
+            BoltResponse::Failure { metadata } => {
+                let msg = metadata
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Reset failed");
+                Err(NetError::ProtocolError(format!("RESET failed: {}", msg)))
+            }
+            other => Err(NetError::ProtocolError(format!(
+                "Unexpected RESET response: {:?}",
+                other
+            ))),
         }
     }
 }
@@ -932,29 +994,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
     }
 
     async fn reset(&mut self) -> Result<()> {
-        self.send_request(&BoltRequest::Reset).await?;
-        let resp = self.receive_response().await?;
-        match resp {
-            BoltResponse::Success { .. } => {
-                self.in_transaction = false;
-                Ok(())
-            }
-            BoltResponse::Failure { metadata } => {
-                self.is_valid = false;
-                let msg = metadata
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Reset failed");
-                Err(NetError::ProtocolError(format!("RESET failed: {}", msg)))
-            }
-            other => {
-                self.is_valid = false;
-                Err(NetError::ProtocolError(format!(
-                    "Unexpected RESET response: {:?}",
-                    other
-                )))
-            }
+        if !self.is_valid {
+            return Err(NetError::Closed(
+                "Bolt connection is closed or broken".to_string(),
+            ));
         }
+        self.reset_inner().await
     }
 
     fn is_valid(&self) -> bool {

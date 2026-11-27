@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::config::{Auth, TlsMode};
 use crate::error::{NetError, Result};
-use crate::redact::{RedactedParams, redact_uri};
+use crate::redact::{RedactedParams, redact_uri, redact_userinfo};
 
 /// Supported graph and relational wire database protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -340,11 +340,21 @@ impl fmt::Display for ParsedUri {
 /// user name, but it finds the user information by the first `/`, `?` or `#`; when a password
 /// contains one of those it masks nothing, so the whole user information is hidden instead.
 fn redact_malformed_uri(uri: &str) -> String {
-    let redacted = redact_uri(uri);
-    if redacted == uri {
+    let userinfo_redacted = redact_userinfo(uri);
+    let has_split_at_before_query = uri
+        .find("://")
+        .map(|pos| &uri[pos + 3..])
+        .map(|rest| {
+            let before_query = rest.split(['?', '#']).next().unwrap_or(rest);
+            let auth_end = before_query.find('/').unwrap_or(before_query.len());
+            before_query[auth_end..].contains('@')
+        })
+        .unwrap_or(false);
+
+    if userinfo_redacted == uri || has_split_at_before_query {
         redact_uri(&redact_credentials(uri))
     } else {
-        redacted
+        redact_uri(&userinfo_redacted)
     }
 }
 
@@ -425,6 +435,14 @@ mod tests {
             rendered.contains("bolt://neo4j:***@db:not-a-port"),
             "{rendered}"
         );
+
+        let slash_err = ParsedUri::parse(&format!(
+            "bolt://neo4j:pa/ss{SECRET}@db:not-a-port?token=tok{SECRET}"
+        ))
+        .expect_err("port is not a number");
+        let slash_rendered = slash_err.to_string();
+        assert!(!slash_rendered.contains(SECRET), "{slash_rendered}");
+        assert!(slash_rendered.contains("token=***"), "{slash_rendered}");
     }
 
     #[test]

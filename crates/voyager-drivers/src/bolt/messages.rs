@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use super::packstream::{BoltValue, PackStream};
+use crate::config::Auth;
 use crate::error::{NetError, Result};
 use crate::redact::is_sensitive_key;
 
@@ -127,6 +128,36 @@ fn build_bolt_agent_map() -> HashMap<String, BoltValue> {
     bolt_agent
 }
 
+fn insert_auth_fields(map: &mut HashMap<String, BoltValue>, auth: &Auth) {
+    match auth {
+        Auth::Basic {
+            username,
+            password,
+            realm,
+        } => {
+            map.insert("scheme".to_string(), BoltValue::String("basic".to_string()));
+            map.insert("principal".to_string(), BoltValue::String(username.clone()));
+            map.insert(
+                "credentials".to_string(),
+                BoltValue::String(password.clone()),
+            );
+            if let Some(r) = realm {
+                map.insert("realm".to_string(), BoltValue::String(r.clone()));
+            }
+        }
+        Auth::Bearer { token } => {
+            map.insert(
+                "scheme".to_string(),
+                BoltValue::String("bearer".to_string()),
+            );
+            map.insert("credentials".to_string(), BoltValue::String(token.clone()));
+        }
+        Auth::None => {
+            map.insert("scheme".to_string(), BoltValue::String("none".to_string()));
+        }
+    }
+}
+
 impl BoltRequest {
     /// Creates a Bolt v5.1-v5.2 `HELLO` message (without inline auth or `bolt_agent`).
     pub fn hello_v51(user_agent: &str, routing: Option<HashMap<String, BoltValue>>) -> Self {
@@ -178,6 +209,24 @@ impl BoltRequest {
         database: Option<&str>,
         patch_bolt: &[&str],
     ) -> Self {
+        let auth = match auth_scheme {
+            Some((u, p)) => Auth::Basic {
+                username: u.to_string(),
+                password: p.to_string(),
+                realm: None,
+            },
+            None => Auth::None,
+        };
+        Self::hello_legacy_with_auth(user_agent, &auth, database, patch_bolt)
+    }
+
+    /// Creates a legacy Bolt (<= v5.0) `HELLO` message supporting all [`Auth`] schemes and `patch_bolt`.
+    pub fn hello_legacy_with_auth(
+        user_agent: &str,
+        auth: &Auth,
+        database: Option<&str>,
+        patch_bolt: &[&str],
+    ) -> Self {
         let mut extra = HashMap::new();
         extra.insert(
             "user_agent".to_string(),
@@ -200,19 +249,7 @@ impl BoltRequest {
             );
         }
 
-        if let Some((username, password)) = auth_scheme {
-            extra.insert("scheme".to_string(), BoltValue::String("basic".to_string()));
-            extra.insert(
-                "principal".to_string(),
-                BoltValue::String(username.to_string()),
-            );
-            extra.insert(
-                "credentials".to_string(),
-                BoltValue::String(password.to_string()),
-            );
-        } else {
-            extra.insert("scheme".to_string(), BoltValue::String("none".to_string()));
-        }
+        insert_auth_fields(&mut extra, auth);
 
         if let Some(db) = database {
             extra.insert("db".to_string(), BoltValue::String(db.to_string()));
@@ -223,20 +260,21 @@ impl BoltRequest {
 
     /// Creates a Bolt v5.1+ `LOGON` request message.
     pub fn logon(auth_scheme: Option<(&str, &str)>) -> Self {
+        let auth = match auth_scheme {
+            Some((u, p)) => Auth::Basic {
+                username: u.to_string(),
+                password: p.to_string(),
+                realm: None,
+            },
+            None => Auth::None,
+        };
+        Self::logon_with_auth(&auth)
+    }
+
+    /// Creates a Bolt v5.1+ `LOGON` request message supporting all [`Auth`] schemes.
+    pub fn logon_with_auth(auth_scheme: &Auth) -> Self {
         let mut auth = HashMap::new();
-        if let Some((username, password)) = auth_scheme {
-            auth.insert("scheme".to_string(), BoltValue::String("basic".to_string()));
-            auth.insert(
-                "principal".to_string(),
-                BoltValue::String(username.to_string()),
-            );
-            auth.insert(
-                "credentials".to_string(),
-                BoltValue::String(password.to_string()),
-            );
-        } else {
-            auth.insert("scheme".to_string(), BoltValue::String("none".to_string()));
-        }
+        insert_auth_fields(&mut auth, auth_scheme);
         Self::Logon { auth }
     }
 

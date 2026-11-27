@@ -321,6 +321,7 @@ struct CircuitInner {
     consecutive_failures: u32,
     consecutive_successes: u32,
     opened_at: Option<Instant>,
+    probe_in_flight: bool,
     config: CircuitConfig,
 }
 
@@ -331,6 +332,7 @@ impl CircuitInner {
             consecutive_failures: 0,
             consecutive_successes: 0,
             opened_at: None,
+            probe_in_flight: false,
             config,
         }
     }
@@ -342,6 +344,7 @@ impl CircuitInner {
         {
             self.state = CircuitState::HalfOpen;
             self.consecutive_successes = 0;
+            self.probe_in_flight = false;
         }
     }
 }
@@ -384,7 +387,14 @@ impl CircuitRouter {
         match inner.state {
             CircuitState::Closed => BackendRoute::Native,
             CircuitState::Open => BackendRoute::Fallback,
-            CircuitState::HalfOpen => BackendRoute::Probe,
+            CircuitState::HalfOpen => {
+                if inner.probe_in_flight {
+                    BackendRoute::Fallback
+                } else {
+                    inner.probe_in_flight = true;
+                    BackendRoute::Probe
+                }
+            }
         }
     }
 
@@ -392,7 +402,7 @@ impl CircuitRouter {
     pub fn should_probe(&self) -> bool {
         let mut inner = self.inner.lock();
         inner.check_and_update_state(Instant::now());
-        inner.state == CircuitState::HalfOpen
+        inner.state == CircuitState::HalfOpen && !inner.probe_in_flight
     }
 
     /// Returns `true` if the query should be routed to the native engine (either normal or probe).
@@ -411,6 +421,7 @@ impl CircuitRouter {
                 inner.consecutive_failures = 0;
             }
             CircuitState::HalfOpen => {
+                inner.probe_in_flight = false;
                 inner.consecutive_successes += 1;
                 if inner.consecutive_successes >= inner.config.success_threshold {
                     inner.state = CircuitState::Closed;
@@ -445,6 +456,7 @@ impl CircuitRouter {
                     inner.state = CircuitState::Open;
                     inner.opened_at = Some(Instant::now());
                     inner.consecutive_successes = 0;
+                    inner.probe_in_flight = false;
                 }
             }
             CircuitState::HalfOpen => {
@@ -452,6 +464,7 @@ impl CircuitRouter {
                 inner.consecutive_failures += 1;
                 inner.opened_at = Some(Instant::now());
                 inner.consecutive_successes = 0;
+                inner.probe_in_flight = false;
             }
             CircuitState::Open => {
                 inner.consecutive_failures += 1;
@@ -481,6 +494,7 @@ impl CircuitRouter {
         inner.opened_at = Some(Instant::now());
         inner.consecutive_successes = 0;
         inner.consecutive_failures += 1;
+        inner.probe_in_flight = false;
     }
 
     /// Manually resets the circuit breaker to `Closed`, clearing all counters and cooldowns.
@@ -490,6 +504,7 @@ impl CircuitRouter {
         inner.consecutive_failures = 0;
         inner.consecutive_successes = 0;
         inner.opened_at = None;
+        inner.probe_in_flight = false;
     }
 
     /// Returns the current count of consecutive transient failures.
@@ -624,11 +639,13 @@ mod tests {
         // Wait for cooldown to expire
         std::thread::sleep(Duration::from_millis(35));
 
-        // State transitions to HalfOpen, route becomes Probe
+        // State transitions to HalfOpen; only one concurrent caller gets Probe
         assert_eq!(router.state(), CircuitState::HalfOpen);
-        assert_eq!(router.route(), BackendRoute::Probe);
         assert!(router.should_probe());
-        assert!(router.should_route_native());
+        assert_eq!(router.route(), BackendRoute::Probe);
+        assert!(!router.should_probe());
+        assert_eq!(router.route(), BackendRoute::Fallback);
+        assert!(!router.should_route_native());
 
         // Probe succeeds -> restored to Closed
         router.record_success();
@@ -728,5 +745,33 @@ mod tests {
         assert_eq!(snap.state, CircuitState::Open);
         assert!(snap.remaining_cooldown_seconds.is_some());
         assert!(snap.remaining_cooldown_seconds.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_half_open_allows_only_single_probe_in_flight() {
+        let config = CircuitConfig::new(1, Duration::from_millis(15)).with_success_threshold(2);
+        let router = CircuitRouter::new(config);
+
+        router.record_failure(true);
+        assert_eq!(router.state(), CircuitState::Open);
+
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(router.state(), CircuitState::HalfOpen);
+
+        // Concurrent callers: only the first receives Probe; others stay on Fallback.
+        assert_eq!(router.route(), BackendRoute::Probe);
+        assert_eq!(router.route(), BackendRoute::Fallback);
+        assert_eq!(router.route(), BackendRoute::Fallback);
+
+        // First probe succeeds (threshold=2 -> stays HalfOpen, clears probe_in_flight).
+        router.record_success();
+        assert_eq!(router.state(), CircuitState::HalfOpen);
+        assert_eq!(router.route(), BackendRoute::Probe);
+        assert_eq!(router.route(), BackendRoute::Fallback);
+
+        // Second probe succeeds -> transitions to Closed.
+        router.record_success();
+        assert_eq!(router.state(), CircuitState::Closed);
+        assert_eq!(router.route(), BackendRoute::Native);
     }
 }

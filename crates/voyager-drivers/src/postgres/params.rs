@@ -21,8 +21,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
-use crate::error::Result;
+use crate::error::{NetError, Result};
 use crate::params::{ParamValue, format_datetime_iso, format_iso_date, format_iso_time};
+
+const MAX_NESTING_DEPTH: usize = 64;
 
 /// Placeholder convention detected in a compiled statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +91,7 @@ pub fn prepare_postgres_statement(
         }
     }
 
-    let (statement, bound) = rewrite_named_placeholders(query, params);
+    let (statement, bound) = rewrite_named_placeholders(query, params)?;
     if bound.is_empty() {
         return Ok(unparameterized(query));
     }
@@ -161,14 +163,14 @@ fn value_oid(value: &ParamValue) -> i32 {
 /// With an explicit JSON cast (or a `Json(...)` wrapper) every list, including
 /// `[]` and `[[]]`, is encoded as one JSON document, so `[]` is never sent as a
 /// JSON object.
-fn bind_value(value: &ParamValue, force_json: bool) -> BoundParameter {
+fn bind_value(value: &ParamValue, force_json: bool) -> Result<BoundParameter> {
     if let ParamValue::Jsonb(inner) = value {
-        return (Some(json_param_text(inner)), parameter_oids::JSONB);
+        return Ok((Some(json_param_text(inner)?), parameter_oids::JSONB));
     }
     if force_json || value_requires_json(value) {
-        return (Some(json_param_text(value)), parameter_oids::JSONB);
+        return Ok((Some(json_param_text(value)?), parameter_oids::JSONB));
     }
-    (value_to_text(value), value_oid(value))
+    Ok((value_to_text(value)?, value_oid(value)))
 }
 
 /// Returns `true` when a value must be encoded as a JSON document rather than a
@@ -215,8 +217,8 @@ fn param_array_oid(items: &[ParamValue]) -> Option<i32> {
     for item in items {
         let candidate = match item {
             ParamValue::Json(Value::Null) => continue,
-            ParamValue::List(nested) => base_param_array_element_oid(nested)?,
-            ParamValue::Json(Value::Array(nested)) => base_json_array_element_oid(nested)?,
+            ParamValue::List(nested) => base_param_array_element_oid(nested, 1)?,
+            ParamValue::Json(Value::Array(nested)) => base_json_array_element_oid(nested, 1)?,
             other => param_element_oid(other)?,
         };
         match element_oid {
@@ -242,12 +244,17 @@ fn param_element_oid(value: &ParamValue) -> Option<i32> {
     }
 }
 
-fn base_param_array_element_oid(items: &[ParamValue]) -> Option<i32> {
+fn base_param_array_element_oid(items: &[ParamValue], depth: usize) -> Option<i32> {
+    if depth > MAX_NESTING_DEPTH {
+        return None;
+    }
     for item in items {
         match item {
             ParamValue::Json(Value::Null) => continue,
-            ParamValue::List(nested) => return base_param_array_element_oid(nested),
-            ParamValue::Json(Value::Array(nested)) => return base_json_array_element_oid(nested),
+            ParamValue::List(nested) => return base_param_array_element_oid(nested, depth + 1),
+            ParamValue::Json(Value::Array(nested)) => {
+                return base_json_array_element_oid(nested, depth + 1);
+            }
             other => return param_element_oid(other),
         }
     }
@@ -286,7 +293,7 @@ fn json_array_oid(items: &[Value]) -> Option<i32> {
     for item in items {
         let candidate = match item {
             Value::Null => continue,
-            Value::Array(nested) => base_json_array_element_oid(nested)?,
+            Value::Array(nested) => base_json_array_element_oid(nested, 1)?,
             Value::Object(_) => parameter_oids::JSONB,
             other => scalar_json_oid(other)?,
         };
@@ -301,11 +308,14 @@ fn json_array_oid(items: &[Value]) -> Option<i32> {
 }
 
 /// Returns the scalar element OID nested inside a JSON list.
-fn base_json_array_element_oid(items: &[Value]) -> Option<i32> {
+fn base_json_array_element_oid(items: &[Value], depth: usize) -> Option<i32> {
+    if depth > MAX_NESTING_DEPTH {
+        return None;
+    }
     for item in items {
         match item {
             Value::Null => continue,
-            Value::Array(nested) => return base_json_array_element_oid(nested),
+            Value::Array(nested) => return base_json_array_element_oid(nested, depth + 1),
             Value::Object(_) => return Some(parameter_oids::JSONB),
             other => return scalar_json_oid(other),
         }
@@ -351,7 +361,7 @@ fn age_parameter_map(params: &HashMap<String, ParamValue>) -> Result<Vec<u8>> {
         }
         push_json_string(key, &mut out);
         out.push(':');
-        write_json_param(value, &mut out);
+        write_json_param(value, &mut out, 0)?;
     }
     out.push('}');
     Ok(out.into_bytes())
@@ -421,7 +431,7 @@ type BoundParameter = (Option<Vec<u8>>, i32);
 fn rewrite_named_placeholders(
     query: &str,
     params: &HashMap<String, ParamValue>,
-) -> (String, Vec<BoundParameter>) {
+) -> Result<(String, Vec<BoundParameter>)> {
     let bytes = query.as_bytes();
     let mut out = String::with_capacity(query.len());
     let mut bound: Vec<BoundParameter> = Vec::new();
@@ -481,7 +491,7 @@ fn rewrite_named_placeholders(
                                 let index = bound.len() + 1;
                                 indices.insert(name.to_string(), index);
                                 let force_json = placeholder_forces_json(bytes, name_end);
-                                bound.push(bind_value(value, force_json));
+                                bound.push(bind_value(value, force_json)?);
                                 index
                             }
                         };
@@ -503,7 +513,7 @@ fn rewrite_named_placeholders(
         }
     }
 
-    (out, bound)
+    Ok((out, bound))
 }
 
 /// Returns `true` when the placeholder ending at `pos` is explicitly cast to
@@ -567,16 +577,21 @@ fn format_pg_interval(months: i64, days: i64, seconds: i64, nanoseconds: i64) ->
 /// Finite floats use the shortest round-trip representation. Non-finite floats
 /// are written as `NaN` / `Infinity` / `-Infinity`, which PostgreSQL `jsonb`
 /// (and Apache AGE `agtype`) accept even though they are not standard JSON.
-fn json_param_text(value: &ParamValue) -> Vec<u8> {
+fn json_param_text(value: &ParamValue) -> Result<Vec<u8>> {
     let mut out = String::new();
-    write_json_param(value, &mut out);
-    out.into_bytes()
+    write_json_param(value, &mut out, 0)?;
+    Ok(out.into_bytes())
 }
 
-fn write_json_param(value: &ParamValue, out: &mut String) {
+fn write_json_param(value: &ParamValue, out: &mut String, depth: usize) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(NetError::ProtocolError(format!(
+            "PostgreSQL JSON parameter exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
     match value {
-        ParamValue::Json(v) => write_json_value(v, out),
-        ParamValue::Jsonb(inner) => write_json_param(inner, out),
+        ParamValue::Json(v) => write_json_value(v, out, depth)?,
+        ParamValue::Jsonb(inner) => write_json_param(inner, out, depth + 1)?,
         ParamValue::Float(f) => write_json_f64(*f, out),
         ParamValue::List(items) => {
             out.push('[');
@@ -584,7 +599,7 @@ fn write_json_param(value: &ParamValue, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                write_json_param(item, out);
+                write_json_param(item, out, depth + 1)?;
             }
             out.push(']');
         }
@@ -598,15 +613,21 @@ fn write_json_param(value: &ParamValue, out: &mut String) {
                 }
                 push_json_string(key, out);
                 out.push(':');
-                write_json_param(item, out);
+                write_json_param(item, out, depth + 1)?;
             }
             out.push('}');
         }
-        other => write_json_value(&other.to_json_value(), out),
+        other => write_json_value(&other.to_json_value(), out, depth)?,
     }
+    Ok(())
 }
 
-fn write_json_value(value: &Value, out: &mut String) {
+fn write_json_value(value: &Value, out: &mut String, depth: usize) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(NetError::ProtocolError(format!(
+            "PostgreSQL JSON parameter exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
     match value {
         Value::Array(items) => {
             out.push('[');
@@ -614,7 +635,7 @@ fn write_json_value(value: &Value, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                write_json_value(item, out);
+                write_json_value(item, out, depth + 1)?;
             }
             out.push(']');
         }
@@ -626,7 +647,7 @@ fn write_json_value(value: &Value, out: &mut String) {
                 }
                 push_json_string(key, out);
                 out.push(':');
-                write_json_value(item, out);
+                write_json_value(item, out, depth + 1)?;
             }
             out.push('}');
         }
@@ -635,6 +656,7 @@ fn write_json_value(value: &Value, out: &mut String) {
             Err(_) => out.push_str("null"),
         },
     }
+    Ok(())
 }
 
 fn write_json_f64(value: f64, out: &mut String) {
@@ -662,10 +684,10 @@ fn push_json_string(value: &str, out: &mut String) {
 }
 
 /// Encodes a typed parameter as PostgreSQL text-format `Bind` bytes.
-fn value_to_text(value: &ParamValue) -> Option<Vec<u8>> {
-    match value {
-        ParamValue::Json(v) => json_to_text(v),
-        ParamValue::Jsonb(inner) => Some(json_param_text(inner)),
+fn value_to_text(value: &ParamValue) -> Result<Option<Vec<u8>>> {
+    Ok(match value {
+        ParamValue::Json(v) => json_to_text(v)?,
+        ParamValue::Jsonb(inner) => Some(json_param_text(inner)?),
         ParamValue::Float(f) => Some(format_pg_float(*f).into_bytes()),
         ParamValue::Bytes(b) => Some(format!("\\x{}", hex::encode(b)).into_bytes()),
         ParamValue::Date { year, month, day } => {
@@ -713,15 +735,15 @@ fn value_to_text(value: &ParamValue) -> Option<Vec<u8>> {
         }
         ParamValue::List(items) => {
             let mut out = String::new();
-            encode_pg_param_array(items, &mut out);
+            encode_pg_param_array(items, &mut out, 0)?;
             Some(out.into_bytes())
         }
         ParamValue::Map(_) => serde_json::to_vec(&value.to_json_value()).ok(),
-    }
+    })
 }
 
-fn json_to_text(value: &Value) -> Option<Vec<u8>> {
-    match value {
+fn json_to_text(value: &Value) -> Result<Option<Vec<u8>>> {
+    Ok(match value {
         Value::Null => None,
         Value::String(s) => Some(s.as_bytes().to_vec()),
         Value::Bool(b) => Some(if *b {
@@ -732,29 +754,35 @@ fn json_to_text(value: &Value) -> Option<Vec<u8>> {
         Value::Number(n) => Some(n.to_string().into_bytes()),
         Value::Array(items) => {
             let mut out = String::new();
-            encode_pg_array(items, &mut out);
+            encode_pg_array(items, &mut out, 0)?;
             Some(out.into_bytes())
         }
         // Top-level maps are sent as JSON text.
         Value::Object(_) => serde_json::to_vec(value).ok(),
-    }
+    })
 }
 
 /// Encodes a typed parameter array as PostgreSQL array literal text (`{elem1,elem2}`).
-fn encode_pg_param_array(items: &[ParamValue], out: &mut String) {
+fn encode_pg_param_array(items: &[ParamValue], out: &mut String, depth: usize) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(NetError::ProtocolError(format!(
+            "PostgreSQL array parameter exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
     out.push('{');
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        encode_pg_param_array_element(item, out);
+        encode_pg_param_array_element(item, out, depth + 1)?;
     }
     out.push('}');
+    Ok(())
 }
 
-fn encode_pg_param_array_element(value: &ParamValue, out: &mut String) {
+fn encode_pg_param_array_element(value: &ParamValue, out: &mut String, depth: usize) -> Result<()> {
     match value {
-        ParamValue::Json(v) => encode_pg_array_element(v, out),
+        ParamValue::Json(v) => encode_pg_array_element(v, out, depth)?,
         ParamValue::Float(f) => escape_and_quote_element(&format_pg_float(*f), out),
         ParamValue::Bytes(b) => escape_and_quote_element(&format!("\\x{}", hex::encode(b)), out),
         ParamValue::Date { year, month, day } => {
@@ -808,44 +836,54 @@ fn encode_pg_param_array_element(value: &ParamValue, out: &mut String) {
         }
         ParamValue::Uuid(s) => escape_and_quote_element(s, out),
         ParamValue::Decimal(s) => out.push_str(s),
-        ParamValue::List(nested) => encode_pg_param_array(nested, out),
+        ParamValue::List(nested) => encode_pg_param_array(nested, out, depth)?,
         ParamValue::Jsonb(inner) => {
-            let json = String::from_utf8_lossy(&json_param_text(inner)).into_owned();
-            escape_and_quote_element(&json, out);
+            let mut json_buf = String::new();
+            write_json_param(inner, &mut json_buf, depth)?;
+            escape_and_quote_element(&json_buf, out);
         }
         ParamValue::Map(_) | ParamValue::Point2D { .. } | ParamValue::Point3D { .. } => {
-            let json = String::from_utf8_lossy(&json_param_text(value)).into_owned();
-            escape_and_quote_element(&json, out);
+            let mut json_buf = String::new();
+            write_json_param(value, &mut json_buf, depth)?;
+            escape_and_quote_element(&json_buf, out);
         }
     }
+    Ok(())
 }
 
 /// Encodes a JSON array as PostgreSQL array literal text (`{elem1,elem2}`).
-fn encode_pg_array(items: &[Value], out: &mut String) {
+fn encode_pg_array(items: &[Value], out: &mut String, depth: usize) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(NetError::ProtocolError(format!(
+            "PostgreSQL array parameter exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
     out.push('{');
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        encode_pg_array_element(item, out);
+        encode_pg_array_element(item, out, depth + 1)?;
     }
     out.push('}');
+    Ok(())
 }
 
 /// Encodes an element inside a PostgreSQL array literal.
-fn encode_pg_array_element(value: &Value, out: &mut String) {
+fn encode_pg_array_element(value: &Value, out: &mut String, depth: usize) -> Result<()> {
     match value {
         Value::Null => out.push_str("NULL"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => out.push_str(&n.to_string()),
         Value::String(s) => escape_and_quote_element(s, out),
-        Value::Array(nested) => encode_pg_array(nested, out),
+        Value::Array(nested) => encode_pg_array(nested, out, depth)?,
         Value::Object(_) => {
-            if let Ok(json_str) = serde_json::to_string(value) {
-                escape_and_quote_element(&json_str, out);
-            }
+            let mut json_buf = String::new();
+            write_json_value(value, &mut json_buf, depth)?;
+            escape_and_quote_element(&json_buf, out);
         }
     }
+    Ok(())
 }
 
 /// Double-quotes an array element, escaping `\` as `\\` and `"` as `\"`.

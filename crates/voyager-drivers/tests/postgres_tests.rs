@@ -19,7 +19,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 fn test_startup_message_encoding() {
     let startup = StartupMessage::new("testuser", Some("testdb"));
     let mut buf = BytesMut::new();
-    startup.encode(&mut buf);
+    startup.encode(&mut buf).unwrap();
 
     // First 4 bytes are length, next 4 are protocol version
     assert!(buf.len() > 8);
@@ -36,7 +36,7 @@ fn test_startup_message_encoding() {
 fn test_frontend_query_encoding() {
     let msg = FrontendMessage::Query("SELECT 1;".to_string());
     let mut buf = BytesMut::new();
-    msg.encode(&mut buf);
+    msg.encode(&mut buf).unwrap();
 
     assert_eq!(buf[0], b'Q');
     let mut bytes = buf.freeze();
@@ -55,7 +55,7 @@ fn test_frontend_parse_bind_execute_sync() {
         param_types: vec![23],
     };
     let mut buf = BytesMut::new();
-    parse.encode(&mut buf);
+    parse.encode(&mut buf).unwrap();
     assert_eq!(buf[0], b'P');
 
     let bind = FrontendMessage::Bind {
@@ -66,7 +66,7 @@ fn test_frontend_parse_bind_execute_sync() {
         result_formats: vec![0],
     };
     buf.clear();
-    bind.encode(&mut buf);
+    bind.encode(&mut buf).unwrap();
     assert_eq!(buf[0], b'B');
 
     let exec = FrontendMessage::Execute {
@@ -74,12 +74,12 @@ fn test_frontend_parse_bind_execute_sync() {
         max_rows: 0,
     };
     buf.clear();
-    exec.encode(&mut buf);
+    exec.encode(&mut buf).unwrap();
     assert_eq!(buf[0], b'E');
 
     let sync = FrontendMessage::Sync;
     buf.clear();
-    sync.encode(&mut buf);
+    sync.encode(&mut buf).unwrap();
     assert_eq!(buf[0], b'S');
     assert_eq!(buf.len(), 5);
 }
@@ -501,7 +501,7 @@ fn test_prepared_age_statement_parse_and_bind_encoding() {
         param_types: prepared.parameter_oids.clone(),
     };
     let mut buf = BytesMut::new();
-    parse.encode(&mut buf);
+    parse.encode(&mut buf).unwrap();
     assert_eq!(buf[0], b'P');
     assert!(contains_bytes(&buf, b"$1) AS (n agtype)"));
     assert!(contains_bytes(
@@ -518,7 +518,7 @@ fn test_prepared_age_statement_parse_and_bind_encoding() {
         result_formats: vec![0],
     };
     let mut buf = BytesMut::new();
-    bind.encode(&mut buf);
+    bind.encode(&mut buf).unwrap();
     assert_eq!(buf[0], b'B');
     assert!(contains_bytes(&buf, br#"{"p0":"Alice"}"#));
     assert!(!contains_bytes(&buf, b"Alice';"));
@@ -538,7 +538,7 @@ fn test_prepared_sql_statement_parse_and_bind_encoding() {
         param_types: prepared.parameter_oids.clone(),
     };
     let mut buf = BytesMut::new();
-    parse.encode(&mut buf);
+    parse.encode(&mut buf).unwrap();
     assert_eq!(buf[0], b'P');
     assert!(contains_bytes(&buf, b"WHERE a = $1 AND b = $2 AND c = $1"));
     assert!(!contains_bytes(&buf, b"OR 1=1"));
@@ -551,7 +551,7 @@ fn test_prepared_sql_statement_parse_and_bind_encoding() {
         result_formats: vec![0],
     };
     let mut buf = BytesMut::new();
-    bind.encode(&mut buf);
+    bind.encode(&mut buf).unwrap();
     assert_eq!(buf[0], b'B');
     assert!(contains_bytes(&buf, b"x' OR 1=1 --"));
 }

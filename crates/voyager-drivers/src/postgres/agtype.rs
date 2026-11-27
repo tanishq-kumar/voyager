@@ -446,6 +446,9 @@ fn age_map_to_json_map(map: HashMap<String, AgeValue>) -> HashMap<String, serde_
     out
 }
 
+/// Maximum recursion depth allowed when parsing nested agtype or PostgreSQL array values.
+pub const MAX_NESTING_DEPTH: usize = 64;
+
 struct AgtypeParser<'a> {
     input: &'a str,
     bytes: &'a [u8],
@@ -552,7 +555,12 @@ impl<'a> AgtypeParser<'a> {
         }
     }
 
-    fn parse_object(&mut self) -> Result<AgeValue> {
+    fn parse_object(&mut self, depth: usize) -> Result<AgeValue> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(NetError::ProtocolError(format!(
+                "agtype value exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+            )));
+        }
         self.pos += 1; // skip '{'
         self.skip_whitespace();
         let mut map = HashMap::new();
@@ -576,7 +584,7 @@ impl<'a> AgtypeParser<'a> {
                     )));
                 }
                 self.skip_whitespace();
-                let val = self.parse_value()?;
+                let val = self.parse_value(depth + 1)?;
                 map.insert(key, val);
                 self.skip_whitespace();
                 if self.consume(",") {
@@ -672,7 +680,12 @@ impl<'a> AgtypeParser<'a> {
         }
     }
 
-    fn parse_array(&mut self) -> Result<AgeValue> {
+    fn parse_array(&mut self, depth: usize) -> Result<AgeValue> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(NetError::ProtocolError(format!(
+                "agtype value exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+            )));
+        }
         self.pos += 1; // skip '['
         self.skip_whitespace();
         let mut items = Vec::new();
@@ -680,7 +693,7 @@ impl<'a> AgtypeParser<'a> {
             self.pos += 1;
         } else {
             loop {
-                let val = self.parse_value()?;
+                let val = self.parse_value(depth + 1)?;
                 items.push(val);
                 self.skip_whitespace();
                 if self.consume(",") {
@@ -732,7 +745,12 @@ impl<'a> AgtypeParser<'a> {
         }
     }
 
-    fn parse_value(&mut self) -> Result<AgeValue> {
+    fn parse_value(&mut self, depth: usize) -> Result<AgeValue> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(NetError::ProtocolError(format!(
+                "agtype value exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+            )));
+        }
         self.skip_whitespace();
         if self.pos >= self.bytes.len() {
             return Ok(AgeValue::Null);
@@ -741,8 +759,8 @@ impl<'a> AgtypeParser<'a> {
         let b = self.bytes[self.pos];
         match b {
             b'"' => self.parse_string().map(AgeValue::String),
-            b'{' => self.parse_object(),
-            b'[' => self.parse_array(),
+            b'{' => self.parse_object(depth),
+            b'[' => self.parse_array(depth),
             b't' if self.consume_keyword("true") => Ok(AgeValue::Boolean(true)),
             b'f' if self.consume_keyword("false") => Ok(AgeValue::Boolean(false)),
             b'n' if self.consume_keyword("null") => Ok(AgeValue::Null),
@@ -784,7 +802,7 @@ pub fn parse_agtype(raw: &str) -> Result<AgeValue> {
     }
 
     let mut parser = AgtypeParser::new(trimmed);
-    let val = parser.parse_value()?;
+    let val = parser.parse_value(0)?;
     parser.skip_whitespace();
     Ok(val)
 }
@@ -841,7 +859,7 @@ fn parse_pg_array_literal(raw: &str) -> Result<PgArrayValue> {
     let raw = raw.trim();
     let body = strip_array_dimensions(raw)?;
     let mut parser = PgArrayParser::new(raw, body);
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(0)?;
     parser.skip_whitespace();
     if parser.pos != body.len() {
         return Err(parser.malformed());
@@ -905,16 +923,26 @@ impl<'a> PgArrayParser<'a> {
         }
     }
 
-    fn parse_value(&mut self) -> Result<PgArrayValue> {
+    fn parse_value(&mut self, depth: usize) -> Result<PgArrayValue> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(NetError::ProtocolError(format!(
+                "PostgreSQL array literal exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+            )));
+        }
         self.skip_whitespace();
         match self.peek() {
-            Some(b'{') => self.parse_array(),
+            Some(b'{') => self.parse_array(depth),
             Some(_) => self.parse_element(),
             None => Err(self.malformed()),
         }
     }
 
-    fn parse_array(&mut self) -> Result<PgArrayValue> {
+    fn parse_array(&mut self, depth: usize) -> Result<PgArrayValue> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(NetError::ProtocolError(format!(
+                "PostgreSQL array literal exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+            )));
+        }
         self.pos += 1; // '{'
         let mut items = Vec::new();
         self.skip_whitespace();
@@ -924,7 +952,7 @@ impl<'a> PgArrayParser<'a> {
         }
 
         loop {
-            items.push(self.parse_value()?);
+            items.push(self.parse_value(depth + 1)?);
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => {
@@ -1009,6 +1037,15 @@ impl<'a> PgArrayParser<'a> {
 /// A scalar element has depth 0 and an array of scalars has depth 1, so a 2-D
 /// matrix has depth 2. Empty arrays report depth 1 at their own level.
 fn pg_array_depth(value: &PgArrayValue) -> Result<usize> {
+    pg_array_depth_inner(value, 0)
+}
+
+fn pg_array_depth_inner(value: &PgArrayValue, depth: usize) -> Result<usize> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(NetError::ProtocolError(format!(
+            "PostgreSQL array literal exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
     let Some(items) = value.children() else {
         return Ok(0);
     };
@@ -1016,9 +1053,9 @@ fn pg_array_depth(value: &PgArrayValue) -> Result<usize> {
         return Ok(1);
     }
 
-    let child_depth = pg_array_depth(&items[0])?;
+    let child_depth = pg_array_depth_inner(&items[0], depth + 1)?;
     for item in &items[1..] {
-        if pg_array_depth(item)? != child_depth {
+        if pg_array_depth_inner(item, depth + 1)? != child_depth {
             return Err(NetError::ProtocolError(
                 "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
             ));

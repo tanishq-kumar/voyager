@@ -535,7 +535,10 @@ async fn read(
     let exists = json_rows(
         connection,
         &format!(
-            "SELECT json_build_object('found', {} IS NOT NULL)::text",
+            "SELECT json_build_object('found', EXISTS (\
+               SELECT 1 FROM pg_catalog.pg_class c \
+               WHERE c.oid = {} AND c.relkind = 'g'\
+             ))::text",
             graph_oid(&graph)
         ),
     )
@@ -905,6 +908,72 @@ mod tests {
                 server_version: Some("19.0".to_string()),
                 message: "PostgreSQL 19.0 does not support SQL/PGQ (experimental: PostgreSQL 19 Beta 1-3 and 20 development builds)".to_string(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn introspect_pgq_checks_relkind_g_for_graph_existence() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let seen_queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen_queries.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let mut startup_reply = Vec::new();
+            startup_reply.extend_from_slice(&pg_frame(b'R', &0i32.to_be_bytes()));
+            startup_reply.extend_from_slice(&pg_param_status("server_version", "19.0"));
+            startup_reply.extend_from_slice(&pg_frame(b'Z', b"I"));
+            if stream.write_all(&startup_reply).await.is_err() {
+                return;
+            }
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 || buf[0] == b'X' {
+                    break;
+                }
+                let query = String::from_utf8_lossy(&buf[5..n]).into_owned();
+                seen_clone.lock().unwrap().push(query.clone());
+                let reply = if query.contains("pg_propgraph_element")
+                    && query.contains("ag_catalog.ag_graph")
+                {
+                    pg_single_text_row("json_build_object", r#"{"pgq": true, "age": false}"#)
+                } else if query.contains("DISTINCT pgepgid") {
+                    pg_single_text_row("json_build_object", r#"{"graph": "real_graph"}"#)
+                } else if query.contains("relkind = 'g'") {
+                    pg_single_text_row("json_build_object", r#"{"found": false}"#)
+                } else {
+                    pg_single_text_row("json_build_object", r#"{}"#)
+                };
+                if stream.write_all(&reply).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let uri = ParsedUri::parse(&format!(
+            "postgresql://postgres:pw@{addr}/db?graph=plain_table"
+        ))
+        .expect("uri");
+        let err = crate::introspect(&uri, &IntrospectOptions::default())
+            .await
+            .expect_err("non-graph table must be rejected");
+        assert!(
+            err.to_string()
+                .contains("property graph 'plain_table' does not exist"),
+            "{err}"
+        );
+        let queries = seen_queries.lock().unwrap();
+        assert!(
+            queries.iter().any(|q| q.contains("relkind = 'g'")),
+            "expected relkind = 'g' check in queries: {queries:?}"
         );
     }
 }

@@ -33,6 +33,7 @@ sha2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
@@ -43,7 +44,7 @@ workspace = true
 [features]
 default = ["bolt", "postgres", "redis", "arrow", "tls"]
 bolt = []
-postgres = ["dep:md-5", "dep:sha2", "dep:hmac", "dep:base64", "dep:hex"]
+postgres = ["dep:md-5", "dep:sha2", "dep:hmac", "dep:base64", "dep:hex", "dep:getrandom"]
 redis = ["dep:tokio-util"]
 arrow = ["voyager-ogm/arrow", "dep:arrow-select"]
 # TLS for every network protocol (bolt+s, rediss, PostgreSQL sslmode) via rustls.

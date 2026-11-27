@@ -18,7 +18,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buf = BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY);
-    msg.encode(&mut buf);
+    msg.encode(&mut buf)?;
     writer.write_all(&buf).await.map_err(NetError::IoError)?;
     writer.flush().await.map_err(NetError::IoError)?;
     Ok(())
@@ -30,7 +30,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buf = BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY);
-    msg.encode(&mut buf);
+    msg.encode(&mut buf)?;
     writer.write_all(&buf).await.map_err(NetError::IoError)?;
     writer.flush().await.map_err(NetError::IoError)?;
     Ok(())
@@ -43,7 +43,7 @@ where
 {
     let mut buf = BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY);
     for msg in msgs {
-        msg.encode(&mut buf);
+        msg.encode(&mut buf)?;
     }
     writer.write_all(&buf).await.map_err(NetError::IoError)?;
     writer.flush().await.map_err(NetError::IoError)?;

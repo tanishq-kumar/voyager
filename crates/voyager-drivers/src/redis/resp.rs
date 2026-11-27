@@ -18,6 +18,12 @@ pub const MAX_RESP_DEPTH: usize = 64;
 /// Maximum allowed collection length for Arrays, Maps, Sets, and Pushes to prevent allocation bombs.
 pub const MAX_RESP_COLLECTION_LEN: usize = 1_000_000;
 
+/// Maximum payload size allowed for a single RESP frame (128 MB), matching Bolt and PostgreSQL safety guards.
+pub const MAX_RESP_FRAME_SIZE: usize = 128 * 1024 * 1024;
+
+/// Maximum allowed length for a single RESP header/inline line (64 KB) to bound O(N²) rescanning.
+pub const MAX_RESP_LINE_SIZE: usize = 64 * 1024;
+
 /// A parsed value according to the Redis Serialization Protocol (RESP2 & RESP3).
 #[derive(Debug, Clone, PartialEq)]
 pub enum RespValue {
@@ -344,15 +350,35 @@ fn find_crlf(src: &[u8]) -> Option<usize> {
 }
 
 /// Parses a line up to `\r\n`, returning the line slice and total consumed bytes (including `\r\n`).
-fn parse_line(src: &[u8]) -> Option<(&[u8], usize)> {
-    let crlf_idx = find_crlf(src)?;
-    let line = src.get(..crlf_idx)?;
-    Some((line, crlf_idx + 2))
+///
+/// Rejects header/inline lines exceeding [`MAX_RESP_LINE_SIZE`] so trickled incomplete lines fail fast.
+fn parse_line(src: &[u8]) -> Result<Option<(&[u8], usize)>> {
+    let search_len = src.len().min(MAX_RESP_LINE_SIZE + 2);
+    let search_slice = src.get(..search_len).unwrap_or(src);
+    if let Some(crlf_idx) = find_crlf(search_slice) {
+        if crlf_idx > MAX_RESP_LINE_SIZE {
+            return Err(NetError::ProtocolError(format!(
+                "RESP header line exceeded maximum length of {} bytes",
+                MAX_RESP_LINE_SIZE
+            )));
+        }
+        let line = src
+            .get(..crlf_idx)
+            .ok_or_else(|| NetError::ProtocolError("RESP header line out of bounds".to_string()))?;
+        return Ok(Some((line, crlf_idx + 2)));
+    }
+    if src.len() > MAX_RESP_LINE_SIZE + 2 {
+        return Err(NetError::ProtocolError(format!(
+            "RESP header line exceeded maximum length of {} bytes",
+            MAX_RESP_LINE_SIZE
+        )));
+    }
+    Ok(None)
 }
 
 #[inline(never)]
 fn parse_simple_string_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((line, consumed)) => {
             let s = std::str::from_utf8(line).map_err(|e| {
                 NetError::ProtocolError(format!("Invalid UTF-8 simple string: {}", e))
@@ -365,7 +391,7 @@ fn parse_simple_string_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> 
 
 #[inline(never)]
 fn parse_error_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((line, consumed)) => {
             let s = std::str::from_utf8(line).map_err(|e| {
                 NetError::ProtocolError(format!("Invalid UTF-8 error string: {}", e))
@@ -378,7 +404,7 @@ fn parse_error_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
 
 #[inline(never)]
 fn parse_integer_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((line, consumed)) => {
             let line_str = std::str::from_utf8(line).map_err(|e| {
                 NetError::ProtocolError(format!("Invalid UTF-8 integer string: {}", e))
@@ -394,7 +420,7 @@ fn parse_integer_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
 
 #[inline(never)]
 fn parse_bulk_string_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((len_line, hdr_consumed)) => {
             let len_str = std::str::from_utf8(len_line).map_err(|e| {
                 NetError::ProtocolError(format!("Invalid bulk string length: {}", e))
@@ -419,9 +445,19 @@ fn parse_bulk_string_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
             }
 
             let byte_len = len as usize;
+            if byte_len > MAX_RESP_FRAME_SIZE {
+                return Err(NetError::ProtocolError(format!(
+                    "Bulk string length {} exceeds maximum frame size of {} bytes",
+                    byte_len, MAX_RESP_FRAME_SIZE
+                )));
+            }
             let payload_start = hdr_consumed;
-            let payload_end = payload_start + byte_len;
-            let total_consumed = payload_end + 2; // +2 for trailing \r\n
+            let payload_end = payload_start.checked_add(byte_len).ok_or_else(|| {
+                NetError::ProtocolError("Bulk string payload length overflow".to_string())
+            })?;
+            let total_consumed = payload_end.checked_add(2).ok_or_else(|| {
+                NetError::ProtocolError("Bulk string total length overflow".to_string())
+            })?; // +2 for trailing \r\n
 
             if rest.len() < total_consumed {
                 // Incomplete payload
@@ -464,7 +500,7 @@ fn parse_null_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
 
 #[inline(never)]
 fn parse_double_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((line, consumed)) => {
             let s = std::str::from_utf8(line)
                 .map_err(|e| NetError::ProtocolError(format!("Invalid double string: {}", e)))?;
@@ -509,7 +545,7 @@ fn parse_boolean_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
 
 #[inline(never)]
 fn parse_blob_error_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((len_line, hdr_consumed)) => {
             let len_str = std::str::from_utf8(len_line).map_err(|e| {
                 NetError::ProtocolError(format!("Invalid blob error length: {}", e))
@@ -518,9 +554,20 @@ fn parse_blob_error_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
                 NetError::ProtocolError(format!("Malformed blob error length '{}': {}", len_str, e))
             })?;
 
+            if len > MAX_RESP_FRAME_SIZE {
+                return Err(NetError::ProtocolError(format!(
+                    "Blob error length {} exceeds maximum frame size of {} bytes",
+                    len, MAX_RESP_FRAME_SIZE
+                )));
+            }
+
             let payload_start = hdr_consumed;
-            let payload_end = payload_start + len;
-            let total_consumed = payload_end + 2;
+            let payload_end = payload_start.checked_add(len).ok_or_else(|| {
+                NetError::ProtocolError("Blob error payload length overflow".to_string())
+            })?;
+            let total_consumed = payload_end.checked_add(2).ok_or_else(|| {
+                NetError::ProtocolError("Blob error total length overflow".to_string())
+            })?;
 
             if rest.len() < total_consumed {
                 return Ok(None);
@@ -544,7 +591,7 @@ fn parse_blob_error_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
 
 #[inline(never)]
 fn parse_verbatim_string_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((len_line, hdr_consumed)) => {
             let len_str = std::str::from_utf8(len_line)
                 .map_err(|e| NetError::ProtocolError(format!("Invalid verbatim length: {}", e)))?;
@@ -557,10 +604,20 @@ fn parse_verbatim_string_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>
                     "Verbatim string length must be at least 4 bytes (format + ':')".to_string(),
                 ));
             }
+            if len > MAX_RESP_FRAME_SIZE {
+                return Err(NetError::ProtocolError(format!(
+                    "Verbatim string length {} exceeds maximum frame size of {} bytes",
+                    len, MAX_RESP_FRAME_SIZE
+                )));
+            }
 
             let payload_start = hdr_consumed;
-            let payload_end = payload_start + len;
-            let total_consumed = payload_end + 2;
+            let payload_end = payload_start.checked_add(len).ok_or_else(|| {
+                NetError::ProtocolError("Verbatim string payload length overflow".to_string())
+            })?;
+            let total_consumed = payload_end.checked_add(2).ok_or_else(|| {
+                NetError::ProtocolError("Verbatim string total length overflow".to_string())
+            })?;
 
             if rest.len() < total_consumed {
                 return Ok(None);
@@ -602,7 +659,7 @@ fn parse_verbatim_string_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>
 
 #[inline(never)]
 fn parse_big_number_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((line, consumed)) => {
             let s = std::str::from_utf8(line).map_err(|e| {
                 NetError::ProtocolError(format!("Invalid big number string: {}", e))
@@ -615,7 +672,7 @@ fn parse_big_number_slice(rest: &[u8]) -> Result<Option<(RespValue, usize)>> {
 
 #[inline(never)]
 fn parse_array_slice(rest: &[u8], depth: usize) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((len_line, hdr_consumed)) => {
             let len_str = std::str::from_utf8(len_line)
                 .map_err(|e| NetError::ProtocolError(format!("Invalid array length: {}", e)))?;
@@ -666,7 +723,7 @@ fn parse_array_slice(rest: &[u8], depth: usize) -> Result<Option<(RespValue, usi
 
 #[inline(never)]
 fn parse_map_slice(rest: &[u8], depth: usize) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((len_line, hdr_consumed)) => {
             let len_str = std::str::from_utf8(len_line)
                 .map_err(|e| NetError::ProtocolError(format!("Invalid map length: {}", e)))?;
@@ -719,7 +776,7 @@ fn parse_map_slice(rest: &[u8], depth: usize) -> Result<Option<(RespValue, usize
 
 #[inline(never)]
 fn parse_set_slice(rest: &[u8], depth: usize) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((len_line, hdr_consumed)) => {
             let len_str = std::str::from_utf8(len_line)
                 .map_err(|e| NetError::ProtocolError(format!("Invalid set length: {}", e)))?;
@@ -757,7 +814,7 @@ fn parse_set_slice(rest: &[u8], depth: usize) -> Result<Option<(RespValue, usize
 
 #[inline(never)]
 fn parse_push_slice(rest: &[u8], depth: usize) -> Result<Option<(RespValue, usize)>> {
-    match parse_line(rest) {
+    match parse_line(rest)? {
         Some((len_line, hdr_consumed)) => {
             let len_str = std::str::from_utf8(len_line)
                 .map_err(|e| NetError::ProtocolError(format!("Invalid push length: {}", e)))?;

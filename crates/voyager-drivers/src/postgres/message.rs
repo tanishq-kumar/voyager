@@ -229,6 +229,38 @@ impl fmt::Debug for StartupMessage {
     }
 }
 
+fn reject_interior_nul(value: &str, field: &str) -> Result<()> {
+    if value.as_bytes().contains(&0) {
+        return Err(NetError::ProtocolError(format!(
+            "PostgreSQL {field} must not contain interior NUL bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_pg_frame_len(body_len: usize, msg_name: &str) -> Result<i32> {
+    i32::try_from(body_len)
+        .ok()
+        .and_then(|n| n.checked_add(4))
+        .ok_or_else(|| {
+            NetError::ProtocolError(format!(
+                "PostgreSQL {msg_name} exceeds maximum i32 frame length"
+            ))
+        })
+}
+
+fn checked_pg_i16(len: usize, field: &str) -> Result<i16> {
+    i16::try_from(len).map_err(|_| {
+        NetError::ProtocolError(format!("PostgreSQL {field} count {len} exceeds i16::MAX"))
+    })
+}
+
+fn checked_pg_i32(len: usize, field: &str) -> Result<i32> {
+    i32::try_from(len).map_err(|_| {
+        NetError::ProtocolError(format!("PostgreSQL {field} length {len} exceeds i32::MAX"))
+    })
+}
+
 impl StartupMessage {
     /// Creates a new startup message with standard parameters.
     pub fn new(user: &str, database: Option<&str>) -> Self {
@@ -251,11 +283,13 @@ impl StartupMessage {
 
     /// Serializes startup message into wire bytes.
     /// Note: StartupMessage does not have a 1-byte message type identifier prefix.
-    pub fn encode(&self, dst: &mut BytesMut) {
+    pub fn encode(&self, dst: &mut BytesMut) -> Result<()> {
         let mut body = BytesMut::new();
         body.put_i32(self.protocol_version);
 
         for (k, v) in &self.parameters {
+            reject_interior_nul(k, "StartupMessage parameter key")?;
+            reject_interior_nul(v, "StartupMessage parameter value")?;
             body.put_slice(k.as_bytes());
             body.put_u8(0);
             body.put_slice(v.as_bytes());
@@ -263,54 +297,61 @@ impl StartupMessage {
         }
         body.put_u8(0); // Terminating null byte
 
-        let total_len = 4 + body.len() as i32;
+        let total_len = checked_pg_frame_len(body.len(), "StartupMessage")?;
         dst.put_i32(total_len);
         dst.put_slice(&body);
+        Ok(())
     }
 }
 
 impl FrontendMessage {
     /// Serializes frontend message into wire buffer.
-    pub fn encode(&self, dst: &mut BytesMut) {
+    pub fn encode(&self, dst: &mut BytesMut) -> Result<()> {
         match self {
             Self::Startup(msg) => {
-                msg.encode(dst);
+                msg.encode(dst)?;
             }
             Self::Password(pwd) => {
+                let len = checked_pg_frame_len(pwd.len(), "Password")?;
                 dst.put_u8(b'p');
-                let len = 4 + pwd.len() as i32;
                 dst.put_i32(len);
                 dst.put_slice(pwd);
             }
             Self::SASLInitialResponse { mechanism, data } => {
-                dst.put_u8(b'p');
+                reject_interior_nul(mechanism, "SASL mechanism")?;
                 let mech_bytes = mechanism.as_bytes();
                 let mut body = BytesMut::new();
                 body.put_slice(mech_bytes);
                 body.put_u8(0);
                 match data {
                     Some(d) => {
-                        body.put_i32(d.len() as i32);
+                        let data_len = checked_pg_i32(d.len(), "SASL initial response")?;
+                        body.put_i32(data_len);
                         body.put_slice(d);
                     }
                     None => {
                         body.put_i32(-1);
                     }
                 }
-                let len = 4 + body.len() as i32;
+                let len = checked_pg_frame_len(body.len(), "SASLInitialResponse")?;
+                dst.put_u8(b'p');
                 dst.put_i32(len);
                 dst.put_slice(&body);
             }
             Self::SASLResponse(data) => {
+                let len = checked_pg_frame_len(data.len(), "SASLResponse")?;
                 dst.put_u8(b'p');
-                let len = 4 + data.len() as i32;
                 dst.put_i32(len);
                 dst.put_slice(data);
             }
             Self::Query(query) => {
-                dst.put_u8(b'Q');
+                reject_interior_nul(query, "Query")?;
                 let q_bytes = query.as_bytes();
-                let len = 4 + q_bytes.len() as i32 + 1; // +1 for null terminator
+                let body_len = q_bytes.len().checked_add(1).ok_or_else(|| {
+                    NetError::ProtocolError("PostgreSQL Query exceeds usize".to_string())
+                })?;
+                let len = checked_pg_frame_len(body_len, "Query")?;
+                dst.put_u8(b'Q');
                 dst.put_i32(len);
                 dst.put_slice(q_bytes);
                 dst.put_u8(0);
@@ -320,17 +361,20 @@ impl FrontendMessage {
                 query,
                 param_types,
             } => {
-                dst.put_u8(b'P');
+                reject_interior_nul(name, "Parse statement name")?;
+                reject_interior_nul(query, "Parse query")?;
+                let param_count = checked_pg_i16(param_types.len(), "Parse parameter types")?;
                 let mut body = BytesMut::new();
                 body.put_slice(name.as_bytes());
                 body.put_u8(0);
                 body.put_slice(query.as_bytes());
                 body.put_u8(0);
-                body.put_i16(param_types.len() as i16);
+                body.put_i16(param_count);
                 for &oid in param_types {
                     body.put_i32(oid);
                 }
-                let len = 4 + body.len() as i32;
+                let len = checked_pg_frame_len(body.len(), "Parse")?;
+                dst.put_u8(b'P');
                 dst.put_i32(len);
                 dst.put_slice(&body);
             }
@@ -341,7 +385,12 @@ impl FrontendMessage {
                 params,
                 result_formats,
             } => {
-                dst.put_u8(b'B');
+                reject_interior_nul(portal, "Bind portal")?;
+                reject_interior_nul(statement, "Bind statement")?;
+                let fmt_count = checked_pg_i16(param_formats.len(), "Bind parameter formats")?;
+                let param_count = checked_pg_i16(params.len(), "Bind parameters")?;
+                let res_fmt_count = checked_pg_i16(result_formats.len(), "Bind result formats")?;
+
                 let mut body = BytesMut::new();
                 body.put_slice(portal.as_bytes());
                 body.put_u8(0);
@@ -349,17 +398,18 @@ impl FrontendMessage {
                 body.put_u8(0);
 
                 // Param formats
-                body.put_i16(param_formats.len() as i16);
+                body.put_i16(fmt_count);
                 for &fmt in param_formats {
                     body.put_i16(fmt);
                 }
 
                 // Param values
-                body.put_i16(params.len() as i16);
+                body.put_i16(param_count);
                 for param in params {
                     match param {
                         Some(val) => {
-                            body.put_i32(val.len() as i32);
+                            let val_len = checked_pg_i32(val.len(), "Bind parameter value")?;
+                            body.put_i32(val_len);
                             body.put_slice(val);
                         }
                         None => {
@@ -369,42 +419,46 @@ impl FrontendMessage {
                 }
 
                 // Result formats
-                body.put_i16(result_formats.len() as i16);
+                body.put_i16(res_fmt_count);
                 for &fmt in result_formats {
                     body.put_i16(fmt);
                 }
 
-                let len = 4 + body.len() as i32;
+                let len = checked_pg_frame_len(body.len(), "Bind")?;
+                dst.put_u8(b'B');
                 dst.put_i32(len);
                 dst.put_slice(&body);
             }
             Self::Execute { portal, max_rows } => {
-                dst.put_u8(b'E');
+                reject_interior_nul(portal, "Execute portal")?;
                 let mut body = BytesMut::new();
                 body.put_slice(portal.as_bytes());
                 body.put_u8(0);
                 body.put_i32(*max_rows);
-                let len = 4 + body.len() as i32;
+                let len = checked_pg_frame_len(body.len(), "Execute")?;
+                dst.put_u8(b'E');
                 dst.put_i32(len);
                 dst.put_slice(&body);
             }
             Self::Describe { target_type, name } => {
-                dst.put_u8(b'D');
+                reject_interior_nul(name, "Describe name")?;
                 let mut body = BytesMut::new();
                 body.put_u8(*target_type);
                 body.put_slice(name.as_bytes());
                 body.put_u8(0);
-                let len = 4 + body.len() as i32;
+                let len = checked_pg_frame_len(body.len(), "Describe")?;
+                dst.put_u8(b'D');
                 dst.put_i32(len);
                 dst.put_slice(&body);
             }
             Self::Close { target_type, name } => {
-                dst.put_u8(b'C');
+                reject_interior_nul(name, "Close name")?;
                 let mut body = BytesMut::new();
                 body.put_u8(*target_type);
                 body.put_slice(name.as_bytes());
                 body.put_u8(0);
-                let len = 4 + body.len() as i32;
+                let len = checked_pg_frame_len(body.len(), "Close")?;
+                dst.put_u8(b'C');
                 dst.put_i32(len);
                 dst.put_slice(&body);
             }
@@ -421,6 +475,7 @@ impl FrontendMessage {
                 dst.put_i32(4);
             }
         }
+        Ok(())
     }
 }
 
@@ -668,8 +723,15 @@ impl BackendMessage {
                         "RowDescription truncated".to_string(),
                     ));
                 }
-                let field_count = payload.get_i16() as usize;
-                let mut fields = Vec::with_capacity(field_count);
+                let raw_field_count = payload.get_i16();
+                if raw_field_count < 0 {
+                    return Err(NetError::ProtocolError(format!(
+                        "Negative RowDescription field_count: {raw_field_count}"
+                    )));
+                }
+                let field_count = raw_field_count as usize;
+                // Each FieldDescription needs at least 1 byte (NUL-terminated name) + 18 metadata bytes = 19 bytes.
+                let mut fields = Vec::with_capacity(field_count.min(payload.len() / 19));
                 for _ in 0..field_count {
                     let name = read_cstring(&mut payload)?;
                     if payload.len() < 18 {
@@ -700,8 +762,15 @@ impl BackendMessage {
                 if payload.len() < 2 {
                     return Err(NetError::ProtocolError("DataRow truncated".to_string()));
                 }
-                let field_count = payload.get_i16() as usize;
-                let mut values = Vec::with_capacity(field_count);
+                let raw_field_count = payload.get_i16();
+                if raw_field_count < 0 {
+                    return Err(NetError::ProtocolError(format!(
+                        "Negative DataRow field_count: {raw_field_count}"
+                    )));
+                }
+                let field_count = raw_field_count as usize;
+                // Each DataRow column needs at least 4 bytes (i32 length prefix).
+                let mut values = Vec::with_capacity(field_count.min(payload.len() / 4));
                 for _ in 0..field_count {
                     if payload.len() < 4 {
                         return Err(NetError::ProtocolError(
