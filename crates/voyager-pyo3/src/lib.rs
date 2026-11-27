@@ -3288,6 +3288,33 @@ fn json_value_to_py<'py>(
     }
 }
 
+/// Converts a JSON fallback value whose leaf scalars need a typed Python representation.
+///
+/// Mixed-depth PostgreSQL array columns fall back to JSON text but their elements
+/// keep the column's declared type, so `numeric` leaves become `Decimal` and
+/// `uuid` leaves become `uuid.UUID` exactly like the typed scalar decoders.
+fn json_value_to_py_typed<'py>(
+    py: Python<'py>,
+    value: &serde_json::Value,
+    kind: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    match value {
+        serde_json::Value::Null => Ok(py.None().into_bound(py)),
+        serde_json::Value::Array(values) => {
+            let list = PyList::empty(py);
+            for value in values {
+                list.append(json_value_to_py_typed(py, value, kind)?)?;
+            }
+            Ok(list.into_any())
+        }
+        serde_json::Value::String(text) => parse_voyager_typed_utf8(py, kind, text),
+        serde_json::Value::Number(number) => {
+            parse_voyager_typed_utf8(py, kind, &number.to_string())
+        }
+        other => json_value_to_py(py, other, false),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PyTemporalTz<'a> {
     Offset(i64),
@@ -3873,21 +3900,46 @@ fn bolt_value_to_py<'py>(
     }
 }
 
+/// Converts a Bolt value whose leaf strings need a typed Python representation.
+fn bolt_value_to_py_typed<'py>(
+    py: Python<'py>,
+    value: &voyager_drivers::BoltValue,
+    kind: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    use voyager_drivers::BoltValue;
+
+    match value {
+        BoltValue::Null => Ok(py.None().into_bound(py)),
+        BoltValue::String(text) => parse_voyager_typed_utf8(py, kind, text),
+        BoltValue::List(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(bolt_value_to_py_typed(py, item, kind)?)?;
+            }
+            Ok(list.into_any())
+        }
+        other => bolt_value_to_py(py, other),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Utf8ColMode {
     Plain,
     JsonEntities,
     JsonPure,
+    JsonTyped(&'static str),
     Typed(&'static str),
 }
 
 fn utf8_col_mode_for_field(field: &arrow_schema::Field) -> Utf8ColMode {
     let meta = field.metadata();
     if meta.get("voyager.encoding").is_some_and(|v| v == "json") {
-        if meta.get("voyager.type").is_some_and(|v| v == "json") {
-            return Utf8ColMode::JsonPure;
+        match meta.get("voyager.type").map(String::as_str) {
+            Some("json") => return Utf8ColMode::JsonPure,
+            Some("decimal") => return Utf8ColMode::JsonTyped("decimal"),
+            Some("uuid") => return Utf8ColMode::JsonTyped("uuid"),
+            _ => return Utf8ColMode::JsonEntities,
         }
-        return Utf8ColMode::JsonEntities;
     }
     if meta.contains_key("voyager.kind") {
         return Utf8ColMode::JsonEntities;
@@ -4251,6 +4303,11 @@ fn arrow_array_value_to_py<'py>(
                         parse_json_result_text(s).map_err(PyValueError::new_err)?;
                     json_value_to_py(py, &parsed, false)
                 }
+                Utf8ColMode::JsonTyped(kind) => {
+                    let parsed: serde_json::Value =
+                        parse_json_result_text(s).map_err(PyValueError::new_err)?;
+                    json_value_to_py_typed(py, &parsed, kind)
+                }
                 Utf8ColMode::Typed(kind) => parse_voyager_typed_utf8(py, kind, s),
                 Utf8ColMode::Plain => Ok(s.into_pyobject(py)?.into_any()),
             }
@@ -4268,6 +4325,11 @@ fn arrow_array_value_to_py<'py>(
                     let parsed: serde_json::Value =
                         parse_json_result_text(s).map_err(PyValueError::new_err)?;
                     json_value_to_py(py, &parsed, false)
+                }
+                Utf8ColMode::JsonTyped(kind) => {
+                    let parsed: serde_json::Value =
+                        parse_json_result_text(s).map_err(PyValueError::new_err)?;
+                    json_value_to_py_typed(py, &parsed, kind)
                 }
                 Utf8ColMode::Typed(kind) => parse_voyager_typed_utf8(py, kind, s),
                 Utf8ColMode::Plain => Ok(s.into_pyobject(py)?.into_any()),
@@ -4331,10 +4393,20 @@ fn record_batch_to_py_dicts<'py>(
                 dict.set_item(field_name, py.None())?;
                 continue;
             }
-            if matches!(col_modes[col_idx], Utf8ColMode::JsonEntities)
+            let bolt_typed = match col_modes[col_idx] {
+                Utf8ColMode::JsonEntities => Some(None),
+                Utf8ColMode::JsonTyped(kind) => Some(Some(kind)),
+                _ => None,
+            };
+            if let Some(kind) = bolt_typed
                 && let Some(bolt_val) = bolt_row.and_then(|r| r.get(col_idx))
+                && !matches!(bolt_val, voyager_drivers::BoltValue::Null)
             {
-                dict.set_item(field_name, bolt_value_to_py(py, bolt_val)?)?;
+                let py_value = match kind {
+                    Some(kind) => bolt_value_to_py_typed(py, bolt_val, kind)?,
+                    None => bolt_value_to_py(py, bolt_val)?,
+                };
+                dict.set_item(field_name, py_value)?;
                 continue;
             }
             dict.set_item(

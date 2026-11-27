@@ -1673,8 +1673,127 @@ def _duckdb_description_has_timetz(description: Sequence[Any]) -> bool:
     )
 
 
+def _duckdb_quote_identifier(name: str) -> str:
+    """Quotes a DuckDB identifier, doubling embedded double quotes."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _duckdb_timetz_projection(description: Sequence[Any]) -> str | None:
+    """Builds a projection that casts ``TIMETZ`` columns to ISO text.
+
+    DuckDB's Arrow export maps ``TIME WITH TIME ZONE`` to a plain ``time64`` and
+    loses the offset, while its DB-API rows fold calendar ``INTERVAL`` months
+    into 30-day ``timedelta`` values. Projecting only the ``TIMETZ`` columns to
+    ``VARCHAR`` with positional references keeps the Arrow export (and therefore
+    ``month_day_nano_interval`` precision) for every other column.
+    """
+    projections: list[str] = []
+    has_timetz = False
+    for idx, item in enumerate(description):
+        name = str(item[0])
+        description_type = str(item[1]).upper() if len(item) > 1 else ""
+        alias = _duckdb_quote_identifier(name)
+        if description_type.startswith("TIME WITH TIME ZONE"):
+            has_timetz = True
+            depth = description_type.count("[")
+            target_type = "VARCHAR" + "[]" * depth
+            projections.append(f"CAST(#{idx + 1} AS {target_type}) AS {alias}")
+        else:
+            projections.append(f"#{idx + 1} AS {alias}")
+    if not has_timetz:
+        return None
+    return ", ".join(projections)
+
+
+def _duckdb_relation_description(relation: Any) -> tuple[tuple[str, str], ...]:
+    """Builds a DB-API-like description from a lazy DuckDB relation's types."""
+    return tuple(
+        (str(name), str(type_name))
+        for name, type_name in zip(relation.columns, relation.types, strict=True)
+    )
+
+
+def _duckdb_is_query_statement(statement: str) -> bool:
+    """Returns whether ``statement`` starts with a DuckDB query keyword."""
+    stripped = statement.lstrip()
+    if not stripped:
+        return False
+    first = stripped.split(None, 1)[0].lower()
+    return first in {"select", "with", "from", "values", "table", "pivot", "unpivot"}
+
+
+def _duckdb_is_single_query_statement(connection: Any, statement: str) -> bool:
+    """Returns whether ``statement`` is one query that a lazy relation can run.
+
+    Multiple statements, DML and statements that only the eager DB-API path
+    supports keep the single-execution ``execute()`` + DB-API row path.
+    """
+    if not _duckdb_is_query_statement(statement):
+        return False
+    extract = getattr(connection, "extract_statements", None)
+    if not callable(extract):
+        return ";" not in statement.strip().rstrip(";")
+    try:
+        return len(extract(statement)) == 1
+    except Exception:
+        return False
+
+
+def _duckdb_complete_pending(connection: Any) -> None:
+    """Clears an unfinished DB-API result so a relation can start.
+
+    ``DuckDBPyConnection.sql`` refuses to run while a prior ``execute()`` result
+    is still open (for example after a bare ``fetchone()``), whereas ``execute()``
+    implicitly replaces it. ``complete()`` gives the relation path the same
+    behaviour without executing the statement twice.
+    """
+    complete = getattr(connection, "complete", None)
+    if not callable(complete):
+        return
+    try:
+        complete()
+    except Exception:
+        pass
+
+
+_DUCKDB_TIMETZ_TEXT_PATTERN = re.compile(
+    r"^(?P<time>\d{2}:\d{2}:\d{2})(?:\.(?P<fraction>\d{1,6}))?"
+    r"(?P<sign>[+-])(?P<hours>\d{2})(?::(?P<minutes>\d{2}))?(?::(?P<seconds>\d{2}))?$"
+)
+
+
+def _duckdb_timetz_text_iso(value: Any) -> Any:
+    """Normalizes DuckDB's ``TIMETZ`` text to ``datetime.time.isoformat()`` form.
+
+    DuckDB renders a whole-hour offset as ``+02`` and trims trailing zeros from
+    fractional seconds, while ``datetime.time.isoformat`` always includes the
+    offset minutes (``+02:00``) and pads microseconds to six digits. Recurses
+    into ``TIMETZ[]`` lists and passes through NULLs and unrecognized text.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_duckdb_timetz_text_iso(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    match = _DUCKDB_TIMETZ_TEXT_PATTERN.match(value)
+    if match is None:
+        return value
+    time_part = match.group("time")
+    fraction = match.group("fraction")
+    if fraction is not None:
+        time_part += "." + fraction.ljust(6, "0")
+    offset = f"{match.group('sign')}{match.group('hours')}:{match.group('minutes') or '00'}"
+    seconds = match.group("seconds")
+    if seconds is not None and seconds != "00":
+        offset += f":{seconds}"
+    return f"{time_part}{offset}"
+
+
 def _duckdb_time_iso(value: Any) -> Any:
     """Converts a ``datetime.time`` (or a nested list of them) to ISO text."""
+    if isinstance(value, str):
+        return _duckdb_timetz_text_iso(value)
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
@@ -1716,10 +1835,10 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
     """Rewrites DuckDB Arrow columns to Voyager's documented export representations.
 
     ``UUID`` becomes ``fixed_size_binary(16)`` (Polars ``Binary``), ``JSON`` stays
-    UTF-8 text tagged ``voyager.encoding=json``, ``HUGEINT`` stays
-    ``decimal128(38, 0)`` tagged ``voyager.type=hugeint`` (Arrow has no int128),
-    and calendar intervals become ``month_day_nano_interval``-free duration
-    columns.
+    UTF-8 text tagged ``voyager.encoding=json``, ``TIMETZ`` stays ISO text tagged
+    ``voyager.type=time_tz``, ``HUGEINT`` stays ``decimal128(38, 0)`` tagged
+    ``voyager.type=hugeint`` (Arrow has no int128), and calendar intervals become
+    ``month_day_nano_interval``-free duration columns.
     """
     import pyarrow as pa
 
@@ -1743,6 +1862,16 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
             array = pa.array(column.to_pylist(), type=pa.string())
             metadata[b"voyager.encoding"] = b"json"
             metadata[b"voyager.type"] = b"json"
+        elif description_type.startswith("TIME WITH TIME ZONE"):
+            depth = description_type.count("[")
+            target_type: Any = pa.string()
+            for _ in range(depth):
+                target_type = pa.list_(target_type)
+            array = pa.array(
+                [_duckdb_timetz_text_iso(value) for value in column.to_pylist()],
+                type=target_type,
+            )
+            metadata[b"voyager.type"] = b"time_tz"
         elif description_type == "HUGEINT":
             array = column
             metadata[b"voyager.type"] = b"hugeint"
@@ -1843,16 +1972,15 @@ class DuckDbBridge:
 
     @staticmethod
     def _arrow_table(rel: Any) -> Any | None:
-        """Returns a DuckDB relation's Arrow table with the version-specific method name."""
-        for name in ("fetch_arrow_table", "to_arrow_table"):
-            method = getattr(rel, name, None)
-            if callable(method):
-                with warnings.catch_warnings():
-                    # DuckDB 2.0 warns that a DB-API result copies rows into Arrow;
-                    # the result is already materialized here, so this is expected.
-                    warnings.filterwarnings("ignore", message="Arrow output on a DB-API result.*")
-                    return method()
-        return None
+        """Returns a DuckDB relation's Arrow table."""
+        method = getattr(rel, "to_arrow_table", None)
+        if not callable(method):
+            return None
+        with warnings.catch_warnings():
+            # DuckDB warns that a DB-API result copies rows into Arrow; the
+            # result is already materialized here, so this is expected.
+            warnings.filterwarnings("ignore", message="Arrow output on a DB-API result.*")
+            return method()
 
     def _duckpgq_is_loaded(self) -> bool:
         """Returns whether DuckPGQ is already loaded on this connection."""
@@ -2013,26 +2141,55 @@ class DuckDbBridge:
         Arrow has no timezone-aware time type, and ``HUGEINT`` columns stay
         ``decimal128(38, 0)`` tagged ``voyager.type=hugeint`` because Arrow has
         no portable int128 type.
+
+        A single query statement runs once as a lazy relation: its columns and
+        types come from the relation itself, ``TIMETZ`` is projected to ISO text
+        there, and the result is materialized once. DML, multi-statement input
+        and statement kinds the eager DB-API path owns keep that path, which
+        also executes the statement once but decodes ``TIMETZ`` from DB-API rows.
         """
         import pyarrow as pa
 
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         params = _adapt_duckdb_parameters(stmt, params)
+        if _duckdb_is_single_query_statement(self.con, stmt):
+            _duckdb_complete_pending(self.con)
+            relation = self.con.sql(stmt, params=params or None)
+            if relation is None:
+                return pa.Table.from_pylist([])
+            description = _duckdb_relation_description(relation)
+            projection = _duckdb_timetz_projection(description)
+            if projection is not None:
+                try:
+                    arrow_table = relation.project(projection).to_arrow_table()
+                except Exception:
+                    return _duckdb_rows_to_arrow(description, relation.fetchall())
+            else:
+                arrow_table = self._arrow_table(relation)
+                if arrow_table is None:
+                    return _duckdb_rows_to_arrow(description, relation.fetchall())
+            return _duckdb_arrow_table_to_canonical(arrow_table, description)
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return pa.Table.from_pylist([])
-        if _duckdb_description_has_timetz(rel.description):
-            return _duckdb_rows_to_arrow(rel.description, rel.fetchall())
+        description = tuple(rel.description)
+        if _duckdb_description_has_timetz(description):
+            return _duckdb_rows_to_arrow(description, rel.fetchall())
         arrow_table = self._arrow_table(rel)
         if arrow_table is None:
-            return _duckdb_rows_to_arrow(rel.description, rel.fetchall())
-        return _duckdb_arrow_table_to_canonical(arrow_table, rel.description)
+            return _duckdb_rows_to_arrow(description, rel.fetchall())
+        return _duckdb_arrow_table_to_canonical(arrow_table, description)
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
-        """Executes query and streams to Polars DataFrame without re-executing.
+        """Executes query and streams to Polars DataFrame from the Arrow result.
+
+        A single query statement runs once as a lazy relation; a ``TIMETZ``
+        column is projected to ISO text on that relation so the rest of the
+        result still streams from Arrow instead of DB-API rows. DML and
+        multi-statement input keep the eager DB-API path (also one execution).
 
         ``UUID`` columns are ``Binary`` (16 bytes), ``TIMETZ`` and ``JSON``
         columns are UTF-8 text (Polars strips Arrow field metadata), and
@@ -2049,18 +2206,40 @@ class DuckDbBridge:
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         params = _adapt_duckdb_parameters(stmt, params)
+        if _duckdb_is_single_query_statement(self.con, stmt):
+            _duckdb_complete_pending(self.con)
+            relation = self.con.sql(stmt, params=params or None)
+            if relation is None:
+                return pl.DataFrame()
+            description = _duckdb_relation_description(relation)
+            projection = _duckdb_timetz_projection(description)
+            if projection is not None:
+                try:
+                    arrow_table = relation.project(projection).to_arrow_table()
+                except Exception:
+                    return _duckdb_arrow_table_to_polars(
+                        _duckdb_rows_to_arrow(description, relation.fetchall())
+                    )
+            else:
+                arrow_table = self._arrow_table(relation)
+                if arrow_table is None:
+                    return _duckdb_arrow_table_to_polars(
+                        _duckdb_rows_to_arrow(description, relation.fetchall())
+                    )
+            return _duckdb_arrow_table_to_polars(
+                _duckdb_arrow_table_to_canonical(arrow_table, description)
+            )
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return pl.DataFrame()
-        if _duckdb_description_has_timetz(rel.description):
-            return _duckdb_arrow_table_to_polars(
-                _duckdb_rows_to_arrow(rel.description, rel.fetchall())
-            )
+        description = tuple(rel.description)
+        if _duckdb_description_has_timetz(description):
+            return _duckdb_arrow_table_to_polars(_duckdb_rows_to_arrow(description, rel.fetchall()))
         arrow_table = self._arrow_table(rel)
         if arrow_table is not None:
-            arrow_table = _duckdb_arrow_table_to_canonical(arrow_table, rel.description)
+            arrow_table = _duckdb_arrow_table_to_canonical(arrow_table, description)
             return _duckdb_arrow_table_to_polars(arrow_table)
-        return _records_to_polars(_records_from_duckdb_rows(rel.description, rel.fetchall()))
+        return _records_to_polars(_records_from_duckdb_rows(description, rel.fetchall()))
 
     def execute_bulk(
         self,

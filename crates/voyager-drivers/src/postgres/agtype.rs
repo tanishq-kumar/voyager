@@ -15,7 +15,9 @@ use std::sync::Arc;
 use crate::bolt::canonical::{
     append_duration_struct, duration_struct_fields, make_duration_struct_builder,
 };
-use crate::bolt::packstream::{BoltDuration, ymd_to_days};
+use crate::bolt::packstream::{
+    BoltDate, BoltDateTime, BoltDuration, BoltLocalDateTime, BoltLocalTime, BoltTime, ymd_to_days,
+};
 use crate::bolt::{BoltNode, BoltPath, BoltRelationship, BoltValue};
 use crate::error::{NetError, Result};
 
@@ -1437,6 +1439,13 @@ fn parse_pg_timestamptz_micros(raw: &str) -> Option<(i64, i32)> {
     Some((utc_micros, offset_secs))
 }
 
+fn parse_pg_timetz_micros(raw: &str) -> Option<(i64, i32)> {
+    let s = raw.trim();
+    let (offset_secs, split_at) = parse_pg_tz_offset(s)?;
+    let local_micros = parse_pg_time_micros(&s[..split_at])?;
+    Some((local_micros, offset_secs))
+}
+
 fn parse_hms_duration_token(tok: &str) -> Option<(i64, i64)> {
     let (neg, unsigned) = if let Some(rest) = tok.strip_prefix('-') {
         (true, rest)
@@ -2133,13 +2142,187 @@ fn build_pg_typed_values(
     }
 }
 
+/// Outcome of decoding a PostgreSQL array column.
+enum ArrayColumnBatch {
+    /// Every non-empty row has the same depth, so the column is a typed Arrow list.
+    Typed(Field, ArrayRef),
+    /// Non-empty rows disagree on depth; the column falls back to JSON text.
+    MixedDepth,
+}
+
+fn json_number_from_f64(value: f64) -> serde_json::Value {
+    serde_json::Number::from_f64(value)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Converts one scalar array element to a JSON value for the text fallback.
+fn pg_array_element_to_json(raw: &str, elem_oid: i32) -> serde_json::Value {
+    match elem_oid {
+        16 => serde_json::Value::Bool(
+            raw.trim().eq_ignore_ascii_case("t") || raw.trim().eq_ignore_ascii_case("true"),
+        ),
+        20 | 21 | 23 => raw
+            .parse::<i64>()
+            .map(|value| serde_json::Value::Number(value.into()))
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+        700 | 701 => raw
+            .parse::<f64>()
+            .map(json_number_from_f64)
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+        1700 => raw
+            .parse::<i64>()
+            .map(|value| serde_json::Value::Number(value.into()))
+            .or_else(|_| raw.parse::<f64>().map(json_number_from_f64))
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+        114 | 3802 => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+        }
+        _ => serde_json::Value::String(raw.to_string()),
+    }
+}
+
+fn pg_array_to_json(value: &PgArrayValue, elem_oid: i32) -> serde_json::Value {
+    match value {
+        PgArrayValue::Element(None) => serde_json::Value::Null,
+        PgArrayValue::Element(Some(raw)) => pg_array_element_to_json(raw, elem_oid),
+        PgArrayValue::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| pg_array_to_json(item, elem_oid))
+                .collect(),
+        ),
+    }
+}
+
+/// Builds the documented JSON-text fallback for a mixed-depth array column.
+fn mixed_depth_array_column(
+    name: &str,
+    elem_oid: i32,
+    rows: &[Vec<Option<String>>],
+    col_idx: usize,
+) -> Result<(Field, ArrayRef)> {
+    let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+    for row in rows {
+        match row.get(col_idx).and_then(|value| value.as_deref()) {
+            Some(raw) => {
+                let parsed = parse_pg_array_literal(raw)?;
+                let text = serde_json::to_string(&pg_array_to_json(&parsed, elem_oid)).map_err(
+                    |error| {
+                        NetError::ProtocolError(format!(
+                            "Failed to encode PostgreSQL array column {name:?} as JSON: {error}"
+                        ))
+                    },
+                )?;
+                builder.append_value(&text);
+            }
+            None => builder.append_null(),
+        }
+    }
+    let mut metadata = HashMap::new();
+    metadata.insert("voyager.encoding".to_string(), "json".to_string());
+    // Keep the declared element type so `execute()` can hand `numeric` elements
+    // back as Decimal and `uuid` elements as uuid.UUID instead of untyped JSON
+    // strings/numbers. The Arrow/Polars exports still expose JSON text.
+    match elem_oid {
+        1700 => {
+            metadata.insert("voyager.type".to_string(), "decimal".to_string());
+        }
+        2950 => {
+            metadata.insert("voyager.type".to_string(), "uuid".to_string());
+        }
+        _ => {}
+    }
+    let field = Field::new(name, DataType::Utf8, true).with_metadata(metadata);
+    Ok((field, Arc::new(builder.finish())))
+}
+
+fn micros_to_seconds_nanos(micros: i64) -> (i64, i64) {
+    (
+        micros.div_euclid(1_000_000),
+        micros.rem_euclid(1_000_000) * 1_000,
+    )
+}
+
+/// Decodes one scalar array element into a [`BoltValue`] for `execute()`.
+fn pg_array_element_to_bolt(raw: &str, elem_oid: i32) -> Result<BoltValue> {
+    let value = match elem_oid {
+        16 => BoltValue::Boolean(parse_bool_element(raw, "array")?),
+        20 | 21 | 23 => BoltValue::Integer(parse_int_element(raw, "array")?),
+        700 | 701 => BoltValue::Float(parse_float_element(raw, "array")?),
+        // Numeric and UUID elements keep their exact text; the JSON-fallback
+        // column is tagged `voyager.type=decimal` / `voyager.type=uuid`, so the
+        // Python conversion parses these leaves into Decimal / uuid.UUID.
+        1700 | 2950 => BoltValue::String(raw.to_string()),
+        17 => BoltValue::Bytes(decode_pg_bytea(raw).ok_or_else(|| {
+            NetError::ProtocolError(format!("Invalid bytea array element {raw:?}"))
+        })?),
+        1082 => match parse_pg_date_days(raw) {
+            Some(days) => BoltValue::Date(BoltDate::new(days as i64)),
+            None => BoltValue::String(raw.to_string()),
+        },
+        1083 => match parse_pg_time_micros(raw) {
+            Some(micros) => BoltValue::LocalTime(BoltLocalTime::new(micros * 1_000)),
+            None => BoltValue::String(raw.to_string()),
+        },
+        1266 => match parse_pg_timetz_micros(raw) {
+            Some((micros, offset_secs)) => {
+                BoltValue::Time(BoltTime::new(micros * 1_000, offset_secs as i64))
+            }
+            None => BoltValue::String(raw.to_string()),
+        },
+        1114 => match parse_pg_timestamp_micros(raw) {
+            Some(micros) => {
+                let (seconds, nanoseconds) = micros_to_seconds_nanos(micros);
+                BoltValue::LocalDateTime(BoltLocalDateTime::new(seconds, nanoseconds))
+            }
+            None => BoltValue::String(raw.to_string()),
+        },
+        1184 => match parse_pg_timestamptz_micros(raw) {
+            Some((micros, offset_secs)) => {
+                let (seconds, nanoseconds) = micros_to_seconds_nanos(micros);
+                BoltValue::DateTime(BoltDateTime::new(seconds, nanoseconds, offset_secs as i64))
+            }
+            None => BoltValue::String(raw.to_string()),
+        },
+        1186 => match parse_pg_interval(raw) {
+            Some(duration) => BoltValue::Duration(duration),
+            None => BoltValue::String(raw.to_string()),
+        },
+        114 | 3802 => serde_json::from_str::<serde_json::Value>(raw)
+            .map(|value| BoltValue::from(&value))
+            .unwrap_or_else(|_| BoltValue::String(raw.to_string())),
+        _ => BoltValue::String(raw.to_string()),
+    };
+    Ok(value)
+}
+
+fn pg_array_value_to_bolt(value: &PgArrayValue, elem_oid: i32) -> Result<BoltValue> {
+    match value {
+        PgArrayValue::Element(None) => Ok(BoltValue::Null),
+        PgArrayValue::Element(Some(raw)) => pg_array_element_to_bolt(raw, elem_oid),
+        PgArrayValue::Array(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(pg_array_value_to_bolt(item, elem_oid)?);
+            }
+            Ok(BoltValue::List(values))
+        }
+    }
+}
+
+fn pg_array_to_bolt_value(raw: &str, elem_oid: i32) -> Result<BoltValue> {
+    let parsed = parse_pg_array_literal(raw)?;
+    pg_array_value_to_bolt(&parsed, elem_oid)
+}
+
 fn array_column_batch(
     name: &str,
     elem_oid: i32,
     typmod: Option<i32>,
     rows: &[Vec<Option<String>>],
     col_idx: usize,
-) -> Result<(Field, ArrayRef)> {
+) -> Result<ArrayColumnBatch> {
     let mut parsed: Vec<Option<PgArrayValue>> = Vec::with_capacity(rows.len());
     let mut depth: Option<usize> = None;
     for row in rows {
@@ -2154,9 +2337,7 @@ fn array_column_batch(
                     let cell_depth = pg_array_depth(&value)?;
                     match depth {
                         Some(existing) if existing != cell_depth => {
-                            return Err(NetError::ProtocolError(format!(
-                                "PostgreSQL array column {name:?} mixes {existing}-dimensional and {cell_depth}-dimensional values"
-                            )));
+                            return Ok(ArrayColumnBatch::MixedDepth);
                         }
                         None => depth = Some(cell_depth),
                         _ => {}
@@ -2274,7 +2455,7 @@ fn array_column_batch(
         child_field = field;
     }
 
-    Ok((child_field, child_array))
+    Ok(ArrayColumnBatch::Typed(child_field, child_array))
 }
 
 /// Dynamically transforms tabular row values into an Apache Arrow [`RecordBatch`].
@@ -2325,8 +2506,36 @@ pub fn rows_to_record_batch_with_column_metadata(
     column_types: &[i32],
     column_type_modifiers: &[i32],
 ) -> Result<RecordBatch> {
+    rows_to_record_batch_with_column_metadata_and_bolt_rows(
+        column_names,
+        rows,
+        age_columns,
+        column_types,
+        column_type_modifiers,
+        false,
+    )
+    .map(|(batch, _)| batch)
+}
+
+/// Like [`rows_to_record_batch_with_column_metadata`], optionally returning raw
+/// Bolt rows for columns that fell back to JSON.
+///
+/// A PostgreSQL array column cannot mix depths in one Arrow `List` type. When
+/// non-empty rows disagree on depth the column is serialized as JSON text tagged
+/// `voyager.encoding=json` (the same representation the native backends use for
+/// mixed values). `collect_bolt_rows` additionally decodes each such cell into a
+/// [`BoltValue`] row so `execute()` can return per-row shapes with element types
+/// intact instead of JSON text.
+pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
+    column_names: &[String],
+    rows: &[Vec<Option<String>>],
+    age_columns: &[bool],
+    column_types: &[i32],
+    column_type_modifiers: &[i32],
+    collect_bolt_rows: bool,
+) -> Result<(RecordBatch, Option<Vec<Vec<BoltValue>>>)> {
     if column_names.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+        return Ok((RecordBatch::new_empty(Arc::new(Schema::empty())), None));
     }
 
     let num_rows = rows.len();
@@ -2334,6 +2543,7 @@ pub fn rows_to_record_batch_with_column_metadata(
 
     let mut fields = Vec::with_capacity(num_cols);
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+    let mut fallback_columns: Vec<(usize, i32)> = Vec::new();
 
     for (col_idx, name) in column_names.iter().enumerate() {
         if age_columns.get(col_idx).copied().unwrap_or(false) {
@@ -2490,9 +2700,21 @@ pub fn rows_to_record_batch_with_column_metadata(
         if let Some(&oid) = column_types.get(col_idx) {
             let typmod = column_type_modifiers.get(col_idx).copied();
             if let Some(elem_oid) = pg_array_element_oid(oid) {
-                let (field, array) = array_column_batch(name, elem_oid, typmod, rows, col_idx)?;
-                fields.push(field);
-                columns.push(array);
+                match array_column_batch(name, elem_oid, typmod, rows, col_idx)? {
+                    ArrayColumnBatch::Typed(field, array) => {
+                        fields.push(field);
+                        columns.push(array);
+                    }
+                    ArrayColumnBatch::MixedDepth => {
+                        let (field, array) =
+                            mixed_depth_array_column(name, elem_oid, rows, col_idx)?;
+                        fields.push(field);
+                        columns.push(array);
+                        if collect_bolt_rows {
+                            fallback_columns.push((col_idx, elem_oid));
+                        }
+                    }
+                }
                 continue;
             }
             let cells: Vec<Option<&str>> = rows
@@ -2609,8 +2831,25 @@ pub fn rows_to_record_batch_with_column_metadata(
         }
     }
 
+    let bolt_rows = if collect_bolt_rows && !fallback_columns.is_empty() {
+        let mut decoded_rows = Vec::with_capacity(num_rows);
+        for row in rows {
+            let mut values = vec![BoltValue::Null; num_cols];
+            for (col_idx, elem_oid) in &fallback_columns {
+                if let Some(raw) = row.get(*col_idx).and_then(|value| value.as_deref()) {
+                    values[*col_idx] = pg_array_to_bolt_value(raw, *elem_oid)?;
+                }
+            }
+            decoded_rows.push(values);
+        }
+        Some(decoded_rows)
+    } else {
+        None
+    };
+
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, columns).map_err(NetError::ArrowError)
+    let batch = RecordBatch::try_new(schema, columns).map_err(NetError::ArrowError)?;
+    Ok((batch, bolt_rows))
 }
 
 #[cfg(test)]
@@ -2916,9 +3155,118 @@ mod pg_array_tests {
             vec![Some("{1,2}".to_string())],
             vec![Some("{{3,4},{5,6}}".to_string())],
         ];
-        let error = rows_to_record_batch_with_column_types(&columns, &rows, &[false], &[1007])
-            .expect_err("mixed dimensionalities are rejected");
-        assert!(error.to_string().contains("mixes"));
+        let batch = rows_to_record_batch_with_column_types(&columns, &rows, &[false], &[1007])
+            .expect("mixed dimensionalities fall back to JSON");
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(
+            batch
+                .schema()
+                .field(0)
+                .metadata()
+                .get("voyager.encoding")
+                .map(String::as_str),
+            Some("json")
+        );
+        let values = batch.column(0).as_string::<i32>();
+        assert_eq!(values.value(0), "[1,2]");
+        assert_eq!(values.value(1), "[[3,4],[5,6]]");
+    }
+
+    #[test]
+    fn mixed_depth_arrays_keep_per_row_shapes_for_execute() {
+        let columns = vec!["value".to_string()];
+        let rows = vec![
+            vec![Some("{1,2}".to_string())],
+            vec![Some("{{3,NULL},{5,6}}".to_string())],
+            vec![Some("{}".to_string())],
+            vec![None],
+        ];
+        let (batch, bolt_rows) = rows_to_record_batch_with_column_metadata_and_bolt_rows(
+            &columns,
+            &rows,
+            &[false],
+            &[1007],
+            &[0],
+            true,
+        )
+        .expect("mixed depth arrays fall back");
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+
+        let bolt_rows = bolt_rows.expect("fallback columns collect raw rows");
+        assert_eq!(bolt_rows.len(), 4);
+        assert_eq!(
+            bolt_rows[0][0],
+            BoltValue::List(vec![BoltValue::Integer(1), BoltValue::Integer(2)])
+        );
+        assert_eq!(
+            bolt_rows[1][0],
+            BoltValue::List(vec![
+                BoltValue::List(vec![BoltValue::Integer(3), BoltValue::Null]),
+                BoltValue::List(vec![BoltValue::Integer(5), BoltValue::Integer(6)]),
+            ])
+        );
+        assert_eq!(bolt_rows[2][0], BoltValue::List(Vec::new()));
+        assert_eq!(bolt_rows[3][0], BoltValue::Null);
+    }
+
+    #[test]
+    fn mixed_depth_numeric_and_uuid_arrays_keep_element_type_tags() {
+        let columns = vec!["nums".to_string(), "ids".to_string()];
+        let rows = vec![
+            vec![
+                Some("{1.5,2}".to_string()),
+                Some("{12345678-1234-5678-1234-567812345678}".to_string()),
+            ],
+            vec![
+                Some("{{3.25},{4}}".to_string()),
+                Some("{{87654321-4321-8765-4321-876543218765}}".to_string()),
+            ],
+        ];
+        let (batch, bolt_rows) = rows_to_record_batch_with_column_metadata_and_bolt_rows(
+            &columns,
+            &rows,
+            &[false, false],
+            &[1231, 2951],
+            &[0, 0],
+            true,
+        )
+        .expect("mixed depth arrays fall back");
+
+        let schema = batch.schema();
+        for (idx, expected_type) in [(0, "decimal"), (1, "uuid")] {
+            let field = schema.field(idx);
+            assert_eq!(field.data_type(), &DataType::Utf8);
+            assert_eq!(
+                field.metadata().get("voyager.encoding").map(String::as_str),
+                Some("json")
+            );
+            assert_eq!(
+                field.metadata().get("voyager.type").map(String::as_str),
+                Some(expected_type)
+            );
+        }
+
+        let bolt_rows = bolt_rows.expect("fallback columns collect raw rows");
+        assert_eq!(
+            bolt_rows[0][0],
+            BoltValue::List(vec![
+                BoltValue::String("1.5".to_string()),
+                BoltValue::String("2".to_string()),
+            ])
+        );
+        assert_eq!(
+            bolt_rows[1][0],
+            BoltValue::List(vec![
+                BoltValue::List(vec![BoltValue::String("3.25".to_string())]),
+                BoltValue::List(vec![BoltValue::String("4".to_string())]),
+            ])
+        );
+        assert_eq!(
+            bolt_rows[0][1],
+            BoltValue::List(vec![BoltValue::String(
+                "12345678-1234-5678-1234-567812345678".to_string()
+            )])
+        );
     }
 
     #[test]
