@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **DuckDB UNION columns in Polars exports (#446)**: `DuckDbBridge.execute_to_polars()` (including inside `Session.transaction()`) no longer raises `ComputeError: cannot create series from Union(...)` for DuckDB `UNION` columns. Polars has no union data type and panics when importing one, so top-level and nested unions are exported as a `Struct` with one field per union member plus a `tag` string field naming the active member (suffixed only when a member is already called `tag`), preserving each member's Polars type and nested structure. A `UserWarning` names each converted column. `execute_to_arrow()` and `execute()` keep returning the Arrow union or Python value unchanged.
+
 ## [0.5.0-alpha.2] - 2026-11-27
 
 Second alpha of the 0.5 line. It fixes the value differences the new value conformance pack (#299) found, so the same value comes back with the same Python type from the official client, the bridge, the native backend and Arrow/Polars on every engine. It also moves to DuckDB 2.x with Python 3.14 support for every engine client, and polishes the `voyager` CLI.
