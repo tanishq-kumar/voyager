@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-alpha.2] - 2026-11-27
+
+Second alpha of the 0.5 line. It fixes the value differences the new value conformance pack (#299) found, so the same value comes back with the same Python type from the official client, the bridge, the native backend and Arrow/Polars on every engine. It also moves to DuckDB 2.x with Python 3.14 support for every engine client, and polishes the `voyager` CLI.
+
+Highlights of 0.5.0-alpha.2:
+- **Bolt**: native sessions negotiate Bolt 5.x with Memgraph, so zoned datetimes keep their exact instant, including DST `fold` (#414). Spatial values come back as `voyager_ogm.Point` (#419). Memgraph Arrow/Polars temporals are correct (#420).
+- **PostgreSQL and Apache AGE**: dicts and nested values bind as `jsonb`, and a new `voyager_ogm.Json(...)` wrapper forces JSON (#421). Floats round-trip exactly through JSON (#422). Multidimensional and mixed-depth array results decode natively (#432, #440).
+- **Bridges**: UUID, offset-aware times, `ZoneInfo` datetimes, `Duration` and JSON parameters are adapted for the Bolt, FalkorDB and DuckDB bridges (#418, #423).
+- **DuckDB 2.0.1**: DuckDB 2.0.1 is now required, and duckdb, psycopg, falkordb and neomodel install on Python 3.14 (#417). The DuckDB bridge has typed Arrow/Polars exports (#424). TIMETZ and INTERVAL edge cases, including nested values, are fixed, and every statement runs once (#439, #442). DuckPGQ live tests now run in CI.
+- **CLI**: `compile` and `validate` accept the spec vector envelope, and `validate --check-expected` is new (#416). Memgraph and FalkorDB index introspection is fixed (#429, #430). `-h` and `--help` agree (#431).
+
+Breaking changes (details in the entries below):
+- Native Bolt (Neo4j, Memgraph) returns spatial values as `voyager_ogm.Point` instead of `dict`, and Arrow/Polars point columns are a struct (`srid`, `x`, `y`, `z`) (#419).
+- DuckDB bridge Arrow/Polars column types:
+  - UUID is 16-byte binary tagged `arrow.uuid`;
+  - HUGEINT is `decimal128(38,0)`;
+  - TIMETZ is ISO text;
+  - JSON is tagged JSON text (#424).
+- DuckDB 2.0.1 is the minimum, and DuckPGQ installs with `INSTALL duckpgq FROM community;` (#417).
+
 ### Added
 - **CLI Spec Vector Envelope Support (#416)**: `voyager compile` and `voyager validate` now unwrap Query Spec vector envelopes (`{"spec": {"spec_version": 1, ...}, ...}`) from `spec/vectors/` files or stdin while keeping bare specs and `compile` text stdout unchanged, marking `"envelope_unwrapped": true` in `compile --format json`, adding a hint mentioning `"spec_version": 1` and the envelope form when neither `spec_version` nor a `spec` object is present, and adding `--check-expected` to `voyager validate` to verify vector `expected` outputs or errors.
 
@@ -556,7 +576,9 @@ Breaking changes in the 0.4 line are marked **Breaking** in the sections below (
 
 
 
-[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.5.0-alpha.1...HEAD
+
+[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.5.0-alpha.2...HEAD
+[0.5.0-alpha.2]: https://github.com/tanishq-kumar/voyager/compare/v0.5.0-alpha.1...v0.5.0-alpha.2
 [0.5.0-alpha.1]: https://github.com/tanishq-kumar/voyager/compare/v0.4.3...v0.5.0-alpha.1
 [0.4.3]: https://github.com/tanishq-kumar/voyager/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tanishq-kumar/voyager/compare/v0.4.1...v0.4.2
