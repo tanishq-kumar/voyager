@@ -1539,7 +1539,8 @@ class Session(_SessionBase):
             install_duckpgq: For a DuckDB session with the ``duck_pgq``/``duckpgq`` dialect,
                 install the DuckPGQ extension before loading it when it is not already
                 available. Off by default because installing downloads the extension;
-                without it a missing extension raises an error naming ``INSTALL duckpgq;``.
+                without it a missing extension raises an error naming
+                ``INSTALL duckpgq FROM community;``.
                 A connection that already ran ``LOAD duckpgq;`` is left untouched.
         """
         super().__init__(
@@ -2425,7 +2426,8 @@ class AsyncSession(_SessionBase):
             install_duckpgq: For a DuckDB session with the ``duck_pgq``/``duckpgq`` dialect,
                 install the DuckPGQ extension before loading it when it is not already
                 available. Off by default because installing downloads the extension;
-                without it a missing extension raises an error naming ``INSTALL duckpgq;``.
+                without it a missing extension raises an error naming
+                ``INSTALL duckpgq FROM community;``.
                 A connection that already ran ``LOAD duckpgq;`` is left untouched.
         """
         super().__init__(

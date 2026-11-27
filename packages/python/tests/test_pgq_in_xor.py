@@ -290,6 +290,7 @@ HAS_DUCKPGQ = _has_duckpgq()
 def duckpgq_bridge():
     connection = duckdb.connect()
     connection.execute("LOAD duckpgq;")
+    connection.execute("SET active_grammar_extensions = ['duckpgq'];")
     connection.execute(
         f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
     )

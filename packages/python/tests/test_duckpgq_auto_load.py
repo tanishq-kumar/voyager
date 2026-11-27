@@ -50,7 +50,9 @@ def _duckpgq_available() -> bool:
 
 def _require_duckpgq() -> None:
     if not _duckpgq_available():
-        pytest.skip("duckpgq extension is not installed locally; run INSTALL duckpgq;")
+        pytest.skip(
+            "duckpgq extension is not installed locally; run INSTALL duckpgq FROM community;"
+        )
 
 
 def _seed_person_table(con) -> None:
@@ -113,6 +115,7 @@ def test_connection_that_already_loaded_duckpgq_keeps_working() -> None:
     con = _connect_duckdb()
     try:
         con.execute("LOAD duckpgq;")
+        con.execute("SET active_grammar_extensions = ['duckpgq'];")
         _seed_person_table(con)
         con.execute('CREATE PROPERTY GRAPH zz_prepared_pg VERTEX TABLES (person LABEL "Person")')
 
@@ -162,7 +165,7 @@ def test_missing_extension_error_names_duckpgq_and_install_command(tmp_path) -> 
             session.execute("CREATE PROPERTY GRAPH zz_missing_pg VERTEX TABLES (person)")
         message = str(exc_info.value)
         assert "DuckPGQ" in message
-        assert "INSTALL duckpgq;" in message
+        assert "INSTALL duckpgq FROM community;" in message
     finally:
         con.close()
 
@@ -216,7 +219,7 @@ def test_install_is_opt_in_only() -> None:
     bridge = DuckDbBridge(con)
     with pytest.raises(RuntimeError) as exc_info:
         bridge.ensure_duckpgq()
-    assert "INSTALL duckpgq;" in str(exc_info.value)
+    assert "INSTALL duckpgq FROM community;" in str(exc_info.value)
     assert not any(statement.startswith("INSTALL") for statement in con.calls)
 
 
@@ -225,5 +228,6 @@ def test_install_opt_in_installs_then_loads() -> None:
     con = _RecordingConnection(fail_first_load=True)
     bridge = DuckDbBridge(con, install_duckpgq=True)
     bridge.ensure_duckpgq()
-    assert "INSTALL duckpgq;" in con.calls
-    assert con.calls[-1] == "LOAD duckpgq;"
+    assert "INSTALL duckpgq FROM community;" in con.calls
+    assert con.calls[-2] == "LOAD duckpgq;"
+    assert con.calls[-1] == "SET active_grammar_extensions = ['duckpgq'];"
