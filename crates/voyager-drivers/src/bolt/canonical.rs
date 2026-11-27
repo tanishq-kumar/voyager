@@ -23,6 +23,7 @@ use crate::bolt::packstream::{
     format_time_string, format_tz_offset,
 };
 use crate::error::{NetError, Result};
+use crate::value::{VOYAGER_META_ENCODING, VOYAGER_META_KIND, VOYAGER_META_TYPE};
 
 /// Converts a [`BoltNode`] into the canonical kind-tagged JSON object.
 pub fn bolt_node_to_canonical_json(node: &BoltNode) -> serde_json::Value {
@@ -717,7 +718,7 @@ where
                     }
                 }
                 let mut meta = HashMap::new();
-                meta.insert("voyager.type".to_string(), "date".to_string());
+                meta.insert(VOYAGER_META_TYPE.to_string(), "date".to_string());
                 Ok((
                     Field::new(name, DataType::Utf8, true).with_metadata(meta),
                     Arc::new(builder.finish()),
@@ -747,7 +748,7 @@ where
                 }
             }
             let mut meta = HashMap::new();
-            meta.insert("voyager.type".to_string(), "time_tz".to_string());
+            meta.insert(VOYAGER_META_TYPE.to_string(), "time_tz".to_string());
             Ok((
                 Field::new(name, DataType::Utf8, true).with_metadata(meta),
                 Arc::new(builder.finish()),
@@ -806,7 +807,7 @@ where
                         }
                     }
                     let mut meta = HashMap::new();
-                    meta.insert("voyager.type".to_string(), "local_datetime".to_string());
+                    meta.insert(VOYAGER_META_TYPE.to_string(), "local_datetime".to_string());
                     Ok((
                         Field::new(name, DataType::Utf8, true).with_metadata(meta),
                         Arc::new(builder.finish()),
@@ -938,7 +939,7 @@ where
                         }
                     }
                     let mut meta = HashMap::new();
-                    meta.insert("voyager.type".to_string(), "duration".to_string());
+                    meta.insert(VOYAGER_META_TYPE.to_string(), "duration".to_string());
                     Ok((
                         Field::new(name, DataType::Struct(duration_struct_fields()), true)
                             .with_metadata(meta),
@@ -961,7 +962,7 @@ where
                 }
             }
             let mut meta = HashMap::new();
-            meta.insert("voyager.type".to_string(), "point".to_string());
+            meta.insert(VOYAGER_META_TYPE.to_string(), "point".to_string());
             Ok((
                 Field::new(name, DataType::Struct(point_struct_fields()), true).with_metadata(meta),
                 Arc::new(builder.finish()),
@@ -989,7 +990,7 @@ where
         }
     }
     let mut meta = HashMap::new();
-    meta.insert("voyager.type".to_string(), "datetime_tz".to_string());
+    meta.insert(VOYAGER_META_TYPE.to_string(), "datetime_tz".to_string());
     Ok((
         Field::new(name, DataType::Utf8, true).with_metadata(meta),
         Arc::new(builder.finish()),
@@ -1096,7 +1097,7 @@ pub(crate) fn wrap_flat_array_in_list(
             if fields.len() == 4
                 && item_field
                     .metadata()
-                    .get("voyager.type")
+                    .get(VOYAGER_META_TYPE)
                     .is_some_and(|v| v == "point") =>
         {
             let src = flat
@@ -1255,8 +1256,8 @@ fn build_typed_bolt_list_column(
 pub fn batch_needs_bolt_rows(batch: &RecordBatch) -> bool {
     batch.schema().fields().iter().any(|field| {
         let meta = field.metadata();
-        meta.get("voyager.encoding").is_some_and(|v| v == "json")
-            || meta.contains_key("voyager.kind")
+        meta.get(VOYAGER_META_ENCODING).is_some_and(|v| v == "json")
+            || meta.contains_key(VOYAGER_META_KIND)
     })
 }
 
@@ -1379,13 +1380,13 @@ pub fn build_bolt_record_batch(
             }
         }
         let mut metadata = HashMap::new();
-        metadata.insert("voyager.encoding".to_string(), "json".to_string());
+        metadata.insert(VOYAGER_META_ENCODING.to_string(), "json".to_string());
         if node_count == non_null_count {
-            metadata.insert("voyager.kind".to_string(), "node".to_string());
+            metadata.insert(VOYAGER_META_KIND.to_string(), "node".to_string());
         } else if rel_count == non_null_count {
-            metadata.insert("voyager.kind".to_string(), "relationship".to_string());
+            metadata.insert(VOYAGER_META_KIND.to_string(), "relationship".to_string());
         } else if path_count == non_null_count {
-            metadata.insert("voyager.kind".to_string(), "path".to_string());
+            metadata.insert(VOYAGER_META_KIND.to_string(), "path".to_string());
         }
         fields.push(Field::new(col_name, DataType::Utf8, true).with_metadata(metadata));
         arrow_arrays.push(Arc::new(builder.finish()));

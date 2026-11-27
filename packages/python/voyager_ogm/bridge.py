@@ -25,6 +25,13 @@ from typing import Any, Literal, Protocol, overload, runtime_checkable
 
 import polars as pl
 
+from voyager_ogm._voyager_rs import (
+    ARROW_EXTENSION_NAME,
+    ARROW_UUID_EXTENSION,
+    VOYAGER_META_ENCODING,
+    VOYAGER_META_KIND,
+    VOYAGER_META_TYPE,
+)
 from voyager_ogm.agtype import decode_agtype
 from voyager_ogm.entities import (
     GraphNode,
@@ -37,6 +44,12 @@ from voyager_ogm.entities import (
 )
 from voyager_ogm.ingestion import BulkIngestionPlan
 from voyager_ogm.types import Duration, Json, parse_pg_interval_text, unwrap_spatial_param
+
+_ARROW_EXTENSION_NAME = ARROW_EXTENSION_NAME.encode()
+_ARROW_UUID_EXTENSION = ARROW_UUID_EXTENSION.encode()
+_VOYAGER_META_ENCODING = VOYAGER_META_ENCODING.encode()
+_VOYAGER_META_KIND = VOYAGER_META_KIND.encode()
+_VOYAGER_META_TYPE = VOYAGER_META_TYPE.encode()
 
 _PAGINATION_PARAMETER_PATTERN = re.compile(
     r"\b(?:SKIP|OFFSET|LIMIT)\s+\$([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE
@@ -1969,21 +1982,21 @@ def _duckdb_arrow_field_metadata(
     metadata = dict(existing) if existing else {}
     tid = _duckdb_type_id(dtype) if dtype else ""
     if tid == "uuid":
-        metadata[b"voyager.type"] = b"uuid"
+        metadata[_VOYAGER_META_TYPE] = b"uuid"
         if pa.types.is_fixed_size_binary(arrow_type):
             # Same extension tag as the native PostgreSQL backend's UUID columns.
-            metadata[b"ARROW:extension:name"] = b"arrow.uuid"
+            metadata[_ARROW_EXTENSION_NAME] = _ARROW_UUID_EXTENSION
     elif tid == "json":
-        metadata[b"voyager.encoding"] = b"json"
-        metadata[b"voyager.type"] = b"json"
+        metadata[_VOYAGER_META_ENCODING] = b"json"
+        metadata[_VOYAGER_META_TYPE] = b"json"
     elif tid == "time with time zone":
-        metadata[b"voyager.type"] = b"time_tz"
+        metadata[_VOYAGER_META_TYPE] = b"time_tz"
     elif tid == "hugeint":
-        metadata[b"voyager.type"] = b"hugeint"
+        metadata[_VOYAGER_META_TYPE] = b"hugeint"
     elif (
         _is_month_day_nano_interval(arrow_type) or tid in _DUCKDB_INTERVAL_TYPE_IDS
     ) and pa.types.is_struct(arrow_type):
-        metadata[b"voyager.type"] = b"duration"
+        metadata[_VOYAGER_META_TYPE] = b"duration"
     return metadata or None
 
 
@@ -2194,11 +2207,11 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
         metadata = dict(field.metadata) if field.metadata else {}
         if tid == "hugeint":
             array = column
-            metadata[b"voyager.type"] = b"hugeint"
+            metadata[_VOYAGER_META_TYPE] = b"hugeint"
         elif _is_month_day_nano_interval(field.type):
             array = _duckdb_mdn_column_to_arrow(column)
             if pa.types.is_struct(array.type):
-                metadata[b"voyager.type"] = b"duration"
+                metadata[_VOYAGER_META_TYPE] = b"duration"
         elif _duckdb_type_has(
             dtype, _DUCKDB_ARROW_CANONICAL_TYPE_IDS
         ) or _arrow_has_month_day_nano_interval(field.type):
@@ -2206,9 +2219,9 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
             if tid in ("uuid", "json", "time with time zone"):
                 metadata = _duckdb_arrow_field_metadata(dtype, array.type, metadata) or {}
             elif description_type.startswith("UUID["):
-                metadata[b"voyager.type"] = b"uuid"
+                metadata[_VOYAGER_META_TYPE] = b"uuid"
             elif description_type.startswith("TIME WITH TIME ZONE"):
-                metadata[b"voyager.type"] = b"time_tz"
+                metadata[_VOYAGER_META_TYPE] = b"time_tz"
         else:
             arrays.append(column)
             fields.append(field)
@@ -2340,9 +2353,9 @@ def _duckdb_python_values_to_arrow(
     else:
         meta_dict = meta
     if description_type.startswith("UUID["):
-        meta_dict[b"voyager.type"] = b"uuid"
+        meta_dict[_VOYAGER_META_TYPE] = b"uuid"
     elif description_type.startswith("TIME WITH TIME ZONE"):
-        meta_dict[b"voyager.type"] = b"time_tz"
+        meta_dict[_VOYAGER_META_TYPE] = b"time_tz"
     return pa.field(name, arr.type, nullable=nullable, metadata=meta_dict or None), arr
 
 
@@ -3703,7 +3716,7 @@ def _duckdb_arrow_table_to_polars(arrow_table: Any) -> pl.DataFrame:
             new_cols.append(arr)
             meta = dict(field.metadata) if field.metadata else {}
             if pa.types.is_struct(arr.type):
-                meta[b"voyager.type"] = b"duration"
+                meta[_VOYAGER_META_TYPE] = b"duration"
             new_fields.append(
                 pa.field(field.name, arr.type, nullable=field.nullable, metadata=meta or None)
             )

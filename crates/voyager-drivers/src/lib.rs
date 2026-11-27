@@ -28,6 +28,7 @@ mod redact;
 pub mod redis;
 pub mod tls;
 pub mod uri;
+pub mod value;
 
 // Re-exports
 #[cfg(feature = "testkit")]
