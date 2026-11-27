@@ -12,7 +12,7 @@ use crate::config::Auth;
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
-use crate::postgres::agtype::rows_to_record_batch_with_column_metadata;
+use crate::postgres::agtype::rows_to_record_batch_with_column_metadata_and_bolt_rows;
 use crate::postgres::auth::{ScramClient, compute_md5_password};
 use crate::postgres::codec::{
     read_backend_message, write_frontend_message, write_frontend_messages, write_startup_message,
@@ -563,12 +563,13 @@ impl PostgresConnection {
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
         let age_cols = self.age_columns(&field_types);
-        let batch = rows_to_record_batch_with_column_metadata(
+        let (batch, bolt_rows) = rows_to_record_batch_with_column_metadata_and_bolt_rows(
             &columns,
             &rows,
             &age_cols,
             &field_types,
             &field_type_modifiers,
+            true,
         )?;
         let batches = if batch.num_rows() > 0 || !columns.is_empty() {
             vec![batch]
@@ -576,7 +577,11 @@ impl PostgresConnection {
             Vec::new()
         };
 
-        Ok(QueryResult::new(columns, batches, summary))
+        let mut result = QueryResult::new(columns, batches, summary);
+        if let Some(rows) = bolt_rows {
+            result = result.with_bolt_rows(rows);
+        }
+        Ok(result)
     }
 
     /// Executes a parameterized statement via the PostgreSQL extended query protocol.
@@ -634,12 +639,13 @@ impl PostgresConnection {
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
         let age_cols = self.age_columns(&response.field_types);
-        let batch = rows_to_record_batch_with_column_metadata(
+        let (batch, bolt_rows) = rows_to_record_batch_with_column_metadata_and_bolt_rows(
             &response.columns,
             &response.rows,
             &age_cols,
             &response.field_types,
             &response.field_type_modifiers,
+            true,
         )?;
         let batches = if batch.num_rows() > 0 || !response.columns.is_empty() {
             vec![batch]
@@ -647,7 +653,11 @@ impl PostgresConnection {
             Vec::new()
         };
 
-        Ok(QueryResult::new(response.columns, batches, summary))
+        let mut result = QueryResult::new(response.columns, batches, summary);
+        if let Some(rows) = bolt_rows {
+            result = result.with_bolt_rows(rows);
+        }
+        Ok(result)
     }
 
     /// Executes a prepared statement with the configured query timeout.
