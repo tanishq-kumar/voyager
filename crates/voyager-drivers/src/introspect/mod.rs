@@ -391,6 +391,21 @@ impl SchemaBuilder {
         self.indexes.push(index);
     }
 
+    /// Records an index without creating a node label from the index row alone.
+    ///
+    /// Memgraph's `SHOW INDEX INFO` does not separate node and relationship
+    /// property indexes reliably on empty labels, so node labels come only from
+    /// label discovery and constraints.
+    #[cfg(feature = "bolt")]
+    pub(crate) fn add_index_without_creating_labels(&mut self, index: IndexEntry) {
+        if index.entity == EntityKind::Relationship {
+            for owner in &index.labels_or_types {
+                self.add_relationship_type(owner.clone());
+            }
+        }
+        self.indexes.push(index);
+    }
+
     /// Records a declared column or property type (PostgreSQL), which wins
     /// over sampled types.
     pub fn declare_property_type(

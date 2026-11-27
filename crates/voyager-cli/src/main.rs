@@ -48,11 +48,12 @@ Exit codes:
     author = "Voyager OGM Team",
     version = env!("CARGO_PKG_VERSION"),
     about = "Compile and validate Voyager Query Spec documents, check database connections and introspect live schemas",
-    long_about = "The Voyager CLI compiles Query Spec v1 JSON documents with the same consumer as \
-                  `compile_query_from_spec`, validates them without emitting a statement, checks \
-                  database connections through voyager-drivers, and prints a live database's graph \
-                  schema in the shape of `export_schema`. Release archives and the Python wheel \
-                  also install the short alias `voy`, which runs this program.",
+    long_about = "Compile and validate Voyager Query Spec documents, check database connections and introspect live schemas\n\n\
+                  Compiles Query Spec v1 JSON documents to openCypher, Apache AGE, ISO GQL, SQL/PGQ or \
+                  DuckPGQ, validates them without emitting a statement, checks database connections \
+                  (including TLS), and prints a live database's graph schema. Spec vector envelopes \
+                  ({\"spec\": ...}) are accepted alongside bare specs. Release archives and the \
+                  Python wheel also install the short alias `voy`, which runs this program.",
     after_help = EXIT_HELP
 )]
 struct Cli {
@@ -64,7 +65,7 @@ struct Cli {
 enum Commands {
     /// Show build facts, or check a database connection with --uri
     #[command(
-        long_about = "Show build facts, or check a database connection with --uri.\n\n\
+        long_about = "Show build facts, or check a database connection with --uri\n\n\
                       Credentials are optional. With no username and no password, doctor connects \
                       without authentication: Bolt uses the `none` authentication scheme and Redis \
                       skips AUTH. PostgreSQL still requires a username. Put the username in the URI \
@@ -89,15 +90,13 @@ enum Commands {
 
     /// Print a live database's graph schema (labels, relationship types, properties, constraints, indexes)
     #[command(
-        long_about = "Print a live database's graph schema: labels, relationship types with their \
-                      endpoints, properties, constraints and indexes.\n\n\
-                      The JSON format is the result of the library call (Python \
-                      `voyager_ogm.introspect_schema`, Rust `voyager_drivers::introspect`) and has the \
-                      shape of `export_schema(models)`, plus `constraints`, `indexes` and `source`. \
-                      Keys a database cannot know (model, attribute, description, has_default, \
-                      constraints) are null. Property value types and relationship endpoints come from \
-                      a sample of at most --sample-size entities per label or relationship type, \
-                      unless the engine declares them (PostgreSQL).\n\n\
+        long_about = "Print a live database's graph schema (labels, relationship types, properties, constraints, indexes)\n\n\
+                      Reads labels, relationship types with their endpoints, properties, constraints \
+                      and indexes. The JSON format outputs `nodes`, `relationships`, `constraints`, \
+                      `indexes` and `source`. Keys a database cannot know (model, attribute, \
+                      description, has_default, constraints) are null. Property value types and \
+                      relationship endpoints come from a sample of at most --sample-size entities \
+                      per label or relationship type, unless the engine declares them (PostgreSQL).\n\n\
                       Supported: Neo4j 5.13+ and Memgraph (bolt://), FalkorDB (redis:// or \
                       falkordb://, graph from the URI), PostgreSQL SQL/PGQ (experimental: \
                       PostgreSQL 19 Beta 1-3 and 20 development builds) property graphs \
@@ -130,7 +129,15 @@ enum Commands {
     },
 
     /// Compile a Query Spec v1 document to a dialect
-    #[command(after_help = EXIT_HELP)]
+    #[command(
+        long_about = "Compile a Query Spec v1 document to a dialect\n\n\
+                      Accepts a bare Query Spec v1 JSON object or a spec vector envelope \
+                      ({\"spec\": ...}) from a file or `-` for stdin. Text format prints only the \
+                      statement to stdout (use --show-params to print parameters to stderr); JSON \
+                      format prints `statement`, `parameters`, `columns`, optional `warnings`, and \
+                      `envelope_unwrapped` when an envelope was unwrapped.",
+        after_help = EXIT_HELP
+    )]
     Compile {
         /// Query Spec v1 JSON file, or `-` to read from stdin
         input: String,
@@ -161,10 +168,22 @@ enum Commands {
     },
 
     /// Validate a Query Spec v1 document without compiling output
-    #[command(after_help = EXIT_HELP)]
+    #[command(
+        long_about = "Validate a Query Spec v1 document without compiling output\n\n\
+                      Accepts a bare Query Spec v1 JSON object or a spec vector envelope \
+                      ({\"spec\": ...}) from a file or `-` for stdin. Exits 0 silently when valid; \
+                      on failure prints `<json-pointer>: <message> (<CODE>)` to stderr and exits 1. \
+                      Pass --check-expected on a spec vector envelope to compare compiled output or \
+                      expected errors against the vector's `expected` field.",
+        after_help = EXIT_HELP
+    )]
     Validate {
         /// Query Spec v1 JSON file, or `-` to read from stdin
         input: String,
+
+        /// Compare compiled output or validation errors against the vector's `expected` field
+        #[arg(long)]
+        check_expected: bool,
     },
 }
 
@@ -234,6 +253,19 @@ impl Failure {
         )
     }
 
+    fn invalid_with_hint(
+        error: &voyager_ogm::spec::SpecError,
+        missing_version_and_envelope: bool,
+    ) -> Self {
+        let mut failure = Self::invalid(error);
+        if missing_version_and_envelope {
+            failure.message.push_str(
+                "\nhint: pass a bare Query Spec with \"spec_version\": 1, or a spec vector envelope {\"spec\": {\"spec_version\": 1, ...}}",
+            );
+        }
+        failure
+    }
+
     fn invalid_message(message: impl Into<String>) -> Self {
         Self::new(EXIT_INVALID_SPEC, message)
     }
@@ -291,7 +323,10 @@ async fn run(cli: Cli) -> Result<(), Failure> {
             optimize,
             optimization_level,
         ),
-        Commands::Validate { input } => run_validate(&input),
+        Commands::Validate {
+            input,
+            check_expected,
+        } => run_validate(&input, check_expected),
     }
 }
 
@@ -305,7 +340,7 @@ fn run_compile(
     optimization_level: String,
 ) -> Result<(), Failure> {
     let text = read_input(input)?;
-    let spec = parse_spec(&text)?;
+    let parsed = parse_spec_input(&text)?;
     let options = SpecCompileOptions {
         graph_name,
         optimize,
@@ -313,7 +348,7 @@ fn run_compile(
         use_cache: true,
     };
 
-    match compile(&spec, dialect.api_name(), &options) {
+    match compile(&parsed.spec, dialect.api_name(), &options) {
         Ok(result) => {
             print_warnings(&result.warnings);
             let parameters = parameters_to_json(&result.compiled.parameters);
@@ -355,6 +390,9 @@ fn run_compile(
                             ),
                         );
                     }
+                    if parsed.unwrapped {
+                        document.insert("envelope_unwrapped".to_string(), Value::Bool(true));
+                    }
                     println!("{}", render_json(&Value::Object(document)));
                 }
             }
@@ -362,16 +400,17 @@ fn run_compile(
         }
         Err(error) => {
             print_warnings(error.warnings());
-            Err(Failure::invalid(&error))
+            Err(Failure::invalid_with_hint(
+                &error,
+                parsed.missing_version_and_envelope,
+            ))
         }
     }
 }
 
-fn run_validate(input: &str) -> Result<(), Failure> {
-    let text = read_input(input)?;
-    let spec = parse_spec(&text)?;
-
-    let builder = build_query(&spec).map_err(|error| Failure::invalid(&error))?;
+fn validate_spec_value(spec: &Value, missing_version_and_envelope: bool) -> Result<(), Failure> {
+    let builder = build_query(spec)
+        .map_err(|error| Failure::invalid_with_hint(&error, missing_version_and_envelope))?;
     builder.try_build().map_err(|error| {
         Failure::new(
             EXIT_INVALID_SPEC,
@@ -379,6 +418,113 @@ fn run_validate(input: &str) -> Result<(), Failure> {
         )
     })?;
     Ok(())
+}
+
+fn vector_dialect_api_name(key: &str) -> Result<&'static str, Failure> {
+    match key {
+        "cypher" => Ok("cypher"),
+        "age" => Ok("age"),
+        "iso_gql" => Ok("iso_gql"),
+        "sql_pgq" => Ok("sql_pgq"),
+        "duck_pgq" => Ok("duckpgq"),
+        other => Err(Failure::invalid_message(format!(
+            "<root>: unknown dialect '{other}' in vector 'expected' (INVALID_SPEC)"
+        ))),
+    }
+}
+
+fn check_vector_expected(parsed: &ParsedSpecInput) -> Result<(), Failure> {
+    let expected = parsed
+        .envelope
+        .as_ref()
+        .and_then(|envelope| envelope.get("expected"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Failure::invalid_message(
+                "<root>: --check-expected requires a spec vector envelope with an 'expected' object (INVALID_SPEC)",
+            )
+        })?;
+
+    if let Some(expected_error) = expected.get("error").and_then(Value::as_str) {
+        let expected_path = expected.get("path").and_then(Value::as_str).unwrap_or("");
+        match build_query(&parsed.spec) {
+            Ok(builder) => match builder.try_build() {
+                Ok(_) => {
+                    return Err(Failure::invalid_message(format!(
+                        "<root>: expected {expected_error} at '{expected_path}', but spec validated successfully (MISMATCH)"
+                    )));
+                }
+                Err(error) => {
+                    let actual_code = error.code().to_string();
+                    if actual_code != expected_error || !expected_path.is_empty() {
+                        return Err(Failure::invalid_message(format!(
+                            "<root>: expected {expected_error} at '{expected_path}', got {actual_code} at '' (MISMATCH)"
+                        )));
+                    }
+                }
+            },
+            Err(error) => {
+                let actual_code = error.code().to_string();
+                let actual_path = error.path().unwrap_or("");
+                if actual_code != expected_error || actual_path != expected_path {
+                    return Err(Failure::invalid_message(format!(
+                        "<root>: expected {expected_error} at '{expected_path}', got {actual_code} at '{actual_path}' (MISMATCH)"
+                    )));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    validate_spec_value(&parsed.spec, parsed.missing_version_and_envelope)?;
+    for (dialect_key, expected_entry) in expected {
+        let api_dialect = vector_dialect_api_name(dialect_key)?;
+        let options = SpecCompileOptions::default();
+        if let Some(expected_error) = expected_entry.get("error").and_then(Value::as_str) {
+            match compile(&parsed.spec, api_dialect, &options) {
+                Ok(_) => {
+                    return Err(Failure::invalid_message(format!(
+                        "<root>: {dialect_key}: expected error {expected_error}, but compilation succeeded (MISMATCH)"
+                    )));
+                }
+                Err(error) => {
+                    let actual_code = error.code().to_string();
+                    if actual_code != expected_error {
+                        return Err(Failure::invalid_message(format!(
+                            "<root>: {dialect_key}: expected error {expected_error}, got {actual_code} (MISMATCH)"
+                        )));
+                    }
+                }
+            }
+            continue;
+        }
+        let result = compile(&parsed.spec, api_dialect, &options)
+            .map_err(|error| Failure::invalid(&error))?;
+        let actual_statement = Value::String(result.compiled.statement);
+        if actual_statement != expected_entry["statement"] {
+            return Err(Failure::invalid_message(format!(
+                "<root>: {dialect_key}: compiled statement does not match expected (MISMATCH)"
+            )));
+        }
+        let actual_params = parameters_to_json(&result.compiled.parameters);
+        if actual_params != expected_entry["parameters"] {
+            return Err(Failure::invalid_message(format!(
+                "<root>: {dialect_key}: compiled parameters do not match expected (MISMATCH)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn run_validate(input: &str, check_expected: bool) -> Result<(), Failure> {
+    let text = read_input(input)?;
+    let parsed = parse_spec_input(&text)?;
+
+    if check_expected {
+        return check_vector_expected(&parsed);
+    }
+
+    validate_spec_value(&parsed.spec, parsed.missing_version_and_envelope)
 }
 
 async fn run_doctor(
@@ -921,9 +1067,47 @@ fn read_input(input: &str) -> Result<String, Failure> {
     }
 }
 
-fn parse_spec(text: &str) -> Result<Value, Failure> {
-    serde_json::from_str(text).map_err(|error| {
+struct ParsedSpecInput {
+    spec: Value,
+    envelope: Option<Value>,
+    unwrapped: bool,
+    missing_version_and_envelope: bool,
+}
+
+fn parse_spec_input(text: &str) -> Result<ParsedSpecInput, Failure> {
+    let value: Value = serde_json::from_str(text).map_err(|error| {
         Failure::invalid_message(format!("<root>: invalid JSON: {error} (INVALID_SPEC)"))
+    })?;
+    if let Value::Object(map) = &value {
+        if map.contains_key("spec_version") {
+            return Ok(ParsedSpecInput {
+                spec: value,
+                envelope: None,
+                unwrapped: false,
+                missing_version_and_envelope: false,
+            });
+        }
+        if let Some(spec_obj @ Value::Object(_)) = map.get("spec") {
+            let spec = spec_obj.clone();
+            return Ok(ParsedSpecInput {
+                spec,
+                envelope: Some(value),
+                unwrapped: true,
+                missing_version_and_envelope: false,
+            });
+        }
+        return Ok(ParsedSpecInput {
+            spec: value,
+            envelope: None,
+            unwrapped: false,
+            missing_version_and_envelope: true,
+        });
+    }
+    Ok(ParsedSpecInput {
+        spec: value,
+        envelope: None,
+        unwrapped: false,
+        missing_version_and_envelope: false,
     })
 }
 

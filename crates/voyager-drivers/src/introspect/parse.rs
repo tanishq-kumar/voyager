@@ -5,6 +5,8 @@
 //! database. List columns may arrive as JSON arrays or, from FalkorDB verbose
 //! replies, as `[a, b]` strings; [`string_list`] accepts both.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde_json::{Map, Value};
 
 use crate::bolt::BoltValue;
@@ -78,10 +80,10 @@ pub fn first_string(row: &Row) -> Option<String> {
     })
 }
 
-/// Returns a list-of-strings column. Accepts a JSON array, a single string,
-/// or a `[a, b]` string (FalkorDB verbose replies).
-pub fn string_list(row: &Row, column: &str) -> Vec<String> {
-    match row.get(column) {
+/// Converts a JSON value to a list of strings. Accepts a JSON array, a single
+/// string, or a `[a, b]` string (FalkorDB verbose replies).
+fn value_to_string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
         Some(Value::Array(items)) => items
             .iter()
             .filter_map(|item| match item {
@@ -110,6 +112,12 @@ pub fn string_list(row: &Row, column: &str) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Returns a list-of-strings column. Accepts a JSON array, a single string,
+/// or a `[a, b]` string (FalkorDB verbose replies).
+pub fn string_list(row: &Row, column: &str) -> Vec<String> {
+    value_to_string_list(row.get(column))
 }
 
 /// Normalises an engine value type name to the type names of a model export.
@@ -262,11 +270,32 @@ pub fn memgraph_constraints(rows: &[Row]) -> Vec<ConstraintEntry> {
 /// Index types: `label`, `label+property`, `edge-type`, `edge-type+property`,
 /// `edge-property`, `point`, `text`, `vector` and their edge variants.
 pub fn memgraph_indexes(rows: &[Row]) -> Vec<IndexEntry> {
+    memgraph_indexes_with_types(rows, &BTreeSet::new(), &BTreeSet::new())
+}
+
+/// Parses Memgraph `SHOW INDEX INFO` rows, classifying rows whose `label`
+/// matches a discovered relationship type (and not a discovered node label) as
+/// relationship indexes.
+///
+/// Memgraph 3.x reports `CREATE INDEX ON :REL(prop)` with
+/// `index type = 'label+property'` and no entity column; matching against the
+/// discovered node labels and relationship types keeps those indexes under the
+/// relationship type without creating a phantom node label.
+pub fn memgraph_indexes_with_types(
+    rows: &[Row],
+    labels: &BTreeSet<String>,
+    rel_types: &BTreeSet<String>,
+) -> Vec<IndexEntry> {
     rows.iter()
         .filter_map(|row| {
             let engine_type = string(row, "index type")?;
             let lower = engine_type.to_ascii_lowercase();
-            let entity = if lower.contains("edge") {
+            let label = string(row, "label");
+            let entity = if lower.contains("edge")
+                || label
+                    .as_deref()
+                    .is_some_and(|name| !labels.contains(name) && rel_types.contains(name))
+            {
                 EntityKind::Relationship
             } else {
                 EntityKind::Node
@@ -286,7 +315,7 @@ pub fn memgraph_indexes(rows: &[Row]) -> Vec<IndexEntry> {
             let labels_or_types = if lower == "edge-property" {
                 Vec::new()
             } else {
-                string(row, "label").into_iter().collect()
+                label.into_iter().collect()
             };
             Some(IndexEntry {
                 entity,
@@ -302,45 +331,175 @@ pub fn memgraph_indexes(rows: &[Row]) -> Vec<IndexEntry> {
         .collect()
 }
 
-/// Parses FalkorDB `db.indexes()` rows unwound to one row per property and
-/// index type (columns `label`, `property`, `kind`, `entitytype`).
-///
-/// FalkorDB requires a range index before a unique constraint on the same
-/// property, so a single-property range index matching a unique constraint is
-/// reported as backing that constraint.
-pub fn falkordb_indexes(rows: &[Row], constraints: &[ConstraintEntry]) -> Vec<IndexEntry> {
-    rows.iter()
-        .filter_map(|row| {
-            let label = string(row, "label")?;
-            let property = string(row, "property")?;
-            let engine_type = string(row, "kind")?;
-            let entity = entity_kind(string(row, "entitytype").as_deref());
-            let index_type = normalize_index_type(&engine_type);
-            let owning_constraint = if index_type == "BTREE" {
-                constraints
-                    .iter()
-                    .find(|c| {
-                        c.entity == entity
-                            && c.label_or_type == label
-                            && c.kind == ConstraintKind::Unique
-                            && c.properties == [property.clone()]
-                    })
-                    .map(|c| c.name.clone().unwrap_or_else(|| c.engine_type.clone()))
-            } else {
-                None
-            };
-            Some(IndexEntry {
-                entity,
-                labels_or_types: vec![label],
-                properties: vec![property],
-                index_type,
-                name: None,
-                owning_constraint,
-                engine_type,
-                options: None,
+fn falkordb_single_index(
+    entity: EntityKind,
+    label: &str,
+    property: String,
+    engine_type: String,
+    constraints: &[ConstraintEntry],
+) -> IndexEntry {
+    let index_type = normalize_index_type(&engine_type);
+    let owning_constraint = if index_type == "BTREE" {
+        constraints
+            .iter()
+            .find(|c| {
+                c.entity == entity
+                    && c.label_or_type == label
+                    && c.kind == ConstraintKind::Unique
+                    && c.properties == [property.clone()]
             })
-        })
-        .collect()
+            .map(|c| c.name.clone().unwrap_or_else(|| c.engine_type.clone()))
+    } else {
+        None
+    };
+    IndexEntry {
+        entity,
+        labels_or_types: vec![label.to_string()],
+        properties: vec![property],
+        index_type,
+        name: None,
+        owning_constraint,
+        engine_type,
+        options: None,
+    }
+}
+
+/// Parses FalkorDB `types` column, accepting either a JSON object or FalkorDB's
+/// verbose map string (`{slug: [RANGE], title: [RANGE, FULLTEXT]}`).
+fn falkordb_types_map(value: Option<&Value>) -> Option<BTreeMap<String, Vec<String>>> {
+    match value? {
+        Value::Object(map) => Some(
+            map.iter()
+                .map(|(k, v)| (k.clone(), value_to_string_list(Some(v))))
+                .collect(),
+        ),
+        Value::String(s) => {
+            let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+            let mut map = BTreeMap::new();
+            if inner.is_empty() {
+                return Some(map);
+            }
+            let mut depth = 0usize;
+            let mut start = 0usize;
+            let mut parts = Vec::new();
+            for (idx, ch) in inner.char_indices() {
+                match ch {
+                    '[' | '{' => depth += 1,
+                    ']' | '}' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => {
+                        parts.push(&inner[start..idx]);
+                        start = idx + 1;
+                    }
+                    _ => {}
+                }
+            }
+            parts.push(&inner[start..]);
+            for part in parts {
+                let Some((raw_key, raw_val)) = part.split_once(':') else {
+                    continue;
+                };
+                let key = raw_key
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string();
+                if key.is_empty() {
+                    continue;
+                }
+                let kinds = value_to_string_list(Some(&Value::String(raw_val.trim().to_string())));
+                map.insert(key, kinds);
+            }
+            Some(map)
+        }
+        _ => None,
+    }
+}
+
+/// Parses FalkorDB `db.indexes()` rows.
+///
+/// Accepts either raw `db.indexes()` rows (`label`, `properties`, `types`,
+/// `entitytype`) or pre-unwound rows (`label`, `property`, `kind`,
+/// `entitytype`). `FULLTEXT` properties on the same `(entity, label)` are
+/// grouped into a single `IndexEntry` with their property list, while
+/// single-property `RANGE` (`BTREE`) and `VECTOR` indexes stay per-property so
+/// property-level `indexed` and `owning_constraint` flags remain accurate.
+pub fn falkordb_indexes(rows: &[Row], constraints: &[ConstraintEntry]) -> Vec<IndexEntry> {
+    let mut entries = Vec::new();
+    let mut unwound_fulltext: BTreeMap<(EntityKind, String), Vec<String>> = BTreeMap::new();
+
+    for row in rows {
+        let Some(label) = string(row, "label") else {
+            continue;
+        };
+        let entity = entity_kind(string(row, "entitytype").as_deref());
+
+        if let Some(types_map) = falkordb_types_map(row.get("types")) {
+            let properties = string_list(row, "properties");
+            let mut fulltext_properties = Vec::new();
+            for property in properties {
+                for kind in types_map.get(&property).into_iter().flatten() {
+                    if kind.eq_ignore_ascii_case("FULLTEXT") {
+                        if !fulltext_properties.contains(&property) {
+                            fulltext_properties.push(property.clone());
+                        }
+                    } else {
+                        entries.push(falkordb_single_index(
+                            entity,
+                            &label,
+                            property.clone(),
+                            kind.clone(),
+                            constraints,
+                        ));
+                    }
+                }
+            }
+            if !fulltext_properties.is_empty() {
+                entries.push(IndexEntry {
+                    entity,
+                    labels_or_types: vec![label],
+                    properties: fulltext_properties,
+                    index_type: "FULLTEXT".to_string(),
+                    name: None,
+                    owning_constraint: None,
+                    engine_type: "FULLTEXT".to_string(),
+                    options: None,
+                });
+            }
+            continue;
+        }
+
+        let (Some(property), Some(kind)) = (string(row, "property"), string(row, "kind")) else {
+            continue;
+        };
+        if kind.eq_ignore_ascii_case("FULLTEXT") {
+            let list = unwound_fulltext.entry((entity, label)).or_default();
+            if !list.contains(&property) {
+                list.push(property);
+            }
+        } else {
+            entries.push(falkordb_single_index(
+                entity,
+                &label,
+                property,
+                kind,
+                constraints,
+            ));
+        }
+    }
+
+    for ((entity, label), properties) in unwound_fulltext {
+        entries.push(IndexEntry {
+            entity,
+            labels_or_types: vec![label],
+            properties,
+            index_type: "FULLTEXT".to_string(),
+            name: None,
+            owning_constraint: None,
+            engine_type: "FULLTEXT".to_string(),
+            options: None,
+        });
+    }
+
+    entries
 }
 
 /// Parses FalkorDB `db.constraints()` rows (`type` is `UNIQUE` or `MANDATORY`).
@@ -528,6 +687,28 @@ mod tests {
         assert_eq!(indexes[2].properties, ["c"]);
         assert_eq!(indexes[3].index_type, "POINT");
         assert!(indexes[4].labels_or_types.is_empty());
+
+        let labels = BTreeSet::from(["P".to_string()]);
+        let rel_types = BTreeSet::from(["ACTED_IN".to_string(), "R".to_string()]);
+        let classified = memgraph_indexes_with_types(
+            &rows(json!([
+                {"index type": "edge-type", "label": "R", "property": null, "count": 1},
+                {"index type": "edge-type+property", "label": "R", "property": "w", "count": 1},
+                {"index type": "label+property", "label": "ACTED_IN", "property": ["billing"], "count": 0},
+                {"index type": "label+property", "label": "P", "property": ["c"], "count": 1}
+            ])),
+            &labels,
+            &rel_types,
+        );
+        assert_eq!(classified[0].entity, EntityKind::Relationship);
+        assert_eq!(classified[0].index_type, "LABEL");
+        assert_eq!(classified[1].entity, EntityKind::Relationship);
+        assert_eq!(classified[1].index_type, "BTREE");
+        assert_eq!(classified[2].entity, EntityKind::Relationship);
+        assert_eq!(classified[2].labels_or_types, ["ACTED_IN"]);
+        assert_eq!(classified[2].properties, ["billing"]);
+        assert_eq!(classified[3].entity, EntityKind::Node);
+        assert_eq!(classified[3].labels_or_types, ["P"]);
     }
 
     #[test]
@@ -542,17 +723,100 @@ mod tests {
 
         let indexes = falkordb_indexes(
             &rows(json!([
-                {"label": "P", "property": "email", "kind": "RANGE", "entitytype": "NODE"},
-                {"label": "P", "property": "name", "kind": "RANGE", "entitytype": "NODE"},
-                {"label": "P", "property": "bio", "kind": "FULLTEXT", "entitytype": "NODE"},
-                {"label": "R", "property": "w", "kind": "RANGE", "entitytype": "RELATIONSHIP"}
+                {
+                    "label": "Movie",
+                    "properties": ["slug", "title", "overview"],
+                    "types": {
+                        "slug": ["RANGE"],
+                        "title": ["RANGE", "FULLTEXT"],
+                        "overview": ["FULLTEXT"]
+                    },
+                    "entitytype": "NODE"
+                },
+                {
+                    "label": "P",
+                    "properties": ["email", "name", "bio", "vec"],
+                    "types": {
+                        "email": ["RANGE"],
+                        "name": ["RANGE"],
+                        "bio": ["FULLTEXT"],
+                        "vec": ["VECTOR"]
+                    },
+                    "entitytype": "NODE"
+                },
+                {
+                    "label": "R",
+                    "properties": ["w", "note", "tag"],
+                    "types": {
+                        "w": ["RANGE"],
+                        "note": ["FULLTEXT"],
+                        "tag": ["FULLTEXT"]
+                    },
+                    "entitytype": "RELATIONSHIP"
+                }
             ])),
             &constraints,
         );
-        assert_eq!(indexes[0].owning_constraint.as_deref(), Some("UNIQUE"));
-        assert!(indexes[1].owning_constraint.is_none());
+        // Movie: 2 range indexes + 1 grouped fulltext index
+        assert_eq!(indexes[0].labels_or_types, ["Movie"]);
+        assert_eq!(indexes[0].properties, ["slug"]);
+        assert_eq!(indexes[0].index_type, "BTREE");
+        assert_eq!(indexes[1].properties, ["title"]);
+        assert_eq!(indexes[1].index_type, "BTREE");
+        assert_eq!(indexes[2].labels_or_types, ["Movie"]);
+        assert_eq!(indexes[2].properties, ["title", "overview"]);
         assert_eq!(indexes[2].index_type, "FULLTEXT");
-        assert_eq!(indexes[3].entity, EntityKind::Relationship);
+        // P: email (backs UNIQUE), name (BTREE), vec (VECTOR), bio (single FULLTEXT)
+        assert_eq!(indexes[3].properties, ["email"]);
+        assert_eq!(indexes[3].owning_constraint.as_deref(), Some("UNIQUE"));
+        assert_eq!(indexes[4].properties, ["name"]);
+        assert!(indexes[4].owning_constraint.is_none());
+        assert_eq!(indexes[5].properties, ["vec"]);
+        assert_eq!(indexes[5].index_type, "VECTOR");
+        assert_eq!(indexes[6].properties, ["bio"]);
+        assert_eq!(indexes[6].index_type, "FULLTEXT");
+        // R: w (BTREE) + grouped relationship fulltext (note, tag)
+        assert_eq!(indexes[7].entity, EntityKind::Relationship);
+        assert_eq!(indexes[7].properties, ["w"]);
+        assert_eq!(indexes[8].entity, EntityKind::Relationship);
+        assert_eq!(indexes[8].properties, ["note", "tag"]);
+        assert_eq!(indexes[8].index_type, "FULLTEXT");
+
+        // Legacy unwound rows also group FULLTEXT per (entity, label)
+        let legacy = falkordb_indexes(
+            &rows(json!([
+                {"label": "P", "property": "email", "kind": "RANGE", "entitytype": "NODE"},
+                {"label": "P", "property": "bio", "kind": "FULLTEXT", "entitytype": "NODE"},
+                {"label": "P", "property": "title", "kind": "FULLTEXT", "entitytype": "NODE"}
+            ])),
+            &constraints,
+        );
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(legacy[0].owning_constraint.as_deref(), Some("UNIQUE"));
+        assert_eq!(legacy[1].index_type, "FULLTEXT");
+        assert_eq!(legacy[1].properties, ["bio", "title"]);
+
+        // Verbose non-compact FalkorDB reply strings
+        let verbose = falkordb_indexes(
+            &rows(json!([
+                {
+                    "label": "Movie",
+                    "properties": "[slug, title, released, overview]",
+                    "types": "{slug: [RANGE], title: [RANGE, FULLTEXT], released: [RANGE], overview: [FULLTEXT]}",
+                    "entitytype": "NODE"
+                }
+            ])),
+            &constraints,
+        );
+        assert_eq!(verbose.len(), 4);
+        assert_eq!(verbose[0].properties, ["slug"]);
+        assert_eq!(verbose[0].index_type, "BTREE");
+        assert_eq!(verbose[1].properties, ["title"]);
+        assert_eq!(verbose[1].index_type, "BTREE");
+        assert_eq!(verbose[2].properties, ["released"]);
+        assert_eq!(verbose[2].index_type, "BTREE");
+        assert_eq!(verbose[3].properties, ["title", "overview"]);
+        assert_eq!(verbose[3].index_type, "FULLTEXT");
     }
 
     #[test]

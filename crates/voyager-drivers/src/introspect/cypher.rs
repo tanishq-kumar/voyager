@@ -164,8 +164,10 @@ pub(crate) async fn collect(
                 builder.add_constraint(constraint);
             }
             let indexes = source.rows("SHOW INDEX INFO").await?;
-            for index in parse::memgraph_indexes(&indexes) {
-                builder.add_index(index);
+            for index in
+                parse::memgraph_indexes_with_types(&indexes, &builder.labels, &builder.rel_types)
+            {
+                builder.add_index_without_creating_labels(index);
             }
         }
         #[cfg(feature = "redis")]
@@ -180,8 +182,7 @@ pub(crate) async fn collect(
             let index_rows = source
                 .rows(
                     "CALL db.indexes() YIELD label, properties, types, entitytype \
-                     UNWIND properties AS property UNWIND types[property] AS kind \
-                     RETURN label, property, kind, entitytype",
+                     RETURN label, properties, types, entitytype",
                 )
                 .await?;
             for index in parse::falkordb_indexes(&index_rows, &constraints) {
@@ -624,8 +625,10 @@ mod tests {
                 ),
                 (
                     "CALL db.indexes()",
-                    Ok(json!([{"label": "P", "property": "k", "kind": "RANGE",
-                               "entitytype": "NODE"}])),
+                    Ok(
+                        json!([{"label": "P", "properties": ["k"], "types": {"k": ["RANGE"]},
+                               "entitytype": "NODE"}]),
+                    ),
                 ),
             ]),
         };
@@ -643,5 +646,149 @@ mod tests {
         assert!(k.unique);
         assert!(!k.indexed, "the range index backs the unique constraint");
         assert_eq!(k.type_name, None);
+    }
+
+    #[tokio::test]
+    async fn memgraph_classifies_rel_label_property_index_without_phantom_label() {
+        let mut source = Replay {
+            answers: VecDeque::from([
+                ("SHOW NODE_LABELS INFO", Err("metadata disabled")),
+                (
+                    "MATCH (n) UNWIND labels(n)",
+                    Ok(json!([{"label": "Movie"}, {"label": "Person"}])),
+                ),
+                ("SHOW EDGE_TYPES INFO", Err("metadata disabled")),
+                (
+                    "MATCH ()-[r]->() RETURN DISTINCT type(r)",
+                    Ok(json!([{"type": "ACTED_IN"}, {"type": "KNOWS"}])),
+                ),
+                ("SHOW CONSTRAINT INFO", Ok(json!([]))),
+                (
+                    "SHOW INDEX INFO",
+                    Ok(json!([
+                        {"index type": "label", "label": "Movie", "property": null, "count": 1},
+                        {"index type": "label+property", "label": "Movie", "property": ["title"], "count": 1},
+                        {"index type": "label+property", "label": "ACTED_IN", "property": ["billing"], "count": 0},
+                        {"index type": "edge-type", "label": "KNOWS", "property": null, "count": 1},
+                        {"index type": "edge-type+property", "label": "KNOWS", "property": "since", "count": 1},
+                        {"index type": "label+property", "label": "PhantomNode", "property": ["ghost"], "count": 0}
+                    ])),
+                ),
+                (
+                    "MATCH (n:`Movie`)",
+                    Ok(json!([{"key": "title", "type": "STRING NOT NULL"}])),
+                ),
+                ("MATCH (n:`Person`)", Ok(json!([]))),
+                (
+                    "MATCH ()-[r:`ACTED_IN`]",
+                    Ok(json!([{"key": "billing", "type": "INTEGER NOT NULL"}])),
+                ),
+                (
+                    "MATCH (a)-[r:`ACTED_IN`]",
+                    Ok(json!([{"source": "Person", "target": "Movie"}])),
+                ),
+                (
+                    "MATCH ()-[r:`KNOWS`]",
+                    Ok(json!([{"key": "since", "type": "INTEGER NOT NULL"}])),
+                ),
+                (
+                    "MATCH (a)-[r:`KNOWS`]",
+                    Ok(json!([{"source": "Person", "target": "Person"}])),
+                ),
+            ]),
+        };
+        let mut builder = SchemaBuilder::new();
+        collect(
+            &mut source,
+            Flavor::Memgraph,
+            &IntrospectOptions { sample_size: 10 },
+            &mut builder,
+        )
+        .await
+        .expect("collect");
+        assert!(source.answers.is_empty());
+        let schema = builder.finish(source_info("memgraph"));
+
+        let node_names: Vec<&str> = schema.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(node_names, vec!["Movie", "Person"]);
+        assert!(schema.nodes[0].properties["title"].indexed);
+
+        let acted_in = schema
+            .relationships
+            .iter()
+            .find(|r| r.name == "ACTED_IN")
+            .expect("ACTED_IN");
+        assert!(acted_in.properties["billing"].indexed);
+        assert_eq!(
+            acted_in.properties["billing"].index_type.as_deref(),
+            Some("BTREE")
+        );
+
+        let knows = schema
+            .relationships
+            .iter()
+            .find(|r| r.name == "KNOWS")
+            .expect("KNOWS");
+        assert!(knows.properties["since"].indexed);
+
+        assert!(schema.indexes.iter().any(|i| {
+            i.entity == EntityKind::Relationship
+                && i.labels_or_types == ["ACTED_IN"]
+                && i.properties == ["billing"]
+        }));
+        assert!(schema.indexes.iter().any(|i| {
+            i.entity == EntityKind::Relationship
+                && i.labels_or_types == ["KNOWS"]
+                && i.properties.is_empty()
+                && i.index_type == "LABEL"
+        }));
+    }
+
+    #[tokio::test]
+    async fn falkordb_groups_multi_property_fulltext_index() {
+        let mut source = Replay {
+            answers: VecDeque::from([
+                ("CALL db.labels()", Ok(json!([{"label": "Movie"}]))),
+                ("CALL db.relationshipTypes()", Ok(json!([]))),
+                ("CALL db.constraints()", Ok(json!([]))),
+                (
+                    "CALL db.indexes()",
+                    Ok(json!([{
+                        "label": "Movie",
+                        "properties": ["title", "overview", "released"],
+                        "types": {
+                            "title": ["RANGE", "FULLTEXT"],
+                            "overview": ["FULLTEXT"],
+                            "released": ["RANGE"]
+                        },
+                        "entitytype": "NODE"
+                    }])),
+                ),
+            ]),
+        };
+        let mut builder = SchemaBuilder::new();
+        collect(
+            &mut source,
+            Flavor::FalkorDb,
+            &IntrospectOptions { sample_size: 0 },
+            &mut builder,
+        )
+        .await
+        .expect("collect");
+        let schema = builder.finish(source_info("falkordb"));
+
+        let fulltext: Vec<_> = schema
+            .indexes
+            .iter()
+            .filter(|i| i.index_type == "FULLTEXT")
+            .collect();
+        assert_eq!(fulltext.len(), 1);
+        assert_eq!(fulltext[0].labels_or_types, ["Movie"]);
+        assert_eq!(fulltext[0].properties, ["title", "overview"]);
+
+        let movie = &schema.nodes[0];
+        assert!(movie.properties["title"].indexed);
+        assert!(movie.properties["released"].indexed);
+        assert!(!movie.properties["overview"].indexed);
     }
 }

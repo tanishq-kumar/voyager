@@ -227,7 +227,9 @@ async fn live_introspect_memgraph() {
     }
     let prefix = unique_prefix("Mg");
     let person = format!("{prefix}Person");
+    let movie = format!("{prefix}Movie");
     let knows = format!("{prefix}Knows");
+    let acted_in = format!("{prefix}ActedIn");
     let uri = format!("bolt://{}:7688", host());
 
     let config = ConnectionConfig::from_uri(uri.clone());
@@ -236,11 +238,15 @@ async fn live_introspect_memgraph() {
         format!("CREATE CONSTRAINT ON (n:{person}) ASSERT n.email IS UNIQUE"),
         format!("CREATE CONSTRAINT ON (n:{person}) ASSERT EXISTS (n.email)"),
         format!("CREATE CONSTRAINT ON (n:{person}) ASSERT n.age IS TYPED INTEGER"),
+        format!("CREATE INDEX ON :{person}"),
         format!("CREATE INDEX ON :{person}(name)"),
+        format!("CREATE EDGE INDEX ON :{knows}"),
         format!("CREATE EDGE INDEX ON :{knows}(since)"),
+        format!("CREATE INDEX ON :{acted_in}(billing)"),
         format!(
-            "CREATE (:{person} {{email: 'a', name: 'A', age: 1}})-[:{knows} {{since: 2020}}]->\
-             (:{person} {{email: 'b', name: 'B', age: 2}})"
+            "CREATE (p1:{person} {{email: 'a', name: 'A', age: 1}})-[:{knows} {{since: 2020}}]->\
+             (p2:{person} {{email: 'b', name: 'B', age: 2}}), \
+             (p1)-[:{acted_in} {{billing: 1}}]->(:{movie} {{title: 'M'}})"
         ),
     ];
     for statement in &setup {
@@ -255,11 +261,15 @@ async fn live_introspect_memgraph() {
 
     for statement in [
         format!("MATCH (n:{person}) DETACH DELETE n"),
+        format!("MATCH (n:{movie}) DETACH DELETE n"),
         format!("DROP CONSTRAINT ON (n:{person}) ASSERT n.email IS UNIQUE"),
         format!("DROP CONSTRAINT ON (n:{person}) ASSERT EXISTS (n.email)"),
         format!("DROP CONSTRAINT ON (n:{person}) ASSERT n.age IS TYPED INTEGER"),
         format!("DROP INDEX ON :{person}(name)"),
+        format!("DROP INDEX ON :{person}"),
         format!("DROP EDGE INDEX ON :{knows}(since)"),
+        format!("DROP EDGE INDEX ON :{knows}"),
+        format!("DROP INDEX ON :{acted_in}(billing)"),
     ] {
         connection
             .execute(&statement, &HashMap::new())
@@ -281,6 +291,53 @@ async fn live_introspect_memgraph() {
         Some(3),
         "{cli:#}"
     );
+
+    // #429: Memgraph relationship indexes (both `edge-type*` and `label+property`
+    // matching a relationship type) must appear as relationship indexes with no
+    // phantom node label.
+    let node_names: Vec<&str> = cli["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter_map(|n| n["name"].as_str())
+        .collect();
+    assert!(!node_names.contains(&acted_in.as_str()), "{cli:#}");
+    assert!(!node_names.contains(&knows.as_str()), "{cli:#}");
+    let acted_rel = relationship(&cli, &acted_in);
+    assert_eq!(
+        acted_rel["properties"]["billing"]["indexed"], true,
+        "{cli:#}"
+    );
+    assert_eq!(
+        acted_rel["properties"]["billing"]["index_type"], "BTREE",
+        "{cli:#}"
+    );
+    let indexes = cli["indexes"].as_array().expect("indexes");
+    assert!(
+        indexes.iter().any(|idx| {
+            idx["entity"] == "relationship"
+                && idx["labels_or_types"] == json!([acted_in])
+                && idx["properties"] == json!(["billing"])
+        }),
+        "{cli:#}"
+    );
+    assert!(
+        indexes.iter().any(|idx| {
+            idx["entity"] == "relationship"
+                && idx["labels_or_types"] == json!([knows])
+                && idx["properties"] == json!([])
+                && idx["index_type"] == "LABEL"
+        }),
+        "{cli:#}"
+    );
+    assert!(
+        indexes.iter().any(|idx| {
+            idx["entity"] == "node"
+                && idx["labels_or_types"] == json!([person])
+                && idx["properties"] == json!(["name"])
+        }),
+        "{cli:#}"
+    );
 }
 
 #[tokio::test]
@@ -293,6 +350,7 @@ async fn live_introspect_falkordb() {
     }
     let prefix = unique_prefix("Fk");
     let person = format!("{prefix}Person");
+    let movie = format!("{prefix}Movie");
     let knows = format!("{prefix}Knows");
     let graph = prefix.to_ascii_lowercase();
     let uri = format!("falkordb://{}:6379?graph={graph}", host());
@@ -301,11 +359,15 @@ async fn live_introspect_falkordb() {
     let mut connection = RedisConnection::connect(&parsed).await.expect("connect");
     for query in [
         format!(
-            "CREATE (:{person} {{email: 'a', name: 'A', age: 1}})-[:{knows} {{since: 2020}}]->\
-             (:{person} {{email: 'b', name: 'B', age: 2.5}})"
+            "CREATE (:{person} {{email: 'a', name: 'A', bio: 'first', age: 1}})-[:{knows} {{since: 2020}}]->\
+             (:{person} {{email: 'b', name: 'B', bio: 'second', age: 2.5}}), \
+             (:{movie} {{title: 'Voyager', overview: 'Graph story'}})"
         ),
         format!("CREATE INDEX FOR (n:{person}) ON (n.email)"),
         format!("CREATE INDEX FOR (n:{person}) ON (n.name)"),
+        format!("CREATE FULLTEXT INDEX FOR (n:{person}) ON (n.bio)"),
+        format!("CREATE INDEX FOR (n:{movie}) ON (n.title)"),
+        format!("CREATE FULLTEXT INDEX FOR (n:{movie}) ON (n.title, n.overview)"),
         format!("CREATE INDEX FOR ()-[r:{knows}]-() ON (r.since)"),
     ] {
         connection
@@ -351,10 +413,25 @@ async fn live_introspect_falkordb() {
     }
 
     let cli = cli_json(&["--uri", &uri], &[]);
+    let text_output = Command::new(bin())
+        .args(["introspect", "--uri", &uri])
+        .output()
+        .expect("run voyager introspect text");
     let library = library_json(&uri).await;
 
     connection.graph_delete(&graph).await.expect("delete graph");
     let _ = connection.close().await;
+
+    assert!(text_output.status.success(), "{}", stderr(&text_output));
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(
+        text.contains(&format!("FULLTEXT node {movie}(title, overview)")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("FULLTEXT node {person}(bio)")),
+        "{text}"
+    );
 
     let cli = own(&cli.expect("cli"), &prefix);
     let library = own(&library.expect("library"), &prefix);
@@ -365,6 +442,34 @@ async fn live_introspect_falkordb() {
     let props = &node(&cli, &person)["properties"];
     assert_eq!(props["email"]["nullable"], false, "{cli:#}");
     assert_eq!(props["age"]["type"], "ANY", "{cli:#}");
+
+    // #430: multi-property full-text index grouped into one IndexEntry,
+    // single-property full-text and range indexes unchanged.
+    let fulltext_movie: Vec<_> = cli["indexes"]
+        .as_array()
+        .expect("indexes")
+        .iter()
+        .filter(|idx| idx["index_type"] == "FULLTEXT" && idx["labels_or_types"] == json!([movie]))
+        .collect();
+    assert_eq!(fulltext_movie.len(), 1, "{cli:#}");
+    assert_eq!(
+        fulltext_movie[0]["properties"],
+        json!(["title", "overview"]),
+        "{cli:#}"
+    );
+    let fulltext_person: Vec<_> = cli["indexes"]
+        .as_array()
+        .expect("indexes")
+        .iter()
+        .filter(|idx| idx["index_type"] == "FULLTEXT" && idx["labels_or_types"] == json!([person]))
+        .collect();
+    assert_eq!(fulltext_person.len(), 1, "{cli:#}");
+    assert_eq!(fulltext_person[0]["properties"], json!(["bio"]), "{cli:#}");
+    assert_eq!(
+        node(&cli, &movie)["properties"]["title"]["indexed"],
+        true,
+        "{cli:#}"
+    );
 }
 
 #[tokio::test]

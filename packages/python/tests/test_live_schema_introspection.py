@@ -209,16 +209,52 @@ def memgraph() -> Iterator[tuple[NativeClient, str]]:
 
 def test_live_memgraph_matches_export_schema(memgraph: tuple[NativeClient, str]) -> None:
     client, uri = memgraph
+    extra_rel = "ZZ_PY_ACTED_IN"
     _run_all(
         client.execute_sync,
         SchemaManager.generate_constraint_ddl(*MODELS, dialect="memgraph")
-        + SchemaManager.generate_index_ddl(*MODELS, dialect="memgraph"),
+        + SchemaManager.generate_index_ddl(*MODELS, dialect="memgraph")
+        + [
+            f"CREATE EDGE INDEX ON :{KNOWS}",
+            f"CREATE INDEX ON :{extra_rel}(billing)",
+        ],
     )
     client.execute_sync(CREATE_DATA)
+    client.execute_sync(
+        f"MATCH (p1:{PERSON} {{pid: 'p1'}}), (p2:{PERSON} {{pid: 'p2'}}) "
+        f"CREATE (p1)-[:{extra_rel} {{billing: 1}}]->(p2)"
+    )
 
-    live = introspect_schema(uri)
+    try:
+        live = introspect_schema(uri)
+    finally:
+        for stmt in (
+            f"DROP EDGE INDEX ON :{KNOWS}",
+            f"DROP INDEX ON :{extra_rel}(billing)",
+        ):
+            client.execute_sync(stmt)
+
     assert live["source"]["engine"] == "memgraph"
     _compare(live, check_nullable=True)
+    node_names = {node["name"] for node in live["nodes"]}
+    assert extra_rel not in node_names
+    assert KNOWS not in node_names
+    acted_rel = _entry(live["relationships"], extra_rel)
+    assert acted_rel["properties"]["billing"]["indexed"] is True
+    assert acted_rel["properties"]["billing"]["index_type"] == "BTREE"
+    assert any(
+        idx["entity"] == "relationship"
+        and idx["labels_or_types"] == [extra_rel]
+        and idx["properties"] == ["billing"]
+        for idx in live["indexes"]
+    )
+    assert any(
+        idx["entity"] == "relationship"
+        and idx["labels_or_types"] == [KNOWS]
+        and idx["properties"] == []
+        and idx["index_type"] == "LABEL"
+        for idx in live["indexes"]
+    )
 
 
 @pytest.fixture
@@ -238,6 +274,8 @@ def test_live_falkordb_matches_export_schema(falkordb: tuple[Any, str, str]) -> 
     graph = db.select_graph(graph_name)
     graph.query(CREATE_DATA)
     _run_all(graph.query, SchemaManager.generate_index_ddl(*MODELS, dialect="falkordb"))
+    graph.query(f"CREATE FULLTEXT INDEX FOR (n:{PERSON}) ON (n.email, n.name)")
+    graph.query(f"CREATE FULLTEXT INDEX FOR (n:{COMPANY}) ON (n.name)")
     # FalkorDB manages constraints with GRAPH.CONSTRAINT; a unique constraint
     # needs a range index on the property first.
     exported = export_schema(MODELS)
@@ -265,6 +303,20 @@ def test_live_falkordb_matches_export_schema(falkordb: tuple[Any, str, str]) -> 
     assert live["source"]["engine"] == "falkordb"
     assert live["source"]["database"] == graph_name
     _compare(live, check_nullable=True)
+    person_fulltext = [
+        idx
+        for idx in live["indexes"]
+        if idx["index_type"] == "FULLTEXT" and idx["labels_or_types"] == [PERSON]
+    ]
+    assert len(person_fulltext) == 1
+    assert sorted(person_fulltext[0]["properties"]) == ["email", "name"]
+    company_fulltext = [
+        idx
+        for idx in live["indexes"]
+        if idx["index_type"] == "FULLTEXT" and idx["labels_or_types"] == [COMPANY]
+    ]
+    assert len(company_fulltext) == 1
+    assert company_fulltext[0]["properties"] == ["name"]
 
 
 @pytest.fixture

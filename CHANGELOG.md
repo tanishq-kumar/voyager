@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **CLI Spec Vector Envelope Support (#416)**: `voyager compile` and `voyager validate` now unwrap Query Spec vector envelopes (`{"spec": {"spec_version": 1, ...}, ...}`) from `spec/vectors/` files or stdin while keeping bare specs and `compile` text stdout unchanged, marking `"envelope_unwrapped": true` in `compile --format json`, adding a hint mentioning `"spec_version": 1` and the envelope form when neither `spec_version` nor a `spec` object is present, and adding `--check-expected` to `voyager validate` to verify vector `expected` outputs or errors.
+
+### Changed
+- **Consistent CLI `-h` and `--help` Summaries (#431)**: aligned the top-level `voyager` command and all subcommands (`doctor`, `introspect`, `compile`, `validate`) so `-h` and `--help` start with the same summary sentence and describe user-facing behaviour without naming internal crates or functions.
+
+### Fixed
+- **Memgraph Relationship Indexes in Schema Introspection (#429)**: `voyager introspect` and `introspect_schema` now classify Memgraph `SHOW INDEX INFO` `label+property` rows whose label matches a discovered relationship type (and not a node label) as relationship indexes rather than node indexes, and never create phantom node labels from index rows alone.
+- **FalkorDB Multi-Property Full-Text Indexes in Schema Introspection (#430)**: `voyager introspect` and `introspect_schema` now query `db.indexes()` without unwinding `properties` and group `FULLTEXT` properties per `(entity, label)` into a single `IndexEntry` with its property list while keeping single-property range and vector indexes unchanged.
+
 ## [0.5.0-alpha.1] - 2026-11-27
 
 First alpha of the 0.5 line. The theme is a portable query interchange format and the same values everywhere: Query Spec v1 with a JSON Schema, reference vectors and a conformance corpus, a working `voyager` CLI, live schema introspection, and native backends that return the same Python types as the bridges and the official clients.
