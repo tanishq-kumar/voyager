@@ -1075,13 +1075,11 @@ class TestDuckDbLiveMatrix:
             conn.execute("LOAD 'duckpgq';")
         except Exception:
             try:
-                conn.execute(
-                    "SET custom_extension_repository = 'http://duckpgq.s3.eu-north-1.amazonaws.com';"
-                )
-                conn.execute("INSTALL 'duckpgq';")
+                conn.execute("INSTALL duckpgq FROM community;")
                 conn.execute("LOAD 'duckpgq';")
             except Exception as e:
                 pytest.skip(f"DuckPGQ extension could not be loaded: {e}")
+        conn.execute("SET active_grammar_extensions = ['duckpgq'];")
 
         # 1. Create schema and Property Graph catalog
         conn.execute(
@@ -1129,7 +1127,7 @@ class TestDuckDbLiveMatrix:
             stmt = stmt.replace(f"${k_param}", val_str)
 
         # 3. Execute live GRAPH_TABLE query and stream into Polars DataFrame
-        df = conn.execute(stmt).pl()
+        df = pl.from_arrow(conn.sql(stmt).to_arrow_table())
         assert isinstance(df, pl.DataFrame)
         assert df.height == 2
         assert df["source"].to_list() == ["Alice", "Bob"]
@@ -1195,13 +1193,11 @@ class TestDuckDbLiveMatrix:
             conn.execute("LOAD 'duckpgq';")
         except Exception:
             try:
-                conn.execute(
-                    "SET custom_extension_repository = 'http://duckpgq.s3.eu-north-1.amazonaws.com';"
-                )
-                conn.execute("INSTALL 'duckpgq';")
+                conn.execute("INSTALL duckpgq FROM community;")
                 conn.execute("LOAD 'duckpgq';")
             except Exception as e:
                 pytest.skip(f"DuckPGQ extension could not be loaded: {e}")
+        conn.execute("SET active_grammar_extensions = ['duckpgq'];")
 
         conn.execute(
             """

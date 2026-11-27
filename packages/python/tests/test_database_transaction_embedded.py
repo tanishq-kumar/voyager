@@ -132,6 +132,7 @@ def test_duckdb_duckpgq_graph_table_parameters_inside_transaction():
     con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     try:
         con.execute("LOAD duckpgq;")
+        con.execute("SET active_grammar_extensions = ['duckpgq'];")
     except Exception as exc:  # pragma: no cover - depends on offline extension cache
         pytest.skip(f"duckpgq extension could not be loaded offline: {exc}")
 

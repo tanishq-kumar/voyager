@@ -74,7 +74,9 @@ def _duckpgq_available() -> bool:
 
 def test_count_nodes_runs_on_embedded_duckpgq() -> None:
     if not _duckpgq_available():
-        pytest.skip("duckpgq extension is not installed locally; run INSTALL duckpgq;")
+        pytest.skip(
+            "duckpgq extension is not installed locally; run INSTALL duckpgq FROM community;"
+        )
     duckdb = pytest.importorskip("duckdb")
     con = duckdb.connect(":memory:")
     try:

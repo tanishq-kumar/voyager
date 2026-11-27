@@ -308,6 +308,7 @@ def test_live_duckpgq_embedded_result_columns() -> None:
     con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     try:
         con.execute("LOAD duckpgq;")
+        con.execute("SET active_grammar_extensions = ['duckpgq'];")
     except Exception as exc:
         con.close()
         pytest.skip(f"duckpgq extension not available: {exc}")

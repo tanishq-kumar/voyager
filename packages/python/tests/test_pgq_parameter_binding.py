@@ -340,13 +340,11 @@ def test_duckdb_duckpgq_graph_table_literal_encoding_live():
         con.execute("LOAD duckpgq;")
     except Exception:
         try:
-            con.execute(
-                "SET custom_extension_repository = 'http://duckpgq.s3.eu-north-1.amazonaws.com';"
-            )
-            con.execute("INSTALL duckpgq;")
+            con.execute("INSTALL duckpgq FROM community;")
             con.execute("LOAD duckpgq;")
         except Exception as exc:
             pytest.skip(f"duckpgq extension could not be loaded: {exc}")
+    con.execute("SET active_grammar_extensions = ['duckpgq'];")
 
     # Set up schema and property graph
     con.execute("DROP TABLE IF EXISTS duck_person CASCADE;")

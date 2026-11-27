@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **DuckDB 2.0.1 minimum and Python 3.14 engine clients (#417)**: the minimum supported DuckDB version is now **2.0.1**: the `duckdb` extra requires `duckdb>=2.0.1`, the dev dependency group pins `duckdb==2.0.1`, and both install on Python 3.14 from the abi3 wheels. The `< 3.14` markers are gone from the `duckdb`, `age`/`psycopg[binary]`, `falkordb` and `neomodel` dependencies because their current releases support 3.14. DuckDB 2.0 only parses `CREATE PROPERTY GRAPH` and `GRAPH_TABLE` after the per-connection `SET active_grammar_extensions = ['duckpgq'];` opt-in, so `DuckDbBridge.ensure_duckpgq()` now runs it after `LOAD duckpgq;` (including when the caller already loaded the extension), and the embedded DuckPGQ tests, PGQ conformance corpus and live harnesses do the same.
+
 ## [0.5.0-alpha.1] - 2026-11-27
 
 First alpha of the 0.5 line. The theme is a portable query interchange format and the same values everywhere: Query Spec v1 with a JSON Schema, reference vectors and a conformance corpus, a working `voyager` CLI, live schema introspection, and native backends that return the same Python types as the bridges and the official clients.
