@@ -1893,6 +1893,10 @@ def _parse_duckdb_timetz_python(value: Any) -> Any:
     if isinstance(value, datetime.time):
         return value
     iso = _duckdb_timetz_text_iso(value)
+    if iso.startswith("24:"):
+        # End of day has no datetime.time equivalent. Python 3.14's fromisoformat
+        # silently maps "24:00:00" to midnight, so keep the ISO text on every version.
+        return iso
     try:
         return datetime.time.fromisoformat(iso)
     except ValueError:
