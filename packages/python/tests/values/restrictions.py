@@ -835,7 +835,37 @@ def _strat_json_doc(_engine: str, _path: str) -> st.SearchStrategy[Any]:
 
 def _strat_list(engine: str, path: str) -> st.SearchStrategy[list[Any]]:
     if engine == "pg19":
-        # PG typed arrays are homogeneous 1-D lists (no mixed scalar types, no nested arrays).
+        # PG typed arrays are homogeneous 1-D or rectangular multidimensional lists.
+        nested_ints = st.integers(0, 3).flatmap(
+            lambda rows: st.integers(0, 3).flatmap(
+                lambda cols: st.lists(
+                    st.lists(
+                        st.one_of(st.none(), st.integers(-100, 100)),
+                        min_size=cols,
+                        max_size=cols,
+                    ),
+                    min_size=rows,
+                    max_size=rows,
+                )
+            )
+        )
+        nested_texts = st.lists(
+            st.lists(
+                st.one_of(
+                    st.none(),
+                    st.text(
+                        alphabet=st.characters(
+                            blacklist_categories=("Cs",), blacklist_characters="\x00"
+                        ),
+                        max_size=12,
+                    ),
+                ),
+                min_size=2,
+                max_size=2,
+            ),
+            min_size=1,
+            max_size=2,
+        )
         return st.one_of(
             st.lists(st.integers(I64_MIN, I64_MAX), min_size=0, max_size=5),
             st.lists(st.one_of(st.none(), st.integers(I64_MIN, I64_MAX)), min_size=1, max_size=5),
@@ -851,6 +881,9 @@ def _strat_list(engine: str, path: str) -> st.SearchStrategy[list[Any]]:
             ),
             st.lists(st.dates(), min_size=0, max_size=4),
             st.lists(st.uuids(), min_size=0, max_size=4),
+            nested_ints,
+            nested_texts,
+            st.just([[[1, 2], [3, 4]], [[5, 6], [7, None]]]),
         )
     if engine == "neo4j" and path in ("stored", "node_prop", "rel_prop"):
         # Neo4j properties only allow homogeneous non-null primitive arrays.

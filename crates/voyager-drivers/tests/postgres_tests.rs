@@ -683,3 +683,122 @@ fn test_rows_to_record_batch_with_age_columns_decodes_entities_and_scalars() {
     assert!(path_val.get("sequence").is_none());
     assert_eq!(path_val["nodes"][0]["element_id"], serde_json::Value::Null);
 }
+
+fn row_description_payload(fields: &[(&str, i32)]) -> BytesMut {
+    use bytes::BufMut;
+    let mut payload = BytesMut::new();
+    payload.put_i16(fields.len() as i16);
+    for (name, type_oid) in fields {
+        payload.put_slice(name.as_bytes());
+        payload.put_u8(0);
+        payload.put_i32(0); // table OID
+        payload.put_i16(0); // column attribute number
+        payload.put_i32(*type_oid);
+        payload.put_i16(-1); // variable length
+        payload.put_i32(-1); // type modifier
+        payload.put_i16(0); // text format
+    }
+    payload
+}
+
+fn data_row_payload(values: &[Option<&str>]) -> BytesMut {
+    use bytes::BufMut;
+    let mut payload = BytesMut::new();
+    payload.put_i16(values.len() as i16);
+    for value in values {
+        match value {
+            Some(bytes) => {
+                payload.put_i32(bytes.len() as i32);
+                payload.put_slice(bytes.as_bytes());
+            }
+            None => payload.put_i32(-1),
+        }
+    }
+    payload
+}
+
+#[test]
+fn test_wire_multidimensional_array_columns_decode_to_nested_arrow_lists() {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    use voyager_drivers::postgres::agtype::rows_to_record_batch_with_column_metadata;
+
+    // RowDescription for bigint[][] and text[][][] columns.
+    let description = BackendMessage::decode(
+        b'T',
+        row_description_payload(&[("matrix", 1016), ("cube", 1009)]).freeze(),
+    )
+    .expect("RowDescription");
+    let (columns, field_types, field_type_modifiers) = match description {
+        BackendMessage::RowDescription(fields) => (
+            fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect::<Vec<_>>(),
+            fields
+                .iter()
+                .map(|field| field.type_oid)
+                .collect::<Vec<_>>(),
+            fields
+                .iter()
+                .map(|field| field.type_modifier)
+                .collect::<Vec<_>>(),
+        ),
+        other => panic!("expected RowDescription, got {other:?}"),
+    };
+
+    // DataRow text format for a 2-D matrix with NULLs and a 3-D text cube with NULLs.
+    let data = BackendMessage::decode(
+        b'D',
+        data_row_payload(&[
+            Some("{{1,2},{3,NULL}}"),
+            Some(r#"{{{alpha,NULL,"beta,gamma"}},{{"NULL",x,"quote""d"}}}"#),
+        ])
+        .freeze(),
+    )
+    .expect("DataRow");
+    let rows: Vec<Vec<Option<String>>> = match data {
+        BackendMessage::DataRow(values) => vec![
+            values
+                .into_iter()
+                .map(|value| {
+                    value.map(|bytes| String::from_utf8(bytes.to_vec()).expect("UTF-8 array text"))
+                })
+                .collect(),
+        ],
+        other => panic!("expected DataRow, got {other:?}"),
+    };
+
+    let batch = rows_to_record_batch_with_column_metadata(
+        &columns,
+        &rows,
+        &[false, false],
+        &field_types,
+        &field_type_modifiers,
+    )
+    .expect("multidimensional arrays decode");
+
+    let matrix = batch.column(0).as_list::<i32>();
+    let matrix_row_values = matrix.value(0);
+    let matrix_rows = matrix_row_values.as_list::<i32>();
+    assert_eq!(matrix_rows.len(), 2);
+    let first_row_values = matrix_rows.value(0);
+    let first = first_row_values.as_primitive::<arrow_array::types::Int64Type>();
+    assert_eq!((first.value(0), first.value(1)), (1, 2));
+    let second_row_values = matrix_rows.value(1);
+    let second = second_row_values.as_primitive::<arrow_array::types::Int64Type>();
+    assert_eq!(second.value(0), 3);
+    assert!(second.is_null(1));
+
+    let cube = batch.column(1).as_list::<i32>();
+    let cube_plane_values = cube.value(0);
+    let cube_planes = cube_plane_values.as_list::<i32>();
+    assert_eq!(cube_planes.len(), 2);
+    let plane_values = cube_planes.value(0);
+    let plane = plane_values.as_list::<i32>();
+    let cell_values = plane.value(0);
+    let values = cell_values.as_string::<i32>();
+    assert_eq!(values.value(0), "alpha");
+    assert!(values.is_null(1));
+    assert_eq!(values.value(2), "beta,gamma");
+}
