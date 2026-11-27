@@ -8,7 +8,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 import pytest
-from voyager_ogm import GraphNode, GraphPath, GraphRelationship, json_default
+from voyager_ogm import GraphNode, GraphPath, GraphRelationship, Point, json_default
 from voyager_ogm.agtype import decode_agtype
 from voyager_ogm.entities import (
     convert_driver_value,
@@ -81,9 +81,18 @@ class _FakeBoltPath:
 
 
 class _FakeSpatialPoint(tuple[float, ...]):
-    """Mimics neo4j.spatial.Point (a tuple subclass with srid)."""
+    """Mimics neo4j.spatial.Point (a tuple subclass with coordinates and srid)."""
 
+    __module__ = "neo4j.spatial"
     srid = 4326
+
+    @property
+    def x(self) -> float:
+        return self[0]
+
+    @property
+    def y(self) -> float:
+        return self[1]
 
 
 class _FakeFalkorNode:
@@ -381,12 +390,16 @@ def test_graph_path_and_json_default() -> None:
     assert payload["node"] == a.to_dict()
     assert payload["path"] == path.to_dict()
 
+    point = Point(latitude=52.52, longitude=13.405)
+    point_payload = json.loads(json.dumps({"p": point}, default=json_default))
+    assert point_payload["p"] == {"srid": 4326, "x": 13.405, "y": 52.52}
+
     with pytest.raises(TypeError):
         json.dumps(object(), default=json_default)
 
 
 def test_convert_driver_value_handles_all_driver_shapes_and_nesting() -> None:
-    # 1. Neo4j / Bolt objects (plus tuple subclass spatial point preserved)
+    # 1. Neo4j / Bolt objects (Bolt spatial points become voyager_ogm.Point)
     bn1 = _FakeBoltNode(1, "4:x:1", ["ZzA", "ZzB"], {"name": "A"})
     bn2 = _FakeBoltNode(2, "4:x:2", ["ZzA"], {"name": "B"})
     br = _FakeBoltRel(3, "5:x:3", "ZK", bn1, bn2, {"w": 1})
@@ -399,7 +412,8 @@ def test_convert_driver_value_handles_all_driver_shapes_and_nesting() -> None:
     assert converted_bolt["path"].nodes[0].labels == frozenset({"ZzA", "ZzB"})
     assert isinstance(converted_bolt["path"].relationships[0], GraphRelationship)
     assert converted_bolt["path"].relationships[0].start_element_id == "4:x:1"
-    assert isinstance(converted_bolt["point"], _FakeSpatialPoint)
+    assert isinstance(converted_bolt["point"], Point)
+    assert converted_bolt["point"] == Point(x=1.0, y=2.0, srid=4326)
 
     # 2. FalkorDB objects
     fn1 = _FakeFalkorNode(10, ["Person", "VIP"], {"name": "Alice"})
@@ -460,6 +474,23 @@ def test_convert_driver_value_handles_all_driver_shapes_and_nesting() -> None:
     assert converted_rel["r"]["type"] == "direct"
     assert converted_rel["r"]["element_id"] == "prop-eid"
     assert isinstance(converted_rel["p"], GraphPath)
+
+
+def test_convert_driver_value_unifies_point_mappings() -> None:
+    """FalkorDB point maps and Bolt wire dicts both hydrate to ``voyager_ogm.Point``."""
+    bolt_wire = convert_driver_value({"srid": 4326, "x": 13.405, "y": 52.52})
+    falkor_map = convert_driver_value({"latitude": 52.52, "longitude": 13.405})
+    cartesian = convert_driver_value({"srid": 7203, "x": 1.0, "y": 2.0})
+
+    assert bolt_wire == Point(latitude=52.52, longitude=13.405)
+    assert falkor_map == Point(latitude=52.52, longitude=13.405)
+    assert cartesian == Point(x=1.0, y=2.0, srid=7203)
+    assert convert_driver_value({"x": 1.0, "y": 2.0}) == {"x": 1.0, "y": 2.0}
+    # A user map that also carries non-coordinate keys stays a map (no data loss).
+    user_map = {"srid": 4326, "x": 1.0, "y": 2.0, "name": "a"}
+    assert convert_driver_value(user_map) == user_map
+    geo_map = {"latitude": 52.52, "longitude": 13.405, "city": "Berlin"}
+    assert convert_driver_value(geo_map) == geo_map
 
 
 def test_arrow_serialization_helpers_and_viewer_extractor() -> None:

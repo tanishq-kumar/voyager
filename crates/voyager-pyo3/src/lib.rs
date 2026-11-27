@@ -3561,6 +3561,31 @@ fn parse_voyager_typed_utf8<'py>(
                 }
             }
         }
+        _ if kind == voyager_drivers::value::META_TYPE_POINT => {
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                return Ok(s.into_pyobject(py)?.into_any());
+            };
+            let Some(map) = parsed.as_object() else {
+                return Ok(s.into_pyobject(py)?.into_any());
+            };
+            let coordinate = |key: &str| map.get(key).and_then(|value| value.as_f64());
+            let (Some(x), Some(y)) = (coordinate("x"), coordinate("y")) else {
+                return Ok(s.into_pyobject(py)?.into_any());
+            };
+            let kwargs = PyDict::new(py);
+            if let Some(srid) = map.get("srid").and_then(|value| value.as_i64()) {
+                kwargs.set_item("srid", srid)?;
+            }
+            kwargs.set_item("x", x)?;
+            kwargs.set_item("y", y)?;
+            if let Some(z) = coordinate("z") {
+                kwargs.set_item("z", z)?;
+            }
+            match ctors.point_cls.bind(py).call((), Some(&kwargs)) {
+                Ok(point) => Ok(point),
+                Err(_) => Ok(s.into_pyobject(py)?.into_any()),
+            }
+        }
         "date" => {
             let mut parts = trimmed.split('-');
             if let (Some(ys), Some(ms), Some(ds), None) =

@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -424,6 +425,13 @@ class Point(Expression):
                 d["height"] = self._z
         return d
 
+    def to_coordinate_dict(self) -> dict[str, Any]:
+        """Returns the canonical Arrow/JSON coordinate dictionary for this Point."""
+        coords: dict[str, Any] = {"srid": self._srid, "x": self._x, "y": self._y}
+        if self._is_3d:
+            coords["z"] = self._z
+        return coords
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Point:
         """Constructs a Point from a dictionary representation.
@@ -616,6 +624,44 @@ class Point(Expression):
             if self._is_3d:
                 return f"Point(x={self.x}, y={self.y}, z={self.z}, crs='{self.crs}')"
             return f"Point(x={self.x}, y={self.y}, crs='{self.crs}')"
+
+
+_POINT_MAPPING_KEYS = frozenset({"srid", "x", "y", "z", "crs", "latitude", "longitude", "height"})
+
+
+def coerce_point_value(value: Any) -> Point | None:
+    """Returns a :class:`Point` for a spatial driver object or coordinate mapping.
+
+    Recognizes ``Point`` instances, Bolt-style ``srid``/``x``/``y`` mappings
+    (including the ``{"__voyager_spatial__": ...}`` parameter wrapper),
+    FalkorDB-style ``latitude``/``longitude`` mappings, and duck-typed driver
+    point objects. Non-spatial values return ``None`` instead of raising.
+    """
+    if isinstance(value, Point):
+        return value
+    if isinstance(value, Mapping):
+        raw = value.get("__voyager_spatial__", value)
+        if not isinstance(raw, Mapping):
+            return None
+        keys = {str(key) for key in raw}
+        # Only a mapping made of coordinate keys alone is a point; a map that also
+        # carries other keys is user data and must not be collapsed into a Point.
+        if not keys <= _POINT_MAPPING_KEYS:
+            return None
+        is_wire = {"srid", "x", "y"} <= keys
+        is_geographic = {"latitude", "longitude"} <= keys
+        if not (is_wire or is_geographic):
+            return None
+        try:
+            return Point.from_spatial(dict(raw))
+        except (TypeError, ValueError):
+            return None
+    if hasattr(value, "srid") and hasattr(value, "x") and hasattr(value, "y"):
+        try:
+            return Point.from_spatial(value)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def distance(point1: Any, point2: Any) -> float:

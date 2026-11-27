@@ -816,10 +816,8 @@ def test_live_neo4j_geospatial_point_write_read_and_distance(clean_neo4j):
     assert len(res_single) == 1
     assert res_single[0]["name"] == "Munich"
     munich_wire_loc = res_single[0]["loc"]
-    # Check that Neo4j received and stored it as a native spatial point
-    from neo4j.spatial import WGS84Point
-
-    assert isinstance(munich_wire_loc, WGS84Point)
+    assert isinstance(munich_wire_loc, Point)
+    assert munich_wire_loc == munich
     munich_node = LiveSpatialPlace(name="Munich", location=munich_wire_loc)
     assert isinstance(munich_node.get("location"), Point)
     assert munich_node.get("location") == munich

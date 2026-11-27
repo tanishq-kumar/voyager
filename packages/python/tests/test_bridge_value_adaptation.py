@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pytest
-from voyager_ogm import Duration, Session
+from voyager_ogm import Duration, Point, Session
 from voyager_ogm.bridge import (
     DuckDbBridge,
     _adapt_bolt_parameters,
@@ -72,6 +72,19 @@ def test_falkordb_bridge_adapts_uuid_parameter_to_string() -> None:
 
     assert _adapt_falkordb_value(value) == str(value)
     assert _adapt_falkordb_value([value]) == [str(value)]
+
+
+def test_falkordb_bridge_adapts_point_parameter_to_map() -> None:
+    """FalkorDB receives an openCypher point map, never the old JSON string (#395)."""
+    from voyager_ogm.types import serialize_param_value
+
+    value = Point(latitude=52.52, longitude=13.405)
+
+    assert _adapt_falkordb_value(value) == {"latitude": 52.52, "longitude": 13.405}
+    assert _adapt_falkordb_value(serialize_param_value(value)) == {
+        "latitude": 52.52,
+        "longitude": 13.405,
+    }
 
 
 @pytest.fixture

@@ -28,6 +28,15 @@
   },
   {
     "engine": "neo4j",
+    "backend": "bridge",
+    "path": "*",
+    "value_kind": "point",
+    "category": "limitation",
+    "reason": "Neo4j/Memgraph bridge execute() returns the canonical voyager_ogm.Point while the official neo4j driver exposes neo4j.spatial.WGS84Point/CartesianPoint.",
+    "match": "type mismatch: actual Point"
+  },
+  {
+    "engine": "neo4j",
     "backend": "native",
     "path": "*",
     "value_kind": "point",
@@ -313,6 +322,15 @@
     "category": "limitation",
     "reason": "neo4j Python driver maps UTC offset 0 (datetime.timezone.utc) to pytz.UTC ('UTC').",
     "match": "datetime zone mismatch"
+  },
+  {
+    "engine": "memgraph",
+    "backend": "bridge",
+    "path": "*",
+    "value_kind": "point",
+    "category": "limitation",
+    "reason": "Neo4j/Memgraph bridge execute() returns the canonical voyager_ogm.Point while the official neo4j driver exposes neo4j.spatial.WGS84Point/CartesianPoint.",
+    "match": "type mismatch: actual Point"
   },
   {
     "engine": "memgraph",
