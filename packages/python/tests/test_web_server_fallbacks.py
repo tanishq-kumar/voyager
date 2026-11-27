@@ -316,11 +316,13 @@ def test_native_circuit_router_lifecycle():
     # 4. Wait for cooldown to expire
     time.sleep(0.05)
 
-    # 5. Automatically transitions to HalfOpen for trial probe
+    # 5. Automatically transitions to HalfOpen; only one caller gets the trial probe
     assert router.state == "half_open"
-    assert router.route() == "probe"
     assert router.should_probe()
-    assert router.should_route_native()
+    assert router.route() == "probe"
+    assert not router.should_probe()
+    assert router.route() == "fallback"
+    assert not router.should_route_native()
 
     # 6. Successful probe restores Closed state
     router.record_success()

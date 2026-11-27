@@ -321,7 +321,10 @@ struct CircuitInner {
     consecutive_failures: u32,
     consecutive_successes: u32,
     opened_at: Option<Instant>,
-    probe_in_flight: bool,
+    /// When the current half-open probe was handed out. A probe whose caller never reports
+    /// back (cancelled, or ended by a non-transient error) expires after one cooldown period,
+    /// so a lost probe cannot pin the circuit to the fallback backend.
+    probe_started_at: Option<Instant>,
     config: CircuitConfig,
 }
 
@@ -332,9 +335,14 @@ impl CircuitInner {
             consecutive_failures: 0,
             consecutive_successes: 0,
             opened_at: None,
-            probe_in_flight: false,
+            probe_started_at: None,
             config,
         }
+    }
+
+    fn probe_claimed(&self, now: Instant) -> bool {
+        self.probe_started_at
+            .is_some_and(|started| now.duration_since(started) < self.config.cooldown_duration)
     }
 
     fn check_and_update_state(&mut self, now: Instant) {
@@ -344,7 +352,7 @@ impl CircuitInner {
         {
             self.state = CircuitState::HalfOpen;
             self.consecutive_successes = 0;
-            self.probe_in_flight = false;
+            self.probe_started_at = None;
         }
     }
 }
@@ -383,15 +391,16 @@ impl CircuitRouter {
     /// Determines the routing destination for an incoming query.
     pub fn route(&self) -> BackendRoute {
         let mut inner = self.inner.lock();
-        inner.check_and_update_state(Instant::now());
+        let now = Instant::now();
+        inner.check_and_update_state(now);
         match inner.state {
             CircuitState::Closed => BackendRoute::Native,
             CircuitState::Open => BackendRoute::Fallback,
             CircuitState::HalfOpen => {
-                if inner.probe_in_flight {
+                if inner.probe_claimed(now) {
                     BackendRoute::Fallback
                 } else {
-                    inner.probe_in_flight = true;
+                    inner.probe_started_at = Some(now);
                     BackendRoute::Probe
                 }
             }
@@ -401,8 +410,9 @@ impl CircuitRouter {
     /// Returns `true` if the cooldown has elapsed and a trial probe should be executed.
     pub fn should_probe(&self) -> bool {
         let mut inner = self.inner.lock();
-        inner.check_and_update_state(Instant::now());
-        inner.state == CircuitState::HalfOpen && !inner.probe_in_flight
+        let now = Instant::now();
+        inner.check_and_update_state(now);
+        inner.state == CircuitState::HalfOpen && !inner.probe_claimed(now)
     }
 
     /// Returns `true` if the query should be routed to the native engine (either normal or probe).
@@ -421,7 +431,7 @@ impl CircuitRouter {
                 inner.consecutive_failures = 0;
             }
             CircuitState::HalfOpen => {
-                inner.probe_in_flight = false;
+                inner.probe_started_at = None;
                 inner.consecutive_successes += 1;
                 if inner.consecutive_successes >= inner.config.success_threshold {
                     inner.state = CircuitState::Closed;
@@ -456,7 +466,7 @@ impl CircuitRouter {
                     inner.state = CircuitState::Open;
                     inner.opened_at = Some(Instant::now());
                     inner.consecutive_successes = 0;
-                    inner.probe_in_flight = false;
+                    inner.probe_started_at = None;
                 }
             }
             CircuitState::HalfOpen => {
@@ -464,7 +474,7 @@ impl CircuitRouter {
                 inner.consecutive_failures += 1;
                 inner.opened_at = Some(Instant::now());
                 inner.consecutive_successes = 0;
-                inner.probe_in_flight = false;
+                inner.probe_started_at = None;
             }
             CircuitState::Open => {
                 inner.consecutive_failures += 1;
@@ -494,7 +504,7 @@ impl CircuitRouter {
         inner.opened_at = Some(Instant::now());
         inner.consecutive_successes = 0;
         inner.consecutive_failures += 1;
-        inner.probe_in_flight = false;
+        inner.probe_started_at = None;
     }
 
     /// Manually resets the circuit breaker to `Closed`, clearing all counters and cooldowns.
@@ -504,7 +514,7 @@ impl CircuitRouter {
         inner.consecutive_failures = 0;
         inner.consecutive_successes = 0;
         inner.opened_at = None;
-        inner.probe_in_flight = false;
+        inner.probe_started_at = None;
     }
 
     /// Returns the current count of consecutive transient failures.
@@ -763,7 +773,7 @@ mod tests {
         assert_eq!(router.route(), BackendRoute::Fallback);
         assert_eq!(router.route(), BackendRoute::Fallback);
 
-        // First probe succeeds (threshold=2 -> stays HalfOpen, clears probe_in_flight).
+        // First probe succeeds (threshold=2 -> stays HalfOpen, clears the probe claim).
         router.record_success();
         assert_eq!(router.state(), CircuitState::HalfOpen);
         assert_eq!(router.route(), BackendRoute::Probe);
@@ -773,5 +783,24 @@ mod tests {
         router.record_success();
         assert_eq!(router.state(), CircuitState::Closed);
         assert_eq!(router.route(), BackendRoute::Native);
+    }
+
+    #[test]
+    fn test_half_open_probe_claim_expires_when_caller_never_reports() {
+        let config = CircuitConfig::new(1, Duration::from_millis(15));
+        let router = CircuitRouter::new(config);
+
+        router.record_failure(true);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(router.state(), CircuitState::HalfOpen);
+
+        // The probe caller is lost (cancelled, or ended by a non-transient error).
+        assert_eq!(router.route(), BackendRoute::Probe);
+        assert_eq!(router.route(), BackendRoute::Fallback);
+
+        // After one cooldown period the claim expires and a new probe is handed out.
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(router.should_probe());
+        assert_eq!(router.route(), BackendRoute::Probe);
     }
 }
