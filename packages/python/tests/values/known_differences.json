@@ -1,39 +1,6 @@
 [
   {
     "engine": "neo4j",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "time_offset",
-    "category": "bug",
-    "reason": "Neo4jBoltBridge passes offset-aware datetime.time unadapted to neo4j==6.1.0, raising TypeError in utcoffset(dt).",
-    "repro": "Session(bridge=Neo4jBoltBridge(drv), dialect='neo4j').execute('RETURN $v AS v', {'v': datetime.time(0, 0, tzinfo=datetime.UTC)})",
-    "match": "utcoffset\\(dt\\)",
-    "issue": 418
-  },
-  {
-    "engine": "neo4j",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "datetime_zone",
-    "category": "bug",
-    "reason": "Neo4jBoltBridge passes zoneinfo.ZoneInfo directly to neo4j==6.1.0, ignoring fold=1 on DST fall-back and segfaulting on Europe/Berlin.",
-    "repro": "Session(bridge=Neo4jBoltBridge(drv), dialect='neo4j').execute('RETURN $v AS v', {'v': datetime.datetime(2024, 1, 2, 3, 4, tzinfo=ZoneInfo('Europe/Berlin'))})",
-    "match": "datetime instant|crashed on zoneinfo\\.ZoneInfo",
-    "issue": 418
-  },
-  {
-    "engine": "neo4j",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "uuid",
-    "category": "bug",
-    "reason": "Neo4jBoltBridge passes uuid.UUID unadapted to neo4j driver, raising ValueError.",
-    "repro": "Session(bridge=Neo4jBoltBridge(drv), dialect='neo4j').execute('RETURN $v AS v', {'v': uuid.UUID(int=0)})",
-    "match": "UUID.*not supported",
-    "issue": 418
-  },
-  {
-    "engine": "neo4j",
     "backend": "official",
     "path": "*",
     "value_kind": "datetime_offset",
@@ -64,21 +31,26 @@
     "backend": "native",
     "path": "*",
     "value_kind": "point",
-    "category": "bug",
-    "issue": 419,
-    "reason": "Native Bolt Session.execute() returns spatial Point as dict instead of WGS84Point/CartesianPoint or voyager_ogm.Point.",
-    "repro": "Session('bolt://192.168.1.12:7687', dialect='neo4j', backend='native').execute('RETURN $v AS v', {'v': Point(latitude=0.0, longitude=0.0)})",
-    "match": "actual dict"
+    "category": "limitation",
+    "reason": "Native Bolt Session.execute() returns voyager_ogm.Point while official neo4j driver returns neo4j.spatial.WGS84Point/CartesianPoint.",
+    "match": "type mismatch: actual Point"
   },
   {
     "engine": "neo4j",
     "backend": "native_arrow",
     "path": "*",
     "value_kind": "point",
-    "category": "bug",
-    "issue": 419,
-    "reason": "Native Bolt execute_to_arrow() surfaces spatial Point as dict via JSON encoding instead of WGS84Point.",
-    "repro": "Session('bolt://192.168.1.12:7687', dialect='neo4j', backend='native').execute_to_arrow('RETURN $v AS v', {'v': Point(latitude=0.0, longitude=0.0)})",
+    "category": "limitation",
+    "reason": "Native Bolt execute_to_arrow() exposes Point as Struct(srid, x, y, z) decoded to voyager_ogm.Point while official neo4j driver returns WGS84Point/CartesianPoint.",
+    "match": "type mismatch: actual Point"
+  },
+  {
+    "engine": "neo4j",
+    "backend": "native_arrow",
+    "path": "*",
+    "value_kind": "point",
+    "category": "fallback",
+    "reason": "Arrow JSON map and entity encodings serialize nested Point values as coordinate dicts.",
     "match": "actual dict"
   },
   {
@@ -86,11 +58,18 @@
     "backend": "native_polars",
     "path": "*",
     "value_kind": "point",
-    "category": "bug",
-    "issue": 419,
-    "reason": "Native Bolt execute_to_polars() surfaces spatial Point as JSON str (Polars strips Arrow voyager.encoding metadata).",
-    "repro": "Session('bolt://192.168.1.12:7687', dialect='neo4j', backend='native').execute_to_polars('RETURN $v AS v', {'v': Point(latitude=0.0, longitude=0.0)})",
-    "match": "actual (str|dict)"
+    "category": "limitation",
+    "reason": "Native Bolt execute_to_polars() exposes Point as Struct(srid, x, y, z) decoded to voyager_ogm.Point while official neo4j driver returns WGS84Point/CartesianPoint.",
+    "match": "type mismatch: actual Point"
+  },
+  {
+    "engine": "neo4j",
+    "backend": "native_polars",
+    "path": "*",
+    "value_kind": "point",
+    "category": "fallback",
+    "reason": "Polars JSON map and entity encodings serialize nested Point values as coordinate dicts.",
+    "match": "actual dict"
   },
   {
     "engine": "neo4j",
@@ -292,36 +271,12 @@
   },
   {
     "engine": "memgraph",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "datetime_zone",
-    "category": "bug",
-    "reason": "Neo4jBoltBridge passes zoneinfo.ZoneInfo directly to neo4j==6.1.0, segfaulting on Europe/Berlin and ignoring fold=1.",
-    "repro": "Session(bridge=Neo4jBoltBridge(drv), dialect='memgraph').execute('RETURN $v AS v', {'v': datetime.datetime(2024, 1, 2, 3, 4, tzinfo=ZoneInfo('Europe/Berlin'))})",
-    "match": "datetime instant|crashed on zoneinfo\\.ZoneInfo",
-    "issue": 418
-  },
-  {
-    "engine": "memgraph",
-    "backend": "native",
-    "path": "*",
-    "value_kind": "datetime_zone",
-    "category": "bug",
-    "reason": "Native Bolt drops fold=1 on ambiguous DST fall-back zoned datetimes on Memgraph (returns 00:30Z instead of 01:30Z for 2024-10-27 02:30 Europe/Berlin fold=1).",
-    "repro": "Session('bolt://192.168.1.12:7688', dialect='memgraph', backend='native').execute('RETURN $v AS v', {'v': datetime.datetime(2024, 10, 27, 2, 30, fold=1, tzinfo=ZoneInfo('Europe/Berlin'))})",
-    "match": "datetime instant",
-    "issue": 414
-  },
-  {
-    "engine": "memgraph",
     "backend": "native_arrow",
     "path": "*",
     "value_kind": "datetime_zone",
-    "category": "bug",
-    "reason": "Memgraph native execute_to_arrow() emits zoned datetime strings without UTC offset/Z (e.g. '2024-01-02T03:04:05.123456[Europe/Berlin]'), causing _hydrate_datetime to misinterpret local wall-clock time as UTC (+1h shift on Europe/Berlin).",
-    "repro": "Session('bolt://192.168.1.12:7688', dialect='memgraph', backend='native').execute_to_arrow('RETURN $v AS v', {'v': datetime.datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=ZoneInfo('Europe/Berlin'))})",
-    "match": "datetime instant|datetime zone mismatch|actual str",
-    "issue": 420
+    "category": "fallback",
+    "reason": "Arrow JSON map and entity encodings serialize nested zoned datetimes as ISO strings.",
+    "match": "actual str"
   },
   {
     "engine": "memgraph",
@@ -329,7 +284,7 @@
     "path": "*",
     "value_kind": "datetime_zone",
     "category": "fallback",
-    "reason": "Polars strips Arrow voyager.type=datetime_tz metadata on Memgraph zoned datetimes and surfaces bracketed strings.",
+    "reason": "Polars JSON map and entity encodings serialize nested zoned datetimes as ISO strings.",
     "match": "actual str"
   },
   {
@@ -364,21 +319,26 @@
     "backend": "native",
     "path": "*",
     "value_kind": "point",
-    "category": "bug",
-    "issue": 419,
-    "reason": "Native Bolt Session.execute() returns spatial Point as dict instead of WGS84Point/CartesianPoint or voyager_ogm.Point.",
-    "repro": "Session('bolt://192.168.1.12:7688', dialect='memgraph', backend='native').execute('RETURN $v AS v', {'v': Point(latitude=0.0, longitude=0.0)})",
-    "match": "actual dict"
+    "category": "limitation",
+    "reason": "Native Bolt Session.execute() returns voyager_ogm.Point while official neo4j driver returns neo4j.spatial.WGS84Point/CartesianPoint.",
+    "match": "type mismatch: actual Point"
   },
   {
     "engine": "memgraph",
     "backend": "native_arrow",
     "path": "*",
     "value_kind": "point",
-    "category": "bug",
-    "issue": 419,
-    "reason": "Native Bolt execute_to_arrow() surfaces spatial Point as dict via JSON encoding instead of WGS84Point.",
-    "repro": "Session('bolt://192.168.1.12:7688', dialect='memgraph', backend='native').execute_to_arrow('RETURN $v AS v', {'v': Point(latitude=0.0, longitude=0.0)})",
+    "category": "limitation",
+    "reason": "Native Bolt execute_to_arrow() exposes Point as Struct(srid, x, y, z) decoded to voyager_ogm.Point while official neo4j driver returns WGS84Point/CartesianPoint.",
+    "match": "type mismatch: actual Point"
+  },
+  {
+    "engine": "memgraph",
+    "backend": "native_arrow",
+    "path": "*",
+    "value_kind": "point",
+    "category": "fallback",
+    "reason": "Arrow JSON map and entity encodings serialize nested Point values as coordinate dicts.",
     "match": "actual dict"
   },
   {
@@ -386,11 +346,18 @@
     "backend": "native_polars",
     "path": "*",
     "value_kind": "point",
-    "category": "bug",
-    "issue": 419,
-    "reason": "Native Bolt execute_to_polars() surfaces spatial Point as JSON str/dict instead of WGS84Point.",
-    "repro": "Session('bolt://192.168.1.12:7688', dialect='memgraph', backend='native').execute_to_polars('RETURN $v AS v', {'v': Point(latitude=0.0, longitude=0.0)})",
-    "match": "actual (str|dict)"
+    "category": "limitation",
+    "reason": "Native Bolt execute_to_polars() exposes Point as Struct(srid, x, y, z) decoded to voyager_ogm.Point while official neo4j driver returns WGS84Point/CartesianPoint.",
+    "match": "type mismatch: actual Point"
+  },
+  {
+    "engine": "memgraph",
+    "backend": "native_polars",
+    "path": "*",
+    "value_kind": "point",
+    "category": "fallback",
+    "reason": "Polars JSON map and entity encodings serialize nested Point values as coordinate dicts.",
+    "match": "actual dict"
   },
   {
     "engine": "memgraph",
@@ -400,17 +367,6 @@
     "category": "limitation",
     "reason": "Official neo4j driver returns neo4j.spatial.WGS84Point/CartesianPoint rather than voyager_ogm.Point.",
     "match": "official_vs_input"
-  },
-  {
-    "engine": "memgraph",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "uuid",
-    "category": "bug",
-    "reason": "Neo4jBoltBridge passes uuid.UUID unadapted to neo4j driver, raising ValueError.",
-    "repro": "Session(bridge=Neo4jBoltBridge(drv), dialect='memgraph').execute('RETURN $v AS v', {'v': uuid.UUID(int=0)})",
-    "match": "UUID.*not supported",
-    "issue": 418
   },
   {
     "engine": "memgraph",
@@ -507,22 +463,18 @@
     "backend": "native_arrow",
     "path": "*",
     "value_kind": "duration",
-    "category": "bug",
-    "reason": "Memgraph native_arrow normalizes negative sub-second durations to days=-1, seconds=86399, nanoseconds=999999000 and serializes nested map/entity durations as ISO strings.",
-    "repro": "Session('bolt://192.168.1.12:7688', dialect='memgraph', backend='native').execute_to_arrow('RETURN $v AS v', {'v': Duration(nanoseconds=-1000)})",
-    "match": "Duration .* !=|actual str",
-    "issue": 420
+    "category": "fallback",
+    "reason": "Arrow JSON map and entity encodings serialize nested durations as ISO strings.",
+    "match": "actual str"
   },
   {
     "engine": "memgraph",
     "backend": "native_polars",
     "path": "*",
     "value_kind": "duration",
-    "category": "bug",
-    "reason": "Memgraph native_polars inherits Arrow normalization of negative sub-second durations (days=-1, seconds=86399, nanoseconds=999999000) and serializes nested map/entity durations as ISO strings.",
-    "repro": "Session('bolt://192.168.1.12:7688', dialect='memgraph', backend='native').execute_to_polars('RETURN $v AS v', {'v': Duration(nanoseconds=-1000)})",
-    "match": "Duration .* !=|actual str",
-    "issue": 420
+    "category": "fallback",
+    "reason": "Polars JSON map and entity encodings serialize nested durations as ISO strings.",
+    "match": "actual str"
   },
   {
     "engine": "memgraph",
@@ -625,17 +577,6 @@
   },
   {
     "engine": "falkordb",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "uuid",
-    "category": "bug",
-    "reason": "FalkorDBBridge passes uuid.UUID unadapted to falkordb.Graph.query(), raising ResponseError.",
-    "repro": "Session(bridge=FalkorDBBridge(g, graph_name=g.name), dialect='falkordb').execute('RETURN $v AS v', {'v': uuid.UUID(int=0)})",
-    "match": "Failed to parse|Invalid parameter expression",
-    "issue": 418
-  },
-  {
-    "engine": "falkordb",
     "backend": "official",
     "path": "*",
     "value_kind": "uuid",
@@ -698,28 +639,6 @@
     "match": "actual str"
   },
   {
-    "engine": "age",
-    "backend": "native",
-    "path": "*",
-    "value_kind": "float",
-    "category": "bug",
-    "reason": "Apache AGE native backend loses 1 ULP float precision on float64 parameters/elements.",
-    "repro": "Session(age_uri, dialect='age', graph_name=g, backend='native').execute(f\"SELECT * FROM cypher('{g}', $$ RETURN $v $$, %s) AS (v agtype)\", {'v': 1.3884398771378935e+25})",
-    "match": "float .* !=",
-    "issue": 422
-  },
-  {
-    "engine": "age",
-    "backend": "native",
-    "path": "*",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "Apache AGE native backend loses 1 ULP float precision inside list parameters.",
-    "repro": "Session(age_uri, dialect='age', graph_name=g, backend='native').execute(f\"SELECT * FROM cypher('{g}', $$ RETURN $v $$, %s) AS (v agtype)\", {'v': [-966116.6771473465]})",
-    "match": "float .* !=",
-    "issue": 422
-  },
-  {
     "engine": "pg19",
     "backend": "native_polars",
     "path": "*",
@@ -736,6 +655,15 @@
     "category": "fallback",
     "reason": "Arrow List<Utf8> omits scalar voyager.type=time_tz metadata on timetz[] elements, surfacing ISO strings.",
     "match": "actual str"
+  },
+  {
+    "engine": "pg19",
+    "backend": "native_polars",
+    "path": "*",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "Polars exports PostgreSQL UUID columns as pl.Binary (16 raw bytes), so Voyager native_polars returns bytes while psycopg returns uuid.UUID.",
+    "match": "type mismatch: actual bytes"
   },
   {
     "engine": "pg19",
@@ -793,17 +721,6 @@
   },
   {
     "engine": "pg19",
-    "backend": "native",
-    "path": "nested_map",
-    "value_kind": "float",
-    "category": "bug",
-    "reason": "PostgreSQL jsonb converts floats through numeric decimal strings, causing native Rust serde_json to lose 1 ULP on extreme/subnormal floats or fail with 'number out of range' on sys.float_info.max (1.7976931348623157e+308).",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute('SELECT $v::jsonb AS v', {'v': {'k': 2.332717393807508e-41}})",
-    "match": "actual float|number out of range|float .* !=",
-    "issue": 422
-  },
-  {
-    "engine": "pg19",
     "backend": "official",
     "path": "*",
     "value_kind": "duration",
@@ -848,204 +765,6 @@
     "match": "Duration .* !="
   },
   {
-    "engine": "pg19",
-    "backend": "bridge",
-    "path": "nested_map",
-    "value_kind": "*",
-    "category": "bug",
-    "reason": "PostgresBridge passes Python dict directly to psycopg without Jsonb/JSON adaptation, raising ProgrammingError on nested maps.",
-    "repro": "Session(bridge=PostgresBridge(conn), dialect='sql_pgq').execute('SELECT $v::jsonb AS v', {'v': {'k': 1}})",
-    "match": "cannot adapt type 'dict'",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "PostgresBridge passes Python dict/list unadapted for jsonb parameters: dicts fail ProgrammingError and empty list [] encodes as PG '{}' turning [] into {}.",
-    "repro": "Session(bridge=PostgresBridge(conn), dialect='sql_pgq').execute('SELECT $v::jsonb AS v', {'v': []})",
-    "match": "cannot adapt type 'dict'|invalid input syntax for type json|cannot cast type|actual dict \\(\\{\\}\\) != expected list",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "PostgresBridge passes Python dict directly to psycopg without Jsonb/JSON adaptation, raising ProgrammingError.",
-    "repro": "Session(bridge=PostgresBridge(conn), dialect='sql_pgq').execute('SELECT $v::jsonb AS v', {'v': {}})",
-    "match": "cannot adapt type 'dict'|invalid input syntax for type json|cannot cast type",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "bridge",
-    "path": "nested_list",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "PostgresBridge encodes nested Python lists as PostgreSQL arrays rather than JSON when bound to a jsonb parameter.",
-    "repro": "Session(bridge=PostgresBridge(conn), dialect='sql_pgq').execute('SELECT $v::jsonb AS v', {'v': [[]]})",
-    "match": "cannot cast type .* to jsonb|invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "Native PostgreSQL driver encodes top-level Python list values as SQL array OIDs rather than JSONB (corrupting [] to {} and failing SQLSTATE 22P02/42846 on non-empty lists).",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute('SELECT $v::jsonb AS v', {'v': []})",
-    "match": "invalid input syntax for type json|cannot cast type .* to jsonb|actual dict \\(\\{\\}\\) != expected list",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_arrow",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_arrow() inherits top-level Python list array-OID encoding instead of JSONB (corrupting [] to {}).",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_arrow('SELECT $v::jsonb AS v', {'v': []})",
-    "match": "invalid input syntax for type json|cannot cast type .* to jsonb|actual dict \\(\\{\\}\\) != expected list",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_polars",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_polars() inherits top-level Python list array-OID encoding instead of JSONB (corrupting [] to {}).",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_polars('SELECT $v::jsonb AS v', {'v': []})",
-    "match": "invalid input syntax for type json|cannot cast type .* to jsonb|actual dict \\(\\{\\}\\) != expected list",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native",
-    "path": "nested_list",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "Native PostgreSQL driver encodes [map] list as SQL array instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute('SELECT $v::jsonb AS v', {'v': [{}]})",
-    "match": "invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_arrow",
-    "path": "nested_list",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_arrow() encodes [map] list as SQL array instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_arrow('SELECT $v::jsonb AS v', {'v': [{}]})",
-    "match": "invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_polars",
-    "path": "nested_list",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_polars() encodes [map] list as SQL array instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_polars('SELECT $v::jsonb AS v', {'v': [{}]})",
-    "match": "invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native",
-    "path": "nested_list",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "Native PostgreSQL driver encodes [[...]] nested list as bigint[] instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute('SELECT $v::jsonb AS v', {'v': [[]]})",
-    "match": "cannot cast type .* to jsonb|invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_arrow",
-    "path": "nested_list",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_arrow() encodes [[...]] nested list as bigint[] instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_arrow('SELECT $v::jsonb AS v', {'v': [[]]})",
-    "match": "cannot cast type .* to jsonb|invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_polars",
-    "path": "nested_list",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_polars() encodes [[...]] nested list as bigint[] instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_polars('SELECT $v::jsonb AS v', {'v': [[]]})",
-    "match": "cannot cast type .* to jsonb|invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "*",
-    "value_kind": "int",
-    "category": "bug",
-    "reason": "DuckDbBridge.execute_to_arrow() raises OverflowError when exporting HUGEINT values outside int64 bounds.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_arrow('SELECT $v::HUGEINT AS v', {'v': 2**63})",
-    "match": "OverflowError|Python int too large",
-    "issue": 424
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_polars",
-    "path": "*",
-    "value_kind": "int",
-    "category": "bug",
-    "reason": "DuckDbBridge.execute_to_polars() returns HUGEINT values as Decimal instead of Python int.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_polars('SELECT $v::HUGEINT AS v', {'v': 2**63})",
-    "match": "actual Decimal",
-    "issue": 424
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "time_offset",
-    "category": "bug",
-    "reason": "DuckDbBridge passes negative-UTC-offset datetime.time objects unadapted to duckdb, raising InvalidInputException (utcoffset returned invalid timedelta days).",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute('SELECT $v::TIMETZ AS v', {'v': datetime.time(0, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=-9, minutes=-30)))})",
-    "match": "utcoffset returned an invalid timedelta",
-    "issue": 423
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "*",
-    "value_kind": "time_offset",
-    "category": "bug",
-    "reason": "DuckDB Arrow export drops timezone from TIMETZ and yields naive time64[us], and fails on negative-UTC-offset datetime.time inputs.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_arrow('SELECT $v::TIMETZ AS v', {'v': datetime.time(0, 0, tzinfo=datetime.UTC)})",
-    "match": "time tz-awareness mismatch|utcoffset returned an invalid timedelta",
-    "issue": 424
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_polars",
-    "path": "*",
-    "value_kind": "time_offset",
-    "category": "bug",
-    "reason": "DuckDB Polars export drops timezone from TIMETZ and yields naive pl.Time, and fails on negative-UTC-offset datetime.time inputs.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_polars('SELECT $v::TIMETZ AS v', {'v': datetime.time(0, 0, tzinfo=datetime.UTC)})",
-    "match": "time tz-awareness mismatch|utcoffset returned an invalid timedelta",
-    "issue": 424
-  },
-  {
     "engine": "duckdb",
     "backend": "official",
     "path": "*",
@@ -1056,121 +775,56 @@
   },
   {
     "engine": "duckdb",
-    "backend": "official",
+    "backend": "*",
     "path": "*",
     "value_kind": "duration",
     "category": "limitation",
-    "reason": "DuckDB Python client returns INTERVAL as datetime.timedelta (months folded into 30-day increments).",
+    "reason": "DuckDB's official Python client returns INTERVAL as datetime.timedelta (months folded into 30-day increments); Voyager preserves calendar months, so calendar durations differ from the official reference.",
     "match": "Duration .* !="
   },
   {
     "engine": "duckdb",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "duration",
-    "category": "bug",
-    "reason": "DuckDbBridge.execute() passes voyager_ogm.Duration unadapted to duckdb.execute(), raising NotImplementedException.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute('SELECT $v AS v', {'v': Duration()})",
-    "match": "Unable to transform python value.*Duration",
-    "issue": 423
-  },
-  {
-    "engine": "duckdb",
     "backend": "bridge_arrow",
     "path": "*",
-    "value_kind": "duration",
-    "category": "bug",
-    "reason": "DuckDbBridge.execute_to_arrow() passes voyager_ogm.Duration unadapted to duckdb.execute(), raising NotImplementedException.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_arrow('SELECT $v AS v', {'v': Duration()})",
-    "match": "Unable to transform python value.*Duration",
-    "issue": 423
+    "value_kind": "int",
+    "category": "fallback",
+    "reason": "DuckDB exports HUGEINT as Arrow decimal128(38, 0) tagged voyager.type=hugeint, so Voyager bridge_arrow returns decimal.Decimal for int values outside the int64 range while the official client returns Python int.",
+    "match": "type mismatch: actual Decimal"
   },
   {
     "engine": "duckdb",
     "backend": "bridge_polars",
     "path": "*",
-    "value_kind": "duration",
-    "category": "bug",
-    "reason": "DuckDbBridge.execute_to_polars() passes voyager_ogm.Duration unadapted to duckdb.execute(), raising NotImplementedException.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_polars('SELECT $v AS v', {'v': Duration()})",
-    "match": "Unable to transform python value.*Duration",
-    "issue": 423
+    "value_kind": "int",
+    "category": "fallback",
+    "reason": "DuckDB exports HUGEINT as Polars Decimal(precision=38, scale=0), so Voyager bridge_polars returns decimal.Decimal for int values outside the int64 range while the official client returns Python int.",
+    "match": "type mismatch: actual Decimal"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "*",
+    "value_kind": "time_offset",
+    "category": "fallback",
+    "reason": "DuckDB Polars export has no zoned time type and emits TIMETZ as ISO text, so Voyager bridge_polars returns str while the official DuckDB client returns datetime.time with tzinfo.",
+    "match": "type mismatch: actual str"
   },
   {
     "engine": "duckdb",
     "backend": "bridge_arrow",
     "path": "*",
     "value_kind": "uuid",
-    "category": "bug",
-    "reason": "DuckDB Arrow export returns UUID columns as str inside Session.transaction() and raises ArrowNotImplementedError on UUID[] arrays.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_arrow('SELECT [$v]::UUID[] AS v', {'v': uuid.UUID(int=0)})",
-    "match": "actual str|ArrowNotImplementedError",
-    "issue": 424
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes UUID columns as fixed_size_binary[16] (ARROW:extension:name=arrow.uuid), so Voyager bridge_arrow returns bytes while the official DuckDB client returns uuid.UUID.",
+    "match": "type mismatch: actual bytes"
   },
   {
     "engine": "duckdb",
     "backend": "bridge_polars",
     "path": "*",
     "value_kind": "uuid",
-    "category": "bug",
-    "reason": "DuckDB Polars export converts UUID columns to Utf8 strings instead of uuid.UUID/pl.Binary.",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_polars('SELECT $v AS v', {'v': uuid.UUID(int=0)})",
-    "match": "actual str",
-    "issue": 424
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "DuckDbBridge passes Python dict unserialized for JSON params, causing DuckDB STRUCT inference to coerce mixed-type lists ([1, True, None] -> [1, 1, None]).",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute('SELECT $v::JSON AS v', {'v': {'a': [1, True, None]}})",
-    "match": "actual int \\(1\\) != expected bool",
-    "issue": 423
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "DuckDbBridge execute_to_arrow() fails with ArrowTypeError on mixed JSON arrays via STRUCT inference and returns raw JSON str inside transaction().",
-    "repro": "with Session(bridge=DuckDbBridge(con), dialect='duckpgq') as s:\n  with s.transaction():\n    s.execute_to_arrow('SELECT $v::JSON AS v', {'v': {}})",
-    "match": "ArrowTypeError|actual int \\(1\\) != expected bool|actual str",
-    "issue": 424
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_polars",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "DuckDbBridge execute_to_polars() inherits STRUCT coercion on mixed-type JSON lists ([1, True, None] -> [1, 1, None]).",
-    "repro": "Session(bridge=DuckDbBridge(con), dialect='duckpgq').execute_to_polars('SELECT $v::JSON AS v', {'v': {'a': [1, True, None]}})",
-    "match": "actual int \\(1\\) != expected bool",
-    "issue": 423
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "transaction",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "DuckDbBridge.execute_to_arrow() inside Session.transaction() returns raw unparsed JSON string instead of dict.",
-    "repro": "with Session(bridge=DuckDbBridge(con), dialect='duckpgq') as s:\n  with s.transaction():\n    s.execute_to_arrow('CREATE TABLE t (v JSON); INSERT INTO t VALUES (\\'{}\\'); SELECT v FROM t')",
-    "match": "actual str",
-    "issue": 424
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "transaction",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "DuckDbBridge.execute_to_arrow() inside Session.transaction() returns raw unparsed JSON string for JSON-backed list columns.",
-    "repro": "with Session(bridge=DuckDbBridge(con), dialect='duckpgq') as s:\n  with s.transaction():\n    s.execute_to_arrow('CREATE TABLE t (v JSON); INSERT INTO t VALUES (\\'[[]]\\'); SELECT v FROM t')",
-    "match": "actual str",
-    "issue": 424
+    "category": "fallback",
+    "reason": "DuckDB Polars export exposes UUID columns as pl.Binary (16 raw bytes), so Voyager bridge_polars returns bytes while the official DuckDB client returns uuid.UUID.",
+    "match": "type mismatch: actual bytes"
   }
 ]

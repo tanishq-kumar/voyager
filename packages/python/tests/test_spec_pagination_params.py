@@ -391,6 +391,7 @@ def test_live_duckpgq_pagination_parameters() -> None:
             conn.execute("LOAD 'duckpgq'")
         except Exception:
             pytest.skip("DuckPGQ extension could not be loaded")
+        conn.execute("SET active_grammar_extensions = ['duckpgq']")
         graph_name = "feat321_duck_pagination"
         conn.execute(
             "CREATE TABLE feat321_pagination_users "

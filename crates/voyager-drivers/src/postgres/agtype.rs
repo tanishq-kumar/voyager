@@ -5,7 +5,8 @@ use arrow_array::builder::{
     DurationNanosecondBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder,
     LargeBinaryBuilder, StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
 };
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch};
+use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -13,7 +14,6 @@ use std::sync::Arc;
 
 use crate::bolt::canonical::{
     append_duration_struct, duration_struct_fields, make_duration_struct_builder,
-    wrap_flat_array_in_list,
 };
 use crate::bolt::packstream::{BoltDuration, ymd_to_days};
 use crate::bolt::{BoltNode, BoltPath, BoltRelationship, BoltValue};
@@ -808,137 +808,235 @@ fn pg_array_element_oid(oid: i32) -> Option<i32> {
     }
 }
 
-/// Parses one PostgreSQL text-format array literal into elements.
-///
-/// Returns `None` for SQL `NULL` elements and rejects multi-dimensional
-/// arrays and malformed literals with a clear protocol error.
-fn parse_pg_array_literal(raw: &str) -> Result<Vec<Option<String>>> {
-    let trimmed = raw.trim();
-    let body = strip_array_dimensions(trimmed)?;
-    if !body.starts_with('{') || !body.ends_with('}') {
-        return Err(NetError::ProtocolError(format!(
-            "Malformed PostgreSQL array literal: {raw:?}"
-        )));
-    }
-    let inner = &body[1..body.len() - 1];
-    if inner.trim().is_empty() {
-        return Ok(Vec::new());
-    }
+/// One parsed PostgreSQL array node: either an element or a nested array.
+#[derive(Debug)]
+enum PgArrayValue {
+    /// A scalar array element; `None` is SQL `NULL`.
+    Element(Option<String>),
+    /// A nested array (the top-level value of every array column is one of these).
+    Array(Vec<PgArrayValue>),
+}
 
-    let mut elements = Vec::new();
-    let mut i = 0usize;
-    let bytes = inner.as_bytes();
-
-    loop {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+impl PgArrayValue {
+    fn children(&self) -> Option<&[PgArrayValue]> {
+        match self {
+            Self::Array(items) => Some(items),
+            Self::Element(_) => None,
         }
-        if i >= bytes.len() {
-            return Err(NetError::ProtocolError(format!(
-                "Malformed PostgreSQL array literal: {raw:?}"
-            )));
+    }
+}
+
+/// Parses one PostgreSQL text-format array literal into a nested value tree.
+///
+/// `None` elements are SQL `NULL`; nested braces describe additional array
+/// dimensions. Non-default lower-bound decorations such as `[0:1][2:3]=` are
+/// ignored, like psycopg does.
+fn parse_pg_array_literal(raw: &str) -> Result<PgArrayValue> {
+    let raw = raw.trim();
+    let body = strip_array_dimensions(raw)?;
+    let mut parser = PgArrayParser::new(raw, body);
+    let value = parser.parse_value()?;
+    parser.skip_whitespace();
+    if parser.pos != body.len() {
+        return Err(parser.malformed());
+    }
+    match value {
+        PgArrayValue::Array(_) => Ok(value),
+        PgArrayValue::Element(_) => Err(parser.malformed()),
+    }
+}
+
+/// Recursive-descent parser for a PostgreSQL array literal body.
+struct PgArrayParser<'a> {
+    raw: &'a str,
+    input: &'a str,
+    pos: usize,
+}
+
+impl<'a> PgArrayParser<'a> {
+    fn new(raw: &'a str, input: &'a str) -> Self {
+        Self { raw, input, pos: 0 }
+    }
+
+    fn malformed(&self) -> NetError {
+        NetError::ProtocolError(format!(
+            "Malformed PostgreSQL array literal: {:?}",
+            self.raw
+        ))
+    }
+
+    fn unterminated(&self) -> NetError {
+        NetError::ProtocolError(format!(
+            "Unterminated quoted PostgreSQL array element: {:?}",
+            self.raw
+        ))
+    }
+
+    fn trailing_backslash(&self) -> NetError {
+        NetError::ProtocolError(format!(
+            "Trailing backslash in PostgreSQL array element: {:?}",
+            self.raw
+        ))
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.input.as_bytes()
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes().get(self.pos).copied()
+    }
+
+    fn next_char(&mut self) -> Option<char> {
+        let ch = self.input[self.pos..].chars().next()?;
+        self.pos += ch.len_utf8();
+        Some(ch)
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(|b| b.is_ascii_whitespace()) {
+            self.pos += 1;
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<PgArrayValue> {
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b'{') => self.parse_array(),
+            Some(_) => self.parse_element(),
+            None => Err(self.malformed()),
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<PgArrayValue> {
+        self.pos += 1; // '{'
+        let mut items = Vec::new();
+        self.skip_whitespace();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(PgArrayValue::Array(items));
+        }
+
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_whitespace();
+                    if self.peek() == Some(b'}') {
+                        return Err(self.malformed());
+                    }
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return Err(self.malformed()),
+            }
+        }
+
+        Ok(PgArrayValue::Array(items))
+    }
+
+    fn parse_element(&mut self) -> Result<PgArrayValue> {
+        if self.peek() == Some(b'"') {
+            return Ok(PgArrayValue::Element(Some(self.parse_quoted_element()?)));
         }
 
         let mut element = String::new();
-        if bytes[i] == b'"' {
-            i += 1;
-            loop {
-                if i >= bytes.len() {
-                    return Err(NetError::ProtocolError(format!(
-                        "Unterminated quoted PostgreSQL array element: {raw:?}"
-                    )));
+        while let Some(ch) = self.input[self.pos..].chars().next() {
+            match ch {
+                ',' | '}' => break,
+                '{' => return Err(self.malformed()),
+                '\\' => {
+                    self.pos += 1;
+                    let escaped = self.next_char().ok_or_else(|| self.trailing_backslash())?;
+                    element.push(escaped);
                 }
-                let ch = inner[i..].chars().next().expect("char boundary");
-                match ch {
-                    '\\' => {
-                        i += 1;
-                        if i >= bytes.len() {
-                            return Err(NetError::ProtocolError(format!(
-                                "Trailing backslash in PostgreSQL array element: {raw:?}"
-                            )));
-                        }
-                        let escaped = inner[i..].chars().next().expect("char boundary");
-                        element.push(escaped);
-                        i += escaped.len_utf8();
-                    }
-                    '"' => {
-                        i += 1;
-                        // PostgreSQL accepts a doubled quote inside a quoted element.
-                        if i < bytes.len() && bytes[i] == b'"' {
-                            element.push('"');
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    other => {
-                        element.push(other);
-                        i += other.len_utf8();
-                    }
+                other => {
+                    element.push(other);
+                    self.pos += other.len_utf8();
                 }
-            }
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            elements.push(Some(element));
-        } else {
-            while i < bytes.len() && bytes[i] != b',' {
-                let ch = inner[i..].chars().next().expect("char boundary");
-                match ch {
-                    '{' | '}' => {
-                        return Err(NetError::ProtocolError(
-                            "Multi-dimensional PostgreSQL array columns are not supported"
-                                .to_string(),
-                        ));
-                    }
-                    '\\' => {
-                        i += 1;
-                        if i >= bytes.len() {
-                            return Err(NetError::ProtocolError(format!(
-                                "Trailing backslash in PostgreSQL array element: {raw:?}"
-                            )));
-                        }
-                        let escaped = inner[i..].chars().next().expect("char boundary");
-                        element.push(escaped);
-                        i += escaped.len_utf8();
-                    }
-                    other => {
-                        element.push(other);
-                        i += other.len_utf8();
-                    }
-                }
-            }
-            let trimmed_element = element.trim();
-            if trimmed_element.is_empty() || trimmed_element.eq_ignore_ascii_case("NULL") {
-                elements.push(None);
-            } else {
-                elements.push(Some(trimmed_element.to_string()));
             }
         }
 
-        if i >= bytes.len() {
-            break;
-        }
-        if bytes[i] != b',' {
-            return Err(NetError::ProtocolError(format!(
-                "Malformed PostgreSQL array literal: {raw:?}"
-            )));
-        }
-        i += 1;
-        if i >= bytes.len() {
-            return Err(NetError::ProtocolError(format!(
-                "Malformed PostgreSQL array literal: {raw:?}"
-            )));
-        }
+        let trimmed = element.trim();
+        Ok(PgArrayValue::Element(
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NULL") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            },
+        ))
     }
 
-    Ok(elements)
+    fn parse_quoted_element(&mut self) -> Result<String> {
+        self.pos += 1; // opening quote
+        let mut element = String::new();
+        loop {
+            let ch = self.next_char().ok_or_else(|| self.unterminated())?;
+            match ch {
+                '\\' => {
+                    let escaped = self.next_char().ok_or_else(|| self.trailing_backslash())?;
+                    element.push(escaped);
+                }
+                '"' => {
+                    // PostgreSQL accepts a doubled quote inside a quoted element.
+                    if self.peek() == Some(b'"') {
+                        self.pos += 1;
+                        element.push('"');
+                        continue;
+                    }
+                    break;
+                }
+                other => element.push(other),
+            }
+        }
+        self.skip_whitespace();
+        Ok(element)
+    }
 }
 
-/// Removes a single dimension decoration such as `[0:2]=` from an array literal.
+/// Validates that a parsed array is rectangular and returns its nesting depth.
 ///
-/// PostgreSQL only emits this prefix for non-default lower bounds. More than
-/// one decoration means a multi-dimensional array, which is rejected.
+/// A scalar element has depth 0 and an array of scalars has depth 1, so a 2-D
+/// matrix has depth 2. Empty arrays report depth 1 at their own level.
+fn pg_array_depth(value: &PgArrayValue) -> Result<usize> {
+    let Some(items) = value.children() else {
+        return Ok(0);
+    };
+    if items.is_empty() {
+        return Ok(1);
+    }
+
+    let child_depth = pg_array_depth(&items[0])?;
+    for item in &items[1..] {
+        if pg_array_depth(item)? != child_depth {
+            return Err(NetError::ProtocolError(
+                "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
+            ));
+        }
+    }
+    if child_depth > 0 {
+        let first_len = items[0].children().map_or(0, |children| children.len());
+        for item in &items[1..] {
+            if item.children().map_or(0, |children| children.len()) != first_len {
+                return Err(NetError::ProtocolError(
+                    "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(1 + child_depth)
+}
+
+/// Removes all dimension decorations such as `[0:2]=` or `[0:1][0:1]=` from
+/// an array literal.
+///
+/// PostgreSQL only emits this prefix for non-default lower bounds, and psycopg
+/// ignores those bounds when it builds Python lists, so the native decoder
+/// ignores them too.
 fn strip_array_dimensions(raw: &str) -> Result<&str> {
     if !raw.starts_with('[') {
         return Ok(raw);
@@ -949,12 +1047,35 @@ fn strip_array_dimensions(raw: &str) -> Result<&str> {
         )));
     };
     let prefix = &raw[..eq];
-    if prefix.matches('[').count() > 1 {
-        return Err(NetError::ProtocolError(
-            "Multi-dimensional PostgreSQL array columns are not supported".to_string(),
-        ));
+    let mut depth = 0usize;
+    for ch in prefix.chars() {
+        match ch {
+            '[' => {
+                if depth != 0 {
+                    return Err(NetError::ProtocolError(format!(
+                        "Malformed PostgreSQL array literal: {raw:?}"
+                    )));
+                }
+                depth = 1;
+            }
+            ']' => {
+                if depth != 1 {
+                    return Err(NetError::ProtocolError(format!(
+                        "Malformed PostgreSQL array literal: {raw:?}"
+                    )));
+                }
+                depth = 0;
+            }
+            _ => {
+                if depth != 1 {
+                    return Err(NetError::ProtocolError(format!(
+                        "Malformed PostgreSQL array literal: {raw:?}"
+                    )));
+                }
+            }
+        }
     }
-    if !prefix.ends_with(']') {
+    if depth != 0 || !prefix.ends_with(']') {
         return Err(NetError::ProtocolError(format!(
             "Malformed PostgreSQL array literal: {raw:?}"
         )));
@@ -2019,40 +2140,141 @@ fn array_column_batch(
     rows: &[Vec<Option<String>>],
     col_idx: usize,
 ) -> Result<(Field, ArrayRef)> {
-    let mut parsed: Vec<Option<Vec<Option<String>>>> = Vec::with_capacity(rows.len());
-    let mut total_elems = 0usize;
+    let mut parsed: Vec<Option<PgArrayValue>> = Vec::with_capacity(rows.len());
+    let mut depth: Option<usize> = None;
     for row in rows {
         match row.get(col_idx).and_then(|value| value.as_deref()) {
             Some(raw) => {
-                let items = parse_pg_array_literal(raw)?;
-                total_elems += items.len();
-                parsed.push(Some(items));
+                let value = parse_pg_array_literal(raw)?;
+                // An empty literal (`{}`) carries no dimensionality: PostgreSQL
+                // serializes an empty array of any rank this way. Treat it as
+                // compatible with the dimensions other rows reveal.
+                let empty = matches!(&value, PgArrayValue::Array(items) if items.is_empty());
+                if !empty {
+                    let cell_depth = pg_array_depth(&value)?;
+                    match depth {
+                        Some(existing) if existing != cell_depth => {
+                            return Err(NetError::ProtocolError(format!(
+                                "PostgreSQL array column {name:?} mixes {existing}-dimensional and {cell_depth}-dimensional values"
+                            )));
+                        }
+                        None => depth = Some(cell_depth),
+                        _ => {}
+                    }
+                }
+                parsed.push(Some(value));
             }
             None => parsed.push(None),
         }
     }
 
-    let mut flat_cells: Vec<Option<&str>> = Vec::with_capacity(total_elems);
-    let mut row_lengths: Vec<Option<usize>> = Vec::with_capacity(rows.len());
+    // An all-NULL or all-empty column has no observable dimensionality; keep
+    // the 1-D shape the previous decoder used so the Arrow type stays stable.
+    let depth = depth.unwrap_or(1);
 
+    // `level_lengths[level]` holds the child count of every node at that level.
+    // Level 0 has one entry per database row (including SQL NULLs); deeper
+    // levels are always array nodes because PostgreSQL arrays are rectangular.
+    let mut level_lengths: Vec<Vec<Option<usize>>> = Vec::with_capacity(depth);
+    let mut level_zero = Vec::with_capacity(parsed.len());
+    let mut nodes: Vec<&PgArrayValue> = Vec::new();
     for cell in &parsed {
         match cell {
-            Some(items) => {
-                for item in items {
-                    flat_cells.push(item.as_deref());
-                }
-                row_lengths.push(Some(items.len()));
+            Some(value) => {
+                let items = value
+                    .children()
+                    .expect("a parsed array literal is always an array");
+                level_zero.push(Some(items.len()));
+                nodes.extend(items.iter());
             }
-            None => row_lengths.push(None),
+            None => level_zero.push(None),
+        }
+    }
+    level_lengths.push(level_zero);
+
+    for _ in 1..depth {
+        let mut lengths = Vec::with_capacity(nodes.len());
+        let mut next = Vec::new();
+        for node in std::mem::take(&mut nodes) {
+            let items = node.children().ok_or_else(|| {
+                NetError::ProtocolError(
+                    "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
+                )
+            })?;
+            lengths.push(Some(items.len()));
+            next.extend(items.iter());
+        }
+        level_lengths.push(lengths);
+        nodes = next;
+    }
+
+    let mut flat_cells: Vec<Option<&str>> = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        match node {
+            PgArrayValue::Element(value) => flat_cells.push(value.as_deref()),
+            PgArrayValue::Array(_) => {
+                return Err(NetError::ProtocolError(
+                    "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
+                ));
+            }
         }
     }
 
-    let (item_field, flat_array) =
+    let (item_field, leaf_array) =
         match build_pg_typed_values("item", elem_oid, typmod, &flat_cells)? {
             Some(pair) => pair,
             None => build_utf8_with_meta("item", &flat_cells, &[]),
         };
-    wrap_flat_array_in_list(name, item_field, flat_array.as_ref(), &row_lengths)
+
+    let mut child_field = item_field;
+    let mut child_array = leaf_array;
+    for level in (0..depth).rev() {
+        let lengths = &level_lengths[level];
+        let mut offsets: Vec<i32> = Vec::with_capacity(lengths.len() + 1);
+        let mut validity = Vec::with_capacity(lengths.len());
+        let mut has_null = false;
+        let mut offset = 0i32;
+        offsets.push(0);
+        for length in lengths {
+            match length {
+                Some(length) => {
+                    offset = offset.checked_add(*length as i32).ok_or_else(|| {
+                        NetError::ProtocolError(
+                            "PostgreSQL array column is too large to decode".to_string(),
+                        )
+                    })?;
+                    validity.push(true);
+                }
+                None => {
+                    has_null = true;
+                    validity.push(false);
+                }
+            }
+            offsets.push(offset);
+        }
+        if offset as usize != child_array.len() {
+            return Err(NetError::ProtocolError(
+                "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
+            ));
+        }
+
+        let field = if level == 0 {
+            Field::new(name, DataType::List(Arc::new(child_field.clone())), true)
+        } else {
+            Field::new("item", DataType::List(Arc::new(child_field.clone())), true)
+        };
+        let nulls = has_null.then(|| NullBuffer::from(validity));
+        let list = ListArray::new(
+            Arc::new(child_field),
+            OffsetBuffer::new(offsets.into()),
+            child_array,
+            nulls,
+        );
+        child_array = Arc::new(list);
+        child_field = field;
+    }
+
+    Ok((child_field, child_array))
 }
 
 /// Dynamically transforms tabular row values into an Apache Arrow [`RecordBatch`].
@@ -2517,12 +2739,186 @@ mod pg_array_tests {
     }
 
     #[test]
-    fn rejects_multi_dimensional_arrays_with_a_clear_error() {
+    fn decodes_multi_dimensional_arrays_with_nulls_and_lower_bounds() {
+        let batch = batch_for(
+            1016,
+            &[
+                Some("{{1,2},{3,NULL}}"),
+                Some("[0:1][0:1]={{4,5},{6,7}}"),
+                Some("{{}}"),
+                Some("{}"),
+                None,
+            ],
+        );
+        let outer = batch.column(0).as_list::<i32>();
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            )))
+        );
+
+        let first_values = outer.value(0);
+        let first = first_values.as_list::<i32>();
+        assert_eq!(first.len(), 2);
+        let first_row_values = first.value(0);
+        let first_row = first_row_values.as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!((first_row.value(0), first_row.value(1)), (1, 2));
+        let second_row_values = first.value(1);
+        let second_row = second_row_values.as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!(second_row.value(0), 3);
+        assert!(second_row.is_null(1));
+
+        let lowered_values = outer.value(1);
+        let lowered = lowered_values.as_list::<i32>();
+        assert_eq!(lowered.len(), 2);
+        let lowered_row_values = lowered.value(1);
+        assert_eq!(
+            lowered_row_values
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(1),
+            7
+        );
+
+        let empty_values = outer.value(2);
+        let empty = empty_values.as_list::<i32>();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty.value(0).len(), 0);
+        let flat_empty_values = outer.value(3);
+        assert_eq!(flat_empty_values.as_list::<i32>().len(), 0);
+        assert!(outer.is_null(4));
+    }
+
+    #[test]
+    fn decodes_three_dimensional_text_arrays_with_nulls() {
+        let batch = batch_for(
+            1009,
+            &[Some(
+                r#"{{{alpha,NULL,"beta,gamma"}},{{"NULL",x,"quote""d"}}}"#,
+            )],
+        );
+        let outer = batch.column(0).as_list::<i32>();
+        let planes_values = outer.value(0);
+        let middle = planes_values.as_list::<i32>();
+        assert_eq!(middle.len(), 2);
+        let first_values = middle.value(0);
+        let first = first_values.as_list::<i32>();
+        let values = first.value(0);
+        let values = values.as_string::<i32>();
+        assert_eq!(values.value(0), "alpha");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), "beta,gamma");
+        let second_values = middle.value(1);
+        let second = second_values.as_list::<i32>();
+        let values = second.value(0);
+        let values = values.as_string::<i32>();
+        assert_eq!(values.value(0), "NULL");
+        assert_eq!(values.value(1), "x");
+        assert_eq!(values.value(2), "quote\"d");
+    }
+
+    #[test]
+    fn decodes_nested_arrays_for_each_supported_element_type() {
+        let floats = batch_for(1022, &[Some("{{1.5,NULL},{-2.25,3.5}}")]);
+        let outer = floats.column(0).as_list::<i32>();
+        let inner_values = outer.value(0);
+        let inner = inner_values.as_list::<i32>();
+        let row_values = inner.value(0);
+        let values = row_values.as_primitive::<arrow_array::types::Float64Type>();
+        assert_eq!(values.value(0), 1.5);
+        assert!(values.is_null(1));
+
+        let nums = batch_for(1231, &[Some("{{1.25,2},{3,4.5}}")]);
+        let outer = nums.column(0).as_list::<i32>();
+        let inner_values = outer.value(0);
+        let inner = inner_values.as_list::<i32>();
+        let row_values = inner.value(0);
+        assert_eq!(
+            row_values
+                .as_primitive::<arrow_array::types::Decimal128Type>()
+                .value(1),
+            200
+        );
+
+        let bools = batch_for(1000, &[Some("{{t,f},{NULL,true}}")]);
+        let outer = bools.column(0).as_list::<i32>();
+        let inner_values = outer.value(0);
+        let inner = inner_values.as_list::<i32>();
+        let row_values = inner.value(0);
+        let values = row_values.as_boolean();
+        assert!(values.value(0));
+        assert!(!values.value(1));
+
+        let dates = batch_for(1182, &[Some("{{2026-01-15,NULL},{2026-02-20,2026-03-01}}")]);
+        let outer = dates.column(0).as_list::<i32>();
+        let inner_values = outer.value(0);
+        let inner = inner_values.as_list::<i32>();
+        let row_values = inner.value(1);
+        assert_eq!(
+            row_values
+                .as_primitive::<arrow_array::types::Date32Type>()
+                .value(0),
+            ymd_to_days(2026, 2, 20) as i32
+        );
+
+        let timestamps = batch_for(
+            1115,
+            &[Some(
+                r#"{{"2026-01-15 10:11:12",NULL},{"2026-01-16 00:00:00","2026-01-17 01:02:03"}}"#,
+            )],
+        );
+        let outer = timestamps.column(0).as_list::<i32>();
+        let inner_values = outer.value(0);
+        let inner = inner_values.as_list::<i32>();
+        let row_values = inner.value(0);
+        assert_eq!(
+            row_values
+                .as_primitive::<arrow_array::types::TimestampMicrosecondType>()
+                .value(0),
+            parse_pg_timestamp_micros("2026-01-15 10:11:12").unwrap()
+        );
+
+        let uuids = batch_for(
+            2951,
+            &[Some(
+                "{{12345678-1234-5678-1234-567812345678,NULL},{NULL,ffffffff-ffff-ffff-ffff-ffffffffffff}}",
+            )],
+        );
+        let outer = uuids.column(0).as_list::<i32>();
+        let inner_values = outer.value(0);
+        let inner = inner_values.as_list::<i32>();
+        let row_values = inner.value(0);
+        assert_eq!(
+            row_values.as_fixed_size_binary().value(0),
+            &parse_pg_uuid("12345678-1234-5678-1234-567812345678").unwrap()
+        );
+
+        let json = batch_for(3807, &[Some(r#"{{"{\"a\":1}",NULL},{"[1,2]","null"}}"#)]);
+        let outer = json.column(0).as_list::<i32>();
+        let inner_values = outer.value(0);
+        let inner = inner_values.as_list::<i32>();
+        let row_values = inner.value(0);
+        let values = row_values.as_string::<i32>();
+        assert_eq!(values.value(0), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn rejects_ragged_and_mixed_dimensional_arrays() {
         let columns = vec!["value".to_string()];
-        let rows = vec![vec![Some("{{1,2},{3,4}}".to_string())]];
+        let rows = vec![vec![Some("{{1,2},{3}}".to_string())]];
         let error = rows_to_record_batch_with_column_types(&columns, &rows, &[false], &[1007])
-            .expect_err("multi-dimensional arrays are rejected");
-        assert!(error.to_string().contains("Multi-dimensional"));
+            .expect_err("ragged arrays are rejected");
+        assert!(error.to_string().contains("Ragged"));
+
+        let rows = vec![
+            vec![Some("{1,2}".to_string())],
+            vec![Some("{{3,4},{5,6}}".to_string())],
+        ];
+        let error = rows_to_record_batch_with_column_types(&columns, &rows, &[false], &[1007])
+            .expect_err("mixed dimensionalities are rejected");
+        assert!(error.to_string().contains("mixes"));
     }
 
     #[test]

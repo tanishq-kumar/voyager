@@ -63,9 +63,9 @@ or with uv:
 uv add "voyager-ogm[neo4j,sqlalchemy]"
 ```
 
-> The `duckdb` and `age` extras carry a `python_version < '3.14'` marker, so on Python 3.14 they install without their driver. The FalkorDB/Redis bridge uses the `falkordb` package, which has no extra: `pip install falkordb`.
+> The `duckdb` and `age` extras install their drivers on every supported Python version, including 3.14. The FalkorDB/Redis bridge uses the `falkordb` package, which has no extra: `pip install falkordb`.
 
-> **DuckPGQ extension:** SQL/PGQ queries (`CREATE PROPERTY GRAPH`, `GRAPH_TABLE`) on DuckDB need the [DuckPGQ](https://duckdb.org/community_extensions/extensions/duckpgq) extension. Voyager loads it with `LOAD duckpgq;` before the first SQL/PGQ statement on a connection, including a `duckdb://` URI session and a connection that has never loaded it; a session that only runs plain SQL never needs it. If the extension is not installed, that first SQL/PGQ statement raises an error naming DuckPGQ and the `INSTALL duckpgq;` command; pass `install_duckpgq=True` to `Session`/`AsyncSession` to let Voyager install it first (that downloads the extension). A connection the caller already prepared with `LOAD duckpgq;` is detected and left as is.
+> **DuckPGQ extension:** SQL/PGQ queries (`CREATE PROPERTY GRAPH`, `GRAPH_TABLE`) on DuckDB need DuckDB 2.0.1 or newer and the [DuckPGQ](https://duckdb.org/community_extensions/extensions/duckpgq) extension. Voyager loads it with `LOAD duckpgq;` before the first SQL/PGQ statement on a connection, including a `duckdb://` URI session and a connection that has never loaded it, and then opts that connection into DuckDB 2.0's grammar-extension API with `SET active_grammar_extensions = ['duckpgq'];`; a session that only runs plain SQL never needs it. If the extension is not installed, that first SQL/PGQ statement raises an error naming DuckPGQ and the `INSTALL duckpgq FROM community;` command; pass `install_duckpgq=True` to `Session`/`AsyncSession` to let Voyager install it first (that downloads the extension). A connection the caller already prepared with `LOAD duckpgq;` is detected, kept loaded, and gets the grammar opt-in.
 
 ### Pre-releases
 

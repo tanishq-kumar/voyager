@@ -23,12 +23,11 @@ use crate::uri::ParsedUri;
 /// Magic 4-byte header sent at the start of every Bolt TCP connection (`0x60 0x60 0xB0 0x17`).
 pub const BOLT_MAGIC_PREAMBLE: [u8; 4] = [0x60, 0x60, 0xB0, 0x17];
 
-/// Default version proposals sent during handshake negotiation (v5.4, v5.0, v4.4, v4.2).
+/// Default version proposals sent during handshake negotiation (v5.4..=5.0, v4.4..=4.2).
 pub const BOLT_PROPOSED_VERSIONS: [u8; 16] = [
-    0x00, 0x00, 0x04, 0x05, // v5.4
-    0x00, 0x00, 0x00, 0x05, // v5.0
-    0x00, 0x00, 0x04, 0x04, // v4.4
-    0x00, 0x00, 0x02, 0x04, // v4.2
+    0x00, 0x04, 0x04, 0x05, // v5.4 down to v5.0 (5.4, 5.3, 5.2, 5.1, 5.0)
+    0x00, 0x02, 0x04, 0x04, // v4.4 down to v4.2 (4.4, 4.3, 4.2)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 /// Negotiated Bolt protocol version.
@@ -45,6 +44,8 @@ pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = NetS
     stream: S,
     read_buf: BytesMut,
     version: BoltVersion,
+    /// True when Bolt 4.4 negotiated the `"utc"` patch via `patch_bolt`.
+    utc_patched: bool,
     /// Database selected in the URI or connection config, sent in `RUN` and `BEGIN` on Bolt 4.0+.
     database: Option<String>,
     is_valid: bool,
@@ -175,6 +176,7 @@ impl BoltConnection<NetStream> {
             stream,
             read_buf: BytesMut::with_capacity(65536),
             version,
+            utc_patched: false,
             database: db.map(str::to_string),
             is_valid: true,
             in_transaction: false,
@@ -185,11 +187,16 @@ impl BoltConnection<NetStream> {
         };
 
         let is_v51_or_higher = version.major > 5 || (version.major == 5 && version.minor >= 1);
+        let is_v53_or_higher = version.major > 5 || (version.major == 5 && version.minor >= 3);
 
         if is_v51_or_higher {
             // 3a. Bolt 5.1+: HELLO without auth, followed by LOGON
-            let hello_req =
-                BoltRequest::hello_v51(concat!("Voyager-OGM/", env!("CARGO_PKG_VERSION")), None);
+            let user_agent = concat!("Voyager-OGM/", env!("CARGO_PKG_VERSION"));
+            let hello_req = if is_v53_or_higher {
+                BoltRequest::hello_v53(user_agent, None)
+            } else {
+                BoltRequest::hello_v51(user_agent, None)
+            };
             conn.send_request(&hello_req).await?;
             let resp = conn.receive_response().await?;
 
@@ -249,11 +256,17 @@ impl BoltConnection<NetStream> {
                 }
             }
         } else {
-            // 3. Legacy Bolt <= 5.0: HELLO with inline auth
-            let hello_req = BoltRequest::hello_legacy(
+            // 3. Legacy Bolt <= 5.0: HELLO with inline auth (and utc patch on 4.4)
+            let patches: &[&str] = if version.major == 4 && version.minor == 4 {
+                &["utc"]
+            } else {
+                &[]
+            };
+            let hello_req = BoltRequest::hello_legacy_with_patches(
                 concat!("Voyager-OGM/", env!("CARGO_PKG_VERSION")),
                 auth_pair,
                 db,
+                patches,
             );
             conn.send_request(&hello_req).await?;
             let resp = conn.receive_response().await?;
@@ -263,6 +276,12 @@ impl BoltConnection<NetStream> {
                     if let Some(agent) = metadata.get("server").and_then(|v| v.as_str()) {
                         conn.server_agent = Some(agent.to_string());
                         debug!("Connected to Bolt server agent: {}", agent);
+                    }
+                    if let Some(applied) = metadata.get("patch_bolt").and_then(BoltValue::as_list)
+                        && applied.iter().any(|v| v.as_str() == Some("utc"))
+                    {
+                        conn.utc_patched = true;
+                        debug!("Negotiated Bolt 4.4 utc patch");
                     }
                 }
                 BoltResponse::Failure { metadata } => {
@@ -298,6 +317,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             stream,
             read_buf: BytesMut::with_capacity(65536),
             version,
+            utc_patched: false,
             database: None,
             is_valid: true,
             in_transaction: false,
@@ -311,6 +331,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
     /// Returns the negotiated Bolt protocol version.
     pub fn version(&self) -> BoltVersion {
         self.version
+    }
+
+    /// Returns `true` when zoned datetimes use UTC epoch seconds (`Bolt >= 5.0` or Bolt 4.4 `utc` patch).
+    pub fn uses_utc_datetimes(&self) -> bool {
+        self.version.major >= 5 || self.utc_patched
     }
 
     /// Returns the database selected in the URI or connection config, if any.
@@ -746,9 +771,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         }
 
         // Convert typed ParamValue params to BoltValue matching the negotiated Bolt version.
+        let temporal_major = if self.uses_utc_datetimes() {
+            5
+        } else {
+            self.version.major
+        };
         let mut bolt_params = HashMap::with_capacity(params.len());
         for (k, v) in params {
-            bolt_params.insert(k.clone(), param_to_bolt_value(v, self.version.major)?);
+            bolt_params.insert(k.clone(), param_to_bolt_value(v, temporal_major)?);
         }
 
         let mut extra = HashMap::new();
@@ -929,6 +959,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
 
     fn is_valid(&self) -> bool {
         self.is_valid
+    }
+
+    fn protocol_version(&self) -> Option<String> {
+        Some(format!("{}.{}", self.version.major, self.version.minor))
     }
 
     fn is_in_transaction(&self) -> bool {

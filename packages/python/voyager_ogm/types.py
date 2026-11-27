@@ -799,6 +799,25 @@ def to_iso_duration(td: datetime.timedelta) -> str:
     return "".join(parts)
 
 
+@dataclass(frozen=True, slots=True)
+class Json:
+    """Wraps a value that must be bound as a JSON document.
+
+    PostgreSQL (native and :class:`~voyager_ogm.bridge.PostgresBridge`) binds the
+    wrapped value as ``jsonb`` regardless of the parameter's SQL context, which
+    is useful for empty or scalar lists that would otherwise be sent as SQL
+    arrays, or for JSON ``null`` (which would otherwise be SQL ``NULL``). Other
+    engines pass the wrapped value through unchanged, so the wrapper is portable.
+
+    Example:
+        >>> session.execute("SELECT $v::jsonb AS v", {"v": Json([1, 2, 3])})
+    """
+
+    value: Any
+
+    __voyager_json__ = True
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class Duration:
     """Calendar and nanosecond-resolution duration returned by graph and SQL queries.
@@ -1248,11 +1267,12 @@ def _hydrate_datetime(val: Any) -> Any:
                 try:
                     import zoneinfo
 
-                    # If naive (e.g. wall clock parsed without offset), anchor to UTC first
+                    # Offset-less bracketed strings carry local wall-clock time in tz_name;
+                    # offset-bearing strings carry an exact instant to convert into tz_name.
                     if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=datetime.UTC)
-                    # Convert to target named timezone, strictly preserving exact instant & .timestamp()
-                    dt = dt.astimezone(zoneinfo.ZoneInfo(tz_name))
+                        dt = dt.replace(tzinfo=zoneinfo.ZoneInfo(tz_name))
+                    else:
+                        dt = dt.astimezone(zoneinfo.ZoneInfo(tz_name))
                 except Exception:
                     pass
             return dt

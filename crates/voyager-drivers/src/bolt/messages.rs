@@ -110,8 +110,25 @@ impl fmt::Debug for BoltRequest {
     }
 }
 
+fn build_bolt_agent_map() -> HashMap<String, BoltValue> {
+    let mut bolt_agent = HashMap::new();
+    bolt_agent.insert(
+        "product".to_string(),
+        BoltValue::String(concat!("voyager-drivers/", env!("CARGO_PKG_VERSION")).to_string()),
+    );
+    bolt_agent.insert(
+        "platform".to_string(),
+        BoltValue::String(std::env::consts::OS.to_string()),
+    );
+    bolt_agent.insert(
+        "language".to_string(),
+        BoltValue::String("Rust".to_string()),
+    );
+    bolt_agent
+}
+
 impl BoltRequest {
-    /// Creates a Bolt v5.1+ `HELLO` message (without inline authentication).
+    /// Creates a Bolt v5.1-v5.2 `HELLO` message (without inline auth or `bolt_agent`).
     pub fn hello_v51(user_agent: &str, routing: Option<HashMap<String, BoltValue>>) -> Self {
         let mut extra = HashMap::new();
         extra.insert(
@@ -119,20 +136,24 @@ impl BoltRequest {
             BoltValue::String(user_agent.to_string()),
         );
 
-        let mut bolt_agent = HashMap::new();
-        bolt_agent.insert(
-            "product".to_string(),
-            BoltValue::String(concat!("voyager-drivers/", env!("CARGO_PKG_VERSION")).to_string()),
+        if let Some(r) = routing {
+            extra.insert("routing".to_string(), BoltValue::Map(r));
+        }
+
+        Self::Hello { extra }
+    }
+
+    /// Creates a Bolt v5.3+ `HELLO` message (without inline authentication, including `bolt_agent`).
+    pub fn hello_v53(user_agent: &str, routing: Option<HashMap<String, BoltValue>>) -> Self {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "user_agent".to_string(),
+            BoltValue::String(user_agent.to_string()),
         );
-        bolt_agent.insert(
-            "platform".to_string(),
-            BoltValue::String(std::env::consts::OS.to_string()),
+        extra.insert(
+            "bolt_agent".to_string(),
+            BoltValue::Map(build_bolt_agent_map()),
         );
-        bolt_agent.insert(
-            "language".to_string(),
-            BoltValue::String("Rust".to_string()),
-        );
-        extra.insert("bolt_agent".to_string(), BoltValue::Map(bolt_agent));
 
         if let Some(r) = routing {
             extra.insert("routing".to_string(), BoltValue::Map(r));
@@ -147,26 +168,37 @@ impl BoltRequest {
         auth_scheme: Option<(&str, &str)>,
         database: Option<&str>,
     ) -> Self {
+        Self::hello_legacy_with_patches(user_agent, auth_scheme, database, &[])
+    }
+
+    /// Creates a legacy Bolt (<= v5.0) `HELLO` message with optional `patch_bolt` entries.
+    pub fn hello_legacy_with_patches(
+        user_agent: &str,
+        auth_scheme: Option<(&str, &str)>,
+        database: Option<&str>,
+        patch_bolt: &[&str],
+    ) -> Self {
         let mut extra = HashMap::new();
         extra.insert(
             "user_agent".to_string(),
             BoltValue::String(user_agent.to_string()),
         );
+        extra.insert(
+            "bolt_agent".to_string(),
+            BoltValue::Map(build_bolt_agent_map()),
+        );
 
-        let mut bolt_agent = HashMap::new();
-        bolt_agent.insert(
-            "product".to_string(),
-            BoltValue::String(concat!("voyager-drivers/", env!("CARGO_PKG_VERSION")).to_string()),
-        );
-        bolt_agent.insert(
-            "platform".to_string(),
-            BoltValue::String(std::env::consts::OS.to_string()),
-        );
-        bolt_agent.insert(
-            "language".to_string(),
-            BoltValue::String("Rust".to_string()),
-        );
-        extra.insert("bolt_agent".to_string(), BoltValue::Map(bolt_agent));
+        if !patch_bolt.is_empty() {
+            extra.insert(
+                "patch_bolt".to_string(),
+                BoltValue::List(
+                    patch_bolt
+                        .iter()
+                        .map(|p| BoltValue::String((*p).to_string()))
+                        .collect(),
+                ),
+            );
+        }
 
         if let Some((username, password)) = auth_scheme {
             extra.insert("scheme".to_string(), BoltValue::String("basic".to_string()));

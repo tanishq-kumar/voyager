@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import importlib
 import inspect
 import json
 import math
 import operator
 import re
 import time
+import uuid
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -28,11 +31,12 @@ from voyager_ogm.entities import (
     GraphPath,
     GraphRelationship,
     convert_driver_value,
+    json_default,
     serialize_records_for_arrow,
     serialize_value_for_arrow,
 )
 from voyager_ogm.ingestion import BulkIngestionPlan
-from voyager_ogm.types import Duration, parse_pg_interval_text, unwrap_spatial_param
+from voyager_ogm.types import Duration, Json, parse_pg_interval_text, unwrap_spatial_param
 
 _PAGINATION_PARAMETER_PATTERN = re.compile(
     r"\b(?:SKIP|OFFSET|LIMIT)\s+\$([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE
@@ -41,14 +45,21 @@ _PAGINATION_PARAMETER_PATTERN = re.compile(
 #: Statements that need the DuckPGQ extension loaded on the DuckDB connection.
 _DUCKPGQ_STATEMENT_PATTERN = re.compile(r"\bGRAPH_TABLE\b|\bPROPERTY\s+GRAPH\b", re.IGNORECASE)
 
+#: DuckDB 2.0+ requires an explicit opt-in before DuckPGQ's SQL/PGQ grammar parses.
+_DUCKPGQ_GRAMMAR_STATEMENT = "SET active_grammar_extensions = ['duckpgq'];"
+
+#: Cypher bulk plans that DuckDB cannot parse; ingest them as relational rows instead.
+_CYPHER_BULK_STATEMENT_PATTERN = re.compile(r"^\s*UNWIND\b", re.IGNORECASE)
+
 
 def _duckpgq_error_message(cause: BaseException) -> str:
     """Builds the actionable error shown when DuckPGQ cannot be loaded."""
     return (
         "SQL/PGQ queries on DuckDB require the DuckPGQ extension, but it could not be "
-        "loaded. Install it with `INSTALL duckpgq;` and then run `LOAD duckpgq;` on the "
-        "connection (Voyager does the `LOAD` for you once per connection), or create the "
-        "Session with install_duckpgq=True so Voyager installs it first. "
+        "loaded. Install it with `INSTALL duckpgq FROM community;` and then run "
+        "`LOAD duckpgq;` on the connection (Voyager does the `LOAD` for you once per "
+        "connection), or create the Session with install_duckpgq=True so Voyager "
+        "installs it first. "
         f"The DuckDB error was: {cause}"
     )
 
@@ -720,8 +731,91 @@ class AsyncMockBridge:
         pass
 
 
+def _adapt_bolt_time(val: datetime.time) -> Any:
+    """Converts an offset-aware Python time to ``neo4j.time.Time`` with a fixed offset.
+
+    The official driver rejects ``datetime.timezone`` objects passed on a plain
+    ``datetime.time`` because it calls ``tzinfo.utcoffset`` with a ``Time``
+    instance.  ``pytz.FixedOffset`` accepts any object and keeps the offset.
+    """
+    try:
+        from neo4j.time import Time as Neo4jTime
+    except ImportError:
+        return None
+    offset = val.utcoffset()
+    if offset is None:
+        return None
+    try:
+        import importlib
+
+        pytz = importlib.import_module("pytz")
+    except ImportError:
+        return None
+    minutes = int(offset.total_seconds() // 60)
+    return Neo4jTime(
+        val.hour,
+        val.minute,
+        val.second,
+        val.microsecond * 1_000,
+        tzinfo=pytz.FixedOffset(minutes),
+    )
+
+
+def _adapt_bolt_zoneinfo_datetime(val: datetime.datetime) -> Any:
+    """Converts a ``zoneinfo.ZoneInfo`` datetime to a driver-safe ``DateTime``.
+
+    ``neo4j`` 6.1.0 can segfault while serialising a raw ``ZoneInfo`` value.
+    Converting through a ``pytz`` zone mirrors the official client conversion,
+    keeps the zone name, and preserves ``fold`` on DST fall-back instants.
+    """
+    import zoneinfo
+
+    tzinfo = val.tzinfo
+    key = getattr(tzinfo, "key", None)
+    if not isinstance(tzinfo, zoneinfo.ZoneInfo) or not isinstance(key, str):
+        return None
+    try:
+        from neo4j.time import DateTime as Neo4jDateTime
+    except ImportError:
+        return None
+    try:
+        import importlib
+
+        pytz = importlib.import_module("pytz")
+    except ImportError:
+        # Keeping the instant is safer than handing raw ZoneInfo back to the
+        # driver; the IANA zone name is lost on this fallback path.
+        offset = val.utcoffset()
+        if offset is None:
+            return None
+        return val.replace(tzinfo=datetime.timezone(offset))
+    localized = pytz.timezone(key).localize(val.replace(tzinfo=None), is_dst=not bool(val.fold))
+    return Neo4jDateTime(
+        localized.year,
+        localized.month,
+        localized.day,
+        localized.hour,
+        localized.minute,
+        localized.second,
+        localized.microsecond * 1_000,
+        tzinfo=localized.tzinfo,
+    )
+
+
 def _adapt_bolt_value(val: Any) -> Any:
-    """Adapts Voyager Duration and tagged spatial values to Bolt driver objects."""
+    """Adapts Voyager Duration, Json, UUID, temporal and tagged spatial values to Bolt driver objects."""
+    if isinstance(val, Json):
+        return _adapt_bolt_value(val.value)
+    if isinstance(val, uuid.UUID):
+        return str(val)
+    if isinstance(val, datetime.datetime):
+        adapted_datetime = _adapt_bolt_zoneinfo_datetime(val)
+        if adapted_datetime is not None:
+            return adapted_datetime
+    elif isinstance(val, datetime.time):
+        adapted_time = _adapt_bolt_time(val)
+        if adapted_time is not None:
+            return adapted_time
     if isinstance(val, Duration):
         try:
             from neo4j.time import Duration as Neo4jDuration
@@ -1438,6 +1532,8 @@ def _encode_duckdb_literal(v: Any) -> str:
     Handles str with proper quoting, int, float (including nan/inf), bool, None,
     date/datetime/time, list/tuple, and dict/map. Raises TypeError for unsupported types.
     """
+    if isinstance(v, Json):
+        return _encode_duckdb_literal(v.value)
     if v is None:
         return "NULL"
     if isinstance(v, bool):
@@ -1499,6 +1595,236 @@ def _encode_duckdb_in_tuple(values: Sequence[Any]) -> str:
     return "(" + ", ".join(_encode_duckdb_literal(v) for v in values) + ")"
 
 
+#: Parameters cast to DuckDB ``JSON`` in the statement, e.g. ``$v::JSON``.
+_DUCKDB_JSON_PARAMETER_PATTERN = re.compile(
+    r"\$([A-Za-z_][A-Za-z0-9_]*)\s*::\s*JSON\b"
+    r"|\bCAST\s*\(\s*\$([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+JSON\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _duckdb_json_parameter_keys(statement: str) -> set[str]:
+    """Returns parameter names that the statement explicitly casts to ``JSON``."""
+    keys: set[str] = set()
+    for match in _DUCKDB_JSON_PARAMETER_PATTERN.finditer(statement):
+        keys.add(match.group(1) or match.group(2))
+    return keys
+
+
+def _duckdb_interval_value(val: Duration) -> Any:
+    """Converts a Voyager ``Duration`` to a DuckDB INTERVAL parameter.
+
+    Microsecond-exact durations without calendar months use ``datetime.timedelta``
+    so the bridge matches the official client's component normalization.  Other
+    values use interval text because DuckDB's INTERVAL keeps calendar months,
+    days and microseconds separately.
+    """
+    if val.months == 0 and val.nanoseconds % 1_000 == 0:
+        interval: Any = val.to_timedelta()
+    else:
+        total_us = val.seconds * 1_000_000 + val.nanoseconds // 1_000
+        sign = "-" if total_us < 0 else ""
+        abs_us = abs(total_us)
+        secs, us = divmod(abs_us, 1_000_000)
+        interval = f"{val.months} months {val.days} days {sign}{secs}.{us:06d} seconds"
+    try:
+        import duckdb
+
+        return duckdb.IntervalValue(interval)
+    except ImportError:
+        return interval
+
+
+def _adapt_duckdb_value(val: Any, *, json_target: bool = False) -> Any:
+    """Adapts a parameter value for DuckDB binding."""
+    if isinstance(val, Duration):
+        return _duckdb_interval_value(val)
+    if isinstance(val, datetime.time) and not isinstance(val, datetime.datetime):
+        offset = val.utcoffset() if val.tzinfo is not None else None
+        if offset is not None and offset.days < 0:
+            # DuckDB rejects negative-offset datetime.time objects because its
+            # binder expects utcoffset().days == 0.  TIMETZ text round-trips.
+            return val.isoformat()
+        return val
+    if json_target and isinstance(val, (dict, list, tuple)):
+        return json.dumps(val, default=json_default)
+    if isinstance(val, dict):
+        return {k: _adapt_duckdb_value(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [_adapt_duckdb_value(v) for v in val]
+    return val
+
+
+def _adapt_duckdb_parameters(statement: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Adapts statement parameters, serialising values whose target column is JSON."""
+    if not params:
+        return params
+    json_keys = _duckdb_json_parameter_keys(statement)
+    return {
+        key: _adapt_duckdb_value(value, json_target=key in json_keys)
+        for key, value in params.items()
+    }
+
+
+def _duckdb_description_has_timetz(description: Sequence[Any]) -> bool:
+    """Returns whether a DuckDB cursor description contains a ``TIMETZ`` column."""
+    return any(
+        len(item) > 1 and "TIME WITH TIME ZONE" in str(item[1]).upper() for item in description
+    )
+
+
+def _duckdb_time_iso(value: Any) -> Any:
+    """Converts a ``datetime.time`` (or a nested list of them) to ISO text."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_duckdb_time_iso(item) for item in value]
+    return value.isoformat()
+
+
+def _duckdb_uuid_bytes(value: Any) -> Any:
+    """Converts a UUID or UUID string to its 16-byte representation."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_duckdb_uuid_bytes(item) for item in value]
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, uuid.UUID):
+        return value.bytes
+    return uuid.UUID(str(value)).bytes
+
+
+def _duckdb_uuid_arrow_type(arrow_type: Any) -> Any:
+    """Maps a UUID string Arrow type to its fixed-size binary equivalent."""
+    import pyarrow as pa
+
+    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        return pa.list_(_duckdb_uuid_arrow_type(arrow_type.value_type))
+    return pa.binary(16)
+
+
+def _duckdb_uuid_column_to_arrow(column: Any, arrow_type: Any) -> Any:
+    """Builds a fixed-size binary Arrow array from a UUID string column."""
+    import pyarrow as pa
+
+    values = [_duckdb_uuid_bytes(value) for value in column.to_pylist()]
+    return pa.array(values, type=_duckdb_uuid_arrow_type(arrow_type))
+
+
+def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any]) -> Any:
+    """Rewrites DuckDB Arrow columns to Voyager's documented export representations.
+
+    ``UUID`` becomes ``fixed_size_binary(16)`` (Polars ``Binary``), ``JSON`` stays
+    UTF-8 text tagged ``voyager.encoding=json``, ``HUGEINT`` stays
+    ``decimal128(38, 0)`` tagged ``voyager.type=hugeint`` (Arrow has no int128),
+    and calendar intervals become ``month_day_nano_interval``-free duration
+    columns.
+    """
+    import pyarrow as pa
+
+    arrays = []
+    fields = []
+    for idx, field in enumerate(arrow_table.schema):
+        description_type = (
+            str(description[idx][1]).upper()
+            if idx < len(description) and len(description[idx]) > 1
+            else ""
+        )
+        column = arrow_table.column(idx)
+        metadata = dict(field.metadata) if field.metadata else {}
+        if description_type == "UUID" or description_type.startswith("UUID["):
+            array = _duckdb_uuid_column_to_arrow(column, field.type)
+            metadata[b"voyager.type"] = b"uuid"
+            if pa.types.is_fixed_size_binary(array.type):
+                # Same extension tag as the native PostgreSQL backend's UUID columns.
+                metadata[b"ARROW:extension:name"] = b"arrow.uuid"
+        elif description_type == "JSON":
+            array = pa.array(column.to_pylist(), type=pa.string())
+            metadata[b"voyager.encoding"] = b"json"
+            metadata[b"voyager.type"] = b"json"
+        elif description_type == "HUGEINT":
+            array = column
+            metadata[b"voyager.type"] = b"hugeint"
+        elif _is_month_day_nano_interval(field.type):
+            array = _duckdb_mdn_column_to_arrow(column)
+            if pa.types.is_struct(array.type):
+                metadata[b"voyager.type"] = b"duration"
+        elif _arrow_has_month_day_nano_interval(field.type):
+            values = [
+                serialize_value_for_arrow(_normalize_duckdb_arrow_value(value, field.type))
+                for value in column.to_pylist()
+            ]
+            array = pa.array(values)
+        else:
+            arrays.append(column)
+            fields.append(field)
+            continue
+        fields.append(
+            pa.field(field.name, array.type, nullable=field.nullable, metadata=metadata or None)
+        )
+        arrays.append(array)
+    return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
+
+
+def _duckdb_rows_to_arrow(description: Sequence[Any], rows: Sequence[Sequence[Any]]) -> Any:
+    """Builds an Arrow table from DB-API rows when DuckDB's Arrow copy loses TIMETZ offsets."""
+    import pyarrow as pa
+
+    arrays = []
+    fields = []
+    for idx, item in enumerate(description):
+        name = str(item[0])
+        description_type = str(item[1]).upper() if len(item) > 1 else ""
+        values = [row[idx] for row in rows]
+        metadata: dict[bytes, bytes] = {}
+        if description_type.startswith("TIME WITH TIME ZONE"):
+            depth = description_type.count("[")
+            target_type = pa.string()
+            for _ in range(depth):
+                target_type = pa.list_(target_type)
+            array = pa.array(
+                [_duckdb_time_iso(value) for value in values],
+                type=target_type,
+            )
+            metadata[b"voyager.type"] = b"time_tz"
+        elif description_type == "JSON":
+            array = pa.array(
+                [
+                    value
+                    if value is None or isinstance(value, str)
+                    else json.dumps(value, default=json_default)
+                    for value in values
+                ],
+                type=pa.string(),
+            )
+            metadata[b"voyager.encoding"] = b"json"
+            metadata[b"voyager.type"] = b"json"
+        elif description_type == "UUID" or description_type.startswith("UUID["):
+            depth = description_type.count("[")
+            uuid_type: Any = pa.binary(16)
+            for _ in range(depth):
+                uuid_type = pa.list_(uuid_type)
+            array = pa.array([_duckdb_uuid_bytes(value) for value in values], type=uuid_type)
+            metadata[b"voyager.type"] = b"uuid"
+            if pa.types.is_fixed_size_binary(array.type):
+                # Same extension tag as the native PostgreSQL backend's UUID columns.
+                metadata[b"ARROW:extension:name"] = b"arrow.uuid"
+        elif description_type == "HUGEINT":
+            array = pa.array(
+                [None if value is None else Decimal(int(value)) for value in values],
+                type=pa.decimal128(38, 0),
+            )
+            metadata[b"voyager.type"] = b"hugeint"
+        elif description_type in ("INTERVAL", "TIMEDELTA"):
+            array = pa.array(values, type=pa.duration("us"))
+        else:
+            array = pa.array(values)
+        fields.append(pa.field(name, array.type, nullable=True, metadata=metadata or None))
+        arrays.append(array)
+    return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
+
+
 class DuckDbBridge:
     """Synchronous DuckDB driver bridge with zero-copy Polars / Arrow output."""
 
@@ -1515,6 +1841,19 @@ class DuckDbBridge:
         self._install_duckpgq = install_duckpgq
         self._duckpgq_loaded = False
 
+    @staticmethod
+    def _arrow_table(rel: Any) -> Any | None:
+        """Returns a DuckDB relation's Arrow table with the version-specific method name."""
+        for name in ("fetch_arrow_table", "to_arrow_table"):
+            method = getattr(rel, name, None)
+            if callable(method):
+                with warnings.catch_warnings():
+                    # DuckDB 2.0 warns that a DB-API result copies rows into Arrow;
+                    # the result is already materialized here, so this is expected.
+                    warnings.filterwarnings("ignore", message="Arrow output on a DB-API result.*")
+                    return method()
+        return None
+
     def _duckpgq_is_loaded(self) -> bool:
         """Returns whether DuckPGQ is already loaded on this connection."""
         try:
@@ -1529,16 +1868,23 @@ class DuckDbBridge:
         """Sets whether a missing DuckPGQ extension may be installed when it is first needed.
 
         Args:
-            install: When ``True``, ``INSTALL duckpgq;`` (which downloads the extension)
-                is attempted if ``LOAD duckpgq;`` fails.
+            install: When ``True``, ``INSTALL duckpgq FROM community;`` (which downloads
+                the extension) is attempted if ``LOAD duckpgq;`` fails.
         """
         self._install_duckpgq = install
 
+    def _enable_duckpgq_grammar(self) -> None:
+        """Opts this connection into DuckPGQ's SQL/PGQ grammar on DuckDB 2.0+."""
+        self.con.execute(_DUCKPGQ_GRAMMAR_STATEMENT)
+
     def ensure_duckpgq(self, install: bool | None = None) -> None:
-        """Loads DuckPGQ on this connection once.
+        """Loads DuckPGQ and its grammar on this connection once.
 
         Loading is idempotent: a connection the caller already prepared with
-        ``LOAD duckpgq;`` is detected and left alone, and later calls are no-ops.
+        ``LOAD duckpgq;`` is detected and left loaded, and later calls are no-ops.
+        On DuckDB 2.0+, SQL/PGQ parsing also requires the per-connection
+        ``SET active_grammar_extensions = ['duckpgq'];`` opt-in, which Voyager
+        runs after loading the extension (or after detecting it already loaded).
 
         Args:
             install: Install the extension first when it is missing. Defaults to
@@ -1548,11 +1894,12 @@ class DuckDbBridge:
 
         Raises:
             RuntimeError: If the extension cannot be loaded, naming DuckPGQ and
-                the ``INSTALL duckpgq;`` command.
+                the ``INSTALL duckpgq FROM community;`` command.
         """
         if self._duckpgq_loaded:
             return
         if self._duckpgq_is_loaded():
+            self._enable_duckpgq_grammar()
             self._duckpgq_loaded = True
             return
         should_install = self._install_duckpgq if install is None else install
@@ -1562,10 +1909,11 @@ class DuckDbBridge:
             if not should_install:
                 raise RuntimeError(_duckpgq_error_message(load_error)) from load_error
             try:
-                self.con.execute("INSTALL duckpgq;")
+                self.con.execute("INSTALL duckpgq FROM community;")
                 self.con.execute("LOAD duckpgq;")
             except Exception as install_error:
                 raise RuntimeError(_duckpgq_error_message(install_error)) from install_error
+        self._enable_duckpgq_grammar()
         self._duckpgq_loaded = True
 
     def _ensure_duckpgq_for_statement(self, statement: str) -> None:
@@ -1626,13 +1974,13 @@ class DuckDbBridge:
 
         Preserves exact calendar ``months``, ``days``, ``seconds``, and
         ``nanoseconds`` on ``INTERVAL`` columns by reading Arrow
-        ``month_day_nano_interval`` when a ``TIMEDELTA`` column is present in
-        ``rel.description``. Queries without any top-level ``INTERVAL`` column
-        decode via ``rel.fetchall()`` (preserving native Python ``int`` for
-        ``HUGEINT`` and ``uuid.UUID`` inside ``UUID[]``), so ``INTERVAL`` values
-        nested solely inside ``LIST``/``STRUCT``/``MAP`` without a top-level
-        ``INTERVAL`` column are approximated as ``datetime.timedelta`` by
-        DuckDB's DBAPI.
+        ``month_day_nano_interval`` when an ``INTERVAL``/``TIMEDELTA`` column is
+        present in ``rel.description``. Queries without any top-level
+        ``INTERVAL`` column decode via ``rel.fetchall()`` (preserving native
+        Python ``int`` for ``HUGEINT`` and ``uuid.UUID`` inside ``UUID[]``), so
+        ``INTERVAL`` values nested solely inside ``LIST``/``STRUCT``/``MAP``
+        without a top-level ``INTERVAL`` column are approximated as
+        ``datetime.timedelta`` by DuckDB's DBAPI.
 
         Args:
             statement: Query statement.
@@ -1643,22 +1991,53 @@ class DuckDbBridge:
         """
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
+        params = _adapt_duckdb_parameters(stmt, params)
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return BridgeResult([], columns=())
-        has_timedelta = any(
-            len(d) > 1 and str(d[1]).upper() == "TIMEDELTA" for d in rel.description
+        has_interval = any(
+            len(d) > 1 and str(d[1]).upper() in ("INTERVAL", "TIMEDELTA") for d in rel.description
         )
-        if has_timedelta and hasattr(rel, "fetch_arrow_table"):
-            arrow_table = rel.fetch_arrow_table()
+        if has_interval:
+            arrow_table = self._arrow_table(rel)
             if arrow_table is not None:
                 return _records_from_duckdb_arrow(rel.description, arrow_table)
         return _records_from_duckdb_rows(rel.description, rel.fetchall())
+
+    def execute_to_arrow(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
+        """Executes a query and returns an Arrow table with Voyager's export types.
+
+        ``UUID`` columns use ``fixed_size_binary(16)`` (``arrow.uuid`` storage),
+        ``JSON`` columns are UTF-8 JSON text tagged ``voyager.encoding=json``,
+        ``TIMETZ`` columns are ISO text tagged ``voyager.type=time_tz`` because
+        Arrow has no timezone-aware time type, and ``HUGEINT`` columns stay
+        ``decimal128(38, 0)`` tagged ``voyager.type=hugeint`` because Arrow has
+        no portable int128 type.
+        """
+        import pyarrow as pa
+
+        self._ensure_duckpgq_for_statement(statement)
+        stmt, params = self._format_pgq_statement(statement, parameters or {})
+        params = _adapt_duckdb_parameters(stmt, params)
+        rel = self.con.execute(stmt, params)
+        if not rel.description:
+            return pa.Table.from_pylist([])
+        if _duckdb_description_has_timetz(rel.description):
+            return _duckdb_rows_to_arrow(rel.description, rel.fetchall())
+        arrow_table = self._arrow_table(rel)
+        if arrow_table is None:
+            return _duckdb_rows_to_arrow(rel.description, rel.fetchall())
+        return _duckdb_arrow_table_to_canonical(arrow_table, rel.description)
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
         """Executes query and streams to Polars DataFrame without re-executing.
+
+        ``UUID`` columns are ``Binary`` (16 bytes), ``TIMETZ`` and ``JSON``
+        columns are UTF-8 text (Polars strips Arrow field metadata), and
+        ``HUGEINT`` columns are ``pl.Decimal`` because Polars' ``Int128`` cannot
+        be exported back to Arrow.
 
         Args:
             statement: Query statement.
@@ -1669,22 +2048,18 @@ class DuckDbBridge:
         """
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
+        params = _adapt_duckdb_parameters(stmt, params)
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return pl.DataFrame()
-        if hasattr(rel, "fetch_arrow_table"):
-            arrow_table = rel.fetch_arrow_table()
-            if arrow_table is not None:
-                return _duckdb_arrow_table_to_polars(arrow_table)
-        if hasattr(self.con, "pl") and hasattr(rel, "pl"):
-            try:
-                return rel.pl()
-            except Exception as exc:
-                if "month_day_nano_interval" not in str(exc):
-                    raise
-                return _records_to_polars(
-                    _records_from_duckdb_rows(rel.description, rel.fetchall())
-                )
+        if _duckdb_description_has_timetz(rel.description):
+            return _duckdb_arrow_table_to_polars(
+                _duckdb_rows_to_arrow(rel.description, rel.fetchall())
+            )
+        arrow_table = self._arrow_table(rel)
+        if arrow_table is not None:
+            arrow_table = _duckdb_arrow_table_to_canonical(arrow_table, rel.description)
+            return _duckdb_arrow_table_to_polars(arrow_table)
         return _records_to_polars(_records_from_duckdb_rows(rel.description, rel.fetchall()))
 
     def execute_bulk(
@@ -1713,6 +2088,11 @@ class DuckDbBridge:
             for b in batch_list:
                 batch_data = b.get("batch", [])
                 total_records += len(batch_data)
+                if _CYPHER_BULK_STATEMENT_PATTERN.match(statement):
+                    # A failed statement aborts the whole explicit transaction on
+                    # DuckDB 2.0, so never send the Cypher plan to the parser.
+                    self._fallback_bulk_ingest(statement, batch_data)
+                    continue
                 try:
                     self.con.execute(statement, b)
                 except Exception:
@@ -1723,6 +2103,9 @@ class DuckDbBridge:
                 total_batches += 1
                 batch_data = batch_item.parameters.get("batch", [])
                 total_records += len(batch_data)
+                if _CYPHER_BULK_STATEMENT_PATTERN.match(batch_item.statement):
+                    self._fallback_bulk_ingest(batch_item.statement, batch_data)
+                    continue
                 try:
                     self.con.execute(batch_item.statement, batch_item.parameters)
                 except Exception:
@@ -1864,6 +2247,15 @@ class DuckDbBridgeTransaction:
             self._mark_failed()
             raise
 
+    def execute_to_arrow(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
+        """Executes a statement through the DuckPGQ bridge and returns Arrow."""
+        self._ensure_executable()
+        try:
+            return self._bridge.execute_to_arrow(statement, parameters)
+        except BaseException:
+            self._mark_failed()
+            raise
+
     def execute_bulk(
         self,
         plan_or_statement: BulkIngestionPlan | str,
@@ -1964,6 +2356,12 @@ class AsyncDuckDbBridge:
         """
         return await asyncio.to_thread(self.sync_bridge.execute_to_polars, statement, parameters)
 
+    async def execute_to_arrow(
+        self, statement: str, parameters: dict[str, Any] | None = None
+    ) -> Any:
+        """Asynchronously streams query results to an Arrow table."""
+        return await asyncio.to_thread(self.sync_bridge.execute_to_arrow, statement, parameters)
+
     async def execute_bulk(
         self,
         plan_or_statement: BulkIngestionPlan | str,
@@ -2032,6 +2430,16 @@ class AsyncDuckDbBridgeTransaction:
         """Executes a statement and returns a Polars DataFrame."""
         try:
             return await asyncio.to_thread(self._sync.execute_to_polars, statement, parameters)
+        except asyncio.CancelledError:
+            self._sync._mark_failed()
+            raise
+
+    async def execute_to_arrow(
+        self, statement: str, parameters: dict[str, Any] | None = None
+    ) -> Any:
+        """Executes a statement and returns an Arrow table."""
+        try:
+            return await asyncio.to_thread(self._sync.execute_to_arrow, statement, parameters)
         except asyncio.CancelledError:
             self._sync._mark_failed()
             raise
@@ -2413,6 +2821,88 @@ def _format_pg_duration_text(dur: Duration) -> str:
     return f"{dur.months} mons {dur.days} days {sign}{secs}.{us:06d} seconds"
 
 
+_JSON_CAST_RE = re.compile(
+    r"\s*::\s*(?:[A-Za-z_][A-Za-z0-9_$]*\s*\.\s*)?(?:jsonb|json)\b", re.IGNORECASE
+)
+
+
+def _placeholder_forces_json(statement: str, position: int) -> bool:
+    """Returns whether the placeholder ending at ``position`` is cast to json/jsonb."""
+    return _JSON_CAST_RE.match(statement, position) is not None
+
+
+def _unwrap_json_marker(value: Any) -> tuple[bool, Any]:
+    """Returns ``(was_explicit, unwrapped)`` after recursively removing ``Json`` wrappers."""
+    if isinstance(value, Json):
+        return True, _unwrap_json_marker(value.value)[1]
+    if isinstance(value, Mapping):
+        return False, {k: _unwrap_json_marker(v)[1] for k, v in value.items()}
+    if isinstance(value, tuple):
+        return False, tuple(_unwrap_json_marker(v)[1] for v in value)
+    if isinstance(value, list):
+        return False, [_unwrap_json_marker(v)[1] for v in value]
+    return False, value
+
+
+def _strip_json_markers(value: Any) -> Any:
+    """Recursively removes ``Json`` wrappers, returning the contained values."""
+    return _unwrap_json_marker(value)[1]
+
+
+def _pg_json_adapter(value: Any) -> Any:
+    """Wraps a value for psycopg so PostgreSQL binds it as ``jsonb``."""
+    try:
+        from psycopg.types.json import Jsonb
+
+        return Jsonb(value)
+    except ImportError:
+        try:
+            extras = importlib.import_module("psycopg2.extras")
+            return extras.Json(value)
+        except ImportError:
+            return value
+
+
+def _encode_pg_array_element(value: Any) -> Any:
+    """Adapts one element of a PostgreSQL array parameter.
+
+    psycopg cannot adapt a raw ``dict``; inside an array each mapping becomes a
+    ``jsonb`` element (giving ``jsonb[]``), and nested lists recurse so they
+    become multidimensional arrays. Explicit ``Json(...)`` elements keep their
+    JSON element type.
+    """
+    if isinstance(value, Json):
+        return _pg_json_adapter(_unwrap_json_marker(value)[1])
+    if isinstance(value, Mapping):
+        return _pg_json_adapter(value)
+    if isinstance(value, tuple):
+        return tuple(_encode_pg_array_element(item) for item in value)
+    if isinstance(value, list):
+        return [_encode_pg_array_element(item) for item in value]
+    return value
+
+
+def _encode_pg_parameter(value: Any, *, force_json: bool) -> Any:
+    """Chooses the PostgreSQL parameter encoding for one value.
+
+    The rule matches the native driver and psycopg: ``Json(...)`` wrappers and
+    maps bind as ``jsonb``; an explicit ``::json``/``::jsonb`` cast forces the
+    whole value into one JSON document (including empty and nested lists, so
+    ``[]`` becomes ``[]``, never ``{}``). Without a cast a list stays a SQL
+    array: a list of dicts becomes ``jsonb[]``, a list of scalars a typed array,
+    and nested lists a multidimensional array. An empty list therefore remains
+    an empty array literal for array-typed slots.
+    """
+    explicit, unwrapped = _unwrap_json_marker(value)
+    if explicit or force_json or isinstance(unwrapped, Mapping):
+        return _pg_json_adapter(unwrapped)
+    if isinstance(value, (list, tuple)):
+        # Use the original list so nested ``Json(...)`` markers keep their JSON
+        # element type instead of being flattened by ``_unwrap_json_marker``.
+        return _encode_pg_array_element(value)
+    return unwrapped
+
+
 def _configure_pg_adapters(cursor: Any) -> bool:
     """Registers per-cursor ``interval`` loader and ``Duration`` dumper on psycopg 3 cursors."""
     adapters = getattr(cursor, "adapters", None)
@@ -2523,7 +3013,7 @@ class PostgresBridge:
                 setup_postgres_age(self.conn, force=True)
             import json
 
-            return statement, (json.dumps(parameters),)
+            return statement, (json.dumps(_strip_json_markers(parameters)),)
 
         ordered_params: list[Any] = []
         regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
@@ -2531,7 +3021,12 @@ class PostgresBridge:
         def repl(m: re.Match[str]) -> str:
             key = m.group(1)
             if key in parameters:
-                ordered_params.append(parameters[key])
+                ordered_params.append(
+                    _encode_pg_parameter(
+                        parameters[key],
+                        force_json=_placeholder_forces_json(statement, m.end()),
+                    )
+                )
                 return "%s"
             return m.group(0)
 
@@ -3021,6 +3516,10 @@ class AsyncPostgresBridgeTransaction:
 
 def _adapt_falkordb_value(val: Any) -> Any:
     """Adapts rich parameter values (temporal types, Duration, Point, etc.) for FalkorDB query execution."""
+    if isinstance(val, Json):
+        return _adapt_falkordb_value(val.value)
+    if isinstance(val, uuid.UUID):
+        return str(val)
     if isinstance(val, (datetime.date, datetime.time, datetime.datetime)):
         return val.isoformat()
     if isinstance(val, datetime.timedelta):

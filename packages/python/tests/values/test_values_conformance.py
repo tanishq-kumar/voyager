@@ -153,7 +153,7 @@ def _decode_columnar_value(
     is_polars: bool = False,
 ) -> Any:
     """Decodes documented Arrow/Polars transport shapes back to comparable Python objects."""
-    from voyager_ogm import Duration
+    from voyager_ogm import Duration, Point
     from voyager_ogm.types import _hydrate_date, _hydrate_datetime, _hydrate_time
 
     if raw is None:
@@ -185,6 +185,15 @@ def _decode_columnar_value(
             seconds=int(raw["seconds"]),
             nanoseconds=int(raw["nanoseconds"]),
         )
+    if (
+        isinstance(raw, dict)
+        and set(raw.keys()) == {"srid", "x", "y", "z"}
+        and (
+            v_type == "point"
+            or (is_polars and (value_kind == "point" or isinstance(reference, Point)))
+        )
+    ):
+        return Point.from_dict(raw)
     if isinstance(raw, list) and isinstance(reference, list):
         if is_polars and value_kind == "list" and reference and isinstance(reference[0], uuid.UUID):
             return [uuid.UUID(bytes=x) if isinstance(x, bytes) and len(x) == 16 else x for x in raw]
@@ -198,8 +207,6 @@ def _decode_columnar_value(
             )
             for idx, (r_item, ref_item) in enumerate(zip(raw, reference, strict=False))
         ]
-    if is_polars and value_kind == "uuid" and isinstance(raw, bytes) and len(raw) == 16:
-        return uuid.UUID(bytes=raw)
     if v_type == "date" and isinstance(raw, str):
         return _hydrate_date(raw)
     if v_type == "time_tz" and isinstance(raw, str):

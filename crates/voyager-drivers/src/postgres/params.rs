@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
-use crate::error::{NetError, Result};
+use crate::error::Result;
 use crate::params::{ParamValue, format_datetime_iso, format_iso_date, format_iso_time};
 
 /// Placeholder convention detected in a compiled statement.
@@ -117,6 +117,7 @@ mod parameter_oids {
     pub(super) const TIMETZ: i32 = 1266;
     pub(super) const NUMERIC: i32 = 1700;
     pub(super) const UUID: i32 = 2950;
+    pub(super) const JSONB: i32 = 3802;
 
     pub(super) const BOOL_ARRAY: i32 = 1000;
     pub(super) const BYTEA_ARRAY: i32 = 1001;
@@ -130,6 +131,7 @@ mod parameter_oids {
     pub(super) const TIMETZ_ARRAY: i32 = 1270;
     pub(super) const NUMERIC_ARRAY: i32 = 1231;
     pub(super) const UUID_ARRAY: i32 = 2951;
+    pub(super) const JSONB_ARRAY: i32 = 3807;
 }
 
 /// Chooses a PostgreSQL type OID for a parameter value.
@@ -137,15 +139,45 @@ mod parameter_oids {
 /// `0` means "untyped, let the server infer". Typed values (booleans, numbers,
 /// temporal values, UUID, numeric, bytea, and homogeneous arrays of them) carry
 /// their PostgreSQL type OID. Genuine strings (`ParamValue::Json(Value::String(_))`),
-/// maps, SQL NULL, empty lists, and mixed lists stay untyped (`0`) so the server
-/// resolves them from column context.
+/// SQL NULL, empty lists, and mixed lists stay untyped (`0`) so the server
+/// resolves them from column context; maps are `jsonb` and lists of maps are
+/// `jsonb[]`.
 fn value_oid(value: &ParamValue) -> i32 {
     match value {
         ParamValue::Json(v) => json_value_oid(v),
+        ParamValue::Jsonb(_) | ParamValue::Map(_) => parameter_oids::JSONB,
         ParamValue::List(items) => param_array_oid(items).unwrap_or(0),
-        ParamValue::Map(_) => 0,
         other => scalar_param_oid(other).unwrap_or(0),
     }
+}
+
+/// Selects the wire text and type OID for one bound parameter.
+///
+/// `force_json` is set when the placeholder is followed by an explicit `::json` /
+/// `::jsonb` cast. Maps and `Json(...)` wrappers always encode as JSON text with
+/// the `jsonb` OID. Lists keep the array behaviour psycopg has: scalar lists are
+/// typed PostgreSQL arrays, lists of maps become `jsonb[]` (each map is one JSON
+/// element), and nested lists become multidimensional arrays (`{{1,2},{3,4}}`).
+/// With an explicit JSON cast (or a `Json(...)` wrapper) every list, including
+/// `[]` and `[[]]`, is encoded as one JSON document, so `[]` is never sent as a
+/// JSON object.
+fn bind_value(value: &ParamValue, force_json: bool) -> BoundParameter {
+    if let ParamValue::Jsonb(inner) = value {
+        return (Some(json_param_text(inner)), parameter_oids::JSONB);
+    }
+    if force_json || value_requires_json(value) {
+        return (Some(json_param_text(value)), parameter_oids::JSONB);
+    }
+    (value_to_text(value), value_oid(value))
+}
+
+/// Returns `true` when a value must be encoded as a JSON document rather than a
+/// PostgreSQL array/scalar, even without an explicit JSON cast.
+fn value_requires_json(value: &ParamValue) -> bool {
+    matches!(
+        value,
+        ParamValue::Jsonb(_) | ParamValue::Map(_) | ParamValue::Json(Value::Object(_))
+    )
 }
 
 fn json_value_oid(value: &Value) -> i32 {
@@ -172,6 +204,7 @@ fn element_to_array_oid(element: i32) -> i32 {
         oid::TIMETZ => oid::TIMETZ_ARRAY,
         oid::NUMERIC => oid::NUMERIC_ARRAY,
         oid::UUID => oid::UUID_ARRAY,
+        oid::JSONB => oid::JSONB_ARRAY,
         _ => element,
     }
 }
@@ -184,7 +217,7 @@ fn param_array_oid(items: &[ParamValue]) -> Option<i32> {
             ParamValue::Json(Value::Null) => continue,
             ParamValue::List(nested) => base_param_array_element_oid(nested)?,
             ParamValue::Json(Value::Array(nested)) => base_json_array_element_oid(nested)?,
-            other => scalar_param_oid(other)?,
+            other => param_element_oid(other)?,
         };
         match element_oid {
             None => element_oid = Some(candidate),
@@ -196,13 +229,26 @@ fn param_array_oid(items: &[ParamValue]) -> Option<i32> {
     element_oid.map(element_to_array_oid)
 }
 
+/// Returns the PostgreSQL element OID for one item of a SQL array.
+///
+/// Maps and `Json(...)` wrappers are elements of a `jsonb[]` array, matching
+/// psycopg's adaptation of a list of dicts.
+fn param_element_oid(value: &ParamValue) -> Option<i32> {
+    match value {
+        ParamValue::Map(_) | ParamValue::Jsonb(_) | ParamValue::Json(Value::Object(_)) => {
+            Some(parameter_oids::JSONB)
+        }
+        other => scalar_param_oid(other),
+    }
+}
+
 fn base_param_array_element_oid(items: &[ParamValue]) -> Option<i32> {
     for item in items {
         match item {
             ParamValue::Json(Value::Null) => continue,
             ParamValue::List(nested) => return base_param_array_element_oid(nested),
             ParamValue::Json(Value::Array(nested)) => return base_json_array_element_oid(nested),
-            other => return scalar_param_oid(other),
+            other => return param_element_oid(other),
         }
     }
     None
@@ -230,7 +276,7 @@ fn scalar_param_oid(value: &ParamValue) -> Option<i32> {
         ParamValue::Uuid(_) => Some(oid::UUID),
         ParamValue::Decimal(_) => Some(oid::NUMERIC),
         ParamValue::Point2D { .. } | ParamValue::Point3D { .. } => None,
-        ParamValue::List(_) | ParamValue::Map(_) => None,
+        ParamValue::List(_) | ParamValue::Map(_) | ParamValue::Jsonb(_) => None,
     }
 }
 
@@ -241,6 +287,7 @@ fn json_array_oid(items: &[Value]) -> Option<i32> {
         let candidate = match item {
             Value::Null => continue,
             Value::Array(nested) => base_json_array_element_oid(nested)?,
+            Value::Object(_) => parameter_oids::JSONB,
             other => scalar_json_oid(other)?,
         };
         match element_oid {
@@ -259,6 +306,7 @@ fn base_json_array_element_oid(items: &[Value]) -> Option<i32> {
         match item {
             Value::Null => continue,
             Value::Array(nested) => return base_json_array_element_oid(nested),
+            Value::Object(_) => return Some(parameter_oids::JSONB),
             other => return scalar_json_oid(other),
         }
     }
@@ -291,12 +339,22 @@ fn looks_like_age_statement(query: &str) -> bool {
 
 /// Serializes the full AGE parameter map into a deterministic JSON object.
 fn age_parameter_map(params: &HashMap<String, ParamValue>) -> Result<Vec<u8>> {
-    let sorted: BTreeMap<&str, Value> = params
+    let sorted: BTreeMap<&str, &ParamValue> = params
         .iter()
-        .map(|(key, value)| (key.as_str(), value.to_json_value()))
+        .map(|(key, value)| (key.as_str(), value))
         .collect();
-    serde_json::to_vec(&sorted)
-        .map_err(|e| NetError::ProtocolError(format!("Failed to encode AGE parameter map: {e}")))
+    let mut out = String::new();
+    out.push('{');
+    for (i, (key, value)) in sorted.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(key, &mut out);
+        out.push(':');
+        write_json_param(value, &mut out);
+    }
+    out.push('}');
+    Ok(out.into_bytes())
 }
 
 /// Rewrites the AGE `%s` driver placeholder (outside `$$ ... $$`) to `$1`.
@@ -422,7 +480,8 @@ fn rewrite_named_placeholders(
                             None => {
                                 let index = bound.len() + 1;
                                 indices.insert(name.to_string(), index);
-                                bound.push((value_to_text(value), value_oid(value)));
+                                let force_json = placeholder_forces_json(bytes, name_end);
+                                bound.push(bind_value(value, force_json));
                                 index
                             }
                         };
@@ -445,6 +504,34 @@ fn rewrite_named_placeholders(
     }
 
     (out, bound)
+}
+
+/// Returns `true` when the placeholder ending at `pos` is explicitly cast to
+/// `json` or `jsonb` (`$v::jsonb`, `$v :: json`, `$v::pg_catalog.jsonb`).
+fn placeholder_forces_json(bytes: &[u8], pos: usize) -> bool {
+    let mut i = pos;
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b':') || bytes.get(i + 1) != Some(&b':') {
+        return false;
+    }
+    i += 2;
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    let start = i;
+    while bytes
+        .get(i)
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')
+    {
+        i += 1;
+    }
+    let name = std::str::from_utf8(&bytes[start..i])
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let last = name.rsplit('.').next().unwrap_or("");
+    last == "json" || last == "jsonb"
 }
 
 /// Formats an `f64` for PostgreSQL text-format `Bind` bytes (preserving `NaN`/`Infinity`/`-Infinity`).
@@ -475,10 +562,110 @@ fn format_pg_interval(months: i64, days: i64, seconds: i64, nanoseconds: i64) ->
     format!("{months} mons {days} days {sign}{s}.{us:06} seconds")
 }
 
+/// Encodes a value as compact JSON text for a `json` / `jsonb` parameter.
+///
+/// Finite floats use the shortest round-trip representation. Non-finite floats
+/// are written as `NaN` / `Infinity` / `-Infinity`, which PostgreSQL `jsonb`
+/// (and Apache AGE `agtype`) accept even though they are not standard JSON.
+fn json_param_text(value: &ParamValue) -> Vec<u8> {
+    let mut out = String::new();
+    write_json_param(value, &mut out);
+    out.into_bytes()
+}
+
+fn write_json_param(value: &ParamValue, out: &mut String) {
+    match value {
+        ParamValue::Json(v) => write_json_value(v, out),
+        ParamValue::Jsonb(inner) => write_json_param(inner, out),
+        ParamValue::Float(f) => write_json_f64(*f, out),
+        ParamValue::List(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_param(item, out);
+            }
+            out.push(']');
+        }
+        ParamValue::Map(map) => {
+            let sorted: BTreeMap<&str, &ParamValue> =
+                map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            out.push('{');
+            for (i, (key, item)) in sorted.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(key, out);
+                out.push(':');
+                write_json_param(item, out);
+            }
+            out.push('}');
+        }
+        other => write_json_value(&other.to_json_value(), out),
+    }
+}
+
+fn write_json_value(value: &Value, out: &mut String) {
+    match value {
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_value(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (key, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(key, out);
+                out.push(':');
+                write_json_value(item, out);
+            }
+            out.push('}');
+        }
+        other => match serde_json::to_string(other) {
+            Ok(text) => out.push_str(&text),
+            Err(_) => out.push_str("null"),
+        },
+    }
+}
+
+fn write_json_f64(value: f64, out: &mut String) {
+    if value.is_nan() {
+        out.push_str("NaN");
+    } else if value.is_infinite() {
+        out.push_str(if value.is_sign_positive() {
+            "Infinity"
+        } else {
+            "-Infinity"
+        });
+    } else {
+        match serde_json::Number::from_f64(value) {
+            Some(number) => out.push_str(&number.to_string()),
+            None => out.push_str("null"),
+        }
+    }
+}
+
+fn push_json_string(value: &str, out: &mut String) {
+    match serde_json::to_string(value) {
+        Ok(text) => out.push_str(&text),
+        Err(_) => out.push_str("\"\""),
+    }
+}
+
 /// Encodes a typed parameter as PostgreSQL text-format `Bind` bytes.
 fn value_to_text(value: &ParamValue) -> Option<Vec<u8>> {
     match value {
         ParamValue::Json(v) => json_to_text(v),
+        ParamValue::Jsonb(inner) => Some(json_param_text(inner)),
         ParamValue::Float(f) => Some(format_pg_float(*f).into_bytes()),
         ParamValue::Bytes(b) => Some(format!("\\x{}", hex::encode(b)).into_bytes()),
         ParamValue::Date { year, month, day } => {
@@ -622,10 +809,13 @@ fn encode_pg_param_array_element(value: &ParamValue, out: &mut String) {
         ParamValue::Uuid(s) => escape_and_quote_element(s, out),
         ParamValue::Decimal(s) => out.push_str(s),
         ParamValue::List(nested) => encode_pg_param_array(nested, out),
+        ParamValue::Jsonb(inner) => {
+            let json = String::from_utf8_lossy(&json_param_text(inner)).into_owned();
+            escape_and_quote_element(&json, out);
+        }
         ParamValue::Map(_) | ParamValue::Point2D { .. } | ParamValue::Point3D { .. } => {
-            if let Ok(json_str) = serde_json::to_string(&value.to_json_value()) {
-                escape_and_quote_element(&json_str, out);
-            }
+            let json = String::from_utf8_lossy(&json_param_text(value)).into_owned();
+            escape_and_quote_element(&json, out);
         }
     }
 }
@@ -920,8 +1110,8 @@ mod tests {
                 Some(b"{1,2,3}".to_vec()),
             ]
         );
-        // NULL and maps stay untyped; integer lists are int8[].
-        assert_eq!(prepared.parameter_oids, vec![0, 0, 1016]);
+        // NULL stays untyped, maps are jsonb, and integer lists are int8[].
+        assert_eq!(prepared.parameter_oids, vec![0, 3802, 1016]);
     }
 
     #[test]
@@ -943,7 +1133,10 @@ mod tests {
         )
         .expect("prepare should succeed");
 
-        assert_eq!(prepared.parameter_oids, vec![16, 20, 701, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            prepared.parameter_oids,
+            vec![16, 20, 701, 0, 0, 3802, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -962,7 +1155,10 @@ mod tests {
         )
         .expect("prepare should succeed");
 
-        assert_eq!(prepared.parameter_oids, vec![1000, 1016, 1022, 0, 1016, 0]);
+        assert_eq!(
+            prepared.parameter_oids,
+            vec![1000, 1016, 1022, 3807, 1016, 0]
+        );
     }
 
     #[test]
@@ -1030,6 +1226,148 @@ mod tests {
             prepared.parameter_values[6].as_deref(),
             Some(br#"{"{\"a\":1}"}"#.as_slice())
         );
+        assert_eq!(
+            &prepared.parameter_oids[5..7],
+            &[1016, parameter_oids::JSONB_ARRAY]
+        );
+    }
+
+    #[test]
+    fn explicit_jsonb_cast_forces_json_for_empty_and_scalar_lists() {
+        let query = "SELECT $empty::jsonb, $ints::jsonb, $plain :: jsonb, $array_cast::bigint[], \
+                     $maps::jsonb, $nested::jsonb";
+        let prepared = prepare_postgres_statement(
+            query,
+            &params(&[
+                ("empty", json!([])),
+                ("ints", json!([1, 2])),
+                ("plain", json!({"k": 1})),
+                ("array_cast", json!([])),
+                ("maps", json!([{}])),
+                ("nested", json!([[]])),
+            ]),
+        )
+        .expect("prepare should succeed");
+
+        assert_eq!(
+            prepared.parameter_oids,
+            vec![3802, 3802, 3802, 0, 3802, 3802]
+        );
+        assert_eq!(
+            prepared.parameter_values,
+            vec![
+                Some(b"[]".to_vec()),
+                Some(b"[1,2]".to_vec()),
+                Some(br#"{"k":1}"#.to_vec()),
+                Some(b"{}".to_vec()),
+                Some(b"[{}]".to_vec()),
+                Some(b"[[]]".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_json_wrapper_binds_json_null_and_non_finite_floats() {
+        let query = "SELECT $null::jsonb, $inf, $map";
+        let mut p = HashMap::new();
+        p.insert(
+            "null".to_string(),
+            ParamValue::Jsonb(Box::new(ParamValue::Json(Value::Null))),
+        );
+        p.insert(
+            "inf".to_string(),
+            ParamValue::Jsonb(Box::new(ParamValue::Float(f64::INFINITY))),
+        );
+        p.insert(
+            "map".to_string(),
+            ParamValue::Jsonb(Box::new(ParamValue::Map(HashMap::from([
+                ("nan".to_string(), ParamValue::Float(f64::NAN)),
+                (
+                    "huge".to_string(),
+                    ParamValue::Json(serde_json::Value::Number(
+                        serde_json::Number::from_f64(1.7976931348623157e308).unwrap(),
+                    )),
+                ),
+            ])))),
+        );
+
+        let prepared = prepare_postgres_statement(query, &p).expect("prepare should succeed");
+        assert_eq!(prepared.parameter_oids, vec![3802, 3802, 3802]);
+        assert_eq!(
+            prepared.parameter_values,
+            vec![
+                Some(b"null".to_vec()),
+                Some(b"Infinity".to_vec()),
+                Some(br#"{"huge":1.7976931348623157e+308,"nan":NaN}"#.to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_nested_lists_bind_as_multidimensional_arrays_without_a_cast() {
+        let mut p = HashMap::new();
+        p.insert(
+            "v".to_string(),
+            ParamValue::List(vec![
+                ParamValue::List(vec![ParamValue::from(1), ParamValue::from(2)]),
+                ParamValue::List(vec![ParamValue::from(3), ParamValue::from(4)]),
+            ]),
+        );
+        assert!(!value_requires_json(&p["v"]));
+        let prepared = prepare_postgres_statement("SELECT $v", &p).expect("prepare should succeed");
+        assert_eq!(prepared.parameter_oids, vec![1016]);
+        assert_eq!(
+            prepared.parameter_values,
+            vec![Some(b"{{1,2},{3,4}}".to_vec())]
+        );
+    }
+
+    #[test]
+    fn typed_list_of_maps_binds_as_jsonb_array_without_a_cast() {
+        let mut p = HashMap::new();
+        p.insert(
+            "v".to_string(),
+            ParamValue::List(vec![
+                ParamValue::Map(HashMap::from([("a".to_string(), ParamValue::from(1))])),
+                ParamValue::Map(HashMap::from([("b".to_string(), ParamValue::from(2))])),
+            ]),
+        );
+        assert!(!value_requires_json(&p["v"]));
+        let prepared = prepare_postgres_statement("SELECT $v", &p).expect("prepare should succeed");
+        assert_eq!(prepared.parameter_oids, vec![parameter_oids::JSONB_ARRAY]);
+        assert_eq!(
+            prepared.parameter_values,
+            vec![Some(br#"{"{\"a\":1}","{\"b\":2}"}"#.to_vec())]
+        );
+    }
+
+    #[test]
+    fn ragged_nested_lists_stay_an_untyped_array_literal() {
+        // PostgreSQL cannot represent ragged multidimensional arrays; the value
+        // is still sent as an array literal, so the server rejects it exactly
+        // like the psycopg adaptation does. Use `Json(...)`/`::jsonb` for ragged JSON.
+        let mut p = HashMap::new();
+        p.insert(
+            "v".to_string(),
+            ParamValue::List(vec![
+                ParamValue::List(vec![ParamValue::from(1), ParamValue::from(2)]),
+                ParamValue::List(vec![]),
+            ]),
+        );
+        let prepared = prepare_postgres_statement("SELECT $v", &p).expect("prepare should succeed");
+        assert_eq!(prepared.parameter_oids, vec![0]);
+        assert_eq!(
+            prepared.parameter_values,
+            vec![Some(b"{{1,2},{}}".to_vec())]
+        );
+    }
+
+    #[test]
+    fn json_arrays_of_scalars_stay_arrays_without_a_json_cast() {
+        let prepared = prepare_postgres_statement("SELECT $v", &params(&[("v", json!([1, 2, 3]))]))
+            .expect("prepare should succeed");
+        assert_eq!(prepared.parameter_oids, vec![1016]);
+        assert_eq!(prepared.parameter_values, vec![Some(b"{1,2,3}".to_vec())]);
     }
 
     #[test]

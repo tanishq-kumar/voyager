@@ -161,7 +161,13 @@ pub fn format_tz_offset(offset_seconds: i64) -> String {
     }
 }
 
-fn format_time_string(h: u32, m: u32, s: u32, nanos: u32, offset: Option<&str>) -> String {
+pub(crate) fn format_time_string(
+    h: u32,
+    m: u32,
+    s: u32,
+    nanos: u32,
+    offset: Option<&str>,
+) -> String {
     let base = if nanos == 0 {
         format!("{:02}:{:02}:{:02}", h, m, s)
     } else if nanos.is_multiple_of(1_000_000) {
@@ -611,6 +617,7 @@ impl From<&serde_json::Value> for BoltValue {
 pub fn param_to_bolt_value(param: &ParamValue, bolt_major: u8) -> Result<BoltValue> {
     match param {
         ParamValue::Json(v) => Ok(BoltValue::from(v)),
+        ParamValue::Jsonb(inner) => param_to_bolt_value(inner, bolt_major),
         ParamValue::Float(f) => Ok(BoltValue::Float(*f)),
         ParamValue::Bytes(b) => Ok(BoltValue::Bytes(b.clone())),
         ParamValue::Date { year, month, day } => Ok(BoltValue::Date(BoltDate::from_ymd(

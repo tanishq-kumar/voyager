@@ -155,13 +155,93 @@ def test_pg19_native_array_columns_match_bridge() -> None:
 
 
 @pytest.mark.live
-def test_pg19_native_multidimensional_array_is_rejected_clearly() -> None:
-    """Multi-dimensional arrays are rejected with an actionable error instead of mis-decoded."""
+def test_pg19_native_multidimensional_arrays_match_bridge() -> None:
+    """2-D and 3-D arrays decode to nested lists like psycopg, including NULLs and bounds."""
     conn = _connect(PG19_PORT)
     native_session = Session(_uri(PG19_PORT), dialect="sql_pgq", backend="native", pool_size=1)
     try:
-        with pytest.raises(ValueError, match="Multi-dimensional"):
-            native_session.execute("SELECT ARRAY[[1,2],[3,4]] AS matrix, ARRAY[5,6] AS flat").all()
+        with conn.cursor() as cur:
+            cur.execute("SET TIME ZONE 'UTC'")
+        native_session.execute("SET TIME ZONE 'UTC'")
+        statement = """
+            SELECT
+                ARRAY[[1,2],[3,NULL]] AS ints_2d,
+                ARRAY[[[1,2],[3,4]],[[5,6],[7,8]]] AS ints_3d,
+                '[0:1][2:3]={{1,2},{3,4}}'::bigint[] AS ints_lower_bounds,
+                ARRAY[]::bigint[][] AS ints_empty,
+                ARRAY[[1.5,NULL],[2.5,3.5]] AS floats_2d,
+                ARRAY[[1.25,2.5],[3.75,4.5]]::numeric[] AS numerics_2d,
+                ARRAY[['a','b,c'],['NULL','quote"d']] AS texts_2d,
+                ARRAY[[true,false],[false,NULL]] AS bools_2d,
+                ARRAY[[DATE '2026-01-15',NULL],
+                      [DATE '2026-02-20',DATE '2026-03-01']] AS dates_2d,
+                ARRAY[[TIMESTAMP '2026-01-15 10:11:12',NULL],
+                      [TIMESTAMP '2026-01-16 00:00:00',
+                       TIMESTAMP '2026-01-17 01:02:03']] AS timestamps_2d,
+                ARRAY[[TIMESTAMPTZ '2026-01-15 10:11:12+00',NULL],
+                      [TIMESTAMPTZ '2026-01-16 00:00:00+00',
+                       TIMESTAMPTZ '2026-01-17 01:02:03+00']] AS timestamptzs_2d,
+                ARRAY[['12345678-1234-5678-1234-567812345678'::uuid,NULL],
+                      [NULL,'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid]] AS uuids_2d,
+                ARRAY[['{"a":1}'::jsonb,'null'::jsonb],
+                      ['[1,2]'::jsonb,'"x"'::jsonb]] AS jsonbs_2d
+        """
+        bridge_session = Session(bridge=PostgresBridge(conn), dialect="sql_pgq")
+        bridge_rows = [_normalize(row) for row in bridge_session.execute(statement).all()]
+        native_rows = [_normalize(row) for row in native_session.execute(statement).all()]
+        assert native_rows == bridge_rows
+
+        row = native_rows[0]
+        assert row["ints_2d"] == [[1, 2], [3, None]]
+        assert row["ints_3d"] == [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+        assert row["ints_lower_bounds"] == [[1, 2], [3, 4]]
+        assert row["ints_empty"] == []
+        assert row["floats_2d"] == [[1.5, None], [2.5, 3.5]]
+        assert row["numerics_2d"] == [[1.25, 2.5], [3.75, 4.5]]
+        assert row["texts_2d"] == [["a", "b,c"], ["NULL", 'quote"d']]
+        assert row["bools_2d"] == [[True, False], [False, None]]
+        assert row["dates_2d"] == [["2026-01-15", None], ["2026-02-20", "2026-03-01"]]
+        assert row["timestamps_2d"] == [
+            ["2026-01-15 10:11:12", None],
+            ["2026-01-16 00:00:00", "2026-01-17 01:02:03"],
+        ]
+        assert row["timestamptzs_2d"] == [
+            ["2026-01-15 10:11:12+00:00", None],
+            ["2026-01-16 00:00:00+00:00", "2026-01-17 01:02:03+00:00"],
+        ]
+        assert row["uuids_2d"] == [
+            [uuid.UUID("12345678-1234-5678-1234-567812345678"), None],
+            [None, uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")],
+        ]
+        assert row["jsonbs_2d"] == [[{"a": 1}, None], [[1, 2], "x"]]
+
+        table = native_session.execute_to_arrow(statement)
+        import pyarrow as pa
+
+        ints_2d_type = table.schema.field("ints_2d").type
+        assert pa.types.is_list(ints_2d_type)
+        assert pa.types.is_list(ints_2d_type.value_type)
+        assert ints_2d_type.value_type.value_type == pa.int64()
+
+        ints_3d_type = table.schema.field("ints_3d").type
+        assert pa.types.is_list(ints_3d_type)
+        assert pa.types.is_list(ints_3d_type.value_type)
+        assert pa.types.is_list(ints_3d_type.value_type.value_type)
+        assert ints_3d_type.value_type.value_type.value_type == pa.int64()
+
+        texts_2d_type = table.schema.field("texts_2d").type
+        assert pa.types.is_list(texts_2d_type.value_type)
+        assert texts_2d_type.value_type.value_type == pa.string()
+        assert table.column("ints_2d")[0].as_py() == [[1, 2], [3, None]]
+        assert table.column("ints_empty")[0].as_py() == []
+
+        frame = native_session.execute_to_polars(statement)
+        import polars as pl
+
+        assert frame.schema["ints_2d"] == pl.List(pl.List(pl.Int64))
+        assert frame.schema["ints_3d"] == pl.List(pl.List(pl.List(pl.Int64)))
+        assert frame.schema["texts_2d"] == pl.List(pl.List(pl.String))
+        assert frame.to_dicts()[0]["ints_2d"] == [[1, 2], [3, None]]
     finally:
         native_session.close()
         conn.close()

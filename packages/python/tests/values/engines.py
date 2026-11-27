@@ -239,6 +239,72 @@ def _to_official_bolt_param(val: Any) -> Any:
     return val
 
 
+def _pg_array_leaf_type(value: Any) -> str | None:
+    """Maps one scalar list element to its PostgreSQL array element SQL type."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "bigint"
+    if isinstance(value, float):
+        return "double precision"
+    if isinstance(value, Decimal):
+        return "numeric"
+    if isinstance(value, bytes):
+        return "bytea"
+    if isinstance(value, str):
+        return "text"
+    if isinstance(value, datetime.datetime):
+        return "timestamptz" if value.tzinfo is not None else "timestamp"
+    if isinstance(value, datetime.date):
+        return "date"
+    if isinstance(value, datetime.time):
+        return "timetz" if value.tzinfo is not None else "time"
+    if isinstance(value, Duration):
+        return "interval"
+    if isinstance(value, uuid.UUID):
+        return "uuid"
+    return None
+
+
+def _pg_nested_array_sql_type(value: Any) -> str | None:
+    """Returns a rectangular multidimensional SQL array type such as ``bigint[][]``.
+
+    Returns ``None`` for mixed, ragged or otherwise non-array values so the
+    caller can fall back to ``jsonb`` exactly like the existing 1-D logic.
+    """
+
+    def walk(node: Any) -> tuple[int, str | None] | None:
+        if not isinstance(node, list):
+            return 0, _pg_array_leaf_type(node)
+        children = [child for child in node if child is not None]
+        if not children:
+            return None
+        infos = [walk(child) for child in children]
+        if any(info is None for info in infos):
+            return None
+        ranks = {info[0] for info in infos if info is not None}
+        types = {info[1] for info in infos if info is not None}
+        if len(ranks) != 1 or len(types) != 1:
+            return None
+        rank = ranks.pop()
+        leaf = types.pop()
+        if leaf is None:
+            return None
+        if rank > 0:
+            lengths = {len(child) for child in node if isinstance(child, list)}
+            if len(lengths) > 1:
+                return None
+        return rank + 1, leaf
+
+    info = walk(value)
+    if info is None:
+        return None
+    rank, leaf = info
+    if rank < 2 or leaf is None:
+        return None
+    return leaf + "[]" * rank
+
+
 def _pg_sql_type_for_value(value: Any, value_kind: str) -> str:
     """Selects the PostgreSQL column SQL type for storing ``value``."""
     mapping = {
@@ -268,6 +334,9 @@ def _pg_sql_type_for_value(value: Any, value_kind: str) -> str:
         item = next((x for x in value if x is not None), None)
         if item is None:
             return "bigint[]"
+        if isinstance(item, list):
+            nested = _pg_nested_array_sql_type(value)
+            return nested if nested is not None else "jsonb"
         if isinstance(item, bool):
             return "boolean[]"
         if isinstance(item, int):
@@ -984,10 +1053,7 @@ class Postgres19ValueAdapter(BaseValueAdapter):
             from psycopg.types.json import Jsonb
 
             adapted = tuple(
-                Jsonb(p)
-                if (force_jsonb or (isinstance(p, (dict, list)) and _is_json_container(p)))
-                else _adapt_pg_official_value(p)
-                for p in params_pos
+                Jsonb(p) if force_jsonb else _adapt_pg_official_value(p) for p in params_pos
             )
             with self.conn.cursor() as cur:
                 if in_tx:
@@ -1126,8 +1192,16 @@ class Postgres19ValueAdapter(BaseValueAdapter):
                 pass
 
     def run_nested_list(self, backend: str, value: Any, value_kind: str) -> tuple[Any, str, str]:
-        if value_kind in ("json_doc", "map", "list"):
+        if value_kind in ("json_doc", "map"):
             safe = _pg_json_safe(value)
+            return self.run_param(backend, [safe], "json_doc")
+        if value_kind == "list":
+            safe = _pg_json_safe(value)
+            # The nested-list path wraps the value in one more list. Use a typed
+            # multidimensional array when the shape is rectangular and fall back
+            # to jsonb for mixed or ragged lists, matching the 1-D behaviour.
+            if _pg_nested_array_sql_type([safe]) is not None:
+                return self.run_param(backend, [safe], "list")
             return self.run_param(backend, [safe], "json_doc")
         if value_kind == "null":
             return self.run_param(backend, [None], "list")
@@ -1166,14 +1240,6 @@ def _pg_json_safe(val: Any) -> Any:
     if isinstance(val, dict):
         return {str(k): _pg_json_safe(v) for k, v in val.items()}
     return str(val)
-
-
-def _is_json_container(val: Any) -> bool:
-    if isinstance(val, dict):
-        return True
-    if isinstance(val, list):
-        return any(isinstance(x, (dict, list)) for x in val)
-    return False
 
 
 class DuckDBValueAdapter(BaseValueAdapter):
