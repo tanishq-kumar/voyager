@@ -705,28 +705,6 @@
     "match": "actual str"
   },
   {
-    "engine": "age",
-    "backend": "native",
-    "path": "*",
-    "value_kind": "float",
-    "category": "bug",
-    "reason": "Apache AGE native backend loses 1 ULP float precision on float64 parameters/elements.",
-    "repro": "Session(age_uri, dialect='age', graph_name=g, backend='native').execute(f\"SELECT * FROM cypher('{g}', $$ RETURN $v $$, %s) AS (v agtype)\", {'v': 1.3884398771378935e+25})",
-    "match": "float .* !=",
-    "issue": 422
-  },
-  {
-    "engine": "age",
-    "backend": "native",
-    "path": "*",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "Apache AGE native backend loses 1 ULP float precision inside list parameters.",
-    "repro": "Session(age_uri, dialect='age', graph_name=g, backend='native').execute(f\"SELECT * FROM cypher('{g}', $$ RETURN $v $$, %s) AS (v agtype)\", {'v': [-966116.6771473465]})",
-    "match": "float .* !=",
-    "issue": 422
-  },
-  {
     "engine": "pg19",
     "backend": "native_polars",
     "path": "*",
@@ -800,17 +778,6 @@
   },
   {
     "engine": "pg19",
-    "backend": "native",
-    "path": "nested_map",
-    "value_kind": "float",
-    "category": "bug",
-    "reason": "PostgreSQL jsonb converts floats through numeric decimal strings, causing native Rust serde_json to lose 1 ULP on extreme/subnormal floats or fail with 'number out of range' on sys.float_info.max (1.7976931348623157e+308).",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute('SELECT $v::jsonb AS v', {'v': {'k': 2.332717393807508e-41}})",
-    "match": "actual float|number out of range|float .* !=",
-    "issue": 422
-  },
-  {
-    "engine": "pg19",
     "backend": "official",
     "path": "*",
     "value_kind": "duration",
@@ -853,149 +820,6 @@
     "category": "limitation",
     "reason": "Voyager native_polars preserves calendar months while official psycopg IntervalLoader approximates them as days.",
     "match": "Duration .* !="
-  },
-  {
-    "engine": "pg19",
-    "backend": "bridge",
-    "path": "nested_map",
-    "value_kind": "*",
-    "category": "bug",
-    "reason": "PostgresBridge passes Python dict directly to psycopg without Jsonb/JSON adaptation, raising ProgrammingError on nested maps.",
-    "repro": "Session(bridge=PostgresBridge(conn), dialect='sql_pgq').execute('SELECT $v::jsonb AS v', {'v': {'k': 1}})",
-    "match": "cannot adapt type 'dict'",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "PostgresBridge passes Python dict/list unadapted for jsonb parameters: dicts fail ProgrammingError and empty list [] encodes as PG '{}' turning [] into {}.",
-    "repro": "Session(bridge=PostgresBridge(conn), dialect='sql_pgq').execute('SELECT $v::jsonb AS v', {'v': []})",
-    "match": "cannot adapt type 'dict'|invalid input syntax for type json|cannot cast type|actual dict \\(\\{\\}\\) != expected list",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "bridge",
-    "path": "*",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "PostgresBridge passes Python dict directly to psycopg without Jsonb/JSON adaptation, raising ProgrammingError.",
-    "repro": "Session(bridge=PostgresBridge(conn), dialect='sql_pgq').execute('SELECT $v::jsonb AS v', {'v': {}})",
-    "match": "cannot adapt type 'dict'|invalid input syntax for type json|cannot cast type",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "bridge",
-    "path": "nested_list",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "PostgresBridge encodes nested Python lists as PostgreSQL arrays rather than JSON when bound to a jsonb parameter.",
-    "repro": "Session(bridge=PostgresBridge(conn), dialect='sql_pgq').execute('SELECT $v::jsonb AS v', {'v': [[]]})",
-    "match": "cannot cast type .* to jsonb|invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "Native PostgreSQL driver encodes top-level Python list values as SQL array OIDs rather than JSONB (corrupting [] to {} and failing SQLSTATE 22P02/42846 on non-empty lists).",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute('SELECT $v::jsonb AS v', {'v': []})",
-    "match": "invalid input syntax for type json|cannot cast type .* to jsonb|actual dict \\(\\{\\}\\) != expected list",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_arrow",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_arrow() inherits top-level Python list array-OID encoding instead of JSONB (corrupting [] to {}).",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_arrow('SELECT $v::jsonb AS v', {'v': []})",
-    "match": "invalid input syntax for type json|cannot cast type .* to jsonb|actual dict \\(\\{\\}\\) != expected list",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_polars",
-    "path": "*",
-    "value_kind": "json_doc",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_polars() inherits top-level Python list array-OID encoding instead of JSONB (corrupting [] to {}).",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_polars('SELECT $v::jsonb AS v', {'v': []})",
-    "match": "invalid input syntax for type json|cannot cast type .* to jsonb|actual dict \\(\\{\\}\\) != expected list",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native",
-    "path": "nested_list",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "Native PostgreSQL driver encodes [map] list as SQL array instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute('SELECT $v::jsonb AS v', {'v': [{}]})",
-    "match": "invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_arrow",
-    "path": "nested_list",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_arrow() encodes [map] list as SQL array instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_arrow('SELECT $v::jsonb AS v', {'v': [{}]})",
-    "match": "invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_polars",
-    "path": "nested_list",
-    "value_kind": "map",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_polars() encodes [map] list as SQL array instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_polars('SELECT $v::jsonb AS v', {'v': [{}]})",
-    "match": "invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native",
-    "path": "nested_list",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "Native PostgreSQL driver encodes [[...]] nested list as bigint[] instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute('SELECT $v::jsonb AS v', {'v': [[]]})",
-    "match": "cannot cast type .* to jsonb|invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_arrow",
-    "path": "nested_list",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_arrow() encodes [[...]] nested list as bigint[] instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_arrow('SELECT $v::jsonb AS v', {'v': [[]]})",
-    "match": "cannot cast type .* to jsonb|invalid input syntax for type json",
-    "issue": 421
-  },
-  {
-    "engine": "pg19",
-    "backend": "native_polars",
-    "path": "nested_list",
-    "value_kind": "list",
-    "category": "bug",
-    "reason": "Native PostgreSQL execute_to_polars() encodes [[...]] nested list as bigint[] instead of JSONB for $v::jsonb.",
-    "repro": "Session(pg_dsn, dialect='sql_pgq', backend='native').execute_to_polars('SELECT $v::jsonb AS v', {'v': [[]]})",
-    "match": "cannot cast type .* to jsonb|invalid input syntax for type json",
-    "issue": 421
   },
   {
     "engine": "duckdb",

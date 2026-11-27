@@ -3007,6 +3007,143 @@ fn is_entity_path_obj(map: &serde_json::Map<String, serde_json::Value>) -> bool 
             .all(|k| matches!(k.as_str(), "kind" | "nodes" | "relationships" | "sequence"))
 }
 
+/// Sentinel strings used to carry JSON numbers `serde_json` cannot represent
+/// through parsing.
+///
+/// PostgreSQL `jsonb` cannot contain a NUL character, so these values can never
+/// collide with a real stored string. PostgreSQL/AGE emit `NaN`, `Infinity` and
+/// `-Infinity` as bare tokens (and Python's `json` accepts them), which
+/// `serde_json` rejects; out-of-range negative/positive integers are preserved
+/// as arbitrary-precision Python integers the way psycopg's `json.loads` does.
+const JSON_NAN_SENTINEL: &str = "\u{0}voyager:json:nan";
+const JSON_INF_SENTINEL: &str = "\u{0}voyager:json:infinity";
+const JSON_NEG_INF_SENTINEL: &str = "\u{0}voyager:json:-infinity";
+const JSON_INT_SENTINEL_PREFIX: &str = "\u{0}voyager:json:int:";
+
+fn parse_json_result_text(text: &str) -> std::result::Result<serde_json::Value, String> {
+    let normalized = normalize_json_numbers(text);
+    serde_json::from_str(&normalized).map_err(|error| error.to_string())
+}
+
+/// Rewrites bare `NaN`/`Infinity` tokens, out-of-range floats and integers that
+/// do not fit `i64`/`u64` into quoted sentinel strings that `serde_json` can
+/// parse without losing precision.
+fn normalize_json_numbers(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 16);
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_string {
+            out.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        if let Some((consumed, replacement)) = json_non_finite_token(&text[i..]) {
+            out.extend_from_slice(replacement.as_bytes());
+            i += consumed;
+            continue;
+        }
+        if byte == b'-' || byte.is_ascii_digit() {
+            let start = i;
+            let mut end = i;
+            if bytes[end] == b'-' {
+                end += 1;
+            }
+            let integer_start = end;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == integer_start {
+                out.push(byte);
+                i += 1;
+                continue;
+            }
+            let mut is_float = false;
+            if end < bytes.len() && bytes[end] == b'.' {
+                is_float = true;
+                end += 1;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+            }
+            if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+                let mut exponent = end + 1;
+                if exponent < bytes.len() && (bytes[exponent] == b'+' || bytes[exponent] == b'-') {
+                    exponent += 1;
+                }
+                let exponent_start = exponent;
+                while exponent < bytes.len() && bytes[exponent].is_ascii_digit() {
+                    exponent += 1;
+                }
+                if exponent > exponent_start {
+                    is_float = true;
+                    end = exponent;
+                }
+            }
+            let token = &text[start..end];
+            if is_float {
+                match token.parse::<f64>() {
+                    Ok(value) if value.is_infinite() => {
+                        out.extend_from_slice(if value.is_sign_positive() {
+                            br#""\u0000voyager:json:infinity""#
+                        } else {
+                            br#""\u0000voyager:json:-infinity""#
+                        });
+                    }
+                    _ => out.extend_from_slice(token.as_bytes()),
+                }
+            } else if token.parse::<i64>().is_ok() || token.parse::<u64>().is_ok() {
+                out.extend_from_slice(token.as_bytes());
+            } else {
+                out.extend_from_slice(br#""\u0000voyager:json:int:"#);
+                out.extend_from_slice(token.as_bytes());
+                out.push(b'"');
+            }
+            i = end;
+            continue;
+        }
+        out.push(byte);
+        i += 1;
+    }
+    // All inserted bytes are ASCII; copying the input bytes preserves valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+/// Returns the number of bytes consumed and the replacement JSON text for a
+/// bare non-finite token at the start of `text`.
+fn json_non_finite_token(text: &str) -> Option<(usize, &'static str)> {
+    for (token, replacement) in [
+        ("-Infinity", r#""\u0000voyager:json:-infinity""#),
+        ("+Infinity", r#""\u0000voyager:json:infinity""#),
+        ("Infinity", r#""\u0000voyager:json:infinity""#),
+        ("NaN", r#""\u0000voyager:json:nan""#),
+    ] {
+        if text.starts_with(token) {
+            let next = text.as_bytes().get(token.len()).copied();
+            if next.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_')) {
+                return Some((token.len(), replacement));
+            }
+        }
+    }
+    None
+}
+
 /// Converts a canonical JSON value to Python objects, optionally hydrating entity objects
 /// into `GraphNode`, `GraphRelationship`, and `GraphPath` instances.
 fn json_value_to_py<'py>(
@@ -3029,6 +3166,20 @@ fn json_value_to_py<'py>(
                     .into_pyobject(py)?
                     .into_any())
             }
+        }
+        serde_json::Value::String(value) if value.starts_with(JSON_INT_SENTINEL_PREFIX) => {
+            let digits = &value[JSON_INT_SENTINEL_PREFIX.len()..];
+            let builtins = py.import("builtins")?;
+            Ok(builtins.getattr("int")?.call1((digits,))?)
+        }
+        serde_json::Value::String(value) if value == JSON_NAN_SENTINEL => {
+            Ok(f64::NAN.into_pyobject(py)?.into_any())
+        }
+        serde_json::Value::String(value) if value == JSON_INF_SENTINEL => {
+            Ok(f64::INFINITY.into_pyobject(py)?.into_any())
+        }
+        serde_json::Value::String(value) if value == JSON_NEG_INF_SENTINEL => {
+            Ok(f64::NEG_INFINITY.into_pyobject(py)?.into_any())
         }
         serde_json::Value::String(value) => Ok(value.into_pyobject(py)?.into_any()),
         serde_json::Value::Array(values) => {
@@ -4091,13 +4242,13 @@ fn arrow_array_value_to_py<'py>(
             let s = values.value(index);
             match utf8_col_mode_for_field(field) {
                 Utf8ColMode::JsonEntities => {
-                    let parsed: serde_json::Value = serde_json::from_str(s)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let parsed: serde_json::Value =
+                        parse_json_result_text(s).map_err(PyValueError::new_err)?;
                     json_value_to_py(py, &parsed, true)
                 }
                 Utf8ColMode::JsonPure => {
-                    let parsed: serde_json::Value = serde_json::from_str(s)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let parsed: serde_json::Value =
+                        parse_json_result_text(s).map_err(PyValueError::new_err)?;
                     json_value_to_py(py, &parsed, false)
                 }
                 Utf8ColMode::Typed(kind) => parse_voyager_typed_utf8(py, kind, s),
@@ -4109,13 +4260,13 @@ fn arrow_array_value_to_py<'py>(
             let s = values.value(index);
             match utf8_col_mode_for_field(field) {
                 Utf8ColMode::JsonEntities => {
-                    let parsed: serde_json::Value = serde_json::from_str(s)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let parsed: serde_json::Value =
+                        parse_json_result_text(s).map_err(PyValueError::new_err)?;
                     json_value_to_py(py, &parsed, true)
                 }
                 Utf8ColMode::JsonPure => {
-                    let parsed: serde_json::Value = serde_json::from_str(s)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let parsed: serde_json::Value =
+                        parse_json_result_text(s).map_err(PyValueError::new_err)?;
                     json_value_to_py(py, &parsed, false)
                 }
                 Utf8ColMode::Typed(kind) => parse_voyager_typed_utf8(py, kind, s),
@@ -4896,6 +5047,12 @@ fn extract_zone_id(tzinfo: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
 
 fn py_any_to_param_value(val: &Bound<'_, PyAny>) -> PyResult<voyager_drivers::ParamValue> {
     use voyager_drivers::{ParamTimezone, ParamValue};
+
+    if val.hasattr("__voyager_json__")? {
+        let inner = val.getattr("value")?;
+        let converted = py_any_to_param_value(&inner)?;
+        return Ok(ParamValue::Jsonb(Box::new(converted)));
+    }
 
     if val.is_none() {
         Ok(ParamValue::Json(serde_json::Value::Null))
@@ -8407,5 +8564,53 @@ mod tests {
             age_columns: Vec::new(),
         };
         assert!(!result.has_age_columns());
+    }
+
+    #[test]
+    fn json_result_parser_keeps_extreme_floats_exact() {
+        let parsed = parse_json_result_text(r#"{"k":2.332717393807508e-41}"#).unwrap();
+        assert_eq!(
+            parsed["k"].as_f64().unwrap().to_bits(),
+            2.332717393807508e-41_f64.to_bits()
+        );
+
+        let max = parse_json_result_text(r#"{"k":1.7976931348623157e+308}"#).unwrap();
+        assert_eq!(max["k"].as_f64().unwrap(), f64::MAX);
+    }
+
+    #[test]
+    fn json_result_parser_accepts_non_finite_and_out_of_range_numbers() {
+        let parsed = parse_json_result_text(r#"{"a":NaN,"b":Infinity,"c":-Infinity}"#).unwrap();
+        assert_eq!(parsed["a"], JSON_NAN_SENTINEL);
+        assert_eq!(parsed["b"], JSON_INF_SENTINEL);
+        assert_eq!(parsed["c"], JSON_NEG_INF_SENTINEL);
+
+        let huge = parse_json_result_text(r#"{"k":1e400}"#).unwrap();
+        assert_eq!(huge["k"], JSON_INF_SENTINEL);
+        let tiny = parse_json_result_text(r#"{"k":-1e400}"#).unwrap();
+        assert_eq!(tiny["k"], JSON_NEG_INF_SENTINEL);
+    }
+
+    #[test]
+    fn json_result_parser_preserves_integers_beyond_u64() {
+        let parsed = parse_json_result_text(r#"{"k":13884398771378935000000000}"#).unwrap();
+        assert_eq!(
+            parsed["k"],
+            format!("{JSON_INT_SENTINEL_PREFIX}13884398771378935000000000")
+        );
+        let negative = parse_json_result_text(r#"{"k":-17976931348623157000000000}"#).unwrap();
+        assert_eq!(
+            negative["k"],
+            format!("{JSON_INT_SENTINEL_PREFIX}-17976931348623157000000000")
+        );
+        let small = parse_json_result_text(r#"{"k":9223372036854775807}"#).unwrap();
+        assert_eq!(small["k"].as_i64(), Some(i64::MAX));
+    }
+
+    #[test]
+    fn json_result_parser_leaves_strings_and_finite_numbers_alone() {
+        let parsed = parse_json_result_text(r#"{"s":"Infinity NaN 1e400","n":0.5}"#).unwrap();
+        assert_eq!(parsed["s"], "Infinity NaN 1e400");
+        assert_eq!(parsed["n"].as_f64(), Some(0.5));
     }
 }

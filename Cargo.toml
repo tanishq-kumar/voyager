@@ -38,7 +38,7 @@ url = "2.5"
 
 # Serialization & Data
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
 arrow-schema = "57.3"
 # chrono-tz lets us validate timestamp zone ids with the same parser Arrow/Polars
 # use, instead of consulting the host's /usr/share/zoneinfo (absent on Windows).

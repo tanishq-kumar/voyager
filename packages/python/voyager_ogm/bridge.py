@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import importlib
 import inspect
 import json
 import math
@@ -33,7 +34,7 @@ from voyager_ogm.entities import (
     serialize_value_for_arrow,
 )
 from voyager_ogm.ingestion import BulkIngestionPlan
-from voyager_ogm.types import Duration, parse_pg_interval_text, unwrap_spatial_param
+from voyager_ogm.types import Duration, Json, parse_pg_interval_text, unwrap_spatial_param
 
 _PAGINATION_PARAMETER_PATTERN = re.compile(
     r"\b(?:SKIP|OFFSET|LIMIT)\s+\$([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE
@@ -730,6 +731,8 @@ class AsyncMockBridge:
 
 def _adapt_bolt_value(val: Any) -> Any:
     """Adapts Voyager Duration and tagged spatial values to Bolt driver objects."""
+    if isinstance(val, Json):
+        return _adapt_bolt_value(val.value)
     if isinstance(val, Duration):
         try:
             from neo4j.time import Duration as Neo4jDuration
@@ -1446,6 +1449,8 @@ def _encode_duckdb_literal(v: Any) -> str:
     Handles str with proper quoting, int, float (including nan/inf), bool, None,
     date/datetime/time, list/tuple, and dict/map. Raises TypeError for unsupported types.
     """
+    if isinstance(v, Json):
+        return _encode_duckdb_literal(v.value)
     if v is None:
         return "NULL"
     if isinstance(v, bool):
@@ -2441,6 +2446,88 @@ def _format_pg_duration_text(dur: Duration) -> str:
     return f"{dur.months} mons {dur.days} days {sign}{secs}.{us:06d} seconds"
 
 
+_JSON_CAST_RE = re.compile(
+    r"\s*::\s*(?:[A-Za-z_][A-Za-z0-9_$]*\s*\.\s*)?(?:jsonb|json)\b", re.IGNORECASE
+)
+
+
+def _placeholder_forces_json(statement: str, position: int) -> bool:
+    """Returns whether the placeholder ending at ``position`` is cast to json/jsonb."""
+    return _JSON_CAST_RE.match(statement, position) is not None
+
+
+def _unwrap_json_marker(value: Any) -> tuple[bool, Any]:
+    """Returns ``(was_explicit, unwrapped)`` after recursively removing ``Json`` wrappers."""
+    if isinstance(value, Json):
+        return True, _unwrap_json_marker(value.value)[1]
+    if isinstance(value, Mapping):
+        return False, {k: _unwrap_json_marker(v)[1] for k, v in value.items()}
+    if isinstance(value, tuple):
+        return False, tuple(_unwrap_json_marker(v)[1] for v in value)
+    if isinstance(value, list):
+        return False, [_unwrap_json_marker(v)[1] for v in value]
+    return False, value
+
+
+def _strip_json_markers(value: Any) -> Any:
+    """Recursively removes ``Json`` wrappers, returning the contained values."""
+    return _unwrap_json_marker(value)[1]
+
+
+def _pg_json_adapter(value: Any) -> Any:
+    """Wraps a value for psycopg so PostgreSQL binds it as ``jsonb``."""
+    try:
+        from psycopg.types.json import Jsonb
+
+        return Jsonb(value)
+    except ImportError:
+        try:
+            extras = importlib.import_module("psycopg2.extras")
+            return extras.Json(value)
+        except ImportError:
+            return value
+
+
+def _encode_pg_array_element(value: Any) -> Any:
+    """Adapts one element of a PostgreSQL array parameter.
+
+    psycopg cannot adapt a raw ``dict``; inside an array each mapping becomes a
+    ``jsonb`` element (giving ``jsonb[]``), and nested lists recurse so they
+    become multidimensional arrays. Explicit ``Json(...)`` elements keep their
+    JSON element type.
+    """
+    if isinstance(value, Json):
+        return _pg_json_adapter(_unwrap_json_marker(value)[1])
+    if isinstance(value, Mapping):
+        return _pg_json_adapter(value)
+    if isinstance(value, tuple):
+        return tuple(_encode_pg_array_element(item) for item in value)
+    if isinstance(value, list):
+        return [_encode_pg_array_element(item) for item in value]
+    return value
+
+
+def _encode_pg_parameter(value: Any, *, force_json: bool) -> Any:
+    """Chooses the PostgreSQL parameter encoding for one value.
+
+    The rule matches the native driver and psycopg: ``Json(...)`` wrappers and
+    maps bind as ``jsonb``; an explicit ``::json``/``::jsonb`` cast forces the
+    whole value into one JSON document (including empty and nested lists, so
+    ``[]`` becomes ``[]``, never ``{}``). Without a cast a list stays a SQL
+    array: a list of dicts becomes ``jsonb[]``, a list of scalars a typed array,
+    and nested lists a multidimensional array. An empty list therefore remains
+    an empty array literal for array-typed slots.
+    """
+    explicit, unwrapped = _unwrap_json_marker(value)
+    if explicit or force_json or isinstance(unwrapped, Mapping):
+        return _pg_json_adapter(unwrapped)
+    if isinstance(value, (list, tuple)):
+        # Use the original list so nested ``Json(...)`` markers keep their JSON
+        # element type instead of being flattened by ``_unwrap_json_marker``.
+        return _encode_pg_array_element(value)
+    return unwrapped
+
+
 def _configure_pg_adapters(cursor: Any) -> bool:
     """Registers per-cursor ``interval`` loader and ``Duration`` dumper on psycopg 3 cursors."""
     adapters = getattr(cursor, "adapters", None)
@@ -2551,7 +2638,7 @@ class PostgresBridge:
                 setup_postgres_age(self.conn, force=True)
             import json
 
-            return statement, (json.dumps(parameters),)
+            return statement, (json.dumps(_strip_json_markers(parameters)),)
 
         ordered_params: list[Any] = []
         regex = re.compile(r"\$([a-zA-Z0-9_]+)\b")
@@ -2559,7 +2646,12 @@ class PostgresBridge:
         def repl(m: re.Match[str]) -> str:
             key = m.group(1)
             if key in parameters:
-                ordered_params.append(parameters[key])
+                ordered_params.append(
+                    _encode_pg_parameter(
+                        parameters[key],
+                        force_json=_placeholder_forces_json(statement, m.end()),
+                    )
+                )
                 return "%s"
             return m.group(0)
 
@@ -3049,6 +3141,8 @@ class AsyncPostgresBridgeTransaction:
 
 def _adapt_falkordb_value(val: Any) -> Any:
     """Adapts rich parameter values (temporal types, Duration, Point, etc.) for FalkorDB query execution."""
+    if isinstance(val, Json):
+        return _adapt_falkordb_value(val.value)
     if isinstance(val, (datetime.date, datetime.time, datetime.datetime)):
         return val.isoformat()
     if isinstance(val, datetime.timedelta):
