@@ -149,6 +149,11 @@ pub trait AsyncConnection: Send + Sync {
     /// Returns `true` if the underlying network socket or stream is currently healthy and open.
     fn is_valid(&self) -> bool;
 
+    /// Returns the negotiated wire protocol version (for example `"5.4"` for Bolt), if available.
+    fn protocol_version(&self) -> Option<String> {
+        None
+    }
+
     /// Returns `true` if the connection is currently inside an explicit transaction block.
     fn is_in_transaction(&self) -> bool;
 
@@ -233,6 +238,10 @@ impl AsyncConnection for Box<dyn AsyncConnection> {
 
     fn is_valid(&self) -> bool {
         (**self).is_valid()
+    }
+
+    fn protocol_version(&self) -> Option<String> {
+        (**self).protocol_version()
     }
 
     fn is_in_transaction(&self) -> bool {

@@ -119,6 +119,12 @@ def test_neo4j_live_result_types_nested_entities_arrow_polars() -> None:
     raw = b"\x01\x02\xfe"
 
     try:
+        assert native._native_client is not None
+        proto_ver = native._native_client.protocol_version_sync()
+        assert proto_ver is not None and proto_ver.startswith("5."), (
+            f"Expected Neo4j Bolt 5.x, got {proto_ver!r}"
+        )
+
         native.execute(
             f"""
                 CREATE (a:{label} {{
@@ -209,20 +215,35 @@ def test_neo4j_live_result_types_nested_entities_arrow_polars() -> None:
         assert fb_row is not None and isinstance(fb_row["sub_ns"], str)
         assert "123456789" in fb_row["sub_ns"] and fb_row["ok_d"] == datetime.date(2024, 1, 2)
 
-        # Point param + NaN/Inf param parity
+        # Point param + NaN/Inf param parity (top-level, nested, Arrow Struct, Polars Struct)
         pt = Point(latitude=52.52, longitude=13.405)
+        pt_3d = Point(x=1.0, y=2.0, z=3.5, srid=9157)
         n_pt = native.execute(
-            "RETURN $p AS p, $nan AS nan, $inf AS inf",
-            {"p": pt, "nan": float("nan"), "inf": float("inf")},
+            "RETURN $p AS p, $p3 AS p3, [$p, $p3] AS plist, {pt: $p} AS pmap, $nan AS nan, $inf AS inf",
+            {"p": pt, "p3": pt_3d, "nan": float("nan"), "inf": float("inf")},
         ).first()
         b_pt = bridge.execute(
-            "RETURN $p AS p, $nan AS nan, $inf AS inf",
-            {"p": pt, "nan": float("nan"), "inf": float("inf")},
+            "RETURN $p AS p, $p3 AS p3, [$p, $p3] AS plist, {pt: $p} AS pmap, $nan AS nan, $inf AS inf",
+            {"p": pt, "nan": float("nan"), "inf": float("inf"), "p3": pt_3d},
         ).first()
         assert n_pt is not None and b_pt is not None
-        assert pt == n_pt["p"]
+        assert isinstance(n_pt["p"], Point) and n_pt["p"].srid == 4326 and n_pt["p"] == pt
+        assert isinstance(n_pt["p3"], Point) and n_pt["p3"].srid == 9157 and n_pt["p3"] == pt_3d
+        assert isinstance(n_pt["plist"][0], Point) and isinstance(n_pt["plist"][1], Point)
+        assert isinstance(n_pt["pmap"]["pt"], Point) and n_pt["pmap"]["pt"] == pt
         assert math.isnan(n_pt["nan"]) and math.isnan(b_pt["nan"])
         assert n_pt["inf"] == b_pt["inf"] == float("inf")
+
+        pt_arrow = native.execute_to_arrow("RETURN $p AS p, $p3 AS p3", {"p": pt, "p3": pt_3d})
+        assert pa.types.is_struct(pt_arrow.schema.field("p").type)
+        assert pt_arrow.schema.field("p").metadata.get(b"voyager.type") == b"point"
+        assert Point.from_arrow(pt_arrow.column("p")[0]) == pt
+        assert Point.from_arrow(pt_arrow.column("p3")[0]) == pt_3d
+
+        pt_df = native.execute_to_polars("RETURN $p AS p, $p3 AS p3", {"p": pt, "p3": pt_3d})
+        assert isinstance(pt_df.schema["p"], pl.Struct)
+        assert Point.from_polars(pt_df["p"]) == pt
+        assert Point.from_polars(pt_df["p3"]) == pt_3d
     finally:
         bridge.execute(f"MATCH (n:{label}) DETACH DELETE n")
         bridge.close()
@@ -255,6 +276,10 @@ def test_memgraph_live_result_types_and_audit() -> None:
     dur_hms = Duration(0, 0, 90_000, 500_000_000)
 
     try:
+        assert native._native_client is not None
+        proto_ver = native._native_client.protocol_version_sync()
+        assert proto_ver == "5.2", f"Expected Memgraph Bolt 5.2, got {proto_ver!r}"
+
         native.execute(
             f"""
             CREATE (a:{label} {{
@@ -300,6 +325,53 @@ def test_memgraph_live_result_types_and_audit() -> None:
             assert df.schema["dur_hms"] == pl.Duration("us")
         else:
             assert isinstance(df.schema["dur_hms"], pl.Struct)
+
+        # #414: DST fold=1 Europe/Berlin round-trips to the exact UTC instant + Polars Datetime with tz
+        dt_fold1 = datetime.datetime(
+            2024, 10, 27, 2, 30, fold=1, tzinfo=zoneinfo.ZoneInfo("Europe/Berlin")
+        )
+        fold_row = native.execute("RETURN $dt AS dt", {"dt": dt_fold1}).first()
+        assert fold_row is not None
+        assert fold_row["dt"].astimezone(datetime.UTC) == dt_fold1.astimezone(datetime.UTC)
+        fold_arrow = native.execute_to_arrow("RETURN $dt AS dt", {"dt": dt_fold1})
+        assert fold_arrow.schema.field("dt").type == pa.timestamp("us", tz="Europe/Berlin")
+        fold_df = native.execute_to_polars("RETURN $dt AS dt", {"dt": dt_fold1})
+        assert fold_df.schema["dt"] == pl.Datetime("us", "Europe/Berlin")
+        assert fold_df["dt"][0].astimezone(datetime.UTC) == dt_fold1.astimezone(datetime.UTC)
+
+        # #419: Spatial Points return voyager_ogm.Point in execute(), Struct in Arrow/Polars
+        mg_pt2 = Point(latitude=52.52, longitude=13.405)
+        mg_pt3 = Point(x=1.0, y=2.0, z=3.5, srid=9157)
+        mg_pt_row = native.execute(
+            "RETURN $p AS p, $p3 AS p3, [$p] AS plist, {pt: $p} AS pmap",
+            {"p": mg_pt2, "p3": mg_pt3},
+        ).first()
+        assert mg_pt_row is not None
+        assert isinstance(mg_pt_row["p"], Point) and mg_pt_row["p"] == mg_pt2
+        assert isinstance(mg_pt_row["p3"], Point) and mg_pt_row["p3"] == mg_pt3
+        assert isinstance(mg_pt_row["plist"][0], Point) and mg_pt_row["plist"][0] == mg_pt2
+        assert isinstance(mg_pt_row["pmap"]["pt"], Point) and mg_pt_row["pmap"]["pt"] == mg_pt2
+        mg_pt_arrow = native.execute_to_arrow("RETURN $p AS p", {"p": mg_pt2})
+        assert pa.types.is_struct(mg_pt_arrow.schema.field("p").type)
+        assert mg_pt_arrow.schema.field("p").metadata.get(b"voyager.type") == b"point"
+        assert Point.from_arrow(mg_pt_arrow.column("p")[0]) == mg_pt2
+        mg_pt_df = native.execute_to_polars("RETURN $p AS p", {"p": mg_pt2})
+        assert isinstance(mg_pt_df.schema["p"], pl.Struct)
+        assert Point.from_polars(mg_pt_df["p"]) == mg_pt2
+
+        # #420: Negative sub-second duration preserves exact components in Arrow/Polars and nested execute()
+        neg_sub = Duration(nanoseconds=-1000)
+        neg_row = native.execute("RETURN $d AS d, {d: $d} AS dmap", {"d": neg_sub}).first()
+        assert neg_row is not None
+        assert neg_row["d"] == neg_sub
+        assert isinstance(neg_row["dmap"]["d"], Duration) and neg_row["dmap"]["d"] == neg_sub
+        neg_arrow = native.execute_to_arrow("RETURN $d AS d", {"d": neg_sub})
+        assert pa.types.is_struct(neg_arrow.schema.field("d").type)
+        raw_d = neg_arrow.column("d")[0].as_py()
+        assert Duration(**raw_d) == neg_sub
+        neg_df = native.execute_to_polars("RETURN $d AS d", {"d": neg_sub})
+        assert isinstance(neg_df.schema["d"], pl.Struct)
+        assert Duration(**neg_df["d"][0]) == neg_sub
     finally:
         bridge.execute(f"MATCH (n:{label}) DETACH DELETE n")
         bridge.close()

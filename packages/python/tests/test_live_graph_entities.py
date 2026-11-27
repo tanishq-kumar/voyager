@@ -223,7 +223,7 @@ def test_live_memgraph_graph_entities_bridge_and_native() -> None:
             native_row,
             expected_labels_a=frozenset({label_a, label_extra}),
             expected_labels_b=frozenset({label_b}),
-            expect_element_id=False,  # Bolt v4 wire protocol has no element_id
+            expect_element_id=True,  # Memgraph negotiates Bolt 5.x (#414), which carries element_id
         )
         assert bridge_row["a"].id == native_row["a"].id
         assert bridge_row["k"].id == native_row["k"].id
