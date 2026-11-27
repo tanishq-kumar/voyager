@@ -300,9 +300,18 @@ fn test_resp_allocation_bomb_defense() {
         result
     );
 
-    // Bulk string requesting 2 GB when only 10 bytes present: should safely return Ok(None) without pre-allocating
+    // Bulk string requesting 2 GB (> MAX_RESP_FRAME_SIZE): rejected upfront with ProtocolError
     let mut bomb_bulk = BytesMut::from(&b"$2000000000\r\nsmall"[..]);
     let result = RespValue::parse(&mut bomb_bulk);
+    assert!(
+        matches!(result, Err(NetError::ProtocolError(_))),
+        "Expected ProtocolError on oversized bulk string length, got: {:?}",
+        result
+    );
+
+    // Incomplete bulk string within MAX_RESP_FRAME_SIZE (1 MB) when only 5 bytes present: safely returns Ok(None)
+    let mut incomplete_bulk = BytesMut::from(&b"$1000000\r\nsmall"[..]);
+    let result = RespValue::parse(&mut incomplete_bulk);
     assert_eq!(result.unwrap(), None);
 }
 

@@ -308,32 +308,62 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
         &self,
         permit: OwnedSemaphorePermit,
     ) -> Result<PooledConnection<C>> {
+        struct AcquireGuard<'a, C: AsyncConnection + 'static> {
+            pool: &'a Arc<PoolInner<C>>,
+            permit: Option<OwnedSemaphorePermit>,
+            in_flight_idle: Option<C>,
+        }
+
+        impl<C: AsyncConnection + 'static> Drop for AcquireGuard<'_, C> {
+            fn drop(&mut self) {
+                if let Some(_conn) = self.in_flight_idle.take() {
+                    self.pool.total_connections.fetch_sub(1, Ordering::SeqCst);
+                }
+                if let Some(permit) = self.permit.take() {
+                    self.pool.handle_permit_return(Some(permit));
+                }
+            }
+        }
+
+        let mut guard = AcquireGuard {
+            pool: &self.inner,
+            permit: Some(permit),
+            in_flight_idle: None,
+        };
+
         loop {
             if self.inner.is_closed.load(Ordering::Relaxed) {
-                drop(permit);
+                if let Some(p) = guard.permit.take() {
+                    drop(p);
+                }
                 return Err(NetError::Closed(
                     "Connection pool has been closed".to_string(),
                 ));
             }
 
             let maybe_idle = self.inner.idle_queue.lock().pop_front();
-            if let Some(mut idle) = maybe_idle {
+            if let Some(idle) = maybe_idle {
                 let now = Instant::now();
+                let created_at = idle.created_at;
+                let last_used_at = idle.last_used_at;
+                guard.in_flight_idle = Some(idle.conn);
 
                 // Check max lifetime
                 if self
                     .inner
                     .config
                     .max_lifetime
-                    .is_some_and(|max| now.duration_since(idle.created_at) > max)
+                    .is_some_and(|max| now.duration_since(created_at) > max)
                 {
                     debug!("Evicting connection exceeding max lifetime");
                     self.inner
                         .metrics
                         .connections_evicted
                         .fetch_add(1, Ordering::Relaxed);
-                    self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                    let _ = idle.conn.close().await;
+                    if let Some(mut conn) = guard.in_flight_idle.take() {
+                        self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
+                        let _ = conn.close().await;
+                    }
                     continue;
                 }
 
@@ -342,84 +372,112 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     .inner
                     .config
                     .idle_timeout
-                    .is_some_and(|to| now.duration_since(idle.last_used_at) > to)
+                    .is_some_and(|to| now.duration_since(last_used_at) > to)
                 {
                     debug!("Evicting idle connection exceeding idle timeout");
                     self.inner
                         .metrics
                         .connections_evicted
                         .fetch_add(1, Ordering::Relaxed);
-                    self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                    let _ = idle.conn.close().await;
+                    if let Some(mut conn) = guard.in_flight_idle.take() {
+                        self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
+                        let _ = conn.close().await;
+                    }
                     continue;
                 }
 
                 // Check liveness probe if test_on_acquire is enabled
-                if self.inner.config.test_on_acquire
-                    && (!idle.conn.is_valid() || idle.conn.ping().await.is_err())
-                {
-                    warn!("Connection failed liveness probe, discarding");
-                    self.inner
-                        .metrics
-                        .connections_failed_health_check
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                    let _ = idle.conn.close().await;
-                    continue;
+                if self.inner.config.test_on_acquire {
+                    let probe_ok = {
+                        let conn = guard
+                            .in_flight_idle
+                            .as_mut()
+                            .expect("in-flight idle connection present");
+                        conn.is_valid() && conn.ping().await.is_ok()
+                    };
+                    if !probe_ok {
+                        warn!("Connection failed liveness probe, discarding");
+                        self.inner
+                            .metrics
+                            .connections_failed_health_check
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(mut conn) = guard.in_flight_idle.take() {
+                            self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
+                            let _ = conn.close().await;
+                        }
+                        continue;
+                    }
                 }
 
                 // Reset state in case transaction was left open, verifying reset succeeded and connection is valid
-                if idle.conn.is_in_transaction() {
-                    if idle.conn.reset().await.is_err() || !idle.conn.is_valid() {
+                let in_tx = guard
+                    .in_flight_idle
+                    .as_ref()
+                    .expect("in-flight idle connection present")
+                    .is_in_transaction();
+                if in_tx {
+                    let reset_ok = {
+                        let conn = guard
+                            .in_flight_idle
+                            .as_mut()
+                            .expect("in-flight idle connection present");
+                        conn.reset().await.is_ok() && conn.is_valid()
+                    };
+                    if !reset_ok {
                         warn!("Connection failed transaction reset or is invalid, discarding");
                         self.inner
                             .metrics
                             .connections_failed_health_check
                             .fetch_add(1, Ordering::Relaxed);
-                        self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                        let _ = idle.conn.close().await;
+                        if let Some(mut conn) = guard.in_flight_idle.take() {
+                            self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
+                            let _ = conn.close().await;
+                        }
                         continue;
                     }
-                } else if !idle.conn.is_valid() {
+                } else if !guard
+                    .in_flight_idle
+                    .as_ref()
+                    .expect("in-flight idle connection present")
+                    .is_valid()
+                {
                     warn!("Connection is marked invalid, discarding");
                     self.inner
                         .metrics
                         .connections_failed_health_check
                         .fetch_add(1, Ordering::Relaxed);
-                    self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                    let _ = idle.conn.close().await;
+                    if let Some(mut conn) = guard.in_flight_idle.take() {
+                        self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
+                        let _ = conn.close().await;
+                    }
                     continue;
                 }
 
+                let conn = guard.in_flight_idle.take();
+                let permit = guard.permit.take();
                 return Ok(PooledConnection {
-                    conn: Some(idle.conn),
-                    created_at: idle.created_at,
+                    conn,
+                    created_at,
                     is_broken: false,
                     pool: Some(self.inner.clone()),
-                    _permit: Some(permit),
+                    _permit: permit,
                 });
             } else {
                 // No idle connections in queue, create a fresh connection
-                match self.inner.factory.create().await {
-                    Ok(conn) => {
-                        self.inner
-                            .metrics
-                            .connections_created
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.inner.total_connections.fetch_add(1, Ordering::SeqCst);
-                        return Ok(PooledConnection {
-                            conn: Some(conn),
-                            created_at: Instant::now(),
-                            is_broken: false,
-                            pool: Some(self.inner.clone()),
-                            _permit: Some(permit),
-                        });
-                    }
-                    Err(e) => {
-                        self.inner.handle_permit_return(Some(permit));
-                        return Err(e);
-                    }
-                }
+                let conn = self.inner.factory.create().await?;
+                self.inner
+                    .metrics
+                    .connections_created
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner.total_connections.fetch_add(1, Ordering::SeqCst);
+                let permit = guard.permit.take();
+                return Ok(PooledConnection {
+                    conn: Some(conn),
+                    created_at: Instant::now(),
+                    is_broken: false,
+                    pool: Some(self.inner.clone()),
+                    _permit: permit,
+                });
             }
         }
     }

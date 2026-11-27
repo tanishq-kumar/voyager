@@ -32,6 +32,7 @@ pub struct PostgresConnection {
     backend_pid: i32,
     secret_key: i32,
     transaction_status: TransactionStatus,
+    is_broken: bool,
     is_age_initialized: bool,
     agtype_oid: Option<i32>,
     query_timeout: Option<std::time::Duration>,
@@ -292,6 +293,7 @@ impl PostgresConnection {
             backend_pid: 0,
             secret_key: 0,
             transaction_status: TransactionStatus::Idle,
+            is_broken: false,
             is_age_initialized: false,
             agtype_oid: None,
             query_timeout,
@@ -333,15 +335,28 @@ impl PostgresConnection {
         write_startup_message(&mut self.stream, &startup).await?;
 
         let mut scram_client: Option<ScramClient> = None;
+        let mut scram_verified = false;
+        let mut auth_ok = false;
 
         loop {
             let msg = read_backend_message(&mut self.stream).await?;
             match msg {
                 BackendMessage::Authentication(auth_req) => match auth_req {
                     AuthenticationRequest::Ok => {
-                        // Authentication succeeded, continue waiting for ReadyForQuery
+                        if scram_client.is_some() && !scram_verified {
+                            return Err(NetError::AuthenticationFailed(
+                                "PostgreSQL server sent AuthenticationOk before completing SCRAM-SHA-256 SASLFinal verification".to_string(),
+                            ));
+                        }
+                        auth_ok = true;
                     }
                     AuthenticationRequest::CleartextPassword => {
+                        if password.as_bytes().contains(&0) {
+                            return Err(NetError::AuthenticationFailed(
+                                "PostgreSQL password must not contain interior NUL bytes"
+                                    .to_string(),
+                            ));
+                        }
                         let mut pwd_bytes = password.as_bytes().to_vec();
                         pwd_bytes.push(0);
                         write_frontend_message(
@@ -365,9 +380,10 @@ impl PostgresConnection {
                                 mechanisms
                             )));
                         }
-                        let client = ScramClient::new();
+                        let client = ScramClient::try_new()?;
                         let first_msg = client.client_first_message();
                         scram_client = Some(client);
+                        scram_verified = false;
 
                         write_frontend_message(
                             &mut self.stream,
@@ -394,6 +410,7 @@ impl PostgresConnection {
                             NetError::AuthenticationFailed("SCRAM client state missing".to_string())
                         })?;
                         client.verify_server_final(&final_data)?;
+                        scram_verified = true;
                     }
                     other => {
                         return Err(NetError::AuthenticationFailed(format!(
@@ -413,6 +430,12 @@ impl PostgresConnection {
                     self.secret_key = secret_key;
                 }
                 BackendMessage::ReadyForQuery(status) => {
+                    if !auth_ok || (scram_client.is_some() && !scram_verified) {
+                        return Err(NetError::AuthenticationFailed(
+                            "PostgreSQL server sent ReadyForQuery before completing authentication"
+                                .to_string(),
+                        ));
+                    }
                     self.transaction_status = status;
                     break;
                 }
@@ -502,6 +525,13 @@ impl PostgresConnection {
     }
 
     async fn execute_simple_inner(&mut self, query: &str) -> Result<QueryResult> {
+        if self.is_broken {
+            return Err(NetError::Closed(
+                "PostgreSQL connection is closed or broken".to_string(),
+            ));
+        }
+        self.is_broken = true;
+
         let start_time = Instant::now();
         write_frontend_message(&mut self.stream, &FrontendMessage::Query(query.to_string()))
             .await?;
@@ -540,6 +570,7 @@ impl PostgresConnection {
                 }
                 BackendMessage::ReadyForQuery(status) => {
                     self.transaction_status = status;
+                    self.is_broken = false;
                     break;
                 }
                 BackendMessage::ErrorResponse(diag) => {
@@ -594,6 +625,13 @@ impl PostgresConnection {
         &mut self,
         prepared: &PreparedPostgresStatement,
     ) -> Result<QueryResult> {
+        if self.is_broken {
+            return Err(NetError::Closed(
+                "PostgreSQL connection is closed or broken".to_string(),
+            ));
+        }
+        self.is_broken = true;
+
         let start_time = Instant::now();
         let parameter_count = prepared.parameter_values.len();
 
@@ -624,6 +662,7 @@ impl PostgresConnection {
 
         let response = read_extended_response(&mut self.stream).await?;
         self.transaction_status = response.transaction_status;
+        self.is_broken = false;
         for (name, value) in response.parameter_status {
             self.server_parameters.insert(name, value);
         }
@@ -732,14 +771,19 @@ impl AsyncConnection for PostgresConnection {
     }
 
     async fn reset(&mut self) -> Result<()> {
+        if self.is_broken {
+            return Err(NetError::Closed(
+                "PostgreSQL connection is closed or broken".to_string(),
+            ));
+        }
         if self.transaction_status != TransactionStatus::Idle {
-            let _ = self.execute_simple("ROLLBACK;").await;
+            self.execute_simple("ROLLBACK;").await?;
         }
         Ok(())
     }
 
     fn is_valid(&self) -> bool {
-        self.transaction_status != TransactionStatus::FailedTransaction
+        !self.is_broken && self.transaction_status != TransactionStatus::FailedTransaction
     }
 
     fn is_in_transaction(&self) -> bool {
@@ -751,7 +795,10 @@ impl AsyncConnection for PostgresConnection {
     }
 
     async fn close(&mut self) -> Result<()> {
-        let _ = write_frontend_message(&mut self.stream, &FrontendMessage::Terminate).await;
+        if !self.is_broken {
+            let _ = write_frontend_message(&mut self.stream, &FrontendMessage::Terminate).await;
+            self.is_broken = true;
+        }
         Ok(())
     }
 

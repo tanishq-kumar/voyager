@@ -720,6 +720,8 @@ pub fn uses_age(uri: &ParsedUri) -> bool {
     let scheme = uri.raw.trim().split("://").next().unwrap_or_default();
     let scheme = scheme.rsplit(':').next().unwrap_or(scheme);
     scheme.eq_ignore_ascii_case("age")
+        || scheme.eq_ignore_ascii_case("age+s")
+        || scheme.eq_ignore_ascii_case("age+ssc")
         || uri.params.contains_key("age")
         || uri.params.get("dialect").map(String::as_str) == Some("age")
 }
@@ -732,7 +734,10 @@ mod tests {
     fn age_uris_are_recognised() {
         for (raw, expected) in [
             ("age://postgres@localhost:5455/db", true),
+            ("age+s://postgres@localhost:5455/db", true),
+            ("age+ssc://postgres@localhost:5455/db", true),
             ("voyager:age://postgres@localhost:5455/db", true),
+            ("voyager:age+s://postgres@localhost:5455/db", true),
             ("postgresql://postgres@localhost:5456/db?dialect=age", true),
             ("postgresql://postgres@localhost:5456/db?graph=g", false),
         ] {

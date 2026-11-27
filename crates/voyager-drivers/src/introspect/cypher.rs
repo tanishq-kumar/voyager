@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{NetError, Result};
 use crate::uri::ParsedUri;
 
 use super::parse::{self, Row};
@@ -50,41 +50,54 @@ pub(crate) trait CatalogSource: Send {
 }
 
 /// Quotes a label, relationship type or property name for Cypher.
-pub(crate) fn quote_identifier(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
+///
+/// Rejects NUL bytes and Cypher `\uXXXX` / `\UXXXXXXXX` unicode escape sequences
+/// (such as `\u0060`) that the Cypher lexer would unescape before tokenization.
+pub(crate) fn quote_identifier(name: &str) -> Result<String> {
+    if name.contains('\0') {
+        return Err(NetError::ProtocolError(
+            "Cypher identifier cannot contain NUL bytes".to_string(),
+        ));
+    }
+    if name.contains("\\u") || name.contains("\\U") {
+        return Err(NetError::ProtocolError(format!(
+            "Cypher identifier cannot contain unicode escape sequences: {name:?}"
+        )));
+    }
+    Ok(format!("`{}`", name.replace('`', "``")))
 }
 
 /// Sampling query: distinct (property, value type) pairs of at most `limit`
 /// nodes with `label`.
-pub(crate) fn node_types_query(flavor: Flavor, label: &str, limit: usize) -> String {
-    format!(
+pub(crate) fn node_types_query(flavor: Flavor, label: &str, limit: usize) -> Result<String> {
+    Ok(format!(
         "MATCH (n:{label}) WITH n LIMIT {limit} UNWIND keys(n) AS key \
          RETURN DISTINCT key, {function}(n[key]) AS type",
-        label = quote_identifier(label),
+        label = quote_identifier(label)?,
         function = flavor.type_function(),
-    )
+    ))
 }
 
 /// Sampling query: distinct (property, value type) pairs of at most `limit`
 /// relationships of `rel_type`.
-pub(crate) fn rel_types_query(flavor: Flavor, rel_type: &str, limit: usize) -> String {
-    format!(
+pub(crate) fn rel_types_query(flavor: Flavor, rel_type: &str, limit: usize) -> Result<String> {
+    Ok(format!(
         "MATCH ()-[r:{rel_type}]->() WITH r LIMIT {limit} UNWIND keys(r) AS key \
          RETURN DISTINCT key, {function}(r[key]) AS type",
-        rel_type = quote_identifier(rel_type),
+        rel_type = quote_identifier(rel_type)?,
         function = flavor.type_function(),
-    )
+    ))
 }
 
 /// Sampling query: distinct (source label, target label) pairs of at most
 /// `limit` relationships of `rel_type`.
-pub(crate) fn endpoints_query(rel_type: &str, limit: usize) -> String {
-    format!(
+pub(crate) fn endpoints_query(rel_type: &str, limit: usize) -> Result<String> {
+    Ok(format!(
         "MATCH (a)-[r:{rel_type}]->(b) WITH a, b LIMIT {limit} \
          UNWIND labels(a) AS source UNWIND labels(b) AS target \
          RETURN DISTINCT source, target",
-        rel_type = quote_identifier(rel_type),
-    )
+        rel_type = quote_identifier(rel_type)?,
+    ))
 }
 
 /// Reads labels, relationship types, catalogs and samples into `builder`.
@@ -201,7 +214,9 @@ pub(crate) async fn collect(
     }
     let labels: Vec<String> = builder.labels.iter().cloned().collect();
     for label in &labels {
-        let rows = source.rows(&node_types_query(flavor, label, limit)).await?;
+        let rows = source
+            .rows(&node_types_query(flavor, label, limit)?)
+            .await?;
         for row in &rows {
             if let Some(key) = parse::string(row, "key") {
                 let type_name = parse::string(row, "type");
@@ -212,7 +227,7 @@ pub(crate) async fn collect(
     let rel_types: Vec<String> = builder.rel_types.iter().cloned().collect();
     for rel_type in &rel_types {
         let rows = source
-            .rows(&rel_types_query(flavor, rel_type, limit))
+            .rows(&rel_types_query(flavor, rel_type, limit)?)
             .await?;
         for row in &rows {
             if let Some(key) = parse::string(row, "key") {
@@ -225,7 +240,7 @@ pub(crate) async fn collect(
                 );
             }
         }
-        let rows = source.rows(&endpoints_query(rel_type, limit)).await?;
+        let rows = source.rows(&endpoints_query(rel_type, limit)?).await?;
         for row in &rows {
             builder.add_endpoint(
                 rel_type,
@@ -458,10 +473,12 @@ mod tests {
 
     #[test]
     fn identifiers_are_backtick_quoted() {
-        assert_eq!(quote_identifier("Person"), "`Person`");
-        assert_eq!(quote_identifier("we`ird"), "`we``ird`");
+        assert_eq!(quote_identifier("Person").unwrap(), "`Person`");
+        assert_eq!(quote_identifier("we`ird").unwrap(), "`we``ird`");
+        assert!(quote_identifier(r"bad\u0060label").is_err());
+        assert!(quote_identifier("bad\0label").is_err());
         assert_eq!(
-            node_types_query(Flavor::FalkorDb, "P", 5),
+            node_types_query(Flavor::FalkorDb, "P", 5).unwrap(),
             "MATCH (n:`P`) WITH n LIMIT 5 UNWIND keys(n) AS key RETURN DISTINCT key, typeOf(n[key]) AS type"
         );
     }

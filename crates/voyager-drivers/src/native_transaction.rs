@@ -229,9 +229,22 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
                 "Savepoints are not supported by this backend; cannot roll back to '{name}'"
             )));
         }
-        let conn = self.active_conn()?;
+        match self.state {
+            NativeTransactionState::Active | NativeTransactionState::Failed => {}
+            NativeTransactionState::Committed | NativeTransactionState::RolledBack => {
+                return Err(NetError::TransactionError(
+                    "Transaction is already completed".to_string(),
+                ));
+            }
+        }
+        let conn = self.conn.as_mut().ok_or_else(|| {
+            NetError::TransactionError("Transaction has no leased connection".to_string())
+        })?;
         match conn.rollback_to_savepoint(name).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.state = NativeTransactionState::Active;
+                Ok(())
+            }
             Err(err) => {
                 self.state = NativeTransactionState::Failed;
                 Err(err)
@@ -408,5 +421,32 @@ mod tests {
             .await
             .expect("release savepoint");
         tx.commit().await.expect("commit");
+    }
+
+    #[tokio::test]
+    async fn native_transaction_rollback_to_savepoint_recovers_from_failed_state() {
+        let (pool, _) = pool().await;
+        let conn = pool.acquire().await.expect("acquire connection");
+        let mut tx = NativeTransaction::begin(conn).await.expect("begin");
+        tx.savepoint("sp_recover").await.expect("create savepoint");
+
+        tx.conn.as_mut().expect("leased connection").fail_execute = true;
+        let err = tx
+            .execute("CREATE (n)", &HashMap::new())
+            .await
+            .expect_err("expected failure");
+        assert!(err.to_string().contains("Simulated execution failure"));
+        assert_eq!(tx.state(), NativeTransactionState::Failed);
+
+        tx.conn.as_mut().expect("leased connection").fail_execute = false;
+        tx.rollback_to_savepoint("sp_recover")
+            .await
+            .expect("rollback to savepoint from Failed state must succeed");
+        assert_eq!(tx.state(), NativeTransactionState::Active);
+
+        tx.execute("CREATE (n)", &HashMap::new())
+            .await
+            .expect("execute after savepoint recovery");
+        tx.commit().await.expect("commit after recovery");
     }
 }

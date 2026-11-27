@@ -4,11 +4,19 @@ use base64::prelude::*;
 use hmac::{Hmac, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use sha2::Sha256;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{NetError, Result};
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Minimum permitted SCRAM-SHA-256 PBKDF2 iteration count (RFC 7677).
+pub const MIN_SCRAM_ITERATIONS: u32 = 4096;
+/// Maximum permitted SCRAM-SHA-256 PBKDF2 iteration count to prevent CPU DoS.
+pub const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
+
+static FALLBACK_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Generates the MD5 authentication response for PostgreSQL.
 ///
@@ -72,20 +80,35 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     result
 }
 
-/// Generates a pseudo-random 24-character client nonce for SCRAM.
-pub fn generate_client_nonce() -> String {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let nanos = duration.as_nanos();
-    let rand_seed = (nanos ^ 0x5deece66d) as u64;
-
+/// Generates a cryptographically random 24-character client nonce for SCRAM.
+pub fn try_generate_client_nonce() -> Result<String> {
     let mut bytes = [0u8; 18];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        let shift = (i % 8) * 8;
-        *b = ((rand_seed.wrapping_add(i as u64 * 31337) >> shift) & 0xFF) as u8;
+    getrandom::fill(&mut bytes).map_err(|e| {
+        NetError::AuthenticationFailed(format!(
+            "OS CSPRNG failed while generating SCRAM client nonce: {e}"
+        ))
+    })?;
+    Ok(BASE64_STANDARD.encode(bytes))
+}
+
+/// Generates a random 24-character client nonce for SCRAM using the OS CSPRNG.
+pub fn generate_client_nonce() -> String {
+    let mut bytes = [0u8; 18];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return BASE64_STANDARD.encode(bytes);
     }
 
+    // Panic-free fallback only if the OS CSPRNG itself returns an error.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = FALLBACK_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut seed = [0u8; 24];
+    seed[..16].copy_from_slice(&nanos.to_le_bytes());
+    seed[16..].copy_from_slice(&seq.to_le_bytes());
+    let digest = sha256_digest(&seed);
+    bytes.copy_from_slice(&digest[..18]);
     BASE64_STANDARD.encode(bytes)
 }
 
@@ -98,6 +121,17 @@ pub struct ScramClient {
 }
 
 impl ScramClient {
+    /// Initializes a new SCRAM-SHA-256 client session using the OS CSPRNG, returning an error if CSPRNG fails.
+    pub fn try_new() -> Result<Self> {
+        let client_nonce = try_generate_client_nonce()?;
+        let client_first_message_bare = format!("n=,r={}", client_nonce);
+        Ok(Self {
+            client_nonce,
+            client_first_message_bare,
+            server_signature: None,
+        })
+    }
+
     /// Initializes a new SCRAM-SHA-256 client session.
     pub fn new() -> Self {
         let client_nonce = generate_client_nonce();
@@ -153,6 +187,13 @@ impl ScramClient {
                 "Missing 'i' iterations parameter in SCRAM challenge".to_string(),
             )
         })?;
+
+        if !(MIN_SCRAM_ITERATIONS..=MAX_SCRAM_ITERATIONS).contains(&iters) {
+            return Err(NetError::AuthenticationFailed(format!(
+                "SCRAM iteration count {} outside permitted range {}..={}",
+                iters, MIN_SCRAM_ITERATIONS, MAX_SCRAM_ITERATIONS
+            )));
+        }
 
         if !combined_nonce.starts_with(&self.client_nonce) {
             return Err(NetError::AuthenticationFailed(
@@ -231,7 +272,17 @@ impl ScramClient {
             ))
         })?;
 
-        if sig_bytes.as_slice() != expected_sig {
+        if sig_bytes.len() != expected_sig.len() {
+            return Err(NetError::AuthenticationFailed(
+                "SCRAM server signature verification mismatch".to_string(),
+            ));
+        }
+
+        let mut diff = 0u8;
+        for (a, b) in sig_bytes.iter().zip(expected_sig.iter()) {
+            diff |= a ^ b;
+        }
+        if diff != 0 {
             return Err(NetError::AuthenticationFailed(
                 "SCRAM server signature verification mismatch".to_string(),
             ));

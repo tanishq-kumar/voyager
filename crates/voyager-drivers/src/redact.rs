@@ -67,7 +67,7 @@ pub(crate) fn redact_uri(raw: &str) -> String {
     redacted
 }
 
-fn redact_userinfo(raw: &str) -> String {
+pub(crate) fn redact_userinfo(raw: &str) -> String {
     let Some(scheme_end) = raw.find("://") else {
         return raw.to_string();
     };
@@ -91,24 +91,50 @@ fn redact_userinfo(raw: &str) -> String {
     )
 }
 
-fn redact_query_secrets(raw: &mut String) {
-    let Some(query_start) = raw.find('?') else {
-        return;
-    };
-    let mut redacted = String::with_capacity(raw.len());
-    redacted.push_str(&raw[..=query_start]);
-    for (index, pair) in raw[query_start + 1..].split('&').enumerate() {
+fn redact_kv_pairs(segment: &str, out: &mut String) {
+    for (index, pair) in segment.split('&').enumerate() {
         if index > 0 {
-            redacted.push('&');
+            out.push('&');
         }
         match pair.split_once('=') {
             Some((key, value)) if is_sensitive_key(key) && !value.is_empty() => {
-                redacted.push_str(key);
-                redacted.push_str("=***");
+                out.push_str(key);
+                out.push_str("=***");
             }
-            _ => redacted.push_str(pair),
+            _ => out.push_str(pair),
         }
     }
+}
+
+fn redact_query_secrets(raw: &mut String) {
+    let (before_frag, frag_opt) = match raw.split_once('#') {
+        Some((before, frag)) => (before, Some(frag)),
+        None => (raw.as_str(), None),
+    };
+    if !before_frag.contains('?') && frag_opt.is_none() {
+        return;
+    }
+
+    let mut redacted = String::with_capacity(raw.len());
+    if let Some((prefix, query)) = before_frag.split_once('?') {
+        redacted.push_str(prefix);
+        redacted.push('?');
+        redact_kv_pairs(query, &mut redacted);
+    } else {
+        redacted.push_str(before_frag);
+    }
+
+    if let Some(frag) = frag_opt {
+        redacted.push('#');
+        if let Some((frag_prefix, frag_query)) = frag.split_once('?') {
+            redact_kv_pairs(frag_prefix, &mut redacted);
+            redacted.push('?');
+            redact_kv_pairs(frag_query, &mut redacted);
+        } else {
+            redact_kv_pairs(frag, &mut redacted);
+        }
+    }
+
     *raw = redacted;
 }
 
@@ -146,6 +172,22 @@ mod tests {
         assert_eq!(
             redact_uri("bolt://db:7687?password=&ssl=true"),
             "bolt://db:7687?password=&ssl=true"
+        );
+    }
+
+    #[test]
+    fn redact_uri_masks_sensitive_fragment_parameters() {
+        assert_eq!(
+            redact_uri("bolt://db:7687#token=s3cr3t-326&section=1"),
+            "bolt://db:7687#token=***&section=1"
+        );
+        assert_eq!(
+            redact_uri("bolt://db:7687?database=movies#password=s3cr3t-326"),
+            "bolt://db:7687?database=movies#password=***"
+        );
+        assert_eq!(
+            redact_uri("bolt://db:7687?token=s3cr3t-326#secret=topsecret"),
+            "bolt://db:7687?token=***#secret=***"
         );
     }
 }

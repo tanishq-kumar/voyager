@@ -9,15 +9,19 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::{NetError, Result};
+pub use crate::redis::resp::MAX_RESP_FRAME_SIZE;
 use crate::redis::resp::RespValue;
 
-/// Maximum payload size allowed for a single RESP frame (128 MB), matching Bolt and PostgreSQL safety guards.
-pub const MAX_RESP_FRAME_SIZE: usize = 128 * 1024 * 1024;
-
 /// Tokio codec for framed RESP2/RESP3 value streaming over asynchronous sockets.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct RespCodec {
     max_frame_size: usize,
+}
+
+impl Default for RespCodec {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RespCodec {

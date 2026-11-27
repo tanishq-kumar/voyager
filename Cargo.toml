@@ -52,6 +52,7 @@ sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
 hex = "0.4"
+getrandom = "0.3"
 
 # TLS (voyager-drivers `tls` feature): rustls with the ring provider, so no
 # aws-lc-rs / cmake toolchain is needed; roots come from the operating system store.

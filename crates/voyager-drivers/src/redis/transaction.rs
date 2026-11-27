@@ -208,8 +208,16 @@ fn render_identifier_or_key(key: &str, out: &mut String) -> Result<()> {
     Ok(())
 }
 
+/// Maximum recursion depth allowed when rendering Cypher parameter literals.
+const MAX_NESTING_DEPTH: usize = 64;
+
 /// Helper to emit a double-quoted Cypher string literal with backslash escaping.
-fn push_cypher_string(s: &str, out: &mut String) {
+fn push_cypher_string(s: &str, out: &mut String) -> Result<()> {
+    if s.contains('\0') {
+        return Err(NetError::ExecutionError(
+            "FalkorDB Cypher string parameter cannot contain null bytes".to_string(),
+        ));
+    }
     out.push('"');
     for ch in s.chars() {
         match ch {
@@ -222,10 +230,20 @@ fn push_cypher_string(s: &str, out: &mut String) {
         }
     }
     out.push('"');
+    Ok(())
 }
 
 /// Recursively renders a JSON value as a Cypher literal for FalkorDB's `CYPHER name=value` prefix.
-fn render_json_cypher_literal(val: &serde_json::Value, out: &mut String) -> Result<()> {
+fn render_json_cypher_literal(
+    val: &serde_json::Value,
+    out: &mut String,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(NetError::ProtocolError(format!(
+            "FalkorDB Cypher parameter exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
     match val {
         serde_json::Value::Null => {
             out.push_str("null");
@@ -239,17 +257,14 @@ fn render_json_cypher_literal(val: &serde_json::Value, out: &mut String) -> Resu
             out.push_str(&n.to_string());
             Ok(())
         }
-        serde_json::Value::String(s) => {
-            push_cypher_string(s, out);
-            Ok(())
-        }
+        serde_json::Value::String(s) => push_cypher_string(s, out),
         serde_json::Value::Array(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                render_json_cypher_literal(item, out)?;
+                render_json_cypher_literal(item, out, depth + 1)?;
             }
             out.push(']');
             Ok(())
@@ -264,7 +279,7 @@ fn render_json_cypher_literal(val: &serde_json::Value, out: &mut String) -> Resu
                 }
                 render_identifier_or_key(key, out)?;
                 out.push_str(": ");
-                render_json_cypher_literal(value, out)?;
+                render_json_cypher_literal(value, out, depth + 1)?;
             }
             out.push('}');
             Ok(())
@@ -276,10 +291,15 @@ fn render_json_cypher_literal(val: &serde_json::Value, out: &mut String) -> Resu
 ///
 /// Matches [`FalkorDBBridge`]'s `_adapt_falkordb_value` for temporal types (ISO strings) and
 /// decimals (numeric literals when finite).
-fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
+fn render_cypher_literal(val: &ParamValue, out: &mut String, depth: usize) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(NetError::ProtocolError(format!(
+            "FalkorDB Cypher parameter exceeded maximum nesting depth of {MAX_NESTING_DEPTH}"
+        )));
+    }
     match val {
-        ParamValue::Json(v) => render_json_cypher_literal(v, out),
-        ParamValue::Jsonb(inner) => render_cypher_literal(inner, out),
+        ParamValue::Json(v) => render_json_cypher_literal(v, out, depth),
+        ParamValue::Jsonb(inner) => render_cypher_literal(inner, out, depth + 1),
         ParamValue::Float(f) => {
             if f.is_finite() {
                 let s = f.to_string();
@@ -299,8 +319,7 @@ fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
             "FalkorDB Cypher does not support binary bytes parameters".to_string(),
         )),
         ParamValue::Date { year, month, day } => {
-            push_cypher_string(&format_iso_date(*year, *month, *day), out);
-            Ok(())
+            push_cypher_string(&format_iso_date(*year, *month, *day), out)
         }
         ParamValue::Time {
             hour,
@@ -308,13 +327,10 @@ fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
             second,
             nanosecond,
             tz_offset_seconds,
-        } => {
-            push_cypher_string(
-                &format_iso_time(*hour, *minute, *second, *nanosecond, *tz_offset_seconds),
-                out,
-            );
-            Ok(())
-        }
+        } => push_cypher_string(
+            &format_iso_time(*hour, *minute, *second, *nanosecond, *tz_offset_seconds),
+            out,
+        ),
         ParamValue::LocalDateTime {
             year,
             month,
@@ -329,8 +345,7 @@ fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
                 format_iso_date(*year, *month, *day),
                 format_iso_time(*hour, *minute, *second, *nanosecond, None)
             );
-            push_cypher_string(&text, out);
-            Ok(())
+            push_cypher_string(&text, out)
         }
         ParamValue::DateTime {
             utc_seconds,
@@ -338,8 +353,7 @@ fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
             tz,
         } => {
             let text = format_datetime_iso(*utc_seconds, *nanosecond, Some(tz.offset_seconds()));
-            push_cypher_string(&text, out);
-            Ok(())
+            push_cypher_string(&text, out)
         }
         ParamValue::Duration {
             months,
@@ -348,20 +362,21 @@ fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
             nanoseconds,
         } => {
             let text = format_iso_duration(*months, *days, *seconds, *nanoseconds);
-            push_cypher_string(&text, out);
-            Ok(())
+            push_cypher_string(&text, out)
         }
-        ParamValue::Uuid(s) => {
-            push_cypher_string(s, out);
-            Ok(())
-        }
+        ParamValue::Uuid(s) => push_cypher_string(s, out),
         ParamValue::Decimal(s) => {
             let f = parse_decimal_f64(s).ok_or_else(|| {
                 NetError::ExecutionError(format!("Invalid decimal parameter literal: {s:?}"))
             })?;
-            render_cypher_literal(&ParamValue::Float(f), out)
+            render_cypher_literal(&ParamValue::Float(f), out, depth)
         }
         ParamValue::Point2D { srid, x, y } => {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(NetError::ExecutionError(
+                    "FalkorDB Cypher point coordinates must be finite".to_string(),
+                ));
+            }
             if *srid == 4326 {
                 out.push_str(&format!("{{latitude: {y}, longitude: {x}}}"));
             } else {
@@ -370,6 +385,11 @@ fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
             Ok(())
         }
         ParamValue::Point3D { srid, x, y, z } => {
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return Err(NetError::ExecutionError(
+                    "FalkorDB Cypher point coordinates must be finite".to_string(),
+                ));
+            }
             if *srid == 4979 {
                 out.push_str(&format!("{{latitude: {y}, longitude: {x}, height: {z}}}"));
             } else {
@@ -383,7 +403,7 @@ fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                render_cypher_literal(item, out)?;
+                render_cypher_literal(item, out, depth + 1)?;
             }
             out.push(']');
             Ok(())
@@ -398,7 +418,7 @@ fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
                 }
                 render_identifier_or_key(key, out)?;
                 out.push_str(": ");
-                render_cypher_literal(value, out)?;
+                render_cypher_literal(value, out, depth + 1)?;
             }
             out.push('}');
             Ok(())
@@ -421,11 +441,14 @@ pub fn format_cypher_with_params(
     let mut parts = Vec::with_capacity(params.len());
     for k in keys {
         let param_name = k.strip_prefix('$').unwrap_or(k);
-        let mut key_buf = String::new();
-        render_identifier_or_key(param_name, &mut key_buf)?;
+        if !is_plain_identifier(param_name) {
+            return Err(NetError::ExecutionError(format!(
+                "Invalid FalkorDB Cypher parameter name: {param_name:?}"
+            )));
+        }
         let mut val_buf = String::new();
-        render_cypher_literal(&params[k], &mut val_buf)?;
-        parts.push(format!("{key_buf}={val_buf}"));
+        render_cypher_literal(&params[k], &mut val_buf, 0)?;
+        parts.push(format!("{param_name}={val_buf}"));
     }
 
     Ok(format!("CYPHER {} {}", parts.join(" "), query))

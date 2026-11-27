@@ -174,6 +174,12 @@ impl RedisConnection {
                     }
                 }
             }
+            RespValue::Error(err) if err.starts_with("WRONGPASS") => {
+                return Err(NetError::AuthenticationFailed(format!(
+                    "Redis authentication failed: {}",
+                    err
+                )));
+            }
             _ => {
                 // Server rejected HELLO 3 (e.g. unknown command), fall back to RESP2
             }
@@ -181,28 +187,26 @@ impl RedisConnection {
 
         // 2. If HELLO 3 wasn't supported, fall back to RESP2 and authenticate via AUTH if needed
         if !switched_to_resp3 && let Some((user_opt, pass)) = auth_credentials {
-            let auth_result = if let Some(user) = user_opt {
-                write_command(&mut self.stream, &["AUTH", user, pass]).await
+            if let Some(user) = user_opt {
+                write_command(&mut self.stream, &["AUTH", user, pass]).await?;
             } else {
-                write_command(&mut self.stream, &["AUTH", pass]).await
-            };
+                write_command(&mut self.stream, &["AUTH", pass]).await?;
+            }
 
-            if auth_result.is_ok() {
-                let resp = read_resp_value(&mut self.stream, &mut self.buffer).await?;
-                match resp {
-                    RespValue::SimpleString(s) if s == "OK" => {}
-                    RespValue::Error(err) => {
-                        return Err(NetError::AuthenticationFailed(format!(
-                            "Redis authentication failed: {}",
-                            err
-                        )));
-                    }
-                    other => {
-                        return Err(NetError::ProtocolError(format!(
-                            "Unexpected authentication response: {:?}",
-                            other
-                        )));
-                    }
+            let resp = read_resp_value(&mut self.stream, &mut self.buffer).await?;
+            match resp {
+                RespValue::SimpleString(s) if s == "OK" => {}
+                RespValue::Error(err) => {
+                    return Err(NetError::AuthenticationFailed(format!(
+                        "Redis authentication failed: {}",
+                        err
+                    )));
+                }
+                other => {
+                    return Err(NetError::ProtocolError(format!(
+                        "Unexpected authentication response: {:?}",
+                        other
+                    )));
                 }
             }
         }
@@ -266,6 +270,11 @@ impl RedisConnection {
 
     /// Executes an arbitrary raw Redis / Valkey command and returns the raw [`RespValue`].
     pub async fn execute_raw(&mut self, args: &[&str]) -> Result<RespValue> {
+        if !self.is_valid {
+            return Err(NetError::Closed(
+                "Redis connection is closed or broken".to_string(),
+            ));
+        }
         if let Some(to) = self.query_timeout {
             match tokio::time::timeout(to, self.execute_raw_inner(args)).await {
                 Ok(res) => res,
@@ -283,8 +292,16 @@ impl RedisConnection {
     }
 
     async fn execute_raw_inner(&mut self, args: &[&str]) -> Result<RespValue> {
+        if !self.is_valid {
+            return Err(NetError::Closed(
+                "Redis connection is closed or broken".to_string(),
+            ));
+        }
+        self.is_valid = false;
         write_command(&mut self.stream, args).await?;
-        read_resp_value(&mut self.stream, &mut self.buffer).await
+        let resp = read_resp_value(&mut self.stream, &mut self.buffer).await?;
+        self.is_valid = true;
+        Ok(resp)
     }
 
     /// Executes a Cypher query on FalkorDB via `GRAPH.QUERY`.
@@ -461,11 +478,15 @@ impl AsyncConnection for RedisConnection {
     }
 
     async fn reset(&mut self) -> Result<()> {
+        if !self.is_valid {
+            return Err(NetError::Closed(
+                "Redis connection is closed or broken".to_string(),
+            ));
+        }
         if self.in_transaction {
-            let _ = self.execute_raw(&["DISCARD"]).await;
+            self.execute_raw(&["DISCARD"]).await?;
             self.in_transaction = false;
         }
-        self.buffer.clear();
         Ok(())
     }
 

@@ -49,6 +49,10 @@ pub async fn read_message_frame_buffered<R: AsyncRead + Unpin>(
         read_buf.advance(2);
 
         if chunk_size == 0 {
+            if message_buf.is_empty() {
+                // Bolt NOOP keepalive chunk (0x00 0x00) sent while awaiting results.
+                continue;
+            }
             // End of message frame reached
             break;
         }
@@ -91,6 +95,10 @@ pub async fn read_message_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<
 
         let chunk_size = u16::from_be_bytes(header) as usize;
         if chunk_size == 0 {
+            if message_buf.is_empty() {
+                // Bolt NOOP keepalive chunk (0x00 0x00) sent while awaiting results.
+                continue;
+            }
             // End of message frame reached
             break;
         }
