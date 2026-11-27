@@ -144,6 +144,12 @@ impl NativeClient {
         self.protocol
     }
 
+    /// Acquires a pooled connection and returns its negotiated wire protocol version, if available.
+    pub async fn protocol_version(&self) -> Result<Option<String>> {
+        let conn = self.pool.acquire().await?;
+        Ok(conn.protocol_version())
+    }
+
     /// Returns a reference to the underlying connection pool.
     pub fn pool(&self) -> &ConnectionPool<Box<dyn AsyncConnection>> {
         &self.pool

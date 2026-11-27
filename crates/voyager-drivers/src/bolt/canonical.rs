@@ -18,7 +18,10 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 
-use crate::bolt::packstream::{BoltDuration, BoltNode, BoltPath, BoltRelationship, BoltValue};
+use crate::bolt::packstream::{
+    BoltDateTimeZoneId, BoltDuration, BoltNode, BoltPath, BoltRelationship, BoltValue, days_to_ymd,
+    format_time_string, format_tz_offset,
+};
 use crate::error::{NetError, Result};
 
 /// Converts a [`BoltNode`] into the canonical kind-tagged JSON object.
@@ -251,7 +254,7 @@ pub fn bolt_value_to_canonical_json(value: &BoltValue) -> serde_json::Value {
         BoltValue::LocalTime(lt) => serde_json::Value::String(lt.to_iso_string()),
         BoltValue::DateTime(dt) => serde_json::Value::String(dt.to_iso_string()),
         BoltValue::LocalDateTime(ldt) => serde_json::Value::String(ldt.to_iso_string()),
-        BoltValue::DateTimeZoneId(dtz) => serde_json::Value::String(dtz.to_iso_string()),
+        BoltValue::DateTimeZoneId(dtz) => serde_json::Value::String(format_dtz_iso(dtz)),
         BoltValue::Duration(dur) => serde_json::Value::String(dur.to_iso_string()),
     }
 }
@@ -262,6 +265,60 @@ pub fn bolt_value_to_canonical_json(value: &BoltValue) -> serde_json::Value {
 /// `/usr/share/zoneinfo`, so validation works on Windows and hosts without tzdata.
 pub(crate) fn is_valid_arrow_tz(zone_id: &str) -> bool {
     zone_id.parse::<Tz>().is_ok()
+}
+
+fn local_wall_secs_for_utc(utc_secs: i64, tz: Tz) -> Option<i64> {
+    let dt = arrow_array::temporal_conversions::as_datetime_with_timezone::<
+        arrow_array::types::TimestampSecondType,
+    >(utc_secs, tz)?;
+    Some(dt.naive_local().and_utc().timestamp())
+}
+
+/// Resolves a legacy Bolt v4 (`0x66`) local wall-clock timestamp and IANA zone ID
+/// into `(utc_seconds, offset_seconds)` using Arrow's `chrono-tz` database.
+pub(crate) fn resolve_local_datetime_utc(local_seconds: i64, zone_id: &str) -> Option<(i64, i64)> {
+    let tz: Tz = zone_id.parse().ok()?;
+    let probe_local = local_wall_secs_for_utc(local_seconds, tz)?;
+    let initial_offset = probe_local.checked_sub(local_seconds)?;
+    let candidate = local_seconds.checked_sub(initial_offset)?;
+    let candidate_local = local_wall_secs_for_utc(candidate, tz)?;
+    let resolved_utc = if candidate_local == local_seconds {
+        // Prefer the earlier (fold=0) instant across DST fall-back overlaps.
+        [3_600i64, 1_800]
+            .into_iter()
+            .filter_map(|step| candidate.checked_sub(step))
+            .find(|&earlier| local_wall_secs_for_utc(earlier, tz) == Some(local_seconds))
+            .unwrap_or(candidate)
+    } else {
+        let adj = local_seconds.checked_sub(candidate_local)?;
+        let second_try = candidate.checked_add(adj)?;
+        if local_wall_secs_for_utc(second_try, tz) == Some(local_seconds) {
+            second_try
+        } else {
+            return None;
+        }
+    };
+    let offset = local_seconds.checked_sub(resolved_utc)?;
+    Some((resolved_utc, offset))
+}
+
+/// Formats a `BoltDateTimeZoneId`, resolving the UTC offset for legacy local (`0x66`) values.
+pub(crate) fn format_dtz_iso(dtz: &BoltDateTimeZoneId) -> String {
+    if !dtz.is_local {
+        return dtz.to_iso_string();
+    }
+    if let Some((_, offset_secs)) = resolve_local_datetime_utc(dtz.seconds, &dtz.zone_id) {
+        let days = dtz.seconds.div_euclid(86_400);
+        let secs_of_day = dtz.seconds.rem_euclid(86_400);
+        let (y, m, d) = days_to_ymd(days);
+        let h = (secs_of_day / 3_600) as u32;
+        let min = ((secs_of_day % 3_600) / 60) as u32;
+        let sec = (secs_of_day % 60) as u32;
+        let offset = format_tz_offset(offset_secs);
+        let time_part = format_time_string(h, min, sec, dtz.nanoseconds as u32, Some(&offset));
+        return format!("{:04}-{:02}-{:02}T{}[{}]", y, m, d, time_part, dtz.zone_id);
+    }
+    dtz.to_iso_string()
 }
 
 fn timestamp_micros(seconds: i64, nanoseconds: i64) -> Option<i64> {
@@ -278,7 +335,12 @@ fn timestamp_nanos(seconds: i64, nanoseconds: i64) -> Option<i64> {
 }
 
 fn duration_micros(dur: &BoltDuration) -> Option<i64> {
-    if dur.months != 0 || dur.days != 0 || dur.nanoseconds % 1_000 != 0 {
+    if dur.months != 0
+        || dur.days != 0
+        || dur.seconds < 0
+        || dur.nanoseconds < 0
+        || dur.nanoseconds % 1_000 != 0
+    {
         return None;
     }
     dur.seconds
@@ -287,7 +349,7 @@ fn duration_micros(dur: &BoltDuration) -> Option<i64> {
 }
 
 fn duration_nanos(dur: &BoltDuration) -> Option<i64> {
-    if dur.months != 0 || dur.days != 0 {
+    if dur.months != 0 || dur.days != 0 || dur.seconds < 0 || dur.nanoseconds < 0 {
         return None;
     }
     dur.seconds
@@ -359,6 +421,73 @@ pub(crate) fn append_duration_struct(builder: &mut StructBuilder, dur: Option<&B
     }
 }
 
+pub(crate) fn point_struct_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("srid", DataType::Int64, false),
+        Field::new("x", DataType::Float64, false),
+        Field::new("y", DataType::Float64, false),
+        Field::new("z", DataType::Float64, true),
+    ])
+}
+
+pub(crate) fn make_point_struct_builder(capacity: usize) -> StructBuilder {
+    StructBuilder::new(
+        point_struct_fields(),
+        vec![
+            Box::new(Int64Builder::with_capacity(capacity)),
+            Box::new(Float64Builder::with_capacity(capacity)),
+            Box::new(Float64Builder::with_capacity(capacity)),
+            Box::new(Float64Builder::with_capacity(capacity)),
+        ],
+    )
+}
+
+pub(crate) fn append_point_struct(
+    builder: &mut StructBuilder,
+    pt: Option<(i64, f64, f64, Option<f64>)>,
+) {
+    match pt {
+        Some((srid, x, y, z)) => {
+            builder
+                .field_builder::<Int64Builder>(0)
+                .expect("srid")
+                .append_value(srid);
+            builder
+                .field_builder::<Float64Builder>(1)
+                .expect("x")
+                .append_value(x);
+            builder
+                .field_builder::<Float64Builder>(2)
+                .expect("y")
+                .append_value(y);
+            builder
+                .field_builder::<Float64Builder>(3)
+                .expect("z")
+                .append_option(z);
+            builder.append(true);
+        }
+        None => {
+            builder
+                .field_builder::<Int64Builder>(0)
+                .expect("srid")
+                .append_null();
+            builder
+                .field_builder::<Float64Builder>(1)
+                .expect("x")
+                .append_null();
+            builder
+                .field_builder::<Float64Builder>(2)
+                .expect("y")
+                .append_null();
+            builder
+                .field_builder::<Float64Builder>(3)
+                .expect("z")
+                .append_null();
+            builder.append(false);
+        }
+    }
+}
+
 fn tz_label_for_offset(offset_seconds: i64) -> Option<String> {
     if offset_seconds == 0 {
         Some("UTC".to_string())
@@ -382,6 +511,7 @@ enum BoltScalarKind {
     DateTimeZone(Option<String>),
     DateTimeMixed,
     Duration,
+    Point,
     Mixed,
 }
 
@@ -405,6 +535,9 @@ fn classify_bolt_scalar(
         ))),
         BoltValue::DateTimeZoneId(dtz) => {
             if dtz.is_local {
+                if resolve_local_datetime_utc(dtz.seconds, &dtz.zone_id).is_some() {
+                    return Some(BoltScalarKind::DateTimeZone(Some(dtz.zone_id.clone())));
+                }
                 return Some(BoltScalarKind::DateTimeZone(None));
             }
             let valid = if let Some(&cached) = tz_cache.get(&dtz.zone_id) {
@@ -419,6 +552,7 @@ fn classify_bolt_scalar(
             ))
         }
         BoltValue::Duration(_) => Some(BoltScalarKind::Duration),
+        BoltValue::Point2D(_) | BoltValue::Point3D(_) => Some(BoltScalarKind::Point),
         _ => Some(BoltScalarKind::Mixed),
     }
 }
@@ -684,7 +818,15 @@ where
             let extract_sn = |v: &BoltValue| -> Option<(i64, i64)> {
                 match v {
                     BoltValue::DateTime(dt) => Some((dt.seconds, dt.nanoseconds)),
-                    BoltValue::DateTimeZoneId(dtz) => Some((dtz.seconds, dtz.nanoseconds)),
+                    BoltValue::DateTimeZoneId(dtz) => {
+                        if dtz.is_local {
+                            let (utc_secs, _) =
+                                resolve_local_datetime_utc(dtz.seconds, &dtz.zone_id)?;
+                            Some((utc_secs, dtz.nanoseconds))
+                        } else {
+                            Some((dtz.seconds, dtz.nanoseconds))
+                        }
+                    }
                     _ => None,
                 }
             };
@@ -805,6 +947,26 @@ where
                 }
             }
         }
+        BoltScalarKind::Point => {
+            let mut builder = make_point_struct_builder(count);
+            for v in values {
+                match v {
+                    Some(BoltValue::Point2D(pt)) => {
+                        append_point_struct(&mut builder, Some((pt.srid, pt.x, pt.y, None)))
+                    }
+                    Some(BoltValue::Point3D(pt)) => {
+                        append_point_struct(&mut builder, Some((pt.srid, pt.x, pt.y, Some(pt.z))))
+                    }
+                    _ => append_point_struct(&mut builder, None),
+                }
+            }
+            let mut meta = HashMap::new();
+            meta.insert("voyager.type".to_string(), "point".to_string());
+            Ok((
+                Field::new(name, DataType::Struct(point_struct_fields()), true).with_metadata(meta),
+                Arc::new(builder.finish()),
+            ))
+        }
         BoltScalarKind::Mixed => unreachable!("Mixed handled by JSON builder"),
     }
 }
@@ -822,7 +984,7 @@ where
         match v {
             Some(BoltValue::LocalDateTime(ldt)) => builder.append_value(ldt.to_iso_string()),
             Some(BoltValue::DateTime(dt)) => builder.append_value(dt.to_iso_string()),
-            Some(BoltValue::DateTimeZoneId(dtz)) => builder.append_value(dtz.to_iso_string()),
+            Some(BoltValue::DateTimeZoneId(dtz)) => builder.append_value(format_dtz_iso(dtz)),
             _ => builder.append_null(),
         }
     }
@@ -929,6 +1091,66 @@ pub(crate) fn wrap_flat_array_in_list(
         }
         DataType::Duration(TimeUnit::Nanosecond) => {
             finish_prim_list!(DurationNanosecondArray, DurationNanosecondBuilder::new())
+        }
+        DataType::Struct(fields)
+            if fields.len() == 4
+                && item_field
+                    .metadata()
+                    .get("voyager.type")
+                    .is_some_and(|v| v == "point") =>
+        {
+            let src = flat
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("StructArray");
+            let c0 = src
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("srid");
+            let c1 = src
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("x");
+            let c2 = src
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("y");
+            let c3 = src
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("z");
+            let mut lb =
+                ListBuilder::new(make_point_struct_builder(src.len())).with_field(item_arc);
+            let mut idx = 0usize;
+            for len_opt in row_lengths {
+                match len_opt {
+                    None => lb.append_null(),
+                    Some(len) => {
+                        for _ in 0..*len {
+                            if src.is_null(idx) {
+                                append_point_struct(lb.values(), None);
+                            } else {
+                                let z = if c3.is_null(idx) {
+                                    None
+                                } else {
+                                    Some(c3.value(idx))
+                                };
+                                append_point_struct(
+                                    lb.values(),
+                                    Some((c0.value(idx), c1.value(idx), c2.value(idx), z)),
+                                );
+                            }
+                            idx += 1;
+                        }
+                        lb.append(true);
+                    }
+                }
+            }
+            Ok((list_field, Arc::new(lb.finish())))
         }
         DataType::Struct(fields) if fields.len() == 4 => {
             let src = flat

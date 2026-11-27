@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Bolt 5.x version range negotiation and 4.4 UTC fallback (#414)**: `BOLT_PROPOSED_VERSIONS` now proposes Bolt `5.4..=5.0` and `4.4..=4.2` ranges so Memgraph negotiates Bolt `5.2` (sending `HELLO` without `bolt_agent` for `5.1..=5.2` followed by `LOGON`) and uses UTC temporal tags (`0x49`/`0x69`), preserving `fold=1` DST instants and emitting typed `Timestamp` / `pl.Datetime` columns with timezones. Bolt `4.4` connections request `patch_bolt: ["utc"]` and keep the legacy `0x46`/`0x66` path when unpatched. Exposes negotiated protocol version on `AsyncConnection`, `NativeClient`, and `PyNativeClient.protocol_version_sync()`. Native Memgraph nodes and relationships now also carry `element_id` (a Bolt 5 field), matching the bridge.
+- **Native Bolt spatial `Point` hydration and Arrow/Polars struct encoding (#419)**: **Breaking** for callers reading `dict` or JSON strings from native Bolt spatial columns: `Session.execute()` now hydrates `Point2D` and `Point3D` values (top-level and nested in lists, maps, nodes, relationships, and paths) to `voyager_ogm.Point` with SRID, and `execute_to_arrow()` / `execute_to_polars()` expose spatial columns (and `List<Point>`) as `Struct(srid: Int64, x: Float64, y: Float64, z: Float64)` with `voyager.type = "point"` metadata.
+- **Legacy Bolt 4.4 zoned datetimes and negative duration component fidelity (#420)**: legacy `0x66` zoned datetimes now resolve local wall-clock time to UTC for Arrow/Polars `Timestamp` columns and include their resolved UTC offset in fallback/JSON ISO strings, `_hydrate_datetime` interprets offset-less bracketed zone strings in the named zone rather than UTC, and negative `Duration` values with `months == 0 && days == 0` route to `Struct(months, days, seconds, nanoseconds)` in Arrow/Polars to preserve exact server components (`days=0, nanoseconds=-1000`) instead of `timedelta` normalization.
+
 ## [0.5.0-alpha.1] - 2026-11-27
 
 First alpha of the 0.5 line. The theme is a portable query interchange format and the same values everywhere: Query Spec v1 with a JSON Schema, reference vectors and a conformance corpus, a working `voyager` CLI, live schema introspection, and native backends that return the same Python types as the bridges and the official clients.
