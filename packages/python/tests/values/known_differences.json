@@ -658,6 +658,15 @@
   },
   {
     "engine": "pg19",
+    "backend": "native_polars",
+    "path": "*",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "Polars exports PostgreSQL UUID columns as pl.Binary (16 raw bytes), so Voyager native_polars returns bytes while psycopg returns uuid.UUID.",
+    "match": "type mismatch: actual bytes"
+  },
+  {
+    "engine": "pg19",
     "backend": "native_arrow",
     "path": "*",
     "value_kind": "datetime_offset",
@@ -772,5 +781,50 @@
     "category": "limitation",
     "reason": "DuckDB's official Python client returns INTERVAL as datetime.timedelta (months folded into 30-day increments); Voyager preserves calendar months, so calendar durations differ from the official reference.",
     "match": "Duration .* !="
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "*",
+    "value_kind": "int",
+    "category": "fallback",
+    "reason": "DuckDB exports HUGEINT as Arrow decimal128(38, 0) tagged voyager.type=hugeint, so Voyager bridge_arrow returns decimal.Decimal for int values outside the int64 range while the official client returns Python int.",
+    "match": "type mismatch: actual Decimal"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "*",
+    "value_kind": "int",
+    "category": "fallback",
+    "reason": "DuckDB exports HUGEINT as Polars Decimal(precision=38, scale=0), so Voyager bridge_polars returns decimal.Decimal for int values outside the int64 range while the official client returns Python int.",
+    "match": "type mismatch: actual Decimal"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "*",
+    "value_kind": "time_offset",
+    "category": "fallback",
+    "reason": "DuckDB Polars export has no zoned time type and emits TIMETZ as ISO text, so Voyager bridge_polars returns str while the official DuckDB client returns datetime.time with tzinfo.",
+    "match": "type mismatch: actual str"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "*",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes UUID columns as fixed_size_binary[16] (ARROW:extension:name=arrow.uuid), so Voyager bridge_arrow returns bytes while the official DuckDB client returns uuid.UUID.",
+    "match": "type mismatch: actual bytes"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "*",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "DuckDB Polars export exposes UUID columns as pl.Binary (16 raw bytes), so Voyager bridge_polars returns bytes while the official DuckDB client returns uuid.UUID.",
+    "match": "type mismatch: actual bytes"
   }
 ]

@@ -162,21 +162,6 @@ def _decode_columnar_value(
     v_enc = meta.get("voyager.encoding")
     v_type = meta.get("voyager.type")
 
-    if isinstance(reference, uuid.UUID):
-        if isinstance(raw, bytes) and len(raw) == 16:
-            return uuid.UUID(bytes=raw)
-        if isinstance(raw, str):
-            try:
-                return uuid.UUID(raw)
-            except ValueError:
-                pass
-    if v_type == "hugeint" and isinstance(raw, Decimal):
-        return int(raw)
-    if isinstance(raw, Decimal) and isinstance(reference, int) and raw == raw.to_integral_value():
-        return int(raw)
-    if is_polars and isinstance(raw, str) and isinstance(reference, datetime.time):
-        return _hydrate_time(raw)
-
     if v_enc == "json" or (
         is_polars
         and isinstance(raw, str)
@@ -222,8 +207,6 @@ def _decode_columnar_value(
             )
             for idx, (r_item, ref_item) in enumerate(zip(raw, reference, strict=False))
         ]
-    if is_polars and value_kind == "uuid" and isinstance(raw, bytes) and len(raw) == 16:
-        return uuid.UUID(bytes=raw)
     if v_type == "date" and isinstance(raw, str):
         return _hydrate_date(raw)
     if v_type == "time_tz" and isinstance(raw, str):
