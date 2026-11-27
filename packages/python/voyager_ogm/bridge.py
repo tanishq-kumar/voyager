@@ -45,9 +45,6 @@ _PAGINATION_PARAMETER_PATTERN = re.compile(
 #: Statements that need the DuckPGQ extension loaded on the DuckDB connection.
 _DUCKPGQ_STATEMENT_PATTERN = re.compile(r"\bGRAPH_TABLE\b|\bPROPERTY\s+GRAPH\b", re.IGNORECASE)
 
-#: DuckDB 2.0+ requires an explicit opt-in before DuckPGQ's SQL/PGQ grammar parses.
-_DUCKPGQ_GRAMMAR_STATEMENT = "SET active_grammar_extensions = ['duckpgq'];"
-
 #: Cypher bulk plans that DuckDB cannot parse; ingest them as relational rows instead.
 _CYPHER_BULK_STATEMENT_PATTERN = re.compile(r"^\s*UNWIND\b", re.IGNORECASE)
 
@@ -1666,10 +1663,72 @@ def _adapt_duckdb_parameters(statement: str, params: dict[str, Any]) -> dict[str
     }
 
 
+_DUCKDB_TIMETZ_TYPE_IDS = frozenset({"time with time zone"})
+_DUCKDB_INTERVAL_TYPE_IDS = frozenset({"interval", "timedelta"})
+
+
+def _duckdb_type_id(dtype: Any) -> str:
+    """Returns the normalized DuckDB type identifier for a type object or string."""
+    raw_id = getattr(dtype, "id", None)
+    if raw_id is not None:
+        # DuckDB's JSON logical type reports id='varchar' while str(dtype) == 'JSON'.
+        if str(dtype).strip().upper() == "JSON":
+            return "json"
+        return str(raw_id).lower()
+    text = str(dtype).strip().upper()
+    for prefix in (
+        "TIME WITH TIME ZONE",
+        "UHUGEINT",
+        "HUGEINT",
+        "INTERVAL",
+        "TIMEDELTA",
+        "UUID",
+        "JSON",
+    ):
+        if text == prefix or text.startswith((f"{prefix}[", f"{prefix}(")):
+            return prefix.lower()
+    return text.lower()
+
+
+def _duckdb_type_children_map(dtype: Any, expected_id: str) -> dict[str, Any]:
+    """Returns a ``name -> child_type`` mapping for nested DuckDB types matching ``expected_id``."""
+    if _duckdb_type_id(dtype) == expected_id and hasattr(dtype, "children"):
+        children: Sequence[tuple[Any, Any]] = dtype.children
+        return {str(name): child for name, child in children}
+    return {}
+
+
+def _duckdb_type_has(dtype: Any, target_ids: frozenset[str]) -> bool:
+    """Returns whether ``dtype`` is or recursively contains any type in ``target_ids``."""
+    tid = _duckdb_type_id(dtype)
+    if tid in target_ids:
+        return True
+    if hasattr(dtype, "id"):
+        if tid in ("list", "array", "struct", "map", "union"):
+            for name, child in dtype.children:
+                if tid == "array" and name == "size":
+                    continue
+                if tid == "union" and not name:
+                    continue
+                if _duckdb_type_has(child, target_ids):
+                    return True
+        return False
+    upper = str(dtype).upper()
+    return any(target.upper() in upper for target in target_ids)
+
+
 def _duckdb_description_has_timetz(description: Sequence[Any]) -> bool:
-    """Returns whether a DuckDB cursor description contains a ``TIMETZ`` column."""
+    """Returns whether a DuckDB cursor description contains ``TIMETZ`` anywhere."""
     return any(
-        len(item) > 1 and "TIME WITH TIME ZONE" in str(item[1]).upper() for item in description
+        len(item) > 1 and _duckdb_type_has(item[1], _DUCKDB_TIMETZ_TYPE_IDS) for item in description
+    )
+
+
+def _duckdb_description_has_interval(description: Sequence[Any]) -> bool:
+    """Returns whether a DuckDB cursor description contains ``INTERVAL`` anywhere."""
+    return any(
+        len(item) > 1 and _duckdb_type_has(item[1], _DUCKDB_INTERVAL_TYPE_IDS)
+        for item in description
     )
 
 
@@ -1678,25 +1737,60 @@ def _duckdb_quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _duckdb_timetz_cast_sql(dtype: Any) -> str:
+    """Builds a DuckDB SQL type replacing nested ``TIME WITH TIME ZONE`` with ``VARCHAR``."""
+    tid = _duckdb_type_id(dtype)
+    if tid == "time with time zone":
+        return "VARCHAR"
+    if hasattr(dtype, "id"):
+        if tid == "list":
+            return f"{_duckdb_timetz_cast_sql(dtype.children[0][1])}[]"
+        if tid == "array":
+            children = dict(dtype.children)
+            return f"{_duckdb_timetz_cast_sql(children['child'])}[{children['size']}]"
+        if tid == "struct":
+            fields = ", ".join(
+                f"{_duckdb_quote_identifier(str(name))} {_duckdb_timetz_cast_sql(child)}"
+                for name, child in dtype.children
+            )
+            return f"STRUCT({fields})"
+        if tid == "map":
+            children = dict(dtype.children)
+            return (
+                f"MAP({_duckdb_timetz_cast_sql(children['key'])}, "
+                f"{_duckdb_timetz_cast_sql(children['value'])})"
+            )
+        if tid == "union":
+            fields = ", ".join(
+                f"{_duckdb_quote_identifier(str(name))} {_duckdb_timetz_cast_sql(child)}"
+                for name, child in dtype.children
+                if name
+            )
+            return f"UNION({fields})"
+        return str(dtype)
+    upper = str(dtype).upper()
+    depth = upper.count("[")
+    return "VARCHAR" + "[]" * depth
+
+
 def _duckdb_timetz_projection(description: Sequence[Any]) -> str | None:
-    """Builds a projection that casts ``TIMETZ`` columns to ISO text.
+    """Builds a projection that casts top-level or nested ``TIMETZ`` values to ISO text.
 
     DuckDB's Arrow export maps ``TIME WITH TIME ZONE`` to a plain ``time64`` and
     loses the offset, while its DB-API rows fold calendar ``INTERVAL`` months
-    into 30-day ``timedelta`` values. Projecting only the ``TIMETZ`` columns to
-    ``VARCHAR`` with positional references keeps the Arrow export (and therefore
-    ``month_day_nano_interval`` precision) for every other column.
+    into 30-day ``timedelta`` values. Projecting only columns containing ``TIMETZ``
+    to ``VARCHAR`` (preserving outer ``LIST``/``ARRAY``/``STRUCT``/``MAP``/``UNION``
+    structure) keeps Arrow's ``month_day_nano_interval`` precision everywhere.
     """
     projections: list[str] = []
     has_timetz = False
     for idx, item in enumerate(description):
         name = str(item[0])
-        description_type = str(item[1]).upper() if len(item) > 1 else ""
+        dtype = item[1] if len(item) > 1 else ""
         alias = _duckdb_quote_identifier(name)
-        if description_type.startswith("TIME WITH TIME ZONE"):
+        if _duckdb_type_has(dtype, _DUCKDB_TIMETZ_TYPE_IDS):
             has_timetz = True
-            depth = description_type.count("[")
-            target_type = "VARCHAR" + "[]" * depth
+            target_type = _duckdb_timetz_cast_sql(dtype)
             projections.append(f"CAST(#{idx + 1} AS {target_type}) AS {alias}")
         else:
             projections.append(f"#{idx + 1} AS {alias}")
@@ -1705,38 +1799,12 @@ def _duckdb_timetz_projection(description: Sequence[Any]) -> str | None:
     return ", ".join(projections)
 
 
-def _duckdb_relation_description(relation: Any) -> tuple[tuple[str, str], ...]:
-    """Builds a DB-API-like description from a lazy DuckDB relation's types."""
+def _duckdb_relation_description(relation: Any) -> tuple[tuple[str, Any], ...]:
+    """Builds a DB-API-like description preserving DuckDB type objects from a relation."""
     return tuple(
-        (str(name), str(type_name))
-        for name, type_name in zip(relation.columns, relation.types, strict=True)
+        (str(name), type_obj)
+        for name, type_obj in zip(relation.columns, relation.types, strict=True)
     )
-
-
-def _duckdb_is_query_statement(statement: str) -> bool:
-    """Returns whether ``statement`` starts with a DuckDB query keyword."""
-    stripped = statement.lstrip()
-    if not stripped:
-        return False
-    first = stripped.split(None, 1)[0].lower()
-    return first in {"select", "with", "from", "values", "table", "pivot", "unpivot"}
-
-
-def _duckdb_is_single_query_statement(connection: Any, statement: str) -> bool:
-    """Returns whether ``statement`` is one query that a lazy relation can run.
-
-    Multiple statements, DML and statements that only the eager DB-API path
-    supports keep the single-execution ``execute()`` + DB-API row path.
-    """
-    if not _duckdb_is_query_statement(statement):
-        return False
-    extract = getattr(connection, "extract_statements", None)
-    if not callable(extract):
-        return ";" not in statement.strip().rstrip(";")
-    try:
-        return len(extract(statement)) == 1
-    except Exception:
-        return False
 
 
 def _duckdb_complete_pending(connection: Any) -> None:
@@ -1757,47 +1825,90 @@ def _duckdb_complete_pending(connection: Any) -> None:
 
 
 _DUCKDB_TIMETZ_TEXT_PATTERN = re.compile(
-    r"^(?P<time>\d{2}:\d{2}:\d{2})(?:\.(?P<fraction>\d{1,6}))?"
-    r"(?P<sign>[+-])(?P<hours>\d{2})(?::(?P<minutes>\d{2}))?(?::(?P<seconds>\d{2}))?$"
+    r"^(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:\.(?P<fraction>\d{1,6}))?"
+    r"(?P<tz>Z|z|(?P<sign>[+-])(?P<hours>\d{2})(?::?(?P<minutes>\d{2})(?::?(?P<seconds>\d{2}))?)?)$"
 )
 
 
-def _duckdb_timetz_text_iso(value: Any) -> Any:
-    """Normalizes DuckDB's ``TIMETZ`` text to ``datetime.time.isoformat()`` form.
+def _normalize_timetz_offset(match: re.Match[str], original: str) -> str:
+    """Validates and normalizes a matched ``TIMETZ`` UTC offset to ``±HH:MM[:SS]``."""
+    tz_raw = match.group("tz")
+    if tz_raw in ("Z", "z"):
+        return "+00:00"
+    sign = match.group("sign")
+    off_h = int(match.group("hours"))
+    off_m = int(match.group("minutes") or "0")
+    off_s = int(match.group("seconds") or "0")
+    if not (0 <= off_h <= 23 and 0 <= off_m <= 59 and 0 <= off_s <= 59):
+        raise ValueError(f"DuckDB TIMETZ UTC offset out of range: {original!r}")
+    if off_h == 0 and off_m == 0 and off_s == 0:
+        return "+00:00"
+    if off_s == 0:
+        return f"{sign}{off_h:02d}:{off_m:02d}"
+    return f"{sign}{off_h:02d}:{off_m:02d}:{off_s:02d}"
 
-    DuckDB renders a whole-hour offset as ``+02`` and trims trailing zeros from
-    fractional seconds, while ``datetime.time.isoformat`` always includes the
-    offset minutes (``+02:00``) and pads microseconds to six digits. Recurses
-    into ``TIMETZ[]`` lists and passes through NULLs and unrecognized text.
+
+def _duckdb_timetz_text_iso(value: Any) -> Any:
+    """Normalizes DuckDB's ``TIMETZ`` text to ISO-8601 ``HH:MM:SS[.ffffff]±HH:MM[:SS]`` form.
+
+    Accepts every valid DuckDB ``TIMETZ`` value, including ``24:00:00`` (which
+    Python's ``datetime.time`` cannot hold), fractional seconds up to 6 digits,
+    ``Z``, and ``±HH[:MM[:SS]]`` / ``±HHMM[SS]`` offsets. Recurses into
+    lists/tuples, passes through ``None``, and raises on non-string values or
+    text that is not a valid DuckDB ``TIMETZ``.
     """
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
         return [_duckdb_timetz_text_iso(item) for item in value]
     if not isinstance(value, str):
-        return value
+        raise TypeError(
+            f"Expected DuckDB TIMETZ text string, got {type(value).__name__}: {value!r}"
+        )
     match = _DUCKDB_TIMETZ_TEXT_PATTERN.match(value)
     if match is None:
-        return value
-    time_part = match.group("time")
+        raise ValueError(f"Unrecognized DuckDB TIMETZ text format: {value!r}")
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    second = int(match.group("second"))
     fraction = match.group("fraction")
-    if fraction is not None:
-        time_part += "." + fraction.ljust(6, "0")
-    offset = f"{match.group('sign')}{match.group('hours')}:{match.group('minutes') or '00'}"
-    seconds = match.group("seconds")
-    if seconds is not None and seconds != "00":
-        offset += f":{seconds}"
+    offset = _normalize_timetz_offset(match, value)
+    if hour == 24:
+        # DuckDB allows 24:00:00 (with optional zero fraction) across the full
+        # TIMETZ offset range, which Python's datetime.time cannot represent.
+        if minute != 0 or second != 0 or (fraction is not None and int(fraction) != 0):
+            raise ValueError(f"DuckDB TIMETZ value out of range: {value!r}")
+        return f"24:00:00{offset}"
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        raise ValueError(f"DuckDB TIMETZ value out of range: {value!r}")
+    frac_us = int(fraction.ljust(6, "0")) if fraction is not None else 0
+    time_part = f"{hour:02d}:{minute:02d}:{second:02d}"
+    if frac_us:
+        time_part += f".{frac_us:06d}"
     return f"{time_part}{offset}"
 
 
+def _parse_duckdb_timetz_python(value: Any) -> Any:
+    """Decodes DuckDB ``TIMETZ`` to ``datetime.time``, or ISO ``str`` when unrepresentable."""
+    if isinstance(value, datetime.time):
+        return value
+    iso = _duckdb_timetz_text_iso(value)
+    try:
+        return datetime.time.fromisoformat(iso)
+    except ValueError:
+        return iso
+
+
 def _duckdb_time_iso(value: Any) -> Any:
-    """Converts a ``datetime.time`` (or a nested list of them) to ISO text."""
+    """Converts a ``datetime.time`` (or nested container of them) to ISO text."""
     if isinstance(value, str):
         return _duckdb_timetz_text_iso(value)
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
         return [_duckdb_time_iso(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _duckdb_time_iso(v) for k, v in value.items()}
     return value.isoformat()
 
 
@@ -1831,25 +1942,90 @@ def _duckdb_uuid_column_to_arrow(column: Any, arrow_type: Any) -> Any:
     return pa.array(values, type=_duckdb_uuid_arrow_type(arrow_type))
 
 
+def _duckdb_canonicalize_arrow_array(arr: Any, dtype: Any) -> Any:
+    """Recursively converts nested ``TIMETZ`` text and ``month_day_nano_interval`` in an Arrow array."""
+    import pyarrow as pa
+
+    if _is_month_day_nano_interval(arr.type):
+        return _duckdb_mdn_column_to_arrow(arr)
+    tid = _duckdb_type_id(dtype)
+    if tid == "time with time zone":
+        return pa.array([_duckdb_timetz_text_iso(v) for v in arr.to_pylist()], type=pa.string())
+    if pa.types.is_list(arr.type):
+        child_dtype = dtype.children[0][1] if tid == "list" and hasattr(dtype, "children") else None
+        new_values = _duckdb_canonicalize_arrow_array(arr.values, child_dtype)
+        return pa.ListArray.from_arrays(arr.offsets, new_values, mask=arr.is_null())
+    if pa.types.is_large_list(arr.type):
+        child_dtype = dtype.children[0][1] if tid == "list" and hasattr(dtype, "children") else None
+        new_values = _duckdb_canonicalize_arrow_array(arr.values, child_dtype)
+        return pa.LargeListArray.from_arrays(arr.offsets, new_values, mask=arr.is_null())
+    if pa.types.is_fixed_size_list(arr.type):
+        child_dtype = _duckdb_type_children_map(dtype, "array").get("child")
+        new_values = _duckdb_canonicalize_arrow_array(arr.values, child_dtype)
+        return pa.FixedSizeListArray.from_arrays(new_values, arr.type.list_size, mask=arr.is_null())
+    if pa.types.is_struct(arr.type):
+        dtype_fields = _duckdb_type_children_map(dtype, "struct")
+        names = [f.name for f in arr.type]
+        new_fields = [
+            _duckdb_canonicalize_arrow_array(arr.field(i), dtype_fields.get(names[i]))
+            for i in range(arr.type.num_fields)
+        ]
+        return pa.StructArray.from_arrays(new_fields, names=names, mask=arr.is_null())
+    if pa.types.is_map(arr.type):
+        dtype_children = _duckdb_type_children_map(dtype, "map")
+        new_keys = _duckdb_canonicalize_arrow_array(arr.keys, dtype_children.get("key"))
+        new_items = _duckdb_canonicalize_arrow_array(arr.items, dtype_children.get("value"))
+        return pa.MapArray.from_arrays(arr.offsets, new_keys, new_items, mask=arr.is_null())
+    if pa.types.is_union(arr.type):
+        dtype_members = _duckdb_type_children_map(dtype, "union")
+        names = [f.name for f in arr.type]
+        new_children = [
+            _duckdb_canonicalize_arrow_array(arr.field(i), dtype_members.get(names[i]))
+            for i in range(arr.type.num_fields)
+        ]
+        codes = list(arr.type.type_codes)
+        if arr.type.mode == "dense":
+            return pa.UnionArray.from_dense(
+                arr.type_codes, arr.offsets, new_children, field_names=names, type_codes=codes
+            )
+        return pa.UnionArray.from_sparse(
+            arr.type_codes, new_children, field_names=names, type_codes=codes
+        )
+    return arr
+
+
+def _duckdb_canonicalize_arrow_column(column: Any, dtype: Any) -> Any:
+    """Canonicalizes an Arrow column (or ChunkedArray) preserving its schema even on 0 rows."""
+    import pyarrow as pa
+
+    if isinstance(column, pa.ChunkedArray):
+        if column.num_chunks == 0:
+            converted_empty = _duckdb_canonicalize_arrow_array(
+                pa.array([], type=column.type), dtype
+            )
+            return pa.chunked_array([], type=converted_empty.type)
+        return _duckdb_canonicalize_arrow_array(column.combine_chunks(), dtype)
+    return _duckdb_canonicalize_arrow_array(column, dtype)
+
+
 def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any]) -> Any:
     """Rewrites DuckDB Arrow columns to Voyager's documented export representations.
 
     ``UUID`` becomes ``fixed_size_binary(16)`` (Polars ``Binary``), ``JSON`` stays
     UTF-8 text tagged ``voyager.encoding=json``, ``TIMETZ`` stays ISO text tagged
     ``voyager.type=time_tz``, ``HUGEINT`` stays ``decimal128(38, 0)`` tagged
-    ``voyager.type=hugeint`` (Arrow has no int128), and calendar intervals become
-    ``month_day_nano_interval``-free duration columns.
+    ``voyager.type=hugeint`` (Arrow has no int128), and calendar intervals (top-level
+    or nested) become ``month_day_nano_interval``-free duration or struct columns.
     """
     import pyarrow as pa
 
     arrays = []
     fields = []
     for idx, field in enumerate(arrow_table.schema):
-        description_type = (
-            str(description[idx][1]).upper()
-            if idx < len(description) and len(description[idx]) > 1
-            else ""
+        dtype: Any = (
+            description[idx][1] if idx < len(description) and len(description[idx]) > 1 else ""
         )
+        description_type = str(dtype).upper()
         column = arrow_table.column(idx)
         metadata = dict(field.metadata) if field.metadata else {}
         if description_type == "UUID" or description_type.startswith("UUID["):
@@ -1879,12 +2055,10 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
             array = _duckdb_mdn_column_to_arrow(column)
             if pa.types.is_struct(array.type):
                 metadata[b"voyager.type"] = b"duration"
-        elif _arrow_has_month_day_nano_interval(field.type):
-            values = [
-                serialize_value_for_arrow(_normalize_duckdb_arrow_value(value, field.type))
-                for value in column.to_pylist()
-            ]
-            array = pa.array(values)
+        elif _duckdb_type_has(dtype, _DUCKDB_TIMETZ_TYPE_IDS) or _arrow_has_month_day_nano_interval(
+            field.type
+        ):
+            array = _duckdb_canonicalize_arrow_column(column, dtype)
         else:
             arrays.append(column)
             fields.append(field)
@@ -2003,7 +2177,19 @@ class DuckDbBridge:
 
     def _enable_duckpgq_grammar(self) -> None:
         """Opts this connection into DuckPGQ's SQL/PGQ grammar on DuckDB 2.0+."""
-        self.con.execute(_DUCKPGQ_GRAMMAR_STATEMENT)
+        extensions: list[str] = []
+        try:
+            row = self.con.execute("SELECT current_setting('active_grammar_extensions')").fetchone()
+        except Exception:
+            row = None
+        current = row[0] if row else None
+        if isinstance(current, (list, tuple)):
+            extensions = [str(item) for item in current]
+            if "duckpgq" in extensions:
+                return
+        extensions.append("duckpgq")
+        encoded = ", ".join(_encode_duckdb_literal(ext) for ext in extensions)
+        self.con.execute(f"SET active_grammar_extensions = [{encoded}];")
 
     def ensure_duckpgq(self, install: bool | None = None) -> None:
         """Loads DuckPGQ and its grammar on this connection once.
@@ -2095,20 +2281,40 @@ class DuckDbBridge:
             return stmt, {}
         return statement, parameters
 
+    def _execute_sql_relation(
+        self, stmt: str, params: dict[str, Any]
+    ) -> tuple[Any, Sequence[Any]] | None:
+        """Runs ``stmt`` once via ``con.sql`` when supported, returning ``(relation, description)``."""
+        sql_fn = getattr(self.con, "sql", None)
+        if not callable(sql_fn):
+            return None
+        _duckdb_complete_pending(self.con)
+        relation = sql_fn(stmt, params=params or None)
+        if relation is None:
+            return None, ()
+        return relation, _duckdb_relation_description(relation)
+
+    def _relation_arrow_table(self, relation: Any, description: Sequence[Any]) -> Any | None:
+        """Materializes ``relation`` as Arrow once, projecting any ``TIMETZ`` values to text."""
+        projection = _duckdb_timetz_projection(description)
+        if projection is not None:
+            return self._arrow_table(relation.project(projection))
+        return self._arrow_table(relation)
+
     def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         """Executes query on DuckDB.
 
         Preserves exact calendar ``months``, ``days``, ``seconds``, and
-        ``nanoseconds`` on ``INTERVAL`` columns by reading Arrow
-        ``month_day_nano_interval`` when an ``INTERVAL``/``TIMEDELTA`` column is
-        present in ``rel.description``. Queries without any top-level
-        ``INTERVAL`` column decode via ``rel.fetchall()`` (preserving native
-        Python ``int`` for ``HUGEINT`` and ``uuid.UUID`` inside ``UUID[]``), so
-        ``INTERVAL`` values nested solely inside ``LIST``/``STRUCT``/``MAP``
-        without a top-level ``INTERVAL`` column are approximated as
-        ``datetime.timedelta`` by DuckDB's DBAPI.
+        ``nanoseconds`` on ``INTERVAL`` values (top-level or nested in
+        ``LIST``/``ARRAY``/``STRUCT``/``MAP``/``UNION``) and retains ``TIMETZ``
+        UTC offsets by projecting ``TIMETZ`` to ISO text before reading Arrow
+        ``month_day_nano_interval``. Queries without any ``INTERVAL`` value
+        decode via ``fetchall()``. ``TIMETZ`` values representable by Python's
+        ``datetime.time`` decode as timezone-aware ``datetime.time`` objects,
+        while valid database values Python cannot hold (such as ``24:00:00``)
+        remain normalized ISO text strings (e.g. ``'24:00:00+00:00'``).
 
         Args:
             statement: Query statement.
@@ -2120,13 +2326,23 @@ class DuckDbBridge:
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         params = _adapt_duckdb_parameters(stmt, params)
+        sql_res = self._execute_sql_relation(stmt, params)
+        if sql_res is not None:
+            relation, description = sql_res
+            if relation is None or not description:
+                return BridgeResult([], columns=())
+            if _duckdb_description_has_interval(description):
+                arrow_table = self._relation_arrow_table(relation, description)
+                if arrow_table is not None:
+                    return _records_from_duckdb_arrow(description, arrow_table)
+            return _records_from_duckdb_rows(description, relation.fetchall())
+
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return BridgeResult([], columns=())
-        has_interval = any(
-            len(d) > 1 and str(d[1]).upper() in ("INTERVAL", "TIMEDELTA") for d in rel.description
-        )
-        if has_interval:
+        if _duckdb_description_has_interval(rel.description) and not _duckdb_description_has_timetz(
+            rel.description
+        ):
             arrow_table = self._arrow_table(rel)
             if arrow_table is not None:
                 return _records_from_duckdb_arrow(rel.description, arrow_table)
@@ -2137,39 +2353,32 @@ class DuckDbBridge:
 
         ``UUID`` columns use ``fixed_size_binary(16)`` (``arrow.uuid`` storage),
         ``JSON`` columns are UTF-8 JSON text tagged ``voyager.encoding=json``,
-        ``TIMETZ`` columns are ISO text tagged ``voyager.type=time_tz`` because
-        Arrow has no timezone-aware time type, and ``HUGEINT`` columns stay
-        ``decimal128(38, 0)`` tagged ``voyager.type=hugeint`` because Arrow has
-        no portable int128 type.
+        ``TIMETZ`` columns (and nested ``TIMETZ`` values) are ISO text tagged
+        ``voyager.type=time_tz`` because Arrow has no timezone-aware time type,
+        and ``HUGEINT`` columns stay ``decimal128(38, 0)`` tagged
+        ``voyager.type=hugeint`` because Arrow has no portable int128 type.
 
-        A single query statement runs once as a lazy relation: its columns and
-        types come from the relation itself, ``TIMETZ`` is projected to ISO text
-        there, and the result is materialized once. DML, multi-statement input
-        and statement kinds the eager DB-API path owns keep that path, which
-        also executes the statement once but decodes ``TIMETZ`` from DB-API rows.
+        Statements run once through ``con.sql`` (including single queries, DML
+        ``RETURNING``, and multi-statement SQL), projecting any top-level or
+        nested ``TIMETZ`` to ISO text before one Arrow materialization so
+        calendar ``INTERVAL`` months are preserved everywhere. Connections without
+        ``sql()`` fall back to the single-execution DB-API path.
         """
         import pyarrow as pa
 
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         params = _adapt_duckdb_parameters(stmt, params)
-        if _duckdb_is_single_query_statement(self.con, stmt):
-            _duckdb_complete_pending(self.con)
-            relation = self.con.sql(stmt, params=params or None)
-            if relation is None:
+        sql_res = self._execute_sql_relation(stmt, params)
+        if sql_res is not None:
+            relation, description = sql_res
+            if relation is None or not description:
                 return pa.Table.from_pylist([])
-            description = _duckdb_relation_description(relation)
-            projection = _duckdb_timetz_projection(description)
-            if projection is not None:
-                try:
-                    arrow_table = relation.project(projection).to_arrow_table()
-                except Exception:
-                    return _duckdb_rows_to_arrow(description, relation.fetchall())
-            else:
-                arrow_table = self._arrow_table(relation)
-                if arrow_table is None:
-                    return _duckdb_rows_to_arrow(description, relation.fetchall())
+            arrow_table = self._relation_arrow_table(relation, description)
+            if arrow_table is None:
+                return _duckdb_rows_to_arrow(description, relation.fetchall())
             return _duckdb_arrow_table_to_canonical(arrow_table, description)
+
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return pa.Table.from_pylist([])
@@ -2186,10 +2395,9 @@ class DuckDbBridge:
     ) -> pl.DataFrame:
         """Executes query and streams to Polars DataFrame from the Arrow result.
 
-        A single query statement runs once as a lazy relation; a ``TIMETZ``
-        column is projected to ISO text on that relation so the rest of the
-        result still streams from Arrow instead of DB-API rows. DML and
-        multi-statement input keep the eager DB-API path (also one execution).
+        Statements run once through ``con.sql``; top-level or nested ``TIMETZ``
+        values are projected to ISO text on that relation so calendar ``INTERVAL``
+        months still stream from Arrow instead of DB-API rows.
 
         ``UUID`` columns are ``Binary`` (16 bytes), ``TIMETZ`` and ``JSON``
         columns are UTF-8 text (Polars strips Arrow field metadata), and
@@ -2206,29 +2414,20 @@ class DuckDbBridge:
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         params = _adapt_duckdb_parameters(stmt, params)
-        if _duckdb_is_single_query_statement(self.con, stmt):
-            _duckdb_complete_pending(self.con)
-            relation = self.con.sql(stmt, params=params or None)
-            if relation is None:
+        sql_res = self._execute_sql_relation(stmt, params)
+        if sql_res is not None:
+            relation, description = sql_res
+            if relation is None or not description:
                 return pl.DataFrame()
-            description = _duckdb_relation_description(relation)
-            projection = _duckdb_timetz_projection(description)
-            if projection is not None:
-                try:
-                    arrow_table = relation.project(projection).to_arrow_table()
-                except Exception:
-                    return _duckdb_arrow_table_to_polars(
-                        _duckdb_rows_to_arrow(description, relation.fetchall())
-                    )
-            else:
-                arrow_table = self._arrow_table(relation)
-                if arrow_table is None:
-                    return _duckdb_arrow_table_to_polars(
-                        _duckdb_rows_to_arrow(description, relation.fetchall())
-                    )
+            arrow_table = self._relation_arrow_table(relation, description)
+            if arrow_table is None:
+                return _duckdb_arrow_table_to_polars(
+                    _duckdb_rows_to_arrow(description, relation.fetchall())
+                )
             return _duckdb_arrow_table_to_polars(
                 _duckdb_arrow_table_to_canonical(arrow_table, description)
             )
+
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return pl.DataFrame()
@@ -2789,28 +2988,56 @@ def _is_month_day_nano_interval(arrow_type: Any) -> bool:
     return bool(arrow_type == pa.month_day_nano_interval())
 
 
-def _normalize_duckdb_arrow_value(val: Any, arrow_type: Any) -> Any:
-    """Normalizes a Python value extracted from a DuckDB PyArrow table."""
+def _decode_duckdb_arrow_python_value(val: Any, arrow_type: Any, dtype: Any) -> Any:
+    """Decodes a Python value from a DuckDB PyArrow table, preserving TIMETZ, HUGEINT, UUID, and Duration."""
+    import uuid as _uuid
+
     import pyarrow as pa
 
     if val is None:
         return None
+    tid = _duckdb_type_id(dtype)
+    if tid == "time with time zone":
+        return _parse_duckdb_timetz_python(val)
+    if tid in ("hugeint", "uhugeint"):
+        return int(val)
+    if tid == "uuid":
+        if isinstance(val, _uuid.UUID):
+            return val
+        if isinstance(val, bytes):
+            return _uuid.UUID(bytes=val)
+        return _uuid.UUID(str(val))
     if _is_month_day_nano_interval(arrow_type):
         return _duckdb_mdn_to_duration(val)
     if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
-        elem_type = arrow_type.value_type
-        return [_normalize_duckdb_arrow_value(item, elem_type) for item in val]
+        child_dtype = dtype.children[0][1] if tid == "list" and hasattr(dtype, "children") else ""
+        return [
+            _decode_duckdb_arrow_python_value(item, arrow_type.value_type, child_dtype)
+            for item in val
+        ]
+    if pa.types.is_fixed_size_list(arrow_type):
+        child_dtype = _duckdb_type_children_map(dtype, "array").get("child", "")
+        return tuple(
+            _decode_duckdb_arrow_python_value(item, arrow_type.value_type, child_dtype)
+            for item in val
+        )
     if pa.types.is_map(arrow_type):
-        key_type = arrow_type.key_type
-        item_type = arrow_type.item_type
+        children = _duckdb_type_children_map(dtype, "map")
+        key_dtype = children.get("key", "")
+        item_dtype = children.get("value", "")
         return {
-            _normalize_duckdb_arrow_value(k, key_type): _normalize_duckdb_arrow_value(v, item_type)
+            _decode_duckdb_arrow_python_value(
+                k, arrow_type.key_type, key_dtype
+            ): _decode_duckdb_arrow_python_value(v, arrow_type.item_type, item_dtype)
             for k, v in val
         }
     if pa.types.is_struct(arrow_type):
+        dtype_fields = _duckdb_type_children_map(dtype, "struct")
         field_map = {field.name: field.type for field in arrow_type}
         return {
-            k: _normalize_duckdb_arrow_value(v, field_map[k]) if k in field_map else v
+            k: _decode_duckdb_arrow_python_value(v, field_map[k], dtype_fields.get(k, ""))
+            if k in field_map
+            else v
             for k, v in val.items()
         }
     return _normalize_duckdb_value(val)
@@ -2821,33 +3048,42 @@ def _records_from_duckdb_rows(
 ) -> BridgeResult:
     """Builds a :class:`BridgeResult` from an already-fetched DuckDB cursor."""
     cols = [str(d[0]) for d in description]
-    json_cols = {
-        idx for idx, d in enumerate(description) if len(d) > 1 and str(d[1]).upper() == "JSON"
-    }
+    dtypes = [d[1] if len(d) > 1 else "" for d in description]
+    json_cols = {idx for idx, dt in enumerate(dtypes) if _duckdb_type_id(dt) == "json"}
     records: list[dict[str, Any]] = []
     for row in rows:
         rec: dict[str, Any] = {}
         for idx, (col, val) in enumerate(zip(cols, row, strict=False)):
             if idx in json_cols and isinstance(val, str):
                 val = json.loads(val)
-            rec[col] = _normalize_duckdb_value(val)
+            dtype = dtypes[idx] if idx < len(dtypes) else ""
+            rec[col] = _normalize_duckdb_value(val, dtype)
         records.append(rec)
     return BridgeResult(records, columns=cols)
 
 
 def _records_from_duckdb_arrow(description: Sequence[Any], arrow_table: Any) -> BridgeResult:
     """Builds a :class:`BridgeResult` from a DuckDB PyArrow table, preserving interval months."""
-    import uuid as _uuid
+    import pyarrow as pa
 
     cols = [str(d[0]) for d in description]
-    json_cols = {
-        idx for idx, d in enumerate(description) if len(d) > 1 and str(d[1]).upper() == "JSON"
-    }
-    uuid_cols = {
-        idx for idx, d in enumerate(description) if len(d) > 1 and str(d[1]).upper() == "UUID"
-    }
+    dtypes = [d[1] if len(d) > 1 else "" for d in description]
+    json_cols = {idx for idx, dt in enumerate(dtypes) if _duckdb_type_id(dt) == "json"}
     schema = arrow_table.schema
     col_lists = [arrow_table.column(idx).to_pylist() for idx in range(len(cols))]
+    union_meta: dict[int, tuple[list[int], dict[int, tuple[Any, Any]]]] = {}
+    for col_idx in range(len(cols)):
+        field_type = schema.field(col_idx).type
+        if pa.types.is_union(field_type):
+            col = arrow_table.column(col_idx)
+            arr = col.combine_chunks() if col.num_chunks > 0 else pa.array([], type=field_type)
+            dtype = dtypes[col_idx]
+            dtype_members = _duckdb_type_children_map(dtype, "union")
+            member_map = {
+                code: (field_type.field(i).type, dtype_members.get(field_type.field(i).name, ""))
+                for i, code in enumerate(field_type.type_codes)
+            }
+            union_meta[col_idx] = (arr.type_codes.to_pylist(), member_map)
     num_rows = arrow_table.num_rows
     records: list[dict[str, Any]] = []
     for row_idx in range(num_rows):
@@ -2857,10 +3093,14 @@ def _records_from_duckdb_arrow(description: Sequence[Any], arrow_table: Any) -> 
             if val is not None:
                 if col_idx in json_cols and isinstance(val, str):
                     val = json.loads(val)
-                elif col_idx in uuid_cols and isinstance(val, str):
-                    val = _uuid.UUID(val)
+                elif col_idx in union_meta:
+                    codes, member_map = union_meta[col_idx]
+                    member_arrow_type, member_dtype = member_map[codes[row_idx]]
+                    val = _decode_duckdb_arrow_python_value(val, member_arrow_type, member_dtype)
                 else:
-                    val = _normalize_duckdb_arrow_value(val, schema.field(col_idx).type)
+                    val = _decode_duckdb_arrow_python_value(
+                        val, schema.field(col_idx).type, dtypes[col_idx]
+                    )
             rec[col] = val
         records.append(rec)
     return BridgeResult(records, columns=cols)
@@ -2872,9 +3112,13 @@ def _arrow_has_month_day_nano_interval(arrow_type: Any) -> bool:
 
     if _is_month_day_nano_interval(arrow_type):
         return True
-    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+    if (
+        pa.types.is_list(arrow_type)
+        or pa.types.is_large_list(arrow_type)
+        or pa.types.is_fixed_size_list(arrow_type)
+    ):
         return _arrow_has_month_day_nano_interval(arrow_type.value_type)
-    if pa.types.is_struct(arrow_type):
+    if pa.types.is_struct(arrow_type) or pa.types.is_union(arrow_type):
         return any(_arrow_has_month_day_nano_interval(f.type) for f in arrow_type)
     if pa.types.is_map(arrow_type):
         return _arrow_has_month_day_nano_interval(
@@ -2964,9 +3208,7 @@ def _duckdb_arrow_table_to_polars(arrow_table: Any) -> pl.DataFrame:
                 pa.field(field.name, arr.type, nullable=field.nullable, metadata=meta or None)
             )
         elif _arrow_has_month_day_nano_interval(field.type):
-            py_vals = [_normalize_duckdb_arrow_value(v, field.type) for v in col.to_pylist()]
-            converted_vals = [serialize_value_for_arrow(v) for v in py_vals]
-            arr = pa.array(converted_vals)
+            arr = _duckdb_canonicalize_arrow_column(col, "")
             new_cols.append(arr)
             new_fields.append(pa.field(field.name, arr.type, nullable=field.nullable))
         else:
@@ -2978,14 +3220,59 @@ def _duckdb_arrow_table_to_polars(arrow_table: Any) -> pl.DataFrame:
     )
 
 
-def _normalize_duckdb_value(val: Any) -> Any:
-    """Normalizes DuckDB Python values (converting ``timedelta`` to :class:`Duration`)."""
+def _duckdb_list_child_dtype(dtype: Any, tid: str) -> Any:
+    """Returns the element type of a DuckDB ``LIST`` type or type string."""
+    if tid == "list" and hasattr(dtype, "children"):
+        return dtype.children[0][1]
+    if isinstance(dtype, str):
+        text = dtype.strip()
+        if text.endswith("[]"):
+            return text[:-2]
+    return ""
+
+
+def _duckdb_array_child_dtype(dtype: Any, tid: str) -> Any:
+    """Returns the element type of a DuckDB fixed-size ``ARRAY`` type or type string."""
+    if tid == "array":
+        return _duckdb_type_children_map(dtype, "array").get("child", "")
+    if isinstance(dtype, str):
+        text = dtype.strip()
+        if text.endswith("]") and not text.endswith("[]") and "[" in text:
+            return text[: text.rfind("[")]
+    return ""
+
+
+def _normalize_duckdb_value(val: Any, dtype: Any = "") -> Any:
+    """Normalizes DuckDB Python values (converting ``timedelta`` and ``TIMETZ``)."""
+    if val is None:
+        return None
+    tid = _duckdb_type_id(dtype) if dtype else ""
+    if tid == "time with time zone":
+        return _parse_duckdb_timetz_python(val)
     if isinstance(val, datetime.timedelta):
         return Duration.from_timedelta(val)
     if isinstance(val, list):
-        return [_normalize_duckdb_value(item) for item in val]
+        child_dtype = _duckdb_list_child_dtype(dtype, tid)
+        return [_normalize_duckdb_value(item, child_dtype) for item in val]
+    if isinstance(val, tuple):
+        child_dtype = _duckdb_array_child_dtype(dtype, tid)
+        return tuple(_normalize_duckdb_value(item, child_dtype) for item in val)
     if isinstance(val, dict):
-        return {k: _normalize_duckdb_value(v) for k, v in val.items()}
+        if tid == "map":
+            children = _duckdb_type_children_map(dtype, "map")
+            key_dtype = children.get("key", "")
+            val_dtype = children.get("value", "")
+            return {
+                _normalize_duckdb_value(k, key_dtype): _normalize_duckdb_value(v, val_dtype)
+                for k, v in val.items()
+            }
+        dtype_fields = _duckdb_type_children_map(dtype, "struct")
+        return {k: _normalize_duckdb_value(v, dtype_fields.get(k, "")) for k, v in val.items()}
+    if tid == "union" and isinstance(val, str) and _duckdb_type_has(dtype, _DUCKDB_TIMETZ_TYPE_IDS):
+        try:
+            return _parse_duckdb_timetz_python(val)
+        except (TypeError, ValueError):
+            return val
     return val
 
 

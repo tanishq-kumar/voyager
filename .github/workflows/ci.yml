@@ -374,8 +374,42 @@ jobs:
       - name: Build Native Python Extension (maturin develop)
         run: uv run --all-extras --no-extra cli --python ${{ matrix.python-version }} maturin develop --uv
 
+      - name: Cache DuckDB Extensions (DuckPGQ)
+        if: runner.os == 'Linux' || runner.os == 'Windows' || (runner.os == 'macOS' && runner.arch == 'ARM64')
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.duckdb/extensions
+          key: duckpgq-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install DuckPGQ Extension
+        id: duckpgq
+        if: runner.os == 'Linux' || runner.os == 'Windows' || (runner.os == 'macOS' && runner.arch == 'ARM64')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if uv run --all-extras --no-extra cli --python ${{ matrix.python-version }} python -c "import duckdb; con = duckdb.connect(':memory:'); con.execute('INSTALL duckpgq FROM community; LOAD duckpgq;')"; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ runner.os }}" == "Linux" ]]; then
+            echo "::error::Failed to install duckpgq extension on Linux"
+            exit 1
+          else
+            echo "::warning::Skipping live DuckPGQ tests: duckpgq extension unavailable on ${{ runner.os }}/${{ runner.arch }}"
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Pytest Suite (Unit & Functional Tests)
         run: uv run --all-extras --no-extra cli --python ${{ matrix.python-version }} pytest -m "not live"
+
+      - name: Run Live DuckPGQ Tests
+        if: steps.duckpgq.outputs.installed == 'true'
+        run: >-
+          uv run --all-extras --no-extra cli --python ${{ matrix.python-version }}
+          pytest -m live -k "duckpgq and not parity"
+
+      - name: Skip Live DuckPGQ Tests (Unsupported Platform)
+        if: steps.duckpgq.outputs.installed != 'true'
+        run: |
+          echo "Skipping live DuckPGQ tests: DuckPGQ extension is not installed/supported on ${{ runner.os }}/${{ runner.arch }}."
 
   # =========================================================================
   # 4b. Base-Only Wheel Install Smoke Test (no optional extras)
