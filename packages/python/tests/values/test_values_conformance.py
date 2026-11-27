@@ -207,8 +207,6 @@ def _decode_columnar_value(
             )
             for idx, (r_item, ref_item) in enumerate(zip(raw, reference, strict=False))
         ]
-    if is_polars and value_kind == "uuid" and isinstance(raw, bytes) and len(raw) == 16:
-        return uuid.UUID(bytes=raw)
     if v_type == "date" and isinstance(raw, str):
         return _hydrate_date(raw)
     if v_type == "time_tz" and isinstance(raw, str):
