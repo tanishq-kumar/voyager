@@ -1181,17 +1181,206 @@ fn test_bolt_mixed_numeric_routing_legacy_0x66_and_bolt_rows_flag() {
         "2024-01-02T03:04:05.123456[Europe/Berlin]"
     );
 
-    // Legacy 0x66 routes to datetime_tz Utf8 fallback (not UTC Arrow Timestamp)
+    // Legacy 0x66 with a valid IANA zone converts local wall-clock seconds to UTC Timestamp
     let dtz_batch = build_bolt_record_batch(&["dt".to_string()], &[vec![decoded.clone()]]).unwrap();
-    assert_eq!(dtz_batch.schema().field(0).data_type(), &DataType::Utf8);
     assert_eq!(
-        dtz_batch
+        dtz_batch.schema().field(0).data_type(),
+        &DataType::Timestamp(
+            arrow_schema::TimeUnit::Microsecond,
+            Some("Europe/Berlin".into())
+        )
+    );
+    let ts_col = dtz_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+        .unwrap();
+    // 2024-01-02T03:04:05.123456 Europe/Berlin (+01:00) == 2024-01-02T02:04:05.123456Z
+    assert_eq!(ts_col.value(0), 1_704_161_045_123_456);
+    assert!(!batch_needs_bolt_rows(&dtz_batch));
+}
+
+#[test]
+fn test_build_bolt_record_batch_points_and_point_lists() {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+
+    let cols = vec![
+        "p2".to_string(),
+        "p3".to_string(),
+        "mixed_dim".to_string(),
+        "plist".to_string(),
+    ];
+    let pt2 = BoltValue::Point2D(BoltPoint2D {
+        srid: srid::WGS_84_2D,
+        x: 13.405,
+        y: 52.52,
+    });
+    let pt3 = BoltValue::Point3D(BoltPoint3D {
+        srid: srid::CARTESIAN_3D,
+        x: 1.0,
+        y: 2.0,
+        z: 3.5,
+    });
+    let rows = vec![
+        vec![
+            pt2.clone(),
+            pt3.clone(),
+            pt2.clone(),
+            BoltValue::List(vec![pt2.clone(), BoltValue::Null, pt3.clone()]),
+        ],
+        vec![BoltValue::Null, pt3.clone(), pt3.clone(), BoltValue::Null],
+    ];
+    let batch = build_bolt_record_batch(&cols, &rows).unwrap();
+    let schema = batch.schema();
+
+    for idx in 0..3 {
+        assert!(matches!(schema.field(idx).data_type(), DataType::Struct(_)));
+        assert_eq!(
+            schema
+                .field(idx)
+                .metadata()
+                .get("voyager.type")
+                .map(String::as_str),
+            Some("point")
+        );
+    }
+    let p2_struct = batch.column(0).as_struct();
+    assert!(!p2_struct.is_null(0));
+    assert!(p2_struct.is_null(1));
+    assert_eq!(
+        p2_struct
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0),
+        4326
+    );
+    assert!(p2_struct.column(3).is_null(0));
+
+    let p3_struct = batch.column(1).as_struct();
+    assert_eq!(
+        p3_struct
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap()
+            .value(0),
+        3.5
+    );
+
+    assert!(matches!(schema.field(3).data_type(), DataType::List(_)));
+    let plist_col = batch.column(3).as_list::<i32>();
+    assert!(plist_col.is_null(1));
+    let row0_list = plist_col.value(0);
+    assert_eq!(row0_list.len(), 3);
+    assert!(row0_list.is_null(1));
+    assert!(!voyager_drivers::bolt::canonical::batch_needs_bolt_rows(
+        &batch
+    ));
+}
+
+#[test]
+fn test_legacy_0x66_wire_bytes_and_negative_durations() {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
+    use arrow_schema::{DataType, TimeUnit};
+    use bytes::BufMut;
+
+    // Raw PackStream struct: 0xB3 (3-field struct), 0x66 (legacy DateTimeZoneId)
+    let local_secs: i64 = 1_704_164_645; // 2024-01-02T03:04:05
+    let mut raw_bytes = BytesMut::new();
+    raw_bytes.put_u8(0xB3);
+    raw_bytes.put_u8(0x66);
+    PackStream::encode(&BoltValue::Integer(local_secs), &mut raw_bytes);
+    PackStream::encode(&BoltValue::Integer(123_456_000), &mut raw_bytes);
+    PackStream::encode(
+        &BoltValue::String("Europe/Berlin".to_string()),
+        &mut raw_bytes,
+    );
+
+    let decoded_berlin = PackStream::decode(&mut raw_bytes.freeze()).unwrap();
+    let mut ny_bytes = BytesMut::new();
+    ny_bytes.put_u8(0xB3);
+    ny_bytes.put_u8(0x66);
+    PackStream::encode(&BoltValue::Integer(local_secs), &mut ny_bytes);
+    PackStream::encode(&BoltValue::Integer(123_456_000), &mut ny_bytes);
+    PackStream::encode(
+        &BoltValue::String("America/New_York".to_string()),
+        &mut ny_bytes,
+    );
+    let decoded_ny = PackStream::decode(&mut ny_bytes.freeze()).unwrap();
+
+    // Mixed-zone 0x66 falls back to Utf8 with resolved offsets (never offset-less!)
+    let fallback_batch = build_bolt_record_batch(
+        &["dt".to_string()],
+        &[vec![decoded_berlin.clone()], vec![decoded_ny]],
+    )
+    .unwrap();
+    assert_eq!(
+        fallback_batch.schema().field(0).data_type(),
+        &DataType::Utf8
+    );
+    let strs = fallback_batch.column(0).as_string::<i32>();
+    assert_eq!(
+        strs.value(0),
+        "2024-01-02T03:04:05.123456+01:00[Europe/Berlin]"
+    );
+    assert_eq!(
+        strs.value(1),
+        "2024-01-02T03:04:05.123456-05:00[America/New_York]"
+    );
+
+    // Canonical JSON (used inside maps/entities) also includes resolved offset for legacy 0x66
+    assert_eq!(
+        bolt_value_to_canonical_json(&decoded_berlin),
+        serde_json::Value::String("2024-01-02T03:04:05.123456+01:00[Europe/Berlin]".to_string())
+    );
+
+    // Negative sub-second duration preserves exact components via Struct(months, days, seconds, nanoseconds)
+    let neg_sub = BoltValue::Duration(BoltDuration::new(0, 0, 0, -1_000));
+    let pos_dur = BoltValue::Duration(BoltDuration::new(0, 0, 5, 0));
+    let dur_batch = build_bolt_record_batch(
+        &["neg".to_string(), "pos".to_string()],
+        &[vec![neg_sub, pos_dur]],
+    )
+    .unwrap();
+    assert!(matches!(
+        dur_batch.schema().field(0).data_type(),
+        DataType::Struct(_)
+    ));
+    assert_eq!(
+        dur_batch
             .schema()
             .field(0)
             .metadata()
             .get("voyager.type")
             .map(String::as_str),
-        Some("datetime_tz")
+        Some("duration")
     );
-    assert!(!batch_needs_bolt_rows(&dtz_batch));
+    let neg_struct = dur_batch.column(0).as_struct();
+    assert_eq!(
+        neg_struct
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0),
+        0 // days=0 (not normalized to -1!)
+    );
+    assert_eq!(
+        neg_struct
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0),
+        -1_000
+    );
+    assert_eq!(
+        dur_batch.schema().field(1).data_type(),
+        &DataType::Duration(TimeUnit::Microsecond)
+    );
 }

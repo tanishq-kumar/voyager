@@ -35,6 +35,8 @@ async fn test_live_memgraph_bolt_crud_and_arrow() {
         .expect("Failed to connect to live Memgraph");
 
     assert!(conn.is_valid());
+    assert_eq!(conn.version().major, 5);
+    assert_eq!(conn.version().minor, 2);
     if let Some(agent) = conn.server_agent() {
         println!("Connected to live Memgraph agent: {}", agent);
     }

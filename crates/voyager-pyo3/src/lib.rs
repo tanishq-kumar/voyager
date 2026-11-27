@@ -2920,6 +2920,7 @@ struct EntityConstructors {
     decimal_cls: Py<PyAny>,
     zoneinfo_cls: Py<PyAny>,
     duration_cls: Py<PyAny>,
+    point_cls: Py<PyAny>,
     parse_pg_interval_fn: Py<PyAny>,
 }
 
@@ -2952,6 +2953,7 @@ fn entity_constructors<'py>(py: Python<'py>) -> PyResult<&'py EntityConstructors
             decimal_cls: dec_mod.getattr("Decimal")?.unbind(),
             zoneinfo_cls: zi_mod.getattr("ZoneInfo")?.unbind(),
             duration_cls: types_mod.getattr("Duration")?.unbind(),
+            point_cls: types_mod.getattr("Point")?.unbind(),
             parse_pg_interval_fn: types_mod.getattr("parse_pg_interval_text")?.unbind(),
         })
     })
@@ -3719,6 +3721,27 @@ fn bolt_rel_to_py<'py>(
     ))
 }
 
+fn bolt_point_to_py<'py>(
+    py: Python<'py>,
+    srid: i64,
+    x: f64,
+    y: f64,
+    z_opt: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let ctors = entity_constructors(py)?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("srid", srid)?;
+    kwargs.set_item("x", x)?;
+    kwargs.set_item("y", y)?;
+    if let Some(z) = z_opt {
+        kwargs.set_item("z", z)?;
+    }
+    match ctors.point_cls.bind(py).call((), Some(&kwargs)) {
+        Ok(pt) => Ok(pt),
+        Err(_) => Ok(kwargs.into_any()),
+    }
+}
+
 fn bolt_value_to_py<'py>(
     py: Python<'py>,
     value: &voyager_drivers::BoltValue,
@@ -3809,21 +3832,8 @@ fn bolt_value_to_py<'py>(
                 .bind(py)
                 .call1((nodes_tuple, rels_tuple))
         }
-        BoltValue::Point2D(pt) => {
-            let dict = PyDict::new(py);
-            dict.set_item("srid", pt.srid)?;
-            dict.set_item("x", pt.x)?;
-            dict.set_item("y", pt.y)?;
-            Ok(dict.into_any())
-        }
-        BoltValue::Point3D(pt) => {
-            let dict = PyDict::new(py);
-            dict.set_item("srid", pt.srid)?;
-            dict.set_item("x", pt.x)?;
-            dict.set_item("y", pt.y)?;
-            dict.set_item("z", pt.z)?;
-            Ok(dict.into_any())
-        }
+        BoltValue::Point2D(pt) => bolt_point_to_py(py, pt.srid, pt.x, pt.y, None),
+        BoltValue::Point3D(pt) => bolt_point_to_py(py, pt.srid, pt.x, pt.y, Some(pt.z)),
         BoltValue::Date(d) => days_to_py_date(py, d.days, Some(&d.to_iso_string())),
         BoltValue::LocalTime(lt) => nanos_to_py_time(py, lt.nanoseconds, None, &lt.to_iso_string()),
         BoltValue::Time(t) => nanos_to_py_time(
@@ -4184,6 +4194,38 @@ fn arrow_array_value_to_py<'py>(
                     .duration_cls
                     .bind(py)
                     .call1((months, days, seconds, nanoseconds));
+            }
+            if field
+                .metadata()
+                .get("voyager.type")
+                .is_some_and(|v| v == "point")
+                && sub_fields.len() == 4
+            {
+                let srid = values
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(index);
+                let x = values
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(index);
+                let y = values
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(index);
+                let z_col = values
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                let z = (!z_col.is_null(index)).then(|| z_col.value(index));
+                return bolt_point_to_py(py, srid, x, y, z);
             }
             let dict = PyDict::new(py);
             for (col_idx, sub_field) in sub_fields.iter().enumerate() {
@@ -5554,6 +5596,13 @@ impl PyNativeClient {
     #[getter]
     fn protocol(&self) -> String {
         self.client.protocol().to_string()
+    }
+
+    /// Synchronously returns the negotiated wire protocol version (e.g. `"5.4"` for Bolt), if any.
+    fn protocol_version_sync(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let client = self.client.clone();
+        py.detach(|| get_tokio_runtime().block_on(async move { client.protocol_version().await }))
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     /// Synchronously executes a query releasing the Python GIL during network I/O.

@@ -161,7 +161,13 @@ pub fn format_tz_offset(offset_seconds: i64) -> String {
     }
 }
 
-fn format_time_string(h: u32, m: u32, s: u32, nanos: u32, offset: Option<&str>) -> String {
+pub(crate) fn format_time_string(
+    h: u32,
+    m: u32,
+    s: u32,
+    nanos: u32,
+    offset: Option<&str>,
+) -> String {
     let base = if nanos == 0 {
         format!("{:02}:{:02}:{:02}", h, m, s)
     } else if nanos.is_multiple_of(1_000_000) {

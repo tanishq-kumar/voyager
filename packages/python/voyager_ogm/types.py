@@ -1267,11 +1267,12 @@ def _hydrate_datetime(val: Any) -> Any:
                 try:
                     import zoneinfo
 
-                    # If naive (e.g. wall clock parsed without offset), anchor to UTC first
+                    # Offset-less bracketed strings carry local wall-clock time in tz_name;
+                    # offset-bearing strings carry an exact instant to convert into tz_name.
                     if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=datetime.UTC)
-                    # Convert to target named timezone, strictly preserving exact instant & .timestamp()
-                    dt = dt.astimezone(zoneinfo.ZoneInfo(tz_name))
+                        dt = dt.replace(tzinfo=zoneinfo.ZoneInfo(tz_name))
+                    else:
+                        dt = dt.astimezone(zoneinfo.ZoneInfo(tz_name))
                 except Exception:
                     pass
             return dt
