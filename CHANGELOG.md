@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-alpha.1] - 2026-11-27
+
 First alpha of the 0.5 line. The theme is a portable query interchange format and the same values everywhere: Query Spec v1 with a JSON Schema, reference vectors and a conformance corpus, a working `voyager` CLI, live schema introspection, and native backends that return the same Python types as the bridges and the official clients.
 
 Highlights of 0.5.0-alpha.1:
@@ -524,7 +526,9 @@ Breaking changes in the 0.4 line are marked **Breaking** in the sections below (
 
 
 
-[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.4.3...HEAD
+
+[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.5.0-alpha.1...HEAD
+[0.5.0-alpha.1]: https://github.com/tanishq-kumar/voyager/compare/v0.4.3...v0.5.0-alpha.1
 [0.4.3]: https://github.com/tanishq-kumar/voyager/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tanishq-kumar/voyager/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/tanishq-kumar/voyager/compare/v0.4.0...v0.4.1
