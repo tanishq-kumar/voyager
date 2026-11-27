@@ -112,6 +112,7 @@ HAS_DUCKPGQ = _has_duckpgq()
 def duckpgq_bridge():
     connection = duckdb.connect()
     connection.execute("LOAD duckpgq;")
+    connection.execute("SET active_grammar_extensions = ['duckpgq'];")
     connection.execute(f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT);")
     connection.executemany(f"INSERT INTO {PERSON} VALUES (?, ?);", ROWS)
     connection.execute(f'CREATE PROPERTY GRAPH {GRAPH} VERTEX TABLES ({PERSON} LABEL "Person");')

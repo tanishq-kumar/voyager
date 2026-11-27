@@ -364,6 +364,7 @@ def test_live_execution_against_duckpgq(case: PgqTestCase):
 
     con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     con.execute("LOAD duckpgq;")
+    con.execute("SET active_grammar_extensions = ['duckpgq'];")
 
     # Execute all setup DDL/DML statements
     for stmt in case.statements:

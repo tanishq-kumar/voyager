@@ -16,6 +16,7 @@ import math
 import operator
 import re
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -42,14 +43,21 @@ _PAGINATION_PARAMETER_PATTERN = re.compile(
 #: Statements that need the DuckPGQ extension loaded on the DuckDB connection.
 _DUCKPGQ_STATEMENT_PATTERN = re.compile(r"\bGRAPH_TABLE\b|\bPROPERTY\s+GRAPH\b", re.IGNORECASE)
 
+#: DuckDB 2.0+ requires an explicit opt-in before DuckPGQ's SQL/PGQ grammar parses.
+_DUCKPGQ_GRAMMAR_STATEMENT = "SET active_grammar_extensions = ['duckpgq'];"
+
+#: Cypher bulk plans that DuckDB cannot parse; ingest them as relational rows instead.
+_CYPHER_BULK_STATEMENT_PATTERN = re.compile(r"^\s*UNWIND\b", re.IGNORECASE)
+
 
 def _duckpgq_error_message(cause: BaseException) -> str:
     """Builds the actionable error shown when DuckPGQ cannot be loaded."""
     return (
         "SQL/PGQ queries on DuckDB require the DuckPGQ extension, but it could not be "
-        "loaded. Install it with `INSTALL duckpgq;` and then run `LOAD duckpgq;` on the "
-        "connection (Voyager does the `LOAD` for you once per connection), or create the "
-        "Session with install_duckpgq=True so Voyager installs it first. "
+        "loaded. Install it with `INSTALL duckpgq FROM community;` and then run "
+        "`LOAD duckpgq;` on the connection (Voyager does the `LOAD` for you once per "
+        "connection), or create the Session with install_duckpgq=True so Voyager "
+        "installs it first. "
         f"The DuckDB error was: {cause}"
     )
 
@@ -1520,6 +1528,19 @@ class DuckDbBridge:
         self._install_duckpgq = install_duckpgq
         self._duckpgq_loaded = False
 
+    @staticmethod
+    def _arrow_table(rel: Any) -> Any | None:
+        """Returns a DuckDB relation's Arrow table with the version-specific method name."""
+        for name in ("fetch_arrow_table", "to_arrow_table"):
+            method = getattr(rel, name, None)
+            if callable(method):
+                with warnings.catch_warnings():
+                    # DuckDB 2.0 warns that a DB-API result copies rows into Arrow;
+                    # the result is already materialized here, so this is expected.
+                    warnings.filterwarnings("ignore", message="Arrow output on a DB-API result.*")
+                    return method()
+        return None
+
     def _duckpgq_is_loaded(self) -> bool:
         """Returns whether DuckPGQ is already loaded on this connection."""
         try:
@@ -1534,16 +1555,23 @@ class DuckDbBridge:
         """Sets whether a missing DuckPGQ extension may be installed when it is first needed.
 
         Args:
-            install: When ``True``, ``INSTALL duckpgq;`` (which downloads the extension)
-                is attempted if ``LOAD duckpgq;`` fails.
+            install: When ``True``, ``INSTALL duckpgq FROM community;`` (which downloads
+                the extension) is attempted if ``LOAD duckpgq;`` fails.
         """
         self._install_duckpgq = install
 
+    def _enable_duckpgq_grammar(self) -> None:
+        """Opts this connection into DuckPGQ's SQL/PGQ grammar on DuckDB 2.0+."""
+        self.con.execute(_DUCKPGQ_GRAMMAR_STATEMENT)
+
     def ensure_duckpgq(self, install: bool | None = None) -> None:
-        """Loads DuckPGQ on this connection once.
+        """Loads DuckPGQ and its grammar on this connection once.
 
         Loading is idempotent: a connection the caller already prepared with
-        ``LOAD duckpgq;`` is detected and left alone, and later calls are no-ops.
+        ``LOAD duckpgq;`` is detected and left loaded, and later calls are no-ops.
+        On DuckDB 2.0+, SQL/PGQ parsing also requires the per-connection
+        ``SET active_grammar_extensions = ['duckpgq'];`` opt-in, which Voyager
+        runs after loading the extension (or after detecting it already loaded).
 
         Args:
             install: Install the extension first when it is missing. Defaults to
@@ -1553,11 +1581,12 @@ class DuckDbBridge:
 
         Raises:
             RuntimeError: If the extension cannot be loaded, naming DuckPGQ and
-                the ``INSTALL duckpgq;`` command.
+                the ``INSTALL duckpgq FROM community;`` command.
         """
         if self._duckpgq_loaded:
             return
         if self._duckpgq_is_loaded():
+            self._enable_duckpgq_grammar()
             self._duckpgq_loaded = True
             return
         should_install = self._install_duckpgq if install is None else install
@@ -1567,10 +1596,11 @@ class DuckDbBridge:
             if not should_install:
                 raise RuntimeError(_duckpgq_error_message(load_error)) from load_error
             try:
-                self.con.execute("INSTALL duckpgq;")
+                self.con.execute("INSTALL duckpgq FROM community;")
                 self.con.execute("LOAD duckpgq;")
             except Exception as install_error:
                 raise RuntimeError(_duckpgq_error_message(install_error)) from install_error
+        self._enable_duckpgq_grammar()
         self._duckpgq_loaded = True
 
     def _ensure_duckpgq_for_statement(self, statement: str) -> None:
@@ -1631,13 +1661,13 @@ class DuckDbBridge:
 
         Preserves exact calendar ``months``, ``days``, ``seconds``, and
         ``nanoseconds`` on ``INTERVAL`` columns by reading Arrow
-        ``month_day_nano_interval`` when a ``TIMEDELTA`` column is present in
-        ``rel.description``. Queries without any top-level ``INTERVAL`` column
-        decode via ``rel.fetchall()`` (preserving native Python ``int`` for
-        ``HUGEINT`` and ``uuid.UUID`` inside ``UUID[]``), so ``INTERVAL`` values
-        nested solely inside ``LIST``/``STRUCT``/``MAP`` without a top-level
-        ``INTERVAL`` column are approximated as ``datetime.timedelta`` by
-        DuckDB's DBAPI.
+        ``month_day_nano_interval`` when an ``INTERVAL``/``TIMEDELTA`` column is
+        present in ``rel.description``. Queries without any top-level
+        ``INTERVAL`` column decode via ``rel.fetchall()`` (preserving native
+        Python ``int`` for ``HUGEINT`` and ``uuid.UUID`` inside ``UUID[]``), so
+        ``INTERVAL`` values nested solely inside ``LIST``/``STRUCT``/``MAP``
+        without a top-level ``INTERVAL`` column are approximated as
+        ``datetime.timedelta`` by DuckDB's DBAPI.
 
         Args:
             statement: Query statement.
@@ -1651,11 +1681,11 @@ class DuckDbBridge:
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return BridgeResult([], columns=())
-        has_timedelta = any(
-            len(d) > 1 and str(d[1]).upper() == "TIMEDELTA" for d in rel.description
+        has_interval = any(
+            len(d) > 1 and str(d[1]).upper() in ("INTERVAL", "TIMEDELTA") for d in rel.description
         )
-        if has_timedelta and hasattr(rel, "fetch_arrow_table"):
-            arrow_table = rel.fetch_arrow_table()
+        if has_interval:
+            arrow_table = self._arrow_table(rel)
             if arrow_table is not None:
                 return _records_from_duckdb_arrow(rel.description, arrow_table)
         return _records_from_duckdb_rows(rel.description, rel.fetchall())
@@ -1677,19 +1707,9 @@ class DuckDbBridge:
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return pl.DataFrame()
-        if hasattr(rel, "fetch_arrow_table"):
-            arrow_table = rel.fetch_arrow_table()
-            if arrow_table is not None:
-                return _duckdb_arrow_table_to_polars(arrow_table)
-        if hasattr(self.con, "pl") and hasattr(rel, "pl"):
-            try:
-                return rel.pl()
-            except Exception as exc:
-                if "month_day_nano_interval" not in str(exc):
-                    raise
-                return _records_to_polars(
-                    _records_from_duckdb_rows(rel.description, rel.fetchall())
-                )
+        arrow_table = self._arrow_table(rel)
+        if arrow_table is not None:
+            return _duckdb_arrow_table_to_polars(arrow_table)
         return _records_to_polars(_records_from_duckdb_rows(rel.description, rel.fetchall()))
 
     def execute_bulk(
@@ -1718,6 +1738,11 @@ class DuckDbBridge:
             for b in batch_list:
                 batch_data = b.get("batch", [])
                 total_records += len(batch_data)
+                if _CYPHER_BULK_STATEMENT_PATTERN.match(statement):
+                    # A failed statement aborts the whole explicit transaction on
+                    # DuckDB 2.0, so never send the Cypher plan to the parser.
+                    self._fallback_bulk_ingest(statement, batch_data)
+                    continue
                 try:
                     self.con.execute(statement, b)
                 except Exception:
@@ -1728,6 +1753,9 @@ class DuckDbBridge:
                 total_batches += 1
                 batch_data = batch_item.parameters.get("batch", [])
                 total_records += len(batch_data)
+                if _CYPHER_BULK_STATEMENT_PATTERN.match(batch_item.statement):
+                    self._fallback_bulk_ingest(batch_item.statement, batch_data)
+                    continue
                 try:
                     self.con.execute(batch_item.statement, batch_item.parameters)
                 except Exception:

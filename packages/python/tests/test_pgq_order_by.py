@@ -218,6 +218,7 @@ def duckpgq_bridge():
         pytest.skip("DuckPGQ extension is not available")
     connection = duckdb.connect()
     connection.execute("LOAD duckpgq;")
+    connection.execute("SET active_grammar_extensions = ['duckpgq'];")
     connection.execute(
         f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
     )
@@ -495,6 +496,7 @@ class TestLivePostgres19AndNeo4jParity:
 
         duck_conn = duckdb.connect()
         duck_conn.execute("LOAD duckpgq;")
+        duck_conn.execute("SET active_grammar_extensions = ['duckpgq'];")
         duck_conn.execute(
             f"CREATE TABLE {PERSON} (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);"
         )

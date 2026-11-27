@@ -919,6 +919,7 @@ def test_embedded_duckpgq_relationship_navigation() -> None:
     except Exception as exc:  # pragma: no cover - environment dependent
         conn.close()
         pytest.skip(f"DuckPGQ extension could not be loaded: {exc}")
+    conn.execute("SET active_grammar_extensions = ['duckpgq'];")
 
     session: Session | None = None
     try:
