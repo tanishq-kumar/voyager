@@ -3933,18 +3933,27 @@ enum Utf8ColMode {
 
 fn utf8_col_mode_for_field(field: &arrow_schema::Field) -> Utf8ColMode {
     let meta = field.metadata();
-    if meta.get("voyager.encoding").is_some_and(|v| v == "json") {
-        match meta.get("voyager.type").map(String::as_str) {
+    if meta
+        .get(voyager_drivers::value::VOYAGER_META_ENCODING)
+        .is_some_and(|v| v == "json")
+    {
+        match meta
+            .get(voyager_drivers::value::VOYAGER_META_TYPE)
+            .map(String::as_str)
+        {
             Some("json") => return Utf8ColMode::JsonPure,
             Some("decimal") => return Utf8ColMode::JsonTyped("decimal"),
             Some("uuid") => return Utf8ColMode::JsonTyped("uuid"),
             _ => return Utf8ColMode::JsonEntities,
         }
     }
-    if meta.contains_key("voyager.kind") {
+    if meta.contains_key(voyager_drivers::value::VOYAGER_META_KIND) {
         return Utf8ColMode::JsonEntities;
     }
-    match meta.get("voyager.type").map(String::as_str) {
+    match meta
+        .get(voyager_drivers::value::VOYAGER_META_TYPE)
+        .map(String::as_str)
+    {
         Some("date") => Utf8ColMode::Typed("date"),
         Some("time") => Utf8ColMode::Typed("time"),
         Some("time_tz") => Utf8ColMode::Typed("time_tz"),
@@ -4038,8 +4047,8 @@ fn arrow_array_value_to_py<'py>(
             let bytes = values.value(index);
             if field
                 .metadata()
-                .get("ARROW:extension:name")
-                .is_some_and(|v| v == "arrow.uuid")
+                .get(voyager_drivers::value::ARROW_EXTENSION_NAME)
+                .is_some_and(|v| v == voyager_drivers::value::ARROW_UUID_EXTENSION)
             {
                 let ctors = entity_constructors(py)?;
                 ctors
@@ -4213,7 +4222,7 @@ fn arrow_array_value_to_py<'py>(
             let values = array.as_any().downcast_ref::<StructArray>().unwrap();
             if field
                 .metadata()
-                .get("voyager.type")
+                .get(voyager_drivers::value::VOYAGER_META_TYPE)
                 .is_some_and(|v| v == "duration")
                 && sub_fields.len() == 4
             {
@@ -4249,7 +4258,7 @@ fn arrow_array_value_to_py<'py>(
             }
             if field
                 .metadata()
-                .get("voyager.type")
+                .get(voyager_drivers::value::VOYAGER_META_TYPE)
                 .is_some_and(|v| v == "point")
                 && sub_fields.len() == 4
             {
@@ -8607,6 +8616,65 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", voyager_ogm::VERSION)?;
     m.add("QUERY_SPEC_VERSION", voyager_ogm::spec::SPEC_VERSION)?;
     m.add("QUERY_SPEC_REVISION", voyager_ogm::spec::SPEC_REVISION)?;
+    m.add(
+        "VOYAGER_META_TYPE",
+        voyager_drivers::value::VOYAGER_META_TYPE,
+    )?;
+    m.add(
+        "VOYAGER_META_ENCODING",
+        voyager_drivers::value::VOYAGER_META_ENCODING,
+    )?;
+    m.add(
+        "VOYAGER_META_KIND",
+        voyager_drivers::value::VOYAGER_META_KIND,
+    )?;
+    m.add(
+        "ARROW_EXTENSION_NAME",
+        voyager_drivers::value::ARROW_EXTENSION_NAME,
+    )?;
+    m.add(
+        "ARROW_UUID_EXTENSION",
+        voyager_drivers::value::ARROW_UUID_EXTENSION,
+    )?;
+    m.add("META_TYPE_DATE", voyager_drivers::value::META_TYPE_DATE)?;
+    m.add("META_TYPE_TIME", voyager_drivers::value::META_TYPE_TIME)?;
+    m.add(
+        "META_TYPE_TIME_TZ",
+        voyager_drivers::value::META_TYPE_TIME_TZ,
+    )?;
+    m.add(
+        "META_TYPE_LOCAL_DATETIME",
+        voyager_drivers::value::META_TYPE_LOCAL_DATETIME,
+    )?;
+    m.add(
+        "META_TYPE_DATETIME_TZ",
+        voyager_drivers::value::META_TYPE_DATETIME_TZ,
+    )?;
+    m.add(
+        "META_TYPE_DURATION",
+        voyager_drivers::value::META_TYPE_DURATION,
+    )?;
+    m.add(
+        "META_TYPE_DECIMAL",
+        voyager_drivers::value::META_TYPE_DECIMAL,
+    )?;
+    m.add("META_TYPE_UUID", voyager_drivers::value::META_TYPE_UUID)?;
+    m.add(
+        "META_TYPE_HUGEINT",
+        voyager_drivers::value::META_TYPE_HUGEINT,
+    )?;
+    m.add("META_TYPE_POINT", voyager_drivers::value::META_TYPE_POINT)?;
+    m.add("META_TYPE_JSON", voyager_drivers::value::META_TYPE_JSON)?;
+    m.add(
+        "META_ENCODING_JSON",
+        voyager_drivers::value::META_ENCODING_JSON,
+    )?;
+    m.add("META_KIND_NODE", voyager_drivers::value::META_KIND_NODE)?;
+    m.add(
+        "META_KIND_RELATIONSHIP",
+        voyager_drivers::value::META_KIND_RELATIONSHIP,
+    )?;
+    m.add("META_KIND_PATH", voyager_drivers::value::META_KIND_PATH)?;
     Ok(())
 }
 

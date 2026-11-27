@@ -20,6 +20,10 @@ use crate::bolt::packstream::{
 };
 use crate::bolt::{BoltNode, BoltPath, BoltRelationship, BoltValue};
 use crate::error::{NetError, Result};
+use crate::value::{
+    ARROW_EXTENSION_NAME, ARROW_UUID_EXTENSION, VOYAGER_META_ENCODING, VOYAGER_META_KIND,
+    VOYAGER_META_TYPE,
+};
 
 /// Apache AGE Graph Vertex entity (`::vertex`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1823,7 +1827,7 @@ fn build_pg_typed_values(
                 Ok(Some(build_utf8_with_meta(
                     field_name,
                     cells,
-                    &[("voyager.type", "decimal")],
+                    &[(VOYAGER_META_TYPE, "decimal")],
                 )))
             }
         }
@@ -1854,8 +1858,8 @@ fn build_pg_typed_values(
                     field_with_meta(
                         field_name,
                         DataType::FixedSizeBinary(16),
-                        "ARROW:extension:name",
-                        "arrow.uuid",
+                        ARROW_EXTENSION_NAME,
+                        ARROW_UUID_EXTENSION,
                     ),
                     Arc::new(builder.finish()),
                 )))
@@ -1863,7 +1867,7 @@ fn build_pg_typed_values(
                 Ok(Some(build_utf8_with_meta(
                     field_name,
                     cells,
-                    &[("voyager.type", "uuid")],
+                    &[(VOYAGER_META_TYPE, "uuid")],
                 )))
             }
         }
@@ -1941,7 +1945,7 @@ fn build_pg_typed_values(
                 Ok(Some(build_utf8_with_meta(
                     field_name,
                     cells,
-                    &[("voyager.type", "date")],
+                    &[(VOYAGER_META_TYPE, "date")],
                 )))
             }
         }
@@ -1976,14 +1980,14 @@ fn build_pg_typed_values(
                 Ok(Some(build_utf8_with_meta(
                     field_name,
                     cells,
-                    &[("voyager.type", "time")],
+                    &[(VOYAGER_META_TYPE, "time")],
                 )))
             }
         }
         1266 => Ok(Some(build_utf8_with_meta(
             field_name,
             cells,
-            &[("voyager.type", "time_tz")],
+            &[(VOYAGER_META_TYPE, "time_tz")],
         ))),
         1114 => {
             let mut parsed = Vec::with_capacity(n);
@@ -2020,7 +2024,7 @@ fn build_pg_typed_values(
                 Ok(Some(build_utf8_with_meta(
                     field_name,
                     cells,
-                    &[("voyager.type", "local_datetime")],
+                    &[(VOYAGER_META_TYPE, "local_datetime")],
                 )))
             }
         }
@@ -2060,7 +2064,7 @@ fn build_pg_typed_values(
                 Ok(Some(build_utf8_with_meta(
                     field_name,
                     cells,
-                    &[("voyager.type", "datetime_tz")],
+                    &[(VOYAGER_META_TYPE, "datetime_tz")],
                 )))
             }
         }
@@ -2083,7 +2087,7 @@ fn build_pg_typed_values(
                 return Ok(Some(build_utf8_with_meta(
                     field_name,
                     cells,
-                    &[("voyager.type", "duration")],
+                    &[(VOYAGER_META_TYPE, "duration")],
                 )));
             }
             if parsed
@@ -2125,7 +2129,7 @@ fn build_pg_typed_values(
                     field_with_meta(
                         field_name,
                         DataType::Struct(duration_struct_fields()),
-                        "voyager.type",
+                        VOYAGER_META_TYPE,
                         "duration",
                     ),
                     Arc::new(builder.finish()),
@@ -2135,7 +2139,7 @@ fn build_pg_typed_values(
         114 | 3802 => Ok(Some(build_utf8_with_meta(
             field_name,
             cells,
-            &[("voyager.encoding", "json"), ("voyager.type", "json")],
+            &[(VOYAGER_META_ENCODING, "json"), (VOYAGER_META_TYPE, "json")],
         ))),
         19 | 25 | 869 | 1042 | 1043 => Ok(Some(build_utf8_with_meta(field_name, cells, &[]))),
         _ => Ok(None),
@@ -2220,16 +2224,16 @@ fn mixed_depth_array_column(
         }
     }
     let mut metadata = HashMap::new();
-    metadata.insert("voyager.encoding".to_string(), "json".to_string());
+    metadata.insert(VOYAGER_META_ENCODING.to_string(), "json".to_string());
     // Keep the declared element type so `execute()` can hand `numeric` elements
     // back as Decimal and `uuid` elements as uuid.UUID instead of untyped JSON
     // strings/numbers. The Arrow/Polars exports still expose JSON text.
     match elem_oid {
         1700 => {
-            metadata.insert("voyager.type".to_string(), "decimal".to_string());
+            metadata.insert(VOYAGER_META_TYPE.to_string(), "decimal".to_string());
         }
         2950 => {
-            metadata.insert("voyager.type".to_string(), "uuid".to_string());
+            metadata.insert(VOYAGER_META_TYPE.to_string(), "uuid".to_string());
         }
         _ => {}
     }
@@ -2673,13 +2677,13 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
                     }
                 }
                 let mut metadata = HashMap::new();
-                metadata.insert("voyager.encoding".to_string(), "json".to_string());
+                metadata.insert(VOYAGER_META_ENCODING.to_string(), "json".to_string());
                 if non_null_count > 0 && node_count == non_null_count {
-                    metadata.insert("voyager.kind".to_string(), "node".to_string());
+                    metadata.insert(VOYAGER_META_KIND.to_string(), "node".to_string());
                 } else if non_null_count > 0 && edge_count == non_null_count {
-                    metadata.insert("voyager.kind".to_string(), "relationship".to_string());
+                    metadata.insert(VOYAGER_META_KIND.to_string(), "relationship".to_string());
                 } else if non_null_count > 0 && path_count == non_null_count {
-                    metadata.insert("voyager.kind".to_string(), "path".to_string());
+                    metadata.insert(VOYAGER_META_KIND.to_string(), "path".to_string());
                 }
                 fields.push(Field::new(name, DataType::Utf8, true).with_metadata(metadata));
                 columns.push(Arc::new(builder.finish()));
@@ -3163,7 +3167,7 @@ mod pg_array_tests {
                 .schema()
                 .field(0)
                 .metadata()
-                .get("voyager.encoding")
+                .get(VOYAGER_META_ENCODING)
                 .map(String::as_str),
             Some("json")
         );
@@ -3237,11 +3241,14 @@ mod pg_array_tests {
             let field = schema.field(idx);
             assert_eq!(field.data_type(), &DataType::Utf8);
             assert_eq!(
-                field.metadata().get("voyager.encoding").map(String::as_str),
+                field
+                    .metadata()
+                    .get(VOYAGER_META_ENCODING)
+                    .map(String::as_str),
                 Some("json")
             );
             assert_eq!(
-                field.metadata().get("voyager.type").map(String::as_str),
+                field.metadata().get(VOYAGER_META_TYPE).map(String::as_str),
                 Some(expected_type)
             );
         }
@@ -3326,9 +3333,9 @@ mod pg_array_tests {
             schema
                 .field(1)
                 .metadata()
-                .get("ARROW:extension:name")
+                .get(ARROW_EXTENSION_NAME)
                 .map(String::as_str),
-            Some("arrow.uuid")
+            Some(ARROW_UUID_EXTENSION)
         );
         assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(38, 2));
         assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
@@ -3336,7 +3343,7 @@ mod pg_array_tests {
             schema
                 .field(3)
                 .metadata()
-                .get("voyager.type")
+                .get(VOYAGER_META_TYPE)
                 .map(String::as_str),
             Some("decimal")
         );
@@ -3349,7 +3356,7 @@ mod pg_array_tests {
             schema
                 .field(6)
                 .metadata()
-                .get("voyager.type")
+                .get(VOYAGER_META_TYPE)
                 .map(String::as_str),
             Some("time_tz")
         );
@@ -3370,7 +3377,7 @@ mod pg_array_tests {
             schema
                 .field(10)
                 .metadata()
-                .get("voyager.type")
+                .get(VOYAGER_META_TYPE)
                 .map(String::as_str),
             Some("duration")
         );
@@ -3379,7 +3386,7 @@ mod pg_array_tests {
             schema
                 .field(11)
                 .metadata()
-                .get("voyager.type")
+                .get(VOYAGER_META_TYPE)
                 .map(String::as_str),
             Some("duration")
         );
@@ -3387,7 +3394,7 @@ mod pg_array_tests {
             schema
                 .field(12)
                 .metadata()
-                .get("voyager.encoding")
+                .get(VOYAGER_META_ENCODING)
                 .map(String::as_str),
             Some("json")
         );
