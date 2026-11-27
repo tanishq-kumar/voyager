@@ -611,6 +611,7 @@ impl From<&serde_json::Value> for BoltValue {
 pub fn param_to_bolt_value(param: &ParamValue, bolt_major: u8) -> Result<BoltValue> {
     match param {
         ParamValue::Json(v) => Ok(BoltValue::from(v)),
+        ParamValue::Jsonb(inner) => param_to_bolt_value(inner, bolt_major),
         ParamValue::Float(f) => Ok(BoltValue::Float(*f)),
         ParamValue::Bytes(b) => Ok(BoltValue::Bytes(b.clone())),
         ParamValue::Date { year, month, day } => Ok(BoltValue::Date(BoltDate::from_ymd(

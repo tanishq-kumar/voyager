@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **PostgreSQL JSON parameter encoding, native and bridge (#421)**: Python dicts and `voyager_ogm.Json(...)` values bind as `jsonb` on the native driver and `PostgresBridge`. Lists keep the array behaviour psycopg has: lists of scalars stay typed SQL arrays, a list of dicts becomes `jsonb[]` (one JSON element per dict), and nested lists become multidimensional arrays. A placeholder explicitly cast to `json`/`jsonb` (for example `$v::jsonb`) binds any list as one JSON document, so an empty list becomes `[]` and never the JSON object `{}`; without such a cast an empty list remains an empty SQL array literal for array-typed slots. `Json(...)` is the escape hatch for forcing JSON in any context, including JSON `null`, scalar lists and ragged nested lists, and is unwrapped for AGE, Bolt, FalkorDB and DuckDB. The value conformance pack no longer records the PostgreSQL JSON parameter differences.
+- **Float precision through JSON text (#422)**: `serde_json` now parses with `float_roundtrip`, so native PostgreSQL `jsonb` results and Apache AGE `agtype` parameters, results and nested list/map values round-trip `f64` exactly (including subnormal values and `1.7976931348623157e+308`). Non-finite JSON numbers written inside containers are emitted as `NaN`/`Infinity`/`-Infinity`, and reading accepts those tokens plus out-of-range numeric literals (returning Python `inf`/`-inf`, like psycopg) instead of raising `number out of range`. The value conformance pack no longer records the PostgreSQL and Apache AGE float differences.
+
 ## [0.5.0-alpha.1] - 2026-11-27
 
 First alpha of the 0.5 line. The theme is a portable query interchange format and the same values everywhere: Query Spec v1 with a JSON Schema, reference vectors and a conformance corpus, a working `voyager` CLI, live schema introspection, and native backends that return the same Python types as the bridges and the official clients.

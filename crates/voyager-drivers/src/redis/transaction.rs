@@ -279,6 +279,7 @@ fn render_json_cypher_literal(val: &serde_json::Value, out: &mut String) -> Resu
 fn render_cypher_literal(val: &ParamValue, out: &mut String) -> Result<()> {
     match val {
         ParamValue::Json(v) => render_json_cypher_literal(v, out),
+        ParamValue::Jsonb(inner) => render_cypher_literal(inner, out),
         ParamValue::Float(f) => {
             if f.is_finite() {
                 let s = f.to_string();

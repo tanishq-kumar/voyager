@@ -39,6 +39,10 @@ impl ParamTimezone {
 pub enum ParamValue {
     /// Plain JSON scalar or container value (`null`, `bool`, `int`/`float`, `str`, JSON list/map).
     Json(serde_json::Value),
+    /// Explicit JSON value (`voyager_ogm.Json(...)`): PostgreSQL binds it as `jsonb`
+    /// regardless of the parameter's SQL context, and other drivers pass the inner
+    /// value through unchanged.
+    Jsonb(Box<ParamValue>),
     /// 64-bit IEEE-754 floating-point value (including `NaN`, `Infinity`, `-Infinity`).
     Float(f64),
     /// Raw binary byte buffer (`bytes` / `bytearray`).
@@ -137,6 +141,7 @@ impl ParamValue {
     pub fn to_json_value(&self) -> serde_json::Value {
         match self {
             Self::Json(v) => v.clone(),
+            Self::Jsonb(inner) => inner.to_json_value(),
             Self::Float(f) => serde_json::Number::from_f64(*f)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null),
