@@ -79,17 +79,64 @@ def _currval(connection: Any, sequence: str) -> int:
     return int(rows[0][0])
 
 
-def test_multi_statement_timetz_uses_one_eager_execution(counting_duckdb) -> None:
-    """Multi-statement input keeps the eager path and still executes once."""
-    _inner, counting, session = counting_duckdb
-    statement = "SELECT 1 AS n; SELECT '11:00:00+03'::TIMETZ AS t"
+def test_multi_statement_timetz_and_interval_runs_once(counting_duckdb) -> None:
+    """Multi-statement input uses the single-execution relation path and keeps months + offsets."""
+    inner, counting, session = counting_duckdb
+    inner.execute("CREATE SEQUENCE zz_multi_seq START 1")
+    statement = (
+        "SELECT nextval('zz_multi_seq'); "
+        "SELECT nextval('zz_multi_seq') AS n, '11:00:00+03'::TIMETZ AS t, INTERVAL '1 year 2 months' AS iv"
+    )
 
     counting.reset()
     table = session.execute_to_arrow(statement)
-    # The eager DB-API row path renders the offset through ``datetime.time.isoformat``.
+    assert table.column("n").to_pylist() == [2]
     assert table.column("t").to_pylist() == ["11:00:00+03:00"]
-    assert counting.sql_calls == []
-    assert len(counting.execute_calls) == 1
+    assert table.column("iv").to_pylist() == [
+        {"months": 14, "days": 0, "seconds": 0, "nanoseconds": 0}
+    ]
+    assert len(counting.sql_calls) == 1
+    assert counting.execute_calls == []
+    assert _currval(inner, "zz_multi_seq") == 2
+
+
+def test_dml_returning_with_timetz_and_interval_runs_once(counting_duckdb) -> None:
+    """INSERT ... RETURNING with nextval(), TIMETZ, and calendar INTERVAL runs once per call."""
+    inner, counting, session = counting_duckdb
+    inner.execute("CREATE SEQUENCE zz_dml_seq START 1")
+    inner.execute("CREATE TABLE zz_dml_tbl (id BIGINT, t TIMETZ, iv INTERVAL)")
+    statement = (
+        "INSERT INTO zz_dml_tbl VALUES "
+        "(nextval('zz_dml_seq'), '10:00:00+02'::TIMETZ, INTERVAL '1 year 2 months') "
+        "RETURNING id, t, iv"
+    )
+
+    counting.reset()
+    rows = session.execute(statement)
+    assert rows.first()["id"] == 1
+    assert len(counting.sql_calls) == 1
+    assert counting.execute_calls == []
+    assert _currval(inner, "zz_dml_seq") == 1
+
+    counting.reset()
+    table = session.execute_to_arrow(statement)
+    assert table.column("id").to_pylist() == [2]
+    assert table.column("t").to_pylist() == ["10:00:00+02:00"]
+    assert table.column("iv").to_pylist() == [
+        {"months": 14, "days": 0, "seconds": 0, "nanoseconds": 0}
+    ]
+    assert len(counting.sql_calls) == 1
+    assert counting.execute_calls == []
+    assert _currval(inner, "zz_dml_seq") == 2
+
+    counting.reset()
+    with session.transaction():
+        frame = session.execute_to_polars(statement)
+    assert frame["id"].to_list() == [3]
+    assert frame["t"].to_list() == ["10:00:00+02:00"]
+    assert frame["iv"].to_list() == [{"months": 14, "days": 0, "seconds": 0, "nanoseconds": 0}]
+    assert len(counting.sql_calls) == 1
+    assert _currval(inner, "zz_dml_seq") == 3
 
 
 def test_lazy_relation_clears_a_pending_dbapi_result(counting_duckdb) -> None:

@@ -196,20 +196,30 @@ def test_plain_sql_session_does_not_need_duckpgq(tmp_path) -> None:
 class _RecordingConnection:
     """Fake DuckDB connection that records extension statements."""
 
-    def __init__(self, *, fail_first_load: bool) -> None:
+    def __init__(
+        self,
+        *,
+        fail_first_load: bool,
+        active_grammar: list[str] | None = None,
+    ) -> None:
         self.calls: list[str] = []
         self._fail_first_load = fail_first_load
         self._load_attempts = 0
+        self._active_grammar = active_grammar
+        self._last_statement = ""
 
     def execute(self, statement: str, _parameters: Any = None) -> _RecordingConnection:
         self.calls.append(statement)
+        self._last_statement = statement
         if statement.startswith("LOAD duckpgq;"):
             self._load_attempts += 1
             if self._fail_first_load and self._load_attempts == 1:
                 raise RuntimeError("Extension not found")
         return self
 
-    def fetchone(self) -> tuple[bool]:
+    def fetchone(self) -> tuple[Any]:
+        if "active_grammar_extensions" in self._last_statement and self._active_grammar is not None:
+            return (list(self._active_grammar),)
         return (False,)
 
 
@@ -229,5 +239,19 @@ def test_install_opt_in_installs_then_loads() -> None:
     bridge = DuckDbBridge(con, install_duckpgq=True)
     bridge.ensure_duckpgq()
     assert "INSTALL duckpgq FROM community;" in con.calls
-    assert con.calls[-2] == "LOAD duckpgq;"
+    assert con.calls[-3] == "LOAD duckpgq;"
+    assert con.calls[-2] == "SELECT current_setting('active_grammar_extensions')"
     assert con.calls[-1] == "SET active_grammar_extensions = ['duckpgq'];"
+
+
+def test_ensure_duckpgq_preserves_existing_active_grammar_extensions() -> None:
+    """ensure_duckpgq() appends 'duckpgq' instead of overwriting existing grammar extensions."""
+    con_other = _RecordingConnection(fail_first_load=False, active_grammar=["other_ext"])
+    DuckDbBridge(con_other).ensure_duckpgq()
+    assert con_other.calls[-1] == "SET active_grammar_extensions = ['other_ext', 'duckpgq'];"
+
+    con_already = _RecordingConnection(
+        fail_first_load=False, active_grammar=["other_ext", "duckpgq"]
+    )
+    DuckDbBridge(con_already).ensure_duckpgq()
+    assert not any(c.startswith("SET active_grammar_extensions") for c in con_already.calls)
