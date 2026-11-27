@@ -934,5 +934,23 @@
     "category": "fallback",
     "reason": "DuckDB Arrow export exposes UNION(..., JSON) with voyager.encoding=json on the union member field; _extract_arrow_cell only forwards top-level metadata, so bridge_arrow surfaces raw JSON strings.",
     "match": "type mismatch: actual str"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "nested_union",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "Polars has no union type, so DuckDbBridge.execute_to_polars() converts UNION columns to a struct with one field per member plus a 'tag' field (#446); the official DuckDB client returns the active member's value.",
+    "match": "type mismatch: actual dict"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "nested_union",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "Polars has no union type, so DuckDbBridge.execute_to_polars() converts UNION columns to a struct with one field per member plus a 'tag' field (#446); the official DuckDB client returns the active member's decoded JSON value.",
+    "match": "dict keys \\['j', 'tag', 'u'\\]|type mismatch: actual dict"
   }
 ]

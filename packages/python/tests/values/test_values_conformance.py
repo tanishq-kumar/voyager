@@ -620,7 +620,6 @@ def test_duckdb_nested_uuid_and_json_containers(engine: str) -> None:
     def _check(u: uuid.UUID, j: Any) -> None:
         j_off = json.dumps(j)
         bridge_backends = ("bridge", "bridge_arrow", "bridge_polars")
-        arrow_backends = ("bridge", "bridge_arrow")
 
         if _path_enabled("nested_struct"):
             _run_duckdb_nested_case(
@@ -678,7 +677,7 @@ def test_duckdb_nested_uuid_and_json_containers(engine: str) -> None:
                 sql="SELECT union_value(u := $v::UUID)::UNION(u UUID, j JSON) AS v",
                 params={"v": u},
                 official_params={"v": u},
-                backends=arrow_backends,
+                backends=bridge_backends,
                 server_type="UNION(u UUID, j JSON)",
             )
             _run_duckdb_nested_case(
@@ -689,7 +688,7 @@ def test_duckdb_nested_uuid_and_json_containers(engine: str) -> None:
                 sql="SELECT union_value(j := $v::JSON)::UNION(u UUID, j JSON) AS v",
                 params={"v": j},
                 official_params={"v": j_off},
-                backends=arrow_backends,
+                backends=bridge_backends,
                 server_type="UNION(u UUID, j JSON)",
             )
 

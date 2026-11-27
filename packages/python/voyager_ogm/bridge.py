@@ -2641,6 +2641,15 @@ class DuckDbBridge:
         ``HUGEINT`` columns are ``pl.Decimal`` because Polars' ``Int128`` cannot
         be exported back to Arrow.
 
+        DuckDB ``UNION`` columns, top-level or nested, are exported as a
+        ``Struct`` with one field per union member plus a ``tag`` string field
+        naming the active member (the tag field is suffixed only if a member is
+        already called ``tag``). Polars has no union data type and cannot import
+        an Arrow union, so this conversion happens before ``pl.from_arrow()``.
+        A struct preserves each member's Arrow type and any nested structure;
+        tagged JSON text would lose both. A ``UserWarning`` names each converted
+        column.
+
         Args:
             statement: Query statement.
             parameters: Query parameters.
@@ -3388,6 +3397,220 @@ def _arrow_has_month_day_nano_interval(arrow_type: Any) -> bool:
     return False
 
 
+def _arrow_has_union(arrow_type: Any) -> bool:
+    """Returns whether ``arrow_type`` is or contains an Arrow union."""
+    import pyarrow as pa
+
+    if pa.types.is_union(arrow_type):
+        return True
+    if (
+        pa.types.is_list(arrow_type)
+        or pa.types.is_large_list(arrow_type)
+        or pa.types.is_fixed_size_list(arrow_type)
+    ):
+        return _arrow_has_union(arrow_type.value_type)
+    if pa.types.is_struct(arrow_type):
+        return any(_arrow_has_union(f.type) for f in arrow_type)
+    if pa.types.is_map(arrow_type):
+        return _arrow_has_union(arrow_type.key_type) or _arrow_has_union(arrow_type.item_type)
+    return False
+
+
+def _duckdb_union_field_names(fields: Sequence[Any]) -> list[str]:
+    """Returns unique, non-empty struct field names for a union's members."""
+    used: set[str] = set()
+    names: list[str] = []
+    for idx, field in enumerate(fields):
+        base = str(field.name) or f"member_{idx}"
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        names.append(candidate)
+    return names
+
+
+def _duckdb_union_tag_name(names: Sequence[str]) -> str:
+    """Returns a ``tag`` field name that does not collide with a union member."""
+    candidate = "tag"
+    suffix = 2
+    while candidate in names:
+        candidate = f"tag_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _duckdb_union_tag_name_for_type(arrow_type: Any) -> str:
+    """Returns the tag field name used for the first union found in ``arrow_type``."""
+    import pyarrow as pa
+
+    if pa.types.is_union(arrow_type):
+        return _duckdb_union_tag_name(_duckdb_union_field_names(list(arrow_type)))
+    if (
+        pa.types.is_list(arrow_type)
+        or pa.types.is_large_list(arrow_type)
+        or pa.types.is_fixed_size_list(arrow_type)
+    ):
+        return _duckdb_union_tag_name_for_type(arrow_type.value_type)
+    if pa.types.is_struct(arrow_type):
+        for field in arrow_type:
+            if _arrow_has_union(field.type):
+                return _duckdb_union_tag_name_for_type(field.type)
+    if pa.types.is_map(arrow_type):
+        if _arrow_has_union(arrow_type.key_type):
+            return _duckdb_union_tag_name_for_type(arrow_type.key_type)
+        return _duckdb_union_tag_name_for_type(arrow_type.item_type)
+    return "tag"
+
+
+def _duckdb_arrow_union_to_struct(arr: Any) -> Any:
+    """Converts an Arrow union array to a struct with one field per member plus ``tag``."""
+    import pyarrow as pa
+
+    union_type = arr.type
+    fields = list(union_type)
+    names = _duckdb_union_field_names(fields)
+    tag_name = _duckdb_union_tag_name(names)
+    codes = arr.type_codes.to_pylist()
+    code_to_name = {
+        int(code): name for code, name in zip(union_type.type_codes, names, strict=True)
+    }
+    tag_array = pa.array([code_to_name[int(code)] for code in codes], type=pa.string())
+    num_rows = len(arr)
+    children = []
+    for idx, code in enumerate(union_type.type_codes):
+        selected_code = int(code)
+        mask = [value == selected_code for value in codes]
+        raw_child = arr.field(idx)
+        if union_type.mode == "dense":
+            selected = raw_child
+            positions = arr.offsets.to_pylist()
+        else:
+            # Sparse union children are full length and their unselected slots are
+            # undefined, so filter before recursing (a nested union's unused slots
+            # may not be valid) and scatter the converted values back by position.
+            selected = raw_child.filter(pa.array(mask))
+            positions = []
+            offset = 0
+            for selected_row in mask:
+                if selected_row:
+                    positions.append(offset)
+                    offset += 1
+                else:
+                    positions.append(-1)
+        converted = _duckdb_arrow_convert_unions(selected)
+        if num_rows == 0:
+            full_child = pa.nulls(0, type=converted.type)
+        else:
+            indices = pa.array(
+                [
+                    int(position) if selected_row else None
+                    for position, selected_row in zip(positions, mask, strict=True)
+                ],
+                type=pa.int64(),
+            )
+            full_child = converted.take(indices)
+        children.append(full_child)
+    return pa.StructArray.from_arrays(
+        [*children, tag_array],
+        names=[*names, tag_name],
+    )
+
+
+def _duckdb_arrow_convert_unions(arr: Any) -> Any:
+    """Recursively replaces Arrow union arrays with tagged struct arrays."""
+    import pyarrow as pa
+
+    arrow_type = arr.type
+    if pa.types.is_union(arrow_type):
+        return _duckdb_arrow_union_to_struct(arr)
+    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        values = _duckdb_arrow_convert_unions(arr.values)
+        if values.type == arr.values.type:
+            return arr
+        if pa.types.is_list(arrow_type):
+            return pa.ListArray.from_arrays(arr.offsets, values, mask=arr.is_null())
+        return pa.LargeListArray.from_arrays(arr.offsets, values, mask=arr.is_null())
+    if pa.types.is_fixed_size_list(arrow_type):
+        values = _duckdb_arrow_convert_unions(arr.values)
+        if values.type == arr.values.type:
+            return arr
+        return pa.FixedSizeListArray.from_arrays(values, arrow_type.list_size, mask=arr.is_null())
+    if pa.types.is_struct(arrow_type):
+        if not any(_arrow_has_union(field.type) for field in arrow_type):
+            return arr
+        children = [
+            _duckdb_arrow_convert_unions(arr.field(idx)) for idx in range(arrow_type.num_fields)
+        ]
+        return pa.StructArray.from_arrays(
+            children,
+            names=[field.name for field in arrow_type],
+            mask=arr.is_null(),
+        )
+    if pa.types.is_map(arrow_type):
+        if not (_arrow_has_union(arrow_type.key_type) or _arrow_has_union(arrow_type.item_type)):
+            return arr
+        keys = _duckdb_arrow_convert_unions(arr.keys)
+        items = _duckdb_arrow_convert_unions(arr.items)
+        return pa.MapArray.from_arrays(arr.offsets, keys, items, mask=arr.is_null())
+    return arr
+
+
+def _duckdb_arrow_type_without_unions(arrow_type: Any) -> Any:
+    """Returns the Arrow type produced by replacing every union with a tagged struct."""
+    import pyarrow as pa
+
+    if pa.types.is_union(arrow_type):
+        fields = list(arrow_type)
+        names = _duckdb_union_field_names(fields)
+        converted = [
+            pa.field(name, _duckdb_arrow_type_without_unions(field.type), nullable=field.nullable)
+            for name, field in zip(names, fields, strict=True)
+        ]
+        converted.append(pa.field(_duckdb_union_tag_name(names), pa.string()))
+        return pa.struct(converted)
+    if pa.types.is_list(arrow_type):
+        return pa.list_(_duckdb_arrow_type_without_unions(arrow_type.value_type))
+    if pa.types.is_large_list(arrow_type):
+        return pa.large_list(_duckdb_arrow_type_without_unions(arrow_type.value_type))
+    if pa.types.is_fixed_size_list(arrow_type):
+        return pa.list_(
+            _duckdb_arrow_type_without_unions(arrow_type.value_type), arrow_type.list_size
+        )
+    if pa.types.is_struct(arrow_type):
+        return pa.struct(
+            [
+                pa.field(
+                    field.name,
+                    _duckdb_arrow_type_without_unions(field.type),
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+                for field in arrow_type
+            ]
+        )
+    if pa.types.is_map(arrow_type):
+        return pa.map_(
+            _duckdb_arrow_type_without_unions(arrow_type.key_type),
+            _duckdb_arrow_type_without_unions(arrow_type.item_type),
+        )
+    return arrow_type
+
+
+def _duckdb_arrow_column_without_unions(column: Any) -> Any:
+    """Converts every union in an Arrow column (or ChunkedArray), preserving empty schemas."""
+    import pyarrow as pa
+
+    if isinstance(column, pa.ChunkedArray):
+        chunks = [_duckdb_arrow_convert_unions(chunk) for chunk in column.chunks]
+        if not chunks:
+            return pa.chunked_array([], type=_duckdb_arrow_type_without_unions(column.type))
+        return pa.chunked_array(chunks, type=chunks[0].type)
+    return _duckdb_arrow_convert_unions(column)
+
+
 def _duckdb_mdn_column_to_arrow(col: Any) -> Any:
     """Converts a scalar ``month_day_nano_interval`` Arrow column to Polars-safe Arrow."""
     import pyarrow as pa
@@ -3448,17 +3671,33 @@ def _ensure_polars_df(val: Any) -> pl.DataFrame:
 
 
 def _duckdb_arrow_table_to_polars(arrow_table: Any) -> pl.DataFrame:
-    """Converts a DuckDB Arrow table to Polars without re-executing, avoiding Polars interval panics."""
+    """Converts a DuckDB Arrow table to Polars without re-executing.
+
+    Avoids Polars interval panics and replaces Arrow ``UNION`` columns, which
+    Polars cannot import, with a struct per union member plus a ``tag`` field.
+    """
     import pyarrow as pa
 
     schema = arrow_table.schema
-    if not any(_arrow_has_month_day_nano_interval(f.type) for f in schema):
+    if not any(
+        _arrow_has_month_day_nano_interval(f.type) or _arrow_has_union(f.type) for f in schema
+    ):
         return _ensure_polars_df(pl.from_arrow(arrow_table))
 
     new_cols = []
     new_fields = []
     for idx, field in enumerate(schema):
         col = arrow_table.column(idx)
+        if _arrow_has_union(field.type):
+            warnings.warn(
+                f"DuckDB UNION column {field.name!r} was converted to a struct with a "
+                f"{_duckdb_union_tag_name_for_type(field.type)!r} "
+                "field because Polars cannot import Arrow union types.",
+                UserWarning,
+                stacklevel=2,
+            )
+            col = _duckdb_arrow_column_without_unions(col)
+            field = pa.field(field.name, col.type, nullable=field.nullable)
         if _is_month_day_nano_interval(field.type):
             arr = _duckdb_mdn_column_to_arrow(col)
             new_cols.append(arr)
