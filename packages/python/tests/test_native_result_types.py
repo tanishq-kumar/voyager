@@ -367,3 +367,273 @@ def test_duckdb_bridge_embedded_result_types() -> None:
         assert row["nested_l"] == [[1, 2], [3, None]]
     finally:
         sess.close()
+
+
+def test_hydrate_datetime_offsetless_bracket_zone_uses_local_wall_clock() -> None:
+    """Offset-less bracketed zoned strings are interpreted in the named zone, never as UTC (#420)."""
+    from voyager_ogm.types import _hydrate_datetime
+
+    dt = _hydrate_datetime("2024-01-02T03:04:05.123456[Europe/Berlin]")
+    expected = datetime.datetime(
+        2024, 1, 2, 3, 4, 5, 123456, tzinfo=zoneinfo.ZoneInfo("Europe/Berlin")
+    )
+    assert isinstance(dt, datetime.datetime)
+    assert dt == expected
+    assert dt.utcoffset() == datetime.timedelta(hours=1)
+    assert dt.astimezone(datetime.UTC) == datetime.datetime(
+        2024, 1, 2, 2, 4, 5, 123456, tzinfo=datetime.UTC
+    )
+
+    # Offset-bearing bracketed string still converts instant accurately
+    dt_with_off = _hydrate_datetime("2024-01-02T03:04:05.123456+01:00[Europe/Berlin]")
+    assert dt_with_off == expected
+    assert dt_with_off.astimezone(datetime.UTC) == datetime.datetime(
+        2024, 1, 2, 2, 4, 5, 123456, tzinfo=datetime.UTC
+    )
+
+
+def _ps_int(v: int) -> bytes:
+    import struct
+
+    if -16 <= v <= 127:
+        return struct.pack(">b", v)
+    if -128 <= v <= 127:
+        return b"\xc8" + struct.pack(">b", v)
+    if -32768 <= v <= 32767:
+        return b"\xc9" + struct.pack(">h", v)
+    if -(2**31) <= v <= 2**31 - 1:
+        return b"\xca" + struct.pack(">i", v)
+    return b"\xcb" + struct.pack(">q", v)
+
+
+def _ps_str(s: str) -> bytes:
+    b = s.encode("utf-8")
+    if len(b) <= 15:
+        return bytes([0x80 | len(b)]) + b
+    return bytes([0xD0, len(b)]) + b
+
+
+def _ps_list(items: list[bytes]) -> bytes:
+    assert len(items) <= 15
+    return bytes([0x90 | len(items)]) + b"".join(items)
+
+
+def _ps_map(items: list[tuple[str, bytes]]) -> bytes:
+    assert len(items) <= 15
+    return bytes([0xA0 | len(items)]) + b"".join(_ps_str(k) + v for k, v in items)
+
+
+def _ps_struct(tag: int, fields: list[bytes]) -> bytes:
+    assert len(fields) <= 15
+    return bytes([0xB0 | len(fields), tag]) + b"".join(fields)
+
+
+def _ps_float(v: float) -> bytes:
+    import struct
+
+    return b"\xc1" + struct.pack(">d", v)
+
+
+def _bolt_send_frame(conn: Any, payload: bytes) -> None:
+    import struct
+
+    conn.sendall(struct.pack(">H", len(payload)) + payload + b"\x00\x00")
+
+
+def _bolt_recv_frame(conn: Any) -> bytes:
+    import struct
+
+    chunks: list[bytes] = []
+    while True:
+        hdr = conn.recv(2)
+        if not hdr:
+            return b""
+        while len(hdr) < 2:
+            hdr += conn.recv(2 - len(hdr))
+        (size,) = struct.unpack(">H", hdr)
+        if size == 0:
+            return b"".join(chunks)
+        buf = b""
+        while len(buf) < size:
+            part = conn.recv(size - len(buf))
+            if not part:
+                raise EOFError("unexpected EOF in Bolt chunk")
+            buf += part
+        chunks.append(buf)
+
+
+def test_native_bolt_e2e_stub_points_v52_and_legacy_v44() -> None:
+    """End-to-end PyO3 + BoltConnection test over a local TCP stub for #414, #419, and #420."""
+    import socket
+    import threading
+
+    import polars as pl
+    import pyarrow as pa
+    from voyager_ogm import Point
+
+    def start_stub(
+        negotiated: bytes, cols: list[str], row_fields: list[bytes]
+    ) -> tuple[int, list[bytes], threading.Thread]:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+        handshakes: list[bytes] = []
+
+        def serve() -> None:
+            try:
+                conn, _ = srv.accept()
+                with conn:
+                    hs = b""
+                    while len(hs) < 20:
+                        chunk = conn.recv(20 - len(hs))
+                        if not chunk:
+                            return
+                        hs += chunk
+                    handshakes.append(hs)
+                    conn.sendall(negotiated)
+                    while True:
+                        frame = _bolt_recv_frame(conn)
+                        if not frame:
+                            break
+                        tag = frame[1] if len(frame) >= 2 else 0
+                        if tag == 0x02:  # GOODBYE
+                            break
+                        if tag == 0x01:  # HELLO
+                            _bolt_send_frame(
+                                conn,
+                                _ps_struct(0x70, [_ps_map([("server", _ps_str("Memgraph/2.20"))])]),
+                            )
+                        elif tag == 0x6A:  # LOGON
+                            _bolt_send_frame(conn, _ps_struct(0x70, [_ps_map([])]))
+                        elif tag == 0x10:  # RUN
+                            _bolt_send_frame(
+                                conn,
+                                _ps_struct(
+                                    0x70,
+                                    [_ps_map([("fields", _ps_list([_ps_str(c) for c in cols]))])],
+                                ),
+                            )
+                        elif tag == 0x3F:  # PULL
+                            _bolt_send_frame(conn, _ps_struct(0x71, [_ps_list(row_fields)]))
+                            _bolt_send_frame(
+                                conn,
+                                _ps_struct(0x70, [_ps_map([("t_last", _ps_int(1))])]),
+                            )
+                        else:
+                            _bolt_send_frame(conn, _ps_struct(0x70, [_ps_map([])]))
+            finally:
+                srv.close()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        return port, handshakes, t
+
+    # Case 1: Bolt 5.2 (#414, #419, #420) returning Point2D, Point3D, nested Point, negative Duration
+    pt2 = _ps_struct(0x58, [_ps_int(4326), _ps_float(13.405), _ps_float(52.52)])
+    pt3 = _ps_struct(0x59, [_ps_int(9157), _ps_float(1.0), _ps_float(2.0), _ps_float(3.5)])
+    neg_dur = _ps_struct(0x45, [_ps_int(0), _ps_int(0), _ps_int(0), _ps_int(-1000)])
+    node_val = _ps_struct(
+        0x4E,
+        [
+            _ps_int(7),
+            _ps_list([_ps_str("Spot")]),
+            _ps_map([("pt", pt2), ("dur", neg_dur)]),
+            _ps_str("4:7"),
+        ],
+    )
+    cols = ["p2", "p3", "plist", "pmap", "neg_d", "node_v"]
+    row = [
+        pt2,
+        pt3,
+        _ps_list([pt2, pt3]),
+        _ps_map([("pt", pt2), ("d", neg_dur)]),
+        neg_dur,
+        node_val,
+    ]
+
+    # Run execute(), execute_to_arrow(), execute_to_polars() against 3 stub accepts
+    for mode in ("execute", "arrow", "polars"):
+        port, handshakes, thread = start_stub(b"\x00\x00\x02\x05", cols, row)
+        sess = Session(
+            f"bolt://127.0.0.1:{port}", dialect="memgraph", backend="native", pool_size=1
+        )
+        try:
+            assert sess._native_client is not None
+            assert sess._native_client.protocol_version_sync() == "5.2"
+            assert handshakes[0][4:12] == b"\x00\x04\x04\x05\x00\x02\x04\x04"
+            if mode == "execute":
+                rec = sess.execute("RETURN 1").first()
+                assert rec is not None
+                assert isinstance(rec["p2"], Point) and rec["p2"] == Point(
+                    latitude=52.52, longitude=13.405
+                )
+                assert isinstance(rec["p3"], Point) and rec["p3"] == Point(
+                    x=1.0, y=2.0, z=3.5, srid=9157
+                )
+                assert rec["plist"] == [
+                    Point(latitude=52.52, longitude=13.405),
+                    Point(x=1.0, y=2.0, z=3.5, srid=9157),
+                ]
+                assert rec["pmap"]["pt"] == Point(latitude=52.52, longitude=13.405)
+                assert rec["pmap"]["d"] == Duration(0, 0, 0, -1000)
+                assert rec["neg_d"] == Duration(0, 0, 0, -1000)
+                assert isinstance(rec["node_v"], GraphNode)
+                assert rec["node_v"].properties["pt"] == Point(latitude=52.52, longitude=13.405)
+                assert rec["node_v"].properties["dur"] == Duration(0, 0, 0, -1000)
+            elif mode == "arrow":
+                tbl = sess.execute_to_arrow("RETURN 1")
+                assert pa.types.is_struct(tbl.schema.field("p2").type)
+                assert tbl.schema.field("p2").metadata.get(b"voyager.type") == b"point"
+                assert Point.from_arrow(tbl.column("p2")[0]) == Point(
+                    latitude=52.52, longitude=13.405
+                )
+                assert Point.from_arrow(tbl.column("p3")[0]) == Point(
+                    x=1.0, y=2.0, z=3.5, srid=9157
+                )
+                assert pa.types.is_struct(tbl.schema.field("neg_d").type)
+                assert Duration(**tbl.column("neg_d")[0].as_py()) == Duration(0, 0, 0, -1000)
+            else:
+                df = sess.execute_to_polars("RETURN 1")
+                assert isinstance(df.schema["p2"], pl.Struct)
+                assert Point.from_polars(df["p2"]) == Point(latitude=52.52, longitude=13.405)
+                assert isinstance(df.schema["neg_d"], pl.Struct)
+                assert Duration(**df["neg_d"][0]) == Duration(0, 0, 0, -1000)
+        finally:
+            sess.close()
+            thread.join(timeout=2)
+
+    # Case 2: Bolt 4.4 legacy 0x66 local zoned datetime (#420) carries the exact instant in execute/Arrow/Polars
+    local_berlin_secs = 1_704_164_645  # 2024-01-02T03:04:05 Europe/Berlin (+01:00) == 02:04:05Z
+    legacy_0x66 = _ps_struct(
+        0x66,
+        [_ps_int(local_berlin_secs), _ps_int(123_456_000), _ps_str("Europe/Berlin")],
+    )
+    expected_dt = datetime.datetime(
+        2024, 1, 2, 3, 4, 5, 123456, tzinfo=zoneinfo.ZoneInfo("Europe/Berlin")
+    )
+    for mode in ("execute", "arrow", "polars"):
+        port, _, thread = start_stub(b"\x00\x00\x04\x04", ["dt"], [legacy_0x66])
+        sess = Session(
+            f"bolt://127.0.0.1:{port}", dialect="memgraph", backend="native", pool_size=1
+        )
+        try:
+            assert sess._native_client is not None
+            assert sess._native_client.protocol_version_sync() == "4.4"
+            if mode == "execute":
+                rec = sess.execute("RETURN 1").first()
+                assert rec is not None
+                assert rec["dt"].astimezone(datetime.UTC) == expected_dt.astimezone(datetime.UTC)
+            elif mode == "arrow":
+                tbl = sess.execute_to_arrow("RETURN 1")
+                assert tbl.schema.field("dt").type == pa.timestamp("us", tz="Europe/Berlin")
+                assert tbl.column("dt")[0].as_py().astimezone(
+                    datetime.UTC
+                ) == expected_dt.astimezone(datetime.UTC)
+            else:
+                df = sess.execute_to_polars("RETURN 1")
+                assert df.schema["dt"] == pl.Datetime("us", "Europe/Berlin")
+                assert df["dt"][0].astimezone(datetime.UTC) == expected_dt.astimezone(datetime.UTC)
+        finally:
+            sess.close()
+            thread.join(timeout=2)

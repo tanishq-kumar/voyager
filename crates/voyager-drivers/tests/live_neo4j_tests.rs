@@ -39,6 +39,8 @@ async fn test_live_neo4j_bolt_crud_and_arrow() {
         .expect("Failed to connect to live Neo4j");
 
     assert!(conn.is_valid());
+    assert_eq!(conn.version().major, 5);
+    assert!(conn.version().minor >= 4);
     if let Some(agent) = conn.server_agent() {
         println!("Connected to live Neo4j agent: {}", agent);
     }

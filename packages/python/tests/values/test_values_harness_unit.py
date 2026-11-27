@@ -138,3 +138,21 @@ def test_known_differences_file_loads_and_has_bug_repros() -> None:
         assert entry.reason
         if entry.category == "bug":
             assert entry.repro
+
+
+def test_decode_columnar_value_decodes_point_struct_arrow_and_polars() -> None:
+    """_decode_columnar_value converts Arrow/Polars Point structs back into Point."""
+    from .test_values_conformance import _decode_columnar_value
+
+    pt2 = Point(latitude=52.52, longitude=13.405)
+    pt3 = Point(x=1.0, y=2.0, z=3.5, srid=9157)
+    raw2 = {"srid": 4326, "x": 13.405, "y": 52.52, "z": None}
+    raw3 = {"srid": 9157, "x": 1.0, "y": 2.0, "z": 3.5}
+
+    arrow_type_desc = "struct<srid: int64, x: double, y: double, z: double> [voyager.type=point]"
+    assert _decode_columnar_value(raw2, pt2, arrow_type_desc, "point") == pt2
+    assert _decode_columnar_value(raw3, pt3, arrow_type_desc, "point") == pt3
+    assert _decode_columnar_value(raw2, pt2, "pl.Struct(...)", "point", is_polars=True) == pt2
+    assert _decode_columnar_value(
+        [raw2, raw3], [pt2, pt3], "pl.List(pl.Struct(...))", "point", is_polars=True
+    ) == [pt2, pt3]
