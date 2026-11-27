@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-alpha.2] - 2026-11-27
+
 Second alpha of the 0.5 line. It fixes the value differences the new value conformance pack (#299) found, so the same value comes back with the same Python type from the official client, the bridge, the native backend and Arrow/Polars on every engine. It also moves to DuckDB 2.x with Python 3.14 support for every engine client, and polishes the `voyager` CLI.
 
 Highlights of 0.5.0-alpha.2:
@@ -574,7 +576,9 @@ Breaking changes in the 0.4 line are marked **Breaking** in the sections below (
 
 
 
-[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.5.0-alpha.1...HEAD
+
+[Unreleased]: https://github.com/tanishq-kumar/voyager/compare/v0.5.0-alpha.2...HEAD
+[0.5.0-alpha.2]: https://github.com/tanishq-kumar/voyager/compare/v0.5.0-alpha.1...v0.5.0-alpha.2
 [0.5.0-alpha.1]: https://github.com/tanishq-kumar/voyager/compare/v0.4.3...v0.5.0-alpha.1
 [0.4.3]: https://github.com/tanishq-kumar/voyager/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/tanishq-kumar/voyager/compare/v0.4.1...v0.4.2
