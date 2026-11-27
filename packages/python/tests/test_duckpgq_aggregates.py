@@ -130,6 +130,7 @@ def test_duckpgq_end_to_end_graph_table_if_available():
     con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     try:
         con.execute("LOAD duckpgq;")
+        con.execute("SET active_grammar_extensions = ['duckpgq'];")
     except Exception as exc:
         pytest.skip(f"duckpgq extension not available: {exc}")
 

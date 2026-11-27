@@ -260,12 +260,10 @@ def test_live_duckpgq_full_schema_ddl() -> None:
     duckdb = pytest.importorskip("duckdb")
     conn = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     try:
-        conn.execute(
-            "SET custom_extension_repository = 'http://duckpgq.s3.eu-north-1.amazonaws.com';"
-        )
-        conn.execute("INSTALL 'duckpgq'; LOAD 'duckpgq';")
+        conn.execute("INSTALL duckpgq FROM community; LOAD duckpgq;")
     except Exception as e:
         pytest.skip(f"DuckPGQ extension could not be loaded: {e}")
+    conn.execute("SET active_grammar_extensions = ['duckpgq'];")
 
     duck_graph = f"zz327_duck_g_{PID}"
     # Generate full schema DDL for DuckDB
