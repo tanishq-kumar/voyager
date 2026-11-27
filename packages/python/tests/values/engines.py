@@ -1242,6 +1242,41 @@ def _pg_json_safe(val: Any) -> Any:
     return str(val)
 
 
+def _decode_duckdb_official_json(val: Any, dtype: Any) -> Any:
+    """Decodes DuckDB ``JSON`` strings in official client results using ``dtype``."""
+    if val is None or not dtype:
+        return val
+    raw_id = getattr(dtype, "id", None)
+    if str(dtype).strip().upper() == "JSON":
+        return json.loads(val) if isinstance(val, str) else val
+    tid = str(raw_id).lower() if raw_id is not None else str(dtype).strip().lower()
+    if tid == "list" and isinstance(val, list) and hasattr(dtype, "children"):
+        child_dtype = dtype.children[0][1]
+        return [_decode_duckdb_official_json(item, child_dtype) for item in val]
+    if tid == "array" and isinstance(val, tuple) and hasattr(dtype, "children"):
+        child_dtype = dict(dtype.children).get("child")
+        return tuple(_decode_duckdb_official_json(item, child_dtype) for item in val)
+    if tid == "map" and isinstance(val, dict) and hasattr(dtype, "children"):
+        children = {str(k): v for k, v in dtype.children}
+        return {k: _decode_duckdb_official_json(v, children.get("value")) for k, v in val.items()}
+    if tid == "struct" and isinstance(val, dict) and hasattr(dtype, "children"):
+        fields = {str(k): v for k, v in dtype.children}
+        return {k: _decode_duckdb_official_json(v, fields.get(k)) for k, v in val.items()}
+    if tid == "union" and isinstance(val, str) and hasattr(dtype, "children"):
+        has_json = any(
+            str(child).strip().upper() == "JSON" for name, child in dtype.children if name
+        )
+        has_plain_varchar = any(
+            str(getattr(child, "id", "")).lower() == "varchar"
+            and str(child).strip().upper() != "JSON"
+            for name, child in dtype.children
+            if name
+        )
+        if has_json and not has_plain_varchar:
+            return json.loads(val)
+    return val
+
+
 class DuckDBValueAdapter(BaseValueAdapter):
     """DuckDB embedded adapter covering official, bridge, bridge_arrow, and bridge_polars."""
 
@@ -1267,7 +1302,13 @@ class DuckDBValueAdapter(BaseValueAdapter):
             pass
 
     def _exec(
-        self, backend: str, sql: str, params: dict[str, Any], col: str = "v", *, in_tx: bool = False
+        self,
+        backend: str,
+        sql: str,
+        params: dict[str, Any],
+        col: str = "v",
+        *,
+        in_tx: bool = False,
     ) -> tuple[Any, str]:
         if backend == "official":
             off_params = _adapt_duckdb_official_params(params)
@@ -1286,14 +1327,8 @@ class DuckDBValueAdapter(BaseValueAdapter):
                 desc = rel.description
                 row = rel.fetchone()
             raw = row[0] if row is not None else None
-            if (
-                raw is not None
-                and isinstance(raw, str)
-                and desc
-                and len(desc[0]) > 1
-                and str(desc[0][1]).upper() == "JSON"
-            ):
-                return json.loads(raw), ""
+            dtype = desc[0][1] if desc and len(desc[0]) > 1 else None
+            raw = _decode_duckdb_official_json(raw, dtype)
             return _canonicalize_official_value(raw, "duckdb"), ""
         if in_tx:
             with self.bridge.transaction():
@@ -1350,14 +1385,12 @@ class DuckDBValueAdapter(BaseValueAdapter):
                 stype = f"<err: {exc}>"
         return val, desc, stype
 
-    def run_stored(
-        self, backend: str, value: Any, value_kind: str, *, in_tx: bool = False
+    def _run_stored_sql_type(
+        self, backend: str, pval: Any, sql_type: str, *, in_tx: bool = False
     ) -> tuple[Any, str, str]:
         table = f"zz_duck_{uuid.uuid4().hex[:8]}"
-        sql_type = _duckdb_sql_type_for_value(value, value_kind)
         self.con.execute(f'CREATE TABLE "{table}" (id INT, v {sql_type})')
         try:
-            pval = json.dumps(_pg_json_safe(value)) if sql_type == "JSON" else value
             ins = f'INSERT INTO "{table}" VALUES ($id, $v)'
             sel = f'SELECT v FROM "{table}" WHERE id = 1'
             if backend == "official":
@@ -1368,14 +1401,8 @@ class DuckDBValueAdapter(BaseValueAdapter):
                 desc = sel_rel.description
                 row = sel_rel.fetchone()
                 raw = row[0] if row is not None else None
-                if (
-                    raw is not None
-                    and isinstance(raw, str)
-                    and desc
-                    and len(desc[0]) > 1
-                    and str(desc[0][1]).upper() == "JSON"
-                ):
-                    return json.loads(raw), "", sql_type
+                dtype = desc[0][1] if desc and len(desc[0]) > 1 else None
+                raw = _decode_duckdb_official_json(raw, dtype)
                 return _canonicalize_official_value(raw, "duckdb"), "", sql_type
             if in_tx:
                 with self.bridge.transaction():
@@ -1403,10 +1430,27 @@ class DuckDBValueAdapter(BaseValueAdapter):
             except Exception:
                 pass
 
+    def run_stored(
+        self, backend: str, value: Any, value_kind: str, *, in_tx: bool = False
+    ) -> tuple[Any, str, str]:
+        sql_type = _duckdb_sql_type_for_value(value, value_kind)
+        pval = json.dumps(_pg_json_safe(value)) if sql_type == "JSON" else value
+        return self._run_stored_sql_type(backend, pval, sql_type, in_tx=in_tx)
+
     def run_nested_list(self, backend: str, value: Any, value_kind: str) -> tuple[Any, str, str]:
+        if value_kind == "json_doc":
+            pval = [json.dumps(_pg_json_safe(value))]
+            return self._run_stored_sql_type(backend, pval, "JSON[]")
         return self.run_stored(backend, [value], "list")
 
     def run_nested_map(self, backend: str, value: Any, value_kind: str) -> tuple[Any, str, str]:
+        if value_kind == "uuid":
+            val, desc = self._exec(backend, "SELECT MAP {'k': $v::UUID} AS v", {"v": value})
+            return val, desc, "MAP(VARCHAR, UUID)"
+        if value_kind == "json_doc":
+            pval = json.dumps(_pg_json_safe(value)) if backend == "official" else value
+            val, desc = self._exec(backend, "SELECT MAP {'k': $v::JSON} AS v", {"v": pval})
+            return val, desc, "MAP(VARCHAR, JSON)"
         return self.run_param(backend, {"k": _pg_json_safe(value)}, "json_doc")
 
     def run_entity_prop(

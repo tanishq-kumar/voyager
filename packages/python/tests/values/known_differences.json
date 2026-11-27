@@ -826,5 +826,113 @@
     "category": "fallback",
     "reason": "DuckDB Polars export exposes UUID columns as pl.Binary (16 raw bytes), so Voyager bridge_polars returns bytes while the official DuckDB client returns uuid.UUID.",
     "match": "type mismatch: actual bytes"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "nested_map",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes MAP(VARCHAR, UUID) as map<string, fixed_size_binary[16]> (nested arrow.uuid), which PyArrow materializes as a list of (key, bytes) pairs while the official client returns dict.",
+    "match": "type mismatch: actual list"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "nested_map",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "DuckDB Polars export exposes MAP(VARCHAR, UUID) as List(Struct({'key': String, 'value': Binary})) while the official DuckDB client returns dict.",
+    "match": "type mismatch: actual list"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "nested_map",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes MAP(VARCHAR, JSON) as map<string, string> (nested voyager.encoding=json), which PyArrow materializes as a list of (key, str) pairs while the official client returns dict.",
+    "match": "type mismatch: actual list"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "nested_map",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "DuckDB Polars export exposes MAP(VARCHAR, JSON) as List(Struct({'key': String, 'value': String})) with field metadata stripped while the official DuckDB client returns dict.",
+    "match": "type mismatch: actual list"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "nested_list",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes JSON[] as list<utf8> with voyager.encoding=json on the nested item field; _extract_arrow_cell only forwards top-level metadata, so bridge_arrow surfaces raw JSON strings.",
+    "match": "type mismatch: actual str"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "nested_struct",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes STRUCT(..., JSON) with voyager.encoding=json on the nested child field; _extract_arrow_cell only forwards top-level metadata, so bridge_arrow surfaces raw JSON strings.",
+    "match": "type mismatch: actual str"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "nested_struct",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "Polars strips Arrow voyager.encoding=json field metadata inside STRUCT(..., JSON), surfacing raw JSON strings while the official DuckDB client returns decoded JSON.",
+    "match": "type mismatch: actual str"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "nested_array",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes UUID[N] as fixed_size_list<fixed_size_binary[16]> (list of bytes) while the official DuckDB client returns a tuple of uuid.UUID.",
+    "match": "type mismatch: actual list"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "nested_array",
+    "value_kind": "uuid",
+    "category": "fallback",
+    "reason": "DuckDB Polars export exposes UUID[N] as Array(Binary, N) (list of bytes) while the official DuckDB client returns a tuple of uuid.UUID.",
+    "match": "type mismatch: actual list"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "nested_array",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes JSON[N] as fixed_size_list<utf8> (list of JSON strings) while the official DuckDB client returns a tuple of decoded JSON.",
+    "match": "type mismatch: actual list"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_polars",
+    "path": "nested_array",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "DuckDB Polars export exposes JSON[N] as Array(String, N) (list of JSON strings) while the official DuckDB client returns a tuple of decoded JSON.",
+    "match": "type mismatch: actual list"
+  },
+  {
+    "engine": "duckdb",
+    "backend": "bridge_arrow",
+    "path": "nested_union",
+    "value_kind": "json_doc",
+    "category": "fallback",
+    "reason": "DuckDB Arrow export exposes UNION(..., JSON) with voyager.encoding=json on the union member field; _extract_arrow_cell only forwards top-level metadata, so bridge_arrow surfaces raw JSON strings.",
+    "match": "type mismatch: actual str"
   }
 ]

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **DuckDB nested UUID and JSON values across Arrow, Polars, and `execute()` (#445)**: `DuckDbBridge.execute_to_arrow()` and `execute_to_polars()` (including inside `Session.transaction()` and on DB-API fallback connections) now recursively apply the #424 representations to `UUID` and `JSON` values nested inside `STRUCT`, `MAP`, `LIST`, `ARRAY`, and `UNION` columns (and 0-row `UNION` schemas), tagging nested `UUID` fields as `fixed_size_binary(16)` with `ARROW:extension:name=arrow.uuid` and `voyager.type=uuid` and nested `JSON` fields as UTF-8 text with `voyager.encoding=json` and `voyager.type=json`. `DuckDbBridge.execute()` now decodes nested `JSON` values recursively (preserving `UNION` member distinctions via Arrow when a `UNION` contains `JSON`) and guards unhashable `MAP` keys while continuing to execute every statement once.
+
 ## [0.5.0-alpha.2] - 2026-11-27
 
 Second alpha of the 0.5 line. It fixes the value differences the new value conformance pack (#299) found, so the same value comes back with the same Python type from the official client, the bridge, the native backend and Arrow/Polars on every engine. It also moves to DuckDB 2.x with Python 3.14 support for every engine client, and polishes the `voyager` CLI.

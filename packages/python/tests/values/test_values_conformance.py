@@ -522,3 +522,175 @@ def test_value_conformance_entities_and_tx(engine: str, value_kind: str) -> None
             )
 
     _check()
+
+
+def _run_duckdb_nested_case(
+    adapter: Any,
+    *,
+    value_kind: str,
+    path: str,
+    value: Any,
+    sql: str,
+    params: dict[str, Any],
+    official_params: dict[str, Any],
+    backends: tuple[str, ...],
+    server_type: str,
+    in_tx: bool = False,
+) -> None:
+    """Runs a DuckDB nested-container conformance case across ``backends``."""
+    ref_val, _ = adapter._exec("official", sql, official_params, in_tx=in_tx)
+    RECORDER.record(
+        engine="duckdb",
+        backend="official",
+        path=path,
+        value_kind=value_kind,
+        status="pass",
+        python_type=type(ref_val).__name__,
+    )
+    failures: list[str] = []
+    for backend in backends:
+        is_columnar = backend.endswith(("_arrow", "_polars"))
+        is_polars = backend.endswith("_polars")
+        try:
+            actual_raw, col_type_desc = adapter._exec(backend, sql, params, in_tx=in_tx)
+        except Exception as exc:
+            err = _handle_difference(
+                engine="duckdb",
+                backend=backend,
+                path=path,
+                value_kind=value_kind,
+                value=value,
+                message=f"execution raised {type(exc).__name__}: {exc}",
+                statement=sql,
+                server_type=server_type,
+                result_error=f"{type(exc).__name__}: {exc}",
+            )
+            if err is not None:
+                failures.append(err)
+            continue
+
+        actual = (
+            _decode_columnar_value(
+                actual_raw, ref_val, col_type_desc, value_kind, is_polars=is_polars
+            )
+            if is_columnar
+            else actual_raw
+        )
+        diffs = compare_value_and_type(actual, ref_val, context=f"{backend}_vs_official")
+        py_type = type(actual_raw).__name__
+        if diffs:
+            err = _handle_difference(
+                engine="duckdb",
+                backend=backend,
+                path=path,
+                value_kind=value_kind,
+                value=value,
+                message="; ".join(diffs),
+                statement=sql,
+                server_type=server_type,
+                arrow_type=col_type_desc or "n/a",
+                result=actual_raw,
+                py_type=py_type,
+            )
+            if err is not None:
+                failures.append(err)
+        else:
+            RECORDER.record(
+                engine="duckdb",
+                backend=backend,
+                path=path,
+                value_kind=value_kind,
+                status="pass",
+                python_type=py_type,
+                arrow_type=col_type_desc,
+            )
+    if failures:
+        pytest.fail("\n\n".join(failures), pytrace=False)
+
+
+@pytest.mark.parametrize("engine", [pytest.param("duckdb", id="duckdb-nested_uuid_json")])
+def test_duckdb_nested_uuid_and_json_containers(engine: str) -> None:
+    """Differential round-trips for UUID and JSON nested inside DuckDB STRUCT, ARRAY, and UNION."""
+    adapter = _get_adapter(engine)
+    uuid_strat = strategy_for(engine, "uuid", path="param")
+    json_strat = strategy_for(engine, "json_doc", path="param")
+
+    @seed(SEED)
+    @given(u=uuid_strat, j=json_strat)
+    def _check(u: uuid.UUID, j: Any) -> None:
+        j_off = json.dumps(j)
+        bridge_backends = ("bridge", "bridge_arrow", "bridge_polars")
+        arrow_backends = ("bridge", "bridge_arrow")
+
+        if _path_enabled("nested_struct"):
+            _run_duckdb_nested_case(
+                adapter,
+                value_kind="uuid",
+                path="nested_struct",
+                value=u,
+                sql="SELECT {'v': $v::UUID} AS v",
+                params={"v": u},
+                official_params={"v": u},
+                backends=bridge_backends,
+                server_type="STRUCT(v UUID)",
+            )
+            _run_duckdb_nested_case(
+                adapter,
+                value_kind="json_doc",
+                path="nested_struct",
+                value=j,
+                sql="SELECT {'v': $v::JSON} AS v",
+                params={"v": j},
+                official_params={"v": j_off},
+                backends=bridge_backends,
+                server_type="STRUCT(v JSON)",
+                in_tx=True,
+            )
+        if _path_enabled("nested_array"):
+            _run_duckdb_nested_case(
+                adapter,
+                value_kind="uuid",
+                path="nested_array",
+                value=u,
+                sql="SELECT [$v::UUID, NULL]::UUID[2] AS v",
+                params={"v": u},
+                official_params={"v": u},
+                backends=bridge_backends,
+                server_type="UUID[2]",
+            )
+            _run_duckdb_nested_case(
+                adapter,
+                value_kind="json_doc",
+                path="nested_array",
+                value=j,
+                sql="SELECT [$v::JSON, NULL]::JSON[2] AS v",
+                params={"v": j},
+                official_params={"v": j_off},
+                backends=bridge_backends,
+                server_type="JSON[2]",
+            )
+        if _path_enabled("nested_union"):
+            _run_duckdb_nested_case(
+                adapter,
+                value_kind="uuid",
+                path="nested_union",
+                value=u,
+                sql="SELECT union_value(u := $v::UUID)::UNION(u UUID, j JSON) AS v",
+                params={"v": u},
+                official_params={"v": u},
+                backends=arrow_backends,
+                server_type="UNION(u UUID, j JSON)",
+            )
+            _run_duckdb_nested_case(
+                adapter,
+                value_kind="json_doc",
+                path="nested_union",
+                value=j,
+                sql="SELECT union_value(j := $v::JSON)::UNION(u UUID, j JSON) AS v",
+                params={"v": j},
+                official_params={"v": j_off},
+                backends=arrow_backends,
+                server_type="UNION(u UUID, j JSON)",
+            )
+
+    _check()

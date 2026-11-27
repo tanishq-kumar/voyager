@@ -1665,6 +1665,11 @@ def _adapt_duckdb_parameters(statement: str, params: dict[str, Any]) -> dict[str
 
 _DUCKDB_TIMETZ_TYPE_IDS = frozenset({"time with time zone"})
 _DUCKDB_INTERVAL_TYPE_IDS = frozenset({"interval", "timedelta"})
+_DUCKDB_UUID_TYPE_IDS = frozenset({"uuid"})
+_DUCKDB_JSON_TYPE_IDS = frozenset({"json"})
+_DUCKDB_ARROW_CANONICAL_TYPE_IDS = (
+    _DUCKDB_TIMETZ_TYPE_IDS | _DUCKDB_UUID_TYPE_IDS | _DUCKDB_JSON_TYPE_IDS
+)
 
 
 def _duckdb_type_id(dtype: Any) -> str:
@@ -1730,6 +1735,30 @@ def _duckdb_description_has_interval(description: Sequence[Any]) -> bool:
         len(item) > 1 and _duckdb_type_has(item[1], _DUCKDB_INTERVAL_TYPE_IDS)
         for item in description
     )
+
+
+def _duckdb_type_has_union_json(dtype: Any) -> bool:
+    """Returns whether ``dtype`` contains a ``UNION`` with a ``JSON`` member anywhere."""
+    tid = _duckdb_type_id(dtype)
+    if not hasattr(dtype, "id"):
+        upper = str(dtype).upper()
+        return "UNION" in upper and "JSON" in upper
+    if tid == "union":
+        return any(
+            name and _duckdb_type_has(child, _DUCKDB_JSON_TYPE_IDS)
+            for name, child in dtype.children
+        )
+    if tid in ("list", "array", "struct", "map"):
+        return any(
+            not (tid == "array" and name == "size") and _duckdb_type_has_union_json(child)
+            for name, child in dtype.children
+        )
+    return False
+
+
+def _duckdb_description_has_union_json(description: Sequence[Any]) -> bool:
+    """Returns whether a DuckDB cursor description contains a ``UNION`` with ``JSON``."""
+    return any(len(item) > 1 and _duckdb_type_has_union_json(item[1]) for item in description)
 
 
 def _duckdb_quote_identifier(name: str) -> str:
@@ -1929,73 +1958,203 @@ def _duckdb_uuid_bytes(value: Any) -> Any:
     return uuid.UUID(str(value)).bytes
 
 
-def _duckdb_uuid_arrow_type(arrow_type: Any) -> Any:
-    """Maps a UUID string Arrow type to its fixed-size binary equivalent."""
+def _duckdb_arrow_field_metadata(
+    dtype: Any,
+    arrow_type: Any,
+    existing: Mapping[bytes, bytes] | None = None,
+) -> dict[bytes, bytes] | None:
+    """Returns Voyager/Arrow field metadata for a DuckDB column or nested child field."""
     import pyarrow as pa
 
-    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
-        return pa.list_(_duckdb_uuid_arrow_type(arrow_type.value_type))
-    return pa.binary(16)
+    metadata = dict(existing) if existing else {}
+    tid = _duckdb_type_id(dtype) if dtype else ""
+    if tid == "uuid":
+        metadata[b"voyager.type"] = b"uuid"
+        if pa.types.is_fixed_size_binary(arrow_type):
+            # Same extension tag as the native PostgreSQL backend's UUID columns.
+            metadata[b"ARROW:extension:name"] = b"arrow.uuid"
+    elif tid == "json":
+        metadata[b"voyager.encoding"] = b"json"
+        metadata[b"voyager.type"] = b"json"
+    elif tid == "time with time zone":
+        metadata[b"voyager.type"] = b"time_tz"
+    elif tid == "hugeint":
+        metadata[b"voyager.type"] = b"hugeint"
+    elif (
+        _is_month_day_nano_interval(arrow_type) or tid in _DUCKDB_INTERVAL_TYPE_IDS
+    ) and pa.types.is_struct(arrow_type):
+        metadata[b"voyager.type"] = b"duration"
+    return metadata or None
 
 
-def _duckdb_uuid_column_to_arrow(column: Any, arrow_type: Any) -> Any:
-    """Builds a fixed-size binary Arrow array from a UUID string column."""
+def _duckdb_canonicalized_child_field(orig_field: Any, arrow_type: Any, dtype: Any) -> Any:
+    """Rebuilds a nested Arrow child ``pa.Field`` with Voyager metadata for ``dtype``."""
     import pyarrow as pa
 
-    values = [_duckdb_uuid_bytes(value) for value in column.to_pylist()]
-    return pa.array(values, type=_duckdb_uuid_arrow_type(arrow_type))
+    metadata = _duckdb_arrow_field_metadata(dtype, arrow_type, orig_field.metadata)
+    return pa.field(orig_field.name, arrow_type, nullable=orig_field.nullable, metadata=metadata)
 
 
 def _duckdb_canonicalize_arrow_array(arr: Any, dtype: Any) -> Any:
-    """Recursively converts nested ``TIMETZ`` text and ``month_day_nano_interval`` in an Arrow array."""
+    """Recursively converts ``TIMETZ``, ``UUID``, ``JSON``, and ``month_day_nano_interval`` in Arrow."""
     import pyarrow as pa
 
     if _is_month_day_nano_interval(arr.type):
         return _duckdb_mdn_column_to_arrow(arr)
-    tid = _duckdb_type_id(dtype)
+    tid = _duckdb_type_id(dtype) if dtype else ""
     if tid == "time with time zone":
         return pa.array([_duckdb_timetz_text_iso(v) for v in arr.to_pylist()], type=pa.string())
+    if tid == "uuid":
+        if pa.types.is_fixed_size_binary(arr.type) and arr.type.byte_width == 16:
+            return arr
+        return pa.array([_duckdb_uuid_bytes(v) for v in arr.to_pylist()], type=pa.binary(16))
+    if tid == "json":
+        if arr.type == pa.string():
+            return arr
+        return pa.array(
+            [
+                v if v is None or isinstance(v, str) else json.dumps(v, default=json_default)
+                for v in arr.to_pylist()
+            ],
+            type=pa.string(),
+        )
     if pa.types.is_list(arr.type):
-        child_dtype = dtype.children[0][1] if tid == "list" and hasattr(dtype, "children") else None
+        child_dtype = _duckdb_list_child_dtype(dtype, tid)
         new_values = _duckdb_canonicalize_arrow_array(arr.values, child_dtype)
-        return pa.ListArray.from_arrays(arr.offsets, new_values, mask=arr.is_null())
+        value_field = _duckdb_canonicalized_child_field(
+            arr.type.value_field, new_values.type, child_dtype
+        )
+        return pa.ListArray.from_arrays(
+            arr.offsets, new_values, type=pa.list_(value_field), mask=arr.is_null()
+        )
     if pa.types.is_large_list(arr.type):
-        child_dtype = dtype.children[0][1] if tid == "list" and hasattr(dtype, "children") else None
+        child_dtype = _duckdb_list_child_dtype(dtype, tid)
         new_values = _duckdb_canonicalize_arrow_array(arr.values, child_dtype)
-        return pa.LargeListArray.from_arrays(arr.offsets, new_values, mask=arr.is_null())
+        value_field = _duckdb_canonicalized_child_field(
+            arr.type.value_field, new_values.type, child_dtype
+        )
+        return pa.LargeListArray.from_arrays(
+            arr.offsets, new_values, type=pa.large_list(value_field), mask=arr.is_null()
+        )
     if pa.types.is_fixed_size_list(arr.type):
-        child_dtype = _duckdb_type_children_map(dtype, "array").get("child")
+        child_dtype = _duckdb_array_child_dtype(dtype, tid)
         new_values = _duckdb_canonicalize_arrow_array(arr.values, child_dtype)
-        return pa.FixedSizeListArray.from_arrays(new_values, arr.type.list_size, mask=arr.is_null())
+        value_field = _duckdb_canonicalized_child_field(
+            arr.type.value_field, new_values.type, child_dtype
+        )
+        return pa.FixedSizeListArray.from_arrays(
+            new_values,
+            type=pa.list_(value_field, arr.type.list_size),
+            mask=arr.is_null(),
+        )
     if pa.types.is_struct(arr.type):
         dtype_fields = _duckdb_type_children_map(dtype, "struct")
-        names = [f.name for f in arr.type]
-        new_fields = [
-            _duckdb_canonicalize_arrow_array(arr.field(i), dtype_fields.get(names[i]))
-            for i in range(arr.type.num_fields)
-        ]
-        return pa.StructArray.from_arrays(new_fields, names=names, mask=arr.is_null())
+        struct_fields = []
+        new_fields = []
+        for i, orig_field in enumerate(arr.type):
+            child_dtype = dtype_fields.get(orig_field.name)
+            child_arr = _duckdb_canonicalize_arrow_array(arr.field(i), child_dtype)
+            new_fields.append(child_arr)
+            struct_fields.append(
+                _duckdb_canonicalized_child_field(orig_field, child_arr.type, child_dtype)
+            )
+        return pa.StructArray.from_arrays(new_fields, fields=struct_fields, mask=arr.is_null())
     if pa.types.is_map(arr.type):
         dtype_children = _duckdb_type_children_map(dtype, "map")
-        new_keys = _duckdb_canonicalize_arrow_array(arr.keys, dtype_children.get("key"))
-        new_items = _duckdb_canonicalize_arrow_array(arr.items, dtype_children.get("value"))
-        return pa.MapArray.from_arrays(arr.offsets, new_keys, new_items, mask=arr.is_null())
+        key_dtype = dtype_children.get("key")
+        val_dtype = dtype_children.get("value")
+        new_keys = _duckdb_canonicalize_arrow_array(arr.keys, key_dtype)
+        new_items = _duckdb_canonicalize_arrow_array(arr.items, val_dtype)
+        key_field = _duckdb_canonicalized_child_field(arr.type.key_field, new_keys.type, key_dtype)
+        item_field = _duckdb_canonicalized_child_field(
+            arr.type.item_field, new_items.type, val_dtype
+        )
+        return pa.MapArray.from_arrays(
+            arr.offsets,
+            new_keys,
+            new_items,
+            type=pa.map_(key_field, item_field),
+            mask=arr.is_null(),
+        )
     if pa.types.is_union(arr.type):
         dtype_members = _duckdb_type_children_map(dtype, "union")
-        names = [f.name for f in arr.type]
-        new_children = [
-            _duckdb_canonicalize_arrow_array(arr.field(i), dtype_members.get(names[i]))
-            for i in range(arr.type.num_fields)
-        ]
+        union_fields = []
+        new_children = []
+        for i, orig_field in enumerate(arr.type):
+            child_dtype = dtype_members.get(orig_field.name)
+            child_arr = _duckdb_canonicalize_arrow_array(arr.field(i), child_dtype)
+            new_children.append(child_arr)
+            union_fields.append(
+                _duckdb_canonicalized_child_field(orig_field, child_arr.type, child_dtype)
+            )
+        names = [f.name for f in union_fields]
         codes = list(arr.type.type_codes)
         if arr.type.mode == "dense":
-            return pa.UnionArray.from_dense(
+            union_arr = pa.UnionArray.from_dense(
                 arr.type_codes, arr.offsets, new_children, field_names=names, type_codes=codes
             )
-        return pa.UnionArray.from_sparse(
-            arr.type_codes, new_children, field_names=names, type_codes=codes
-        )
+            target_type = pa.dense_union(union_fields, type_codes=codes)
+        else:
+            union_arr = pa.UnionArray.from_sparse(
+                arr.type_codes, new_children, field_names=names, type_codes=codes
+            )
+            target_type = pa.sparse_union(union_fields, type_codes=codes)
+        return union_arr.cast(target_type)
     return arr
+
+
+def _duckdb_empty_arrow_array(arrow_type: Any) -> Any:
+    """Builds an empty PyArrow array for ``arrow_type``, including nested ``UnionType``."""
+    import pyarrow as pa
+
+    if pa.types.is_union(arrow_type):
+        children = [_duckdb_empty_arrow_array(f.type) for f in arrow_type]
+        names = [f.name for f in arrow_type]
+        codes = list(arrow_type.type_codes)
+        if arrow_type.mode == "dense":
+            return pa.UnionArray.from_dense(
+                pa.array([], type=pa.int8()),
+                pa.array([], type=pa.int32()),
+                children,
+                field_names=names,
+                type_codes=codes,
+            )
+        return pa.UnionArray.from_sparse(
+            pa.array([], type=pa.int8()),
+            children,
+            field_names=names,
+            type_codes=codes,
+        )
+    if pa.types.is_list(arrow_type):
+        return pa.ListArray.from_arrays(
+            pa.array([0], type=pa.int32()),
+            _duckdb_empty_arrow_array(arrow_type.value_type),
+            type=arrow_type,
+        )
+    if pa.types.is_large_list(arrow_type):
+        return pa.LargeListArray.from_arrays(
+            pa.array([0], type=pa.int64()),
+            _duckdb_empty_arrow_array(arrow_type.value_type),
+            type=arrow_type,
+        )
+    if pa.types.is_fixed_size_list(arrow_type):
+        return pa.FixedSizeListArray.from_arrays(
+            _duckdb_empty_arrow_array(arrow_type.value_type),
+            type=arrow_type,
+        )
+    if pa.types.is_struct(arrow_type):
+        return pa.StructArray.from_arrays(
+            [_duckdb_empty_arrow_array(f.type) for f in arrow_type],
+            fields=list(arrow_type),
+        )
+    if pa.types.is_map(arrow_type):
+        return pa.MapArray.from_arrays(
+            pa.array([0], type=pa.int32()),
+            _duckdb_empty_arrow_array(arrow_type.key_type),
+            _duckdb_empty_arrow_array(arrow_type.item_type),
+            type=arrow_type,
+        )
+    return pa.array([], type=arrow_type)
 
 
 def _duckdb_canonicalize_arrow_column(column: Any, dtype: Any) -> Any:
@@ -2005,7 +2164,7 @@ def _duckdb_canonicalize_arrow_column(column: Any, dtype: Any) -> Any:
     if isinstance(column, pa.ChunkedArray):
         if column.num_chunks == 0:
             converted_empty = _duckdb_canonicalize_arrow_array(
-                pa.array([], type=column.type), dtype
+                _duckdb_empty_arrow_array(column.type), dtype
             )
             return pa.chunked_array([], type=converted_empty.type)
         return _duckdb_canonicalize_arrow_array(column.combine_chunks(), dtype)
@@ -2030,39 +2189,26 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
             description[idx][1] if idx < len(description) and len(description[idx]) > 1 else ""
         )
         description_type = str(dtype).upper()
+        tid = _duckdb_type_id(dtype) if dtype else ""
         column = arrow_table.column(idx)
         metadata = dict(field.metadata) if field.metadata else {}
-        if description_type == "UUID" or description_type.startswith("UUID["):
-            array = _duckdb_uuid_column_to_arrow(column, field.type)
-            metadata[b"voyager.type"] = b"uuid"
-            if pa.types.is_fixed_size_binary(array.type):
-                # Same extension tag as the native PostgreSQL backend's UUID columns.
-                metadata[b"ARROW:extension:name"] = b"arrow.uuid"
-        elif description_type == "JSON":
-            array = pa.array(column.to_pylist(), type=pa.string())
-            metadata[b"voyager.encoding"] = b"json"
-            metadata[b"voyager.type"] = b"json"
-        elif description_type.startswith("TIME WITH TIME ZONE"):
-            depth = description_type.count("[")
-            target_type: Any = pa.string()
-            for _ in range(depth):
-                target_type = pa.list_(target_type)
-            array = pa.array(
-                [_duckdb_timetz_text_iso(value) for value in column.to_pylist()],
-                type=target_type,
-            )
-            metadata[b"voyager.type"] = b"time_tz"
-        elif description_type == "HUGEINT":
+        if tid == "hugeint":
             array = column
             metadata[b"voyager.type"] = b"hugeint"
         elif _is_month_day_nano_interval(field.type):
             array = _duckdb_mdn_column_to_arrow(column)
             if pa.types.is_struct(array.type):
                 metadata[b"voyager.type"] = b"duration"
-        elif _duckdb_type_has(dtype, _DUCKDB_TIMETZ_TYPE_IDS) or _arrow_has_month_day_nano_interval(
-            field.type
-        ):
+        elif _duckdb_type_has(
+            dtype, _DUCKDB_ARROW_CANONICAL_TYPE_IDS
+        ) or _arrow_has_month_day_nano_interval(field.type):
             array = _duckdb_canonicalize_arrow_column(column, dtype)
+            if tid in ("uuid", "json", "time with time zone"):
+                metadata = _duckdb_arrow_field_metadata(dtype, array.type, metadata) or {}
+            elif description_type.startswith("UUID["):
+                metadata[b"voyager.type"] = b"uuid"
+            elif description_type.startswith("TIME WITH TIME ZONE"):
+                metadata[b"voyager.type"] = b"time_tz"
         else:
             arrays.append(column)
             fields.append(field)
@@ -2074,6 +2220,132 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
     return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
 
+def _duckdb_python_values_to_arrow(
+    name: str, values: list[Any], dtype: Any, *, nullable: bool = True
+) -> tuple[Any, Any]:
+    """Builds an Arrow ``(field, array)`` from DuckDB DB-API Python values recursively."""
+    import pyarrow as pa
+
+    tid = _duckdb_type_id(dtype) if dtype else ""
+    if tid == "time with time zone":
+        arr = pa.array([_duckdb_time_iso(value) for value in values], type=pa.string())
+    elif tid == "json":
+        arr = pa.array(
+            [
+                value
+                if value is None or isinstance(value, str)
+                else json.dumps(value, default=json_default)
+                for value in values
+            ],
+            type=pa.string(),
+        )
+    elif tid == "uuid":
+        arr = pa.array([_duckdb_uuid_bytes(value) for value in values], type=pa.binary(16))
+    elif tid == "hugeint":
+        arr = pa.array(
+            [None if value is None else Decimal(int(value)) for value in values],
+            type=pa.decimal128(38, 0),
+        )
+    elif tid in ("interval", "timedelta"):
+        arr = pa.array(values, type=pa.duration("us"))
+    elif tid == "list" and _duckdb_type_has(dtype, _DUCKDB_ARROW_CANONICAL_TYPE_IDS):
+        child_dtype = _duckdb_list_child_dtype(dtype, tid)
+        offsets = [0]
+        flat: list[Any] = []
+        null_flags: list[bool] = []
+        for item in values:
+            if item is None:
+                null_flags.append(True)
+            else:
+                null_flags.append(False)
+                flat.extend(item)
+            offsets.append(len(flat))
+        child_name = (
+            str(dtype.children[0][0]) if hasattr(dtype, "children") and dtype.children else "item"
+        )
+        child_field, child_arr = _duckdb_python_values_to_arrow(child_name, flat, child_dtype)
+        arr = pa.ListArray.from_arrays(
+            pa.array(offsets, type=pa.int32()),
+            child_arr,
+            type=pa.list_(child_field),
+            mask=pa.array(null_flags, type=pa.bool_()),
+        )
+    elif tid == "array" and _duckdb_type_has(dtype, _DUCKDB_ARROW_CANONICAL_TYPE_IDS):
+        children = _duckdb_type_children_map(dtype, "array")
+        child_dtype = _duckdb_array_child_dtype(dtype, tid)
+        size = int(children["size"]) if "size" in children else 0
+        flat = []
+        null_flags = []
+        for item in values:
+            if item is None:
+                null_flags.append(True)
+                flat.extend([None] * size)
+            else:
+                null_flags.append(False)
+                flat.extend(item)
+        child_field, child_arr = _duckdb_python_values_to_arrow("item", flat, child_dtype)
+        arr = pa.FixedSizeListArray.from_arrays(
+            child_arr,
+            type=pa.list_(child_field, size),
+            mask=pa.array(null_flags, type=pa.bool_()),
+        )
+    elif tid == "struct" and _duckdb_type_has(dtype, _DUCKDB_ARROW_CANONICAL_TYPE_IDS):
+        dtype_fields = _duckdb_type_children_map(dtype, "struct")
+        struct_fields = []
+        field_arrays = []
+        null_flags = [item is None for item in values]
+        for fname, child_dtype in dtype_fields.items():
+            sub_vals = [None if item is None else item.get(fname) for item in values]
+            cfield, carr = _duckdb_python_values_to_arrow(fname, sub_vals, child_dtype)
+            struct_fields.append(cfield)
+            field_arrays.append(carr)
+        arr = pa.StructArray.from_arrays(
+            field_arrays, fields=struct_fields, mask=pa.array(null_flags, type=pa.bool_())
+        )
+    elif tid == "map" and _duckdb_type_has(dtype, _DUCKDB_ARROW_CANONICAL_TYPE_IDS):
+        children = _duckdb_type_children_map(dtype, "map")
+        key_dtype = children.get("key", "")
+        val_dtype = children.get("value", "")
+        offsets = [0]
+        flat_keys: list[Any] = []
+        flat_vals: list[Any] = []
+        null_flags = []
+        for item in values:
+            if item is None:
+                null_flags.append(True)
+            else:
+                null_flags.append(False)
+                for k, v in item.items():
+                    flat_keys.append(k)
+                    flat_vals.append(v)
+            offsets.append(len(flat_keys))
+        key_field, key_arr = _duckdb_python_values_to_arrow(
+            "key", flat_keys, key_dtype, nullable=False
+        )
+        val_field, val_arr = _duckdb_python_values_to_arrow("value", flat_vals, val_dtype)
+        arr = pa.MapArray.from_arrays(
+            pa.array(offsets, type=pa.int32()),
+            key_arr,
+            val_arr,
+            type=pa.map_(key_field, val_field),
+            mask=pa.array(null_flags, type=pa.bool_()),
+        )
+    else:
+        arr = pa.array(values)
+
+    meta = _duckdb_arrow_field_metadata(dtype, arr.type)
+    description_type = str(dtype).upper() if dtype else ""
+    if meta is None:
+        meta_dict: dict[bytes, bytes] = {}
+    else:
+        meta_dict = meta
+    if description_type.startswith("UUID["):
+        meta_dict[b"voyager.type"] = b"uuid"
+    elif description_type.startswith("TIME WITH TIME ZONE"):
+        meta_dict[b"voyager.type"] = b"time_tz"
+    return pa.field(name, arr.type, nullable=nullable, metadata=meta_dict or None), arr
+
+
 def _duckdb_rows_to_arrow(description: Sequence[Any], rows: Sequence[Sequence[Any]]) -> Any:
     """Builds an Arrow table from DB-API rows when DuckDB's Arrow copy loses TIMETZ offsets."""
     import pyarrow as pa
@@ -2082,52 +2354,10 @@ def _duckdb_rows_to_arrow(description: Sequence[Any], rows: Sequence[Sequence[An
     fields = []
     for idx, item in enumerate(description):
         name = str(item[0])
-        description_type = str(item[1]).upper() if len(item) > 1 else ""
+        dtype: Any = item[1] if len(item) > 1 else ""
         values = [row[idx] for row in rows]
-        metadata: dict[bytes, bytes] = {}
-        if description_type.startswith("TIME WITH TIME ZONE"):
-            depth = description_type.count("[")
-            target_type = pa.string()
-            for _ in range(depth):
-                target_type = pa.list_(target_type)
-            array = pa.array(
-                [_duckdb_time_iso(value) for value in values],
-                type=target_type,
-            )
-            metadata[b"voyager.type"] = b"time_tz"
-        elif description_type == "JSON":
-            array = pa.array(
-                [
-                    value
-                    if value is None or isinstance(value, str)
-                    else json.dumps(value, default=json_default)
-                    for value in values
-                ],
-                type=pa.string(),
-            )
-            metadata[b"voyager.encoding"] = b"json"
-            metadata[b"voyager.type"] = b"json"
-        elif description_type == "UUID" or description_type.startswith("UUID["):
-            depth = description_type.count("[")
-            uuid_type: Any = pa.binary(16)
-            for _ in range(depth):
-                uuid_type = pa.list_(uuid_type)
-            array = pa.array([_duckdb_uuid_bytes(value) for value in values], type=uuid_type)
-            metadata[b"voyager.type"] = b"uuid"
-            if pa.types.is_fixed_size_binary(array.type):
-                # Same extension tag as the native PostgreSQL backend's UUID columns.
-                metadata[b"ARROW:extension:name"] = b"arrow.uuid"
-        elif description_type == "HUGEINT":
-            array = pa.array(
-                [None if value is None else Decimal(int(value)) for value in values],
-                type=pa.decimal128(38, 0),
-            )
-            metadata[b"voyager.type"] = b"hugeint"
-        elif description_type in ("INTERVAL", "TIMEDELTA"):
-            array = pa.array(values, type=pa.duration("us"))
-        else:
-            array = pa.array(values)
-        fields.append(pa.field(name, array.type, nullable=True, metadata=metadata or None))
+        field, array = _duckdb_python_values_to_arrow(name, values, dtype)
+        fields.append(field)
         arrays.append(array)
     return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
@@ -2335,7 +2565,9 @@ class DuckDbBridge:
             relation, description = sql_res
             if relation is None or not description:
                 return BridgeResult([], columns=())
-            if _duckdb_description_has_interval(description):
+            if _duckdb_description_has_interval(description) or _duckdb_description_has_union_json(
+                description
+            ):
                 arrow_table = self._relation_arrow_table(relation, description)
                 if arrow_table is not None:
                     return _records_from_duckdb_arrow(description, arrow_table)
@@ -2344,9 +2576,10 @@ class DuckDbBridge:
         rel = self.con.execute(stmt, params)
         if not rel.description:
             return BridgeResult([], columns=())
-        if _duckdb_description_has_interval(rel.description) and not _duckdb_description_has_timetz(
-            rel.description
-        ):
+        if (
+            _duckdb_description_has_interval(rel.description)
+            or _duckdb_description_has_union_json(rel.description)
+        ) and not _duckdb_description_has_timetz(rel.description):
             arrow_table = self._arrow_table(rel)
             if arrow_table is not None:
                 return _records_from_duckdb_arrow(rel.description, arrow_table)
@@ -2992,59 +3225,113 @@ def _is_month_day_nano_interval(arrow_type: Any) -> bool:
     return bool(arrow_type == pa.month_day_nano_interval())
 
 
-def _decode_duckdb_arrow_python_value(val: Any, arrow_type: Any, dtype: Any) -> Any:
-    """Decodes a Python value from a DuckDB PyArrow table, preserving TIMETZ, HUGEINT, UUID, and Duration."""
+def _duckdb_hashable_map_key(decoded_key: Any, raw_key: Any) -> Any:
+    """Returns ``decoded_key`` when hashable as a Python dict key, else ``raw_key``."""
+    try:
+        hash(decoded_key)
+    except TypeError:
+        return raw_key
+    return decoded_key
+
+
+def _decode_duckdb_arrow_array(arr: Any, dtype: Any) -> list[Any]:
+    """Recursively decodes a DuckDB PyArrow array into Python values using ``dtype``."""
     import uuid as _uuid
 
     import pyarrow as pa
 
-    if val is None:
-        return None
-    tid = _duckdb_type_id(dtype)
+    if isinstance(arr, pa.ChunkedArray):
+        if arr.num_chunks == 0:
+            return []
+        arr = arr.combine_chunks()
+    if len(arr) == 0:
+        return []
+    tid = _duckdb_type_id(dtype) if dtype else ""
     if tid == "time with time zone":
-        return _parse_duckdb_timetz_python(val)
+        return [None if v is None else _parse_duckdb_timetz_python(v) for v in arr.to_pylist()]
     if tid in ("hugeint", "uhugeint"):
-        return int(val)
+        return [None if v is None else int(v) for v in arr.to_pylist()]
     if tid == "uuid":
-        if isinstance(val, _uuid.UUID):
-            return val
-        if isinstance(val, bytes):
-            return _uuid.UUID(bytes=val)
-        return _uuid.UUID(str(val))
-    if _is_month_day_nano_interval(arrow_type):
-        return _duckdb_mdn_to_duration(val)
-    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
-        child_dtype = dtype.children[0][1] if tid == "list" and hasattr(dtype, "children") else ""
         return [
-            _decode_duckdb_arrow_python_value(item, arrow_type.value_type, child_dtype)
-            for item in val
+            None
+            if v is None
+            else (
+                v
+                if isinstance(v, _uuid.UUID)
+                else (_uuid.UUID(bytes=v) if isinstance(v, bytes) else _uuid.UUID(str(v)))
+            )
+            for v in arr.to_pylist()
         ]
-    if pa.types.is_fixed_size_list(arrow_type):
-        child_dtype = _duckdb_type_children_map(dtype, "array").get("child", "")
-        return tuple(
-            _decode_duckdb_arrow_python_value(item, arrow_type.value_type, child_dtype)
-            for item in val
-        )
-    if pa.types.is_map(arrow_type):
+    if tid == "json":
+        return [
+            None if v is None else (json.loads(v) if isinstance(v, str) else v)
+            for v in arr.to_pylist()
+        ]
+    if _is_month_day_nano_interval(arr.type):
+        return [None if v is None else _duckdb_mdn_to_duration(v) for v in arr.to_pylist()]
+    if pa.types.is_list(arr.type) or pa.types.is_large_list(arr.type):
+        child_dtype = _duckdb_list_child_dtype(dtype, tid)
+        decoded_vals = _decode_duckdb_arrow_array(arr.values, child_dtype)
+        offsets = arr.offsets.to_pylist()
+        nulls = arr.is_null().to_pylist()
+        base = arr.offset
+        return [
+            None if is_null else decoded_vals[offsets[base + i] : offsets[base + i + 1]]
+            for i, is_null in enumerate(nulls)
+        ]
+    if pa.types.is_fixed_size_list(arr.type):
+        child_dtype = _duckdb_array_child_dtype(dtype, tid)
+        decoded_vals = _decode_duckdb_arrow_array(arr.values, child_dtype)
+        size = arr.type.list_size
+        nulls = arr.is_null().to_pylist()
+        base = arr.offset * size
+        return [
+            None if is_null else tuple(decoded_vals[base + i * size : base + (i + 1) * size])
+            for i, is_null in enumerate(nulls)
+        ]
+    if pa.types.is_map(arr.type):
         children = _duckdb_type_children_map(dtype, "map")
-        key_dtype = children.get("key", "")
-        item_dtype = children.get("value", "")
-        return {
-            _decode_duckdb_arrow_python_value(
-                k, arrow_type.key_type, key_dtype
-            ): _decode_duckdb_arrow_python_value(v, arrow_type.item_type, item_dtype)
-            for k, v in val
-        }
-    if pa.types.is_struct(arrow_type):
+        decoded_keys = _decode_duckdb_arrow_array(arr.keys, children.get("key", ""))
+        decoded_items = _decode_duckdb_arrow_array(arr.items, children.get("value", ""))
+        raw_keys = arr.keys.to_pylist()
+        offsets = arr.offsets.to_pylist()
+        nulls = arr.is_null().to_pylist()
+        base = arr.offset
+        return [
+            None
+            if is_null
+            else {
+                _duckdb_hashable_map_key(decoded_keys[j], raw_keys[j]): decoded_items[j]
+                for j in range(offsets[base + i], offsets[base + i + 1])
+            }
+            for i, is_null in enumerate(nulls)
+        ]
+    if pa.types.is_struct(arr.type):
         dtype_fields = _duckdb_type_children_map(dtype, "struct")
-        field_map = {field.name: field.type for field in arrow_type}
-        return {
-            k: _decode_duckdb_arrow_python_value(v, field_map[k], dtype_fields.get(k, ""))
-            if k in field_map
-            else v
-            for k, v in val.items()
+        names = [f.name for f in arr.type]
+        decoded_fields = [
+            _decode_duckdb_arrow_array(arr.field(idx), dtype_fields.get(name, ""))
+            for idx, name in enumerate(names)
+        ]
+        nulls = arr.is_null().to_pylist()
+        return [
+            None if is_null else {name: decoded_fields[idx][i] for idx, name in enumerate(names)}
+            for i, is_null in enumerate(nulls)
+        ]
+    if pa.types.is_union(arr.type):
+        dtype_members = _duckdb_type_children_map(dtype, "union")
+        decoded_members = {
+            code: _decode_duckdb_arrow_array(
+                arr.field(idx), dtype_members.get(arr.type.field(idx).name, "")
+            )
+            for idx, code in enumerate(arr.type.type_codes)
         }
-    return _normalize_duckdb_value(val)
+        codes = arr.type_codes.to_pylist()
+        if arr.type.mode == "dense":
+            offsets = arr.offsets.to_pylist()
+            return [decoded_members[codes[i]][offsets[i]] for i in range(len(arr))]
+        return [decoded_members[codes[i]][i] for i in range(len(arr))]
+    return [_normalize_duckdb_value(v) for v in arr.to_pylist()]
 
 
 def _records_from_duckdb_rows(
@@ -3053,13 +3340,10 @@ def _records_from_duckdb_rows(
     """Builds a :class:`BridgeResult` from an already-fetched DuckDB cursor."""
     cols = [str(d[0]) for d in description]
     dtypes = [d[1] if len(d) > 1 else "" for d in description]
-    json_cols = {idx for idx, dt in enumerate(dtypes) if _duckdb_type_id(dt) == "json"}
     records: list[dict[str, Any]] = []
     for row in rows:
         rec: dict[str, Any] = {}
         for idx, (col, val) in enumerate(zip(cols, row, strict=False)):
-            if idx in json_cols and isinstance(val, str):
-                val = json.loads(val)
             dtype = dtypes[idx] if idx < len(dtypes) else ""
             rec[col] = _normalize_duckdb_value(val, dtype)
         records.append(rec)
@@ -3068,45 +3352,18 @@ def _records_from_duckdb_rows(
 
 def _records_from_duckdb_arrow(description: Sequence[Any], arrow_table: Any) -> BridgeResult:
     """Builds a :class:`BridgeResult` from a DuckDB PyArrow table, preserving interval months."""
-    import pyarrow as pa
-
     cols = [str(d[0]) for d in description]
+    if arrow_table.num_rows == 0:
+        return BridgeResult([], columns=cols)
     dtypes = [d[1] if len(d) > 1 else "" for d in description]
-    json_cols = {idx for idx, dt in enumerate(dtypes) if _duckdb_type_id(dt) == "json"}
-    schema = arrow_table.schema
-    col_lists = [arrow_table.column(idx).to_pylist() for idx in range(len(cols))]
-    union_meta: dict[int, tuple[list[int], dict[int, tuple[Any, Any]]]] = {}
-    for col_idx in range(len(cols)):
-        field_type = schema.field(col_idx).type
-        if pa.types.is_union(field_type):
-            col = arrow_table.column(col_idx)
-            arr = col.combine_chunks() if col.num_chunks > 0 else pa.array([], type=field_type)
-            dtype = dtypes[col_idx]
-            dtype_members = _duckdb_type_children_map(dtype, "union")
-            member_map = {
-                code: (field_type.field(i).type, dtype_members.get(field_type.field(i).name, ""))
-                for i, code in enumerate(field_type.type_codes)
-            }
-            union_meta[col_idx] = (arr.type_codes.to_pylist(), member_map)
+    decoded_cols = [
+        _decode_duckdb_arrow_array(arrow_table.column(idx), dtypes[idx]) for idx in range(len(cols))
+    ]
     num_rows = arrow_table.num_rows
-    records: list[dict[str, Any]] = []
-    for row_idx in range(num_rows):
-        rec: dict[str, Any] = {}
-        for col_idx, col in enumerate(cols):
-            val = col_lists[col_idx][row_idx]
-            if val is not None:
-                if col_idx in json_cols and isinstance(val, str):
-                    val = json.loads(val)
-                elif col_idx in union_meta:
-                    codes, member_map = union_meta[col_idx]
-                    member_arrow_type, member_dtype = member_map[codes[row_idx]]
-                    val = _decode_duckdb_arrow_python_value(val, member_arrow_type, member_dtype)
-                else:
-                    val = _decode_duckdb_arrow_python_value(
-                        val, schema.field(col_idx).type, dtypes[col_idx]
-                    )
-            rec[col] = val
-        records.append(rec)
+    records: list[dict[str, Any]] = [
+        {col: decoded_cols[col_idx][row_idx] for col_idx, col in enumerate(cols)}
+        for row_idx in range(num_rows)
+    ]
     return BridgeResult(records, columns=cols)
 
 
@@ -3247,12 +3504,24 @@ def _duckdb_array_child_dtype(dtype: Any, tid: str) -> Any:
 
 
 def _normalize_duckdb_value(val: Any, dtype: Any = "") -> Any:
-    """Normalizes DuckDB Python values (converting ``timedelta`` and ``TIMETZ``)."""
+    """Normalizes DuckDB Python values (converting ``timedelta``, ``TIMETZ``, ``UUID``, and ``JSON``)."""
     if val is None:
         return None
     tid = _duckdb_type_id(dtype) if dtype else ""
     if tid == "time with time zone":
         return _parse_duckdb_timetz_python(val)
+    if tid == "json":
+        if isinstance(val, str):
+            return json.loads(val)
+        return val
+    if tid == "uuid":
+        if isinstance(val, uuid.UUID):
+            return val
+        if isinstance(val, bytes):
+            return uuid.UUID(bytes=val)
+        if isinstance(val, str):
+            return uuid.UUID(val)
+        return val
     if isinstance(val, datetime.timedelta):
         return Duration.from_timedelta(val)
     if isinstance(val, list):
@@ -3267,16 +3536,23 @@ def _normalize_duckdb_value(val: Any, dtype: Any = "") -> Any:
             key_dtype = children.get("key", "")
             val_dtype = children.get("value", "")
             return {
-                _normalize_duckdb_value(k, key_dtype): _normalize_duckdb_value(v, val_dtype)
+                _duckdb_hashable_map_key(_normalize_duckdb_value(k, key_dtype), k): (
+                    _normalize_duckdb_value(v, val_dtype)
+                )
                 for k, v in val.items()
             }
         dtype_fields = _duckdb_type_children_map(dtype, "struct")
         return {k: _normalize_duckdb_value(v, dtype_fields.get(k, "")) for k, v in val.items()}
-    if tid == "union" and isinstance(val, str) and _duckdb_type_has(dtype, _DUCKDB_TIMETZ_TYPE_IDS):
-        try:
-            return _parse_duckdb_timetz_python(val)
-        except (TypeError, ValueError):
-            return val
+    if tid == "union" and isinstance(val, str):
+        if _duckdb_type_has(dtype, _DUCKDB_TIMETZ_TYPE_IDS):
+            try:
+                return _parse_duckdb_timetz_python(val)
+            except (TypeError, ValueError):
+                pass
+        if _duckdb_type_has(dtype, _DUCKDB_JSON_TYPE_IDS) and not _duckdb_type_has(
+            dtype, frozenset({"varchar"})
+        ):
+            return json.loads(val)
     return val
 
 
