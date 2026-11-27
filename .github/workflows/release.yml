@@ -453,7 +453,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          - os: ubuntu-latest
+          # Native Arm runner: no QEMU emulation needed for the aarch64 binary.
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -467,12 +468,6 @@ jobs:
         with:
           name: cli-${{ matrix.target }}
           path: dist
-
-      - name: Install QEMU User Emulation (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user-static libc6-arm64-cross
 
       - name: Unpack and Smoke Test CLI Archive (Unix)
         if: runner.os != 'Windows'
@@ -490,9 +485,7 @@ jobs:
           test -f "${BIN_DIR}/README.md"
 
           run_bin() {
-            if [[ "${TARGET}" == "aarch64-unknown-linux-gnu" ]]; then
-              qemu-aarch64-static -L /usr/aarch64-linux-gnu "$@"
-            elif [[ "${TARGET}" == "x86_64-apple-darwin" ]]; then
+            if [[ "${TARGET}" == "x86_64-apple-darwin" ]]; then
               arch -x86_64 "$@"
             else
               "$@"
