@@ -256,6 +256,9 @@ class Transaction:
 
             result = self._driver_tx.execute_sync(statement, parameters)
             return _stream_to_arrow(result.stream)
+        arrow_execute = getattr(self._driver_tx, "execute_to_arrow", None)
+        if callable(arrow_execute):
+            return arrow_execute(statement, parameters)
         return self._driver_tx.execute_to_polars(statement, parameters).to_arrow()
 
     def _execute_bulk_sync(self, plan: Any) -> BulkExecutionResult:
@@ -570,6 +573,9 @@ class AsyncTransaction:
 
                 result = await self._driver_tx.execute(statement, parameters)
                 return _stream_to_arrow(result.stream)
+            arrow_execute = getattr(self._driver_tx, "execute_to_arrow", None)
+            if callable(arrow_execute):
+                return await arrow_execute(statement, parameters)
             return (await self._driver_tx.execute_to_polars(statement, parameters)).to_arrow()
         except asyncio.CancelledError:
             self._release()

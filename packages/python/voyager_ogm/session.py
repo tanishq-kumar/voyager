@@ -1744,6 +1744,9 @@ class Session(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
+        arrow_execute = getattr(self._bridge, "execute_to_arrow", None)
+        if callable(arrow_execute):
+            return arrow_execute(stmt, params)
         res = self.execute(query_or_statement, parameters)
         return res.to_arrow()
 
@@ -2629,6 +2632,9 @@ class AsyncSession(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
+        arrow_execute = getattr(self._bridge, "execute_to_arrow", None)
+        if callable(arrow_execute):
+            return await arrow_execute(stmt, params)
         res = await self.execute(query_or_statement, parameters)
         return res.to_arrow()
 
