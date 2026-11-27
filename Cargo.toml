@@ -43,6 +43,7 @@ arrow-schema = "57.3"
 # chrono-tz lets us validate timestamp zone ids with the same parser Arrow/Polars
 # use, instead of consulting the host's /usr/share/zoneinfo (absent on Windows).
 arrow-array = { version = "57.3", features = ["chrono-tz"] }
+arrow-buffer = "57.3"
 arrow-select = "57.3"
 
 # Cryptography & Auth (PostgreSQL MD5 & SCRAM-SHA-256)
