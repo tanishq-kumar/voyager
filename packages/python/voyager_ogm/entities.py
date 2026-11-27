@@ -16,7 +16,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any
 
-from voyager_ogm.types import Duration, to_iso_duration
+from voyager_ogm.types import Duration, Point, coerce_point_value, to_iso_duration
 
 
 class GraphNode(Mapping[str, Any]):
@@ -426,6 +426,8 @@ def json_default(obj: Any) -> Any:
         return dict(obj)
     if isinstance(obj, Duration):
         return obj.to_iso()
+    if isinstance(obj, Point):
+        return obj.to_coordinate_dict()
     if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
         return obj.isoformat()
     if isinstance(obj, datetime.timedelta):
@@ -560,8 +562,9 @@ def convert_driver_value(value: Any) -> Any:
 
     Handles Neo4j/Memgraph Bolt driver entities, FalkorDB entities, Relate
     entities, temporal types (``neo4j.time.*``, ``relativedelta``, Relate
-    ``Duration``), and recurses through lists and dicts while preserving spatial
-    tuple subclasses (such as ``neo4j.spatial.WGS84Point``).
+    ``Duration``), and spatial values, and recurses through lists and dicts.
+    Bolt ``WGS84Point``/``CartesianPoint`` objects and FalkorDB point maps
+    become :class:`voyager_ogm.Point`.
     """
     if isinstance(value, (GraphNode, GraphRelationship, GraphPath, Duration)):
         return value
@@ -673,7 +676,12 @@ def convert_driver_value(value: Any) -> Any:
             properties=_extract_properties(value),
         )
 
-    # 5. Temporal driver objects (neo4j.time.*, dateutil.relativedelta, Relate Duration) & Relate Point
+    # 5. Spatial values: Bolt driver points, FalkorDB point dicts, Relate Point
+    point = coerce_point_value(value)
+    if point is not None:
+        return point
+
+    # 6. Temporal driver objects (neo4j.time.*, dateutil.relativedelta, Relate Duration)
     mod = type(value).__module__
     if mod.startswith("neo4j.time"):
         return _convert_neo4j_temporal(value)
@@ -682,15 +690,6 @@ def convert_driver_value(value: Any) -> Any:
         td = (epoch + value) - epoch
         return Duration.from_timedelta(td)
     if not mod.startswith("neo4j"):
-        if hasattr(value, "srid") and hasattr(value, "x") and hasattr(value, "y"):
-            from voyager_ogm.types import Point
-
-            return Point(
-                x=value.x,
-                y=value.y,
-                z=getattr(value, "z", None),
-                srid=value.srid,
-            )
         if hasattr(value, "months") and hasattr(value, "seconds") and hasattr(value, "nanoseconds"):
             return Duration(
                 months=int(value.months),
@@ -699,7 +698,7 @@ def convert_driver_value(value: Any) -> Any:
                 nanoseconds=int(value.nanoseconds),
             )
 
-    # 6. Plain mappings and lists/tuples (preserving tuple subclasses such as neo4j.spatial.Point)
+    # 7. Plain mappings and lists/tuples
     if isinstance(value, Mapping):
         return {k: convert_driver_value(v) for k, v in value.items()}
     if isinstance(value, list) or type(value) is tuple:
@@ -731,6 +730,8 @@ def serialize_value_for_arrow(value: Any) -> Any:
             "seconds": value.seconds,
             "nanoseconds": value.nanoseconds,
         }
+    if isinstance(value, Point):
+        return value.to_coordinate_dict()
     if isinstance(value, list):
         return [serialize_value_for_arrow(item) for item in value]
     if isinstance(value, Mapping):
