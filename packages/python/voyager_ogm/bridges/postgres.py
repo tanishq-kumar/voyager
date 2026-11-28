@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import importlib
+import itertools
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -15,7 +16,11 @@ import polars as pl
 from voyager_ogm.agtype import decode_agtype
 from voyager_ogm.bridges.base import (
     BridgeResult,
+    BridgeStreamChunk,
+    BufferedBridgeStream,
     BulkExecutionResult,
+    GeneratorBridgeStream,
+    SyncBridgeStreamAsAsync,
     _validate_savepoint_name,
     validate_graph_name,
     validate_pagination_parameters,
@@ -48,6 +53,21 @@ def _pg_connection_closed(conn: Any) -> bool:
         return bool(value)
     except Exception:
         return False
+
+
+_STREAM_CURSOR_IDS = itertools.count(1)
+
+
+def _pg_uses_server_cursor(conn: Any) -> bool:
+    """Returns whether a named psycopg cursor can be used on this connection.
+
+    A named (server-side) cursor requires a transaction. psycopg on an
+    autocommit connection outside an explicit transaction has none, so those
+    streams fall back to client-side chunking.
+    """
+    if getattr(conn, "autocommit", True) is False:
+        return True
+    return _pg_transaction_status(conn) in ("INTRANS", "ACTIVE")
 
 
 def _description_type_oid(description: Any) -> int | None:
@@ -365,6 +385,82 @@ class PostgresBridge:
         with self.conn.cursor() as cur:
             return self._execute_cursor(cur, stmt, params)
 
+    def _open_cursor_stream(
+        self,
+        connection: Any,
+        statement: str,
+        parameters: dict[str, Any],
+        fetch_size: int,
+        on_close: Any = None,
+    ) -> GeneratorBridgeStream:
+        """Opens a server-side named cursor and returns a chunk-pulling stream."""
+        stmt, params = self._format_pgq_statement(statement, parameters)
+        cursor = connection.cursor(name=f"voyager_cur_{next(_STREAM_CURSOR_IDS)}", scrollable=False)
+        cursor.itersize = fetch_size
+        try:
+            has_adapters = _configure_pg_adapters(cursor)
+            cursor.execute(stmt, params or None)
+            columns = [str(item[0]) for item in cursor.description] if cursor.description else []
+        except BaseException:
+            cursor.close()
+            raise
+
+        def _chunks() -> Any:
+            while True:
+                rows = cursor.fetchmany(fetch_size)
+                if not rows:
+                    return
+                decoded = [
+                    self._decode_row(cursor, row, convert_timedelta=not has_adapters)
+                    for row in rows
+                ]
+                yield BridgeStreamChunk(
+                    [dict(zip(columns, row, strict=False)) for row in decoded],
+                    columns=columns,
+                )
+
+        def _close() -> None:
+            try:
+                cursor.close()
+            finally:
+                if on_close is not None:
+                    on_close()
+
+        return GeneratorBridgeStream(
+            _chunks(),
+            columns=columns,
+            is_server_streaming=True,
+            close_callback=_close,
+            gc_callback=on_close,
+        )
+
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> Any:
+        """Opens a pull-based PostgreSQL/AGE result stream.
+
+        Inside an explicit transaction (or on a non-autocommit connection) the
+        stream uses a server-side named cursor and pulls ``fetch_size`` rows per
+        ``FETCH``. On an autocommit connection outside a transaction it falls
+        back to client-side chunking of the materialized result.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows pulled per batch.
+
+        Returns:
+            A server-streaming or buffered bridge stream.
+        """
+        validate_pagination_parameters(statement, parameters)
+        fetch_size = max(1, int(fetch_size))
+        if _pg_uses_server_cursor(self.conn):
+            return self._open_cursor_stream(self.conn, statement, parameters or {}, fetch_size)
+        return BufferedBridgeStream.from_records(self.execute(statement, parameters), fetch_size)
+
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
@@ -474,6 +570,8 @@ class PostgresBridgeTransaction:
             self._restore_autocommit()
             raise
         self._state = "ACTIVE"
+        self._open_stream = False
+        self._active_stream: Any = None
 
     @property
     def state(self) -> str:
@@ -509,6 +607,48 @@ class PostgresBridgeTransaction:
         if not self.is_active:
             raise ValueError("Cannot execute query on inactive transaction")
 
+    def _ensure_no_open_stream(self) -> None:
+        """Fails fast when a stream is open on this transaction's connection."""
+        if self._open_stream:
+            raise RuntimeError(
+                "an active stream is open on this transaction; close or exhaust it first"
+            )
+
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> GeneratorBridgeStream:
+        """Opens a server-side portal-like named cursor inside this transaction.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows pulled per batch.
+
+        Returns:
+            A server-streaming bridge stream.
+        """
+        self._ensure_executable()
+        self._ensure_no_open_stream()
+        fetch_size = max(1, int(fetch_size))
+        stream = self._bridge._open_cursor_stream(
+            self._bridge.conn,
+            statement,
+            parameters or {},
+            fetch_size,
+            on_close=self._clear_open_stream,
+        )
+        self._open_stream = True
+        self._active_stream = stream
+        return stream
+
+    def _clear_open_stream(self) -> None:
+        """Clears the open-stream fail-fast flag."""
+        self._open_stream = False
+        self._active_stream = None
+
     def _restore_autocommit(self) -> None:
         """Restores the connection's original autocommit mode."""
         if self._original_autocommit is not None:
@@ -528,6 +668,7 @@ class PostgresBridgeTransaction:
     ) -> list[dict[str, Any]]:
         """Executes a statement inside the transaction."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
@@ -541,6 +682,7 @@ class PostgresBridgeTransaction:
     ) -> pl.DataFrame:
         """Executes a statement and returns a Polars DataFrame."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         stmt, params = self._bridge._format_pgq_statement(statement, parameters or {})
         try:
             with self._bridge.conn.cursor() as cur:
@@ -556,6 +698,7 @@ class PostgresBridgeTransaction:
     ) -> BulkExecutionResult:
         """Executes a bulk plan inside the transaction."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         start_time = time.perf_counter()
         statement = ""
         total_records = 0
@@ -593,6 +736,7 @@ class PostgresBridgeTransaction:
 
     def commit(self) -> None:
         """Commits the transaction."""
+        self._ensure_no_open_stream()
         if self._state == "FAILED":
             raise RuntimeError("transaction is aborted; roll back instead of committing")
         if not self.is_active:
@@ -614,9 +758,17 @@ class PostgresBridgeTransaction:
             self._restore_autocommit()
 
     def rollback(self) -> None:
-        """Rolls the transaction back."""
+        """Rolls the transaction back, closing any open stream first."""
         if self._state not in ("ACTIVE", "FAILED"):
             raise ValueError("Cannot rollback inactive transaction")
+        stream = self._active_stream
+        self._active_stream = None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self._open_stream = False
         try:
             self._execute_sql("ROLLBACK")
             self._state = "ROLLED_BACK"
@@ -629,18 +781,21 @@ class PostgresBridgeTransaction:
     def savepoint(self, name: str) -> None:
         """Creates a real SAVEPOINT."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         name = _validate_savepoint_name(name)
         self._execute_sql(f"SAVEPOINT {name}")
 
     def rollback_to_savepoint(self, name: str) -> None:
         """Rolls back to a real SAVEPOINT."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         name = _validate_savepoint_name(name)
         self._execute_sql(f"ROLLBACK TO SAVEPOINT {name}")
 
     def release_savepoint(self, name: str) -> None:
         """Releases a real SAVEPOINT."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         name = _validate_savepoint_name(name)
         self._execute_sql(f"RELEASE SAVEPOINT {name}")
 
@@ -682,6 +837,25 @@ class AsyncPostgresBridge:
     ) -> list[dict[str, Any]]:
         """Asynchronously executes query."""
         return await asyncio.to_thread(self.sync_bridge.execute, statement, parameters)
+
+    async def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> SyncBridgeStreamAsAsync:
+        """Opens a PostgreSQL/AGE result stream on a worker thread.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows pulled per batch.
+
+        Returns:
+            An async wrapper over the server-side or buffered bridge stream.
+        """
+        stream = await asyncio.to_thread(self.sync_bridge.stream, statement, parameters, fetch_size)
+        return SyncBridgeStreamAsAsync(stream, offload=True)
 
     async def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -742,6 +916,29 @@ class AsyncPostgresBridgeTransaction:
         except asyncio.CancelledError:
             self._sync._mark_failed()
             raise
+
+    async def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> SyncBridgeStreamAsAsync:
+        """Opens a server-side named cursor stream inside the async transaction.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows pulled per batch.
+
+        Returns:
+            An async wrapper over the transaction's server-side stream.
+        """
+        try:
+            stream = await asyncio.to_thread(self._sync.stream, statement, parameters, fetch_size)
+        except asyncio.CancelledError:
+            self._sync._mark_failed()
+            raise
+        return SyncBridgeStreamAsAsync(stream, offload=True)
 
     async def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None

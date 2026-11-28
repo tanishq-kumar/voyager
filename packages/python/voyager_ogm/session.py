@@ -6,6 +6,7 @@ import contextvars
 import inspect
 import itertools
 import logging
+import threading
 import time
 import warnings
 import weakref
@@ -43,6 +44,14 @@ from voyager_ogm.ingestion import (
 )
 from voyager_ogm.models import get_primary_key_field
 from voyager_ogm.query import CompiledQuery, Query
+from voyager_ogm.stream import (
+    DEFAULT_STREAM_FETCH_SIZE,
+    AsyncResultStream,
+    ResultStream,
+    _validate_stream_format,
+    open_async_bridge_stream,
+    open_bridge_stream,
+)
 from voyager_ogm.transaction import AsyncTransaction, Transaction
 from voyager_ogm.types import serialize_param_value
 from voyager_ogm.unit_of_work import UnitOfWork
@@ -460,9 +469,10 @@ class ExecutionResult(list[dict[str, Any]]):
 
         The query has already run and its rows are fully materialized when this
         method is called, so the chunks are views over that result and do not
-        reduce peak memory. Real incremental streaming from the database is
-        tracked separately (#458); until then prefer `execute_to_polars()` or
-        `execute_to_arrow()` for large result sets.
+        reduce peak memory. For constant-memory, pull-based streaming from the
+        database, use `Session.stream()` / `AsyncSession.stream()` (or
+        `Transaction.stream()`), which pulls bounded `fetch_size`-row batches
+        and releases the connection on close or exhaustion.
 
         Parameters
         ----------
@@ -698,6 +708,11 @@ def _is_query_semantic_error(exc: Exception) -> bool:
     return NativeCircuitRouter.is_semantic_error(str(exc))
 
 
+def _is_pool_exhausted(exc: Exception) -> bool:
+    """Checks whether ``exc`` is a native connection-pool exhaustion error."""
+    return "pool exhausted" in str(exc).lower()
+
+
 class _SessionBase:
     """Shared query preparation, identity mapping, and plan compilation base class.
 
@@ -713,6 +728,7 @@ class _SessionBase:
         optimization_level: str | None = None,
         backend: str = "auto",
         pool_size: int = 10,
+        acquire_timeout: float | None = None,
         is_async: bool = False,
         circuit_cooldown_seconds: float = 30.0,
         circuit_failure_threshold: int = 1,
@@ -743,6 +759,7 @@ class _SessionBase:
             self._optimization_level = optimization_level or cfg.optimization_level
 
         self._requested_backend = backend.lower() if isinstance(backend, str) else "auto"
+        self._acquire_timeout = acquire_timeout
         self._native_client: Any = None
         self._circuit_cooldown_seconds = circuit_cooldown_seconds
         self._circuit_failure_threshold = circuit_failure_threshold
@@ -786,6 +803,7 @@ class _SessionBase:
                         min_idle=1,
                         max_size=pool_size,
                         age=self._wants_apache_age(graph_name),
+                        acquire_timeout=acquire_timeout,
                     )
                 except Exception:
                     pass
@@ -799,6 +817,7 @@ class _SessionBase:
                         min_idle=1,
                         max_size=pool_size,
                         age=self._wants_apache_age(graph_name),
+                        acquire_timeout=acquire_timeout,
                     )
                     if self._requested_backend == "native":
                         # A native-only session has no bridge: bridge-only
@@ -836,6 +855,8 @@ class _SessionBase:
         self._last_relationship_results: list[ExecutionResult] = []
         self._is_async = is_async
         self._tx_token: int = next(_SESSION_TX_COUNTER)
+        self._active_stream_count = 0
+        self._stream_count_lock = threading.Lock()
 
         self._is_explicit_mock = (
             bridge is None
@@ -1020,6 +1041,40 @@ class _SessionBase:
                 "Native re-enablement probe failed: %s. Remaining on bridge backend.",
                 exc,
             )
+
+    @property
+    def active_stream_count(self) -> int:
+        """Number of result streams currently open on this session."""
+        with self._stream_count_lock:
+            return self._active_stream_count
+
+    def _begin_stream(self) -> None:
+        """Records that a result stream now holds a cursor or pooled connection."""
+        with self._stream_count_lock:
+            self._active_stream_count += 1
+
+    def _end_stream(self) -> None:
+        """Records that an open result stream was exhausted, closed, or dropped."""
+        with self._stream_count_lock:
+            if self._active_stream_count > 0:
+                self._active_stream_count -= 1
+
+    def _enrich_pool_exhausted(self, exc: Exception) -> ValueError | None:
+        """Explains a pool-exhaustion error caused by this session's own open streams.
+
+        Local pool starvation by open user streams is not a server outage: the
+        returned error tells the caller how to recover and must be re-raised
+        without recording a circuit-router failure or falling back to a bridge.
+        """
+        if not _is_pool_exhausted(exc):
+            return None
+        count = self.active_stream_count
+        if count <= 0:
+            return None
+        return ValueError(
+            f"{exc} ({count} active stream(s) open on this session; close open streams "
+            "with a context manager or increase pool max_size)"
+        )
 
     @property
     def native_client(self) -> Any:
@@ -1582,6 +1637,7 @@ class Session(_SessionBase):
         optimization_level: str | None = None,
         backend: str = "auto",
         pool_size: int = 10,
+        acquire_timeout: float | None = None,
         circuit_cooldown_seconds: float = 30.0,
         circuit_failure_threshold: int = 1,
         fallback: str | None = None,
@@ -1607,6 +1663,8 @@ class Session(_SessionBase):
                 uses the native Rust async network engine (`voyager-drivers`) over raw sockets with connection
                 pooling and direct wire-to-Arrow streaming, falling back to 'bridge' if unavailable.
             pool_size: Connection pool capacity for native network engine connections (default 10).
+            acquire_timeout: Seconds to wait for a pooled connection before raising ``PoolExhausted``
+                (native ``None`` keeps the pool default of 30 seconds).
             circuit_cooldown_seconds: Cooldown duration in seconds before attempting to probe native re-enablement.
             circuit_failure_threshold: Number of consecutive transient failures before opening the circuit breaker (default 1).
             fallback: Strategy when connection initialization fails (e.g. fallback="mock" for testing).
@@ -1628,6 +1686,7 @@ class Session(_SessionBase):
             optimization_level=optimization_level,
             backend=backend,
             pool_size=pool_size,
+            acquire_timeout=acquire_timeout,
             is_async=False,
             circuit_cooldown_seconds=circuit_cooldown_seconds,
             circuit_failure_threshold=circuit_failure_threshold,
@@ -1730,6 +1789,9 @@ class Session(_SessionBase):
                 self._record_native_success()
                 return self._native_execution_result(native_res, stmt, q_obj)
             except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
                 if (
@@ -1788,6 +1850,9 @@ class Session(_SessionBase):
                 self._record_native_success()
                 return _stream_to_polars(native_res.stream)
             except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
                 if (
@@ -1842,6 +1907,9 @@ class Session(_SessionBase):
                 self._record_native_success()
                 return _stream_to_arrow(native_res.stream)
             except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
                 if (
@@ -1859,6 +1927,99 @@ class Session(_SessionBase):
             return arrow_execute(stmt, params)
         res = self.execute(query_or_statement, parameters)
         return res.to_arrow()
+
+    def stream(
+        self,
+        query_or_statement: Query | CompiledQuery | str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        fetch_size: int = DEFAULT_STREAM_FETCH_SIZE,
+        as_format: str = "dicts",
+    ) -> ResultStream:
+        """Streams a query with a bounded ``fetch_size``-row buffer.
+
+        The stream opens immediately, so syntax errors raise here and
+        ``stream.columns`` is available before the first batch. Use it as a
+        context manager to release the connection deterministically::
+
+            with session.stream("MATCH (n) RETURN n", fetch_size=1_000) as stream:
+                for batch in stream:
+                    process(batch)
+
+        Native backends pull rows from Bolt ``PULL {n}``, a PostgreSQL/AGE named
+        portal, or a DuckDB Arrow record batch reader. FalkorDB buffers its RESP
+        reply (no server cursor exists) and slices it client-side. A native open
+        failure may fall back to the bridge; a failure after the first batch is
+        always propagated, never re-executed.
+
+        Args:
+            query_or_statement: Voyager Query, CompiledQuery, or raw statement string.
+            parameters: Query parameters dictionary (if statement is a string).
+            fetch_size: Maximum rows per batch (default 1,000).
+            as_format: Batch format: ``"dicts"``, ``"arrow"``, or ``"polars"``.
+
+        Returns:
+            A :class:`~voyager_ogm.stream.ResultStream` of batches.
+
+        Raises:
+            ValueError: If ``fetch_size`` is below 1 or ``as_format`` is unknown.
+        """
+        if fetch_size < 1:
+            raise ValueError("fetch_size must be at least 1")
+        _validate_stream_format(as_format)
+        stmt, params, _ = self._prepare_statement(query_or_statement, parameters)
+
+        active = self._active_transaction
+        if active is not None:
+            return active._stream_prepared(stmt, params, fetch_size=fetch_size, as_format=as_format)
+
+        should_try_native = (
+            self._native_client is not None
+            and self._requested_backend in ("native", "auto")
+            and self._circuit_router.should_route_native()
+        )
+
+        if should_try_native:
+            try:
+                native_stream = self._native_client.stream_sync(stmt, params, fetch_size)
+            except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
+                if self._requested_backend == "native" or _is_query_semantic_error(e):
+                    raise
+                if (
+                    isinstance(self._bridge, (MockBridge, AsyncMockBridge))
+                    and not self._is_explicit_mock
+                ):
+                    raise RuntimeError(
+                        f"Native backend stream failed: {e}. No official database driver available for fallback."
+                    ) from e
+                self._record_native_failure(e)
+            else:
+                self._record_native_success()
+                stream = ResultStream(
+                    native_stream,
+                    statement=stmt,
+                    dialect=self._dialect,
+                    as_format=as_format,
+                    on_release=self._end_stream,
+                    on_error=self._record_native_failure,
+                )
+                self._begin_stream()
+                return stream
+
+        bridge = self._require_bridge("Session.stream() fallback")
+        source = open_bridge_stream(bridge, stmt, params, fetch_size)
+        stream = ResultStream(
+            source,
+            statement=stmt,
+            dialect=self._dialect,
+            as_format=as_format,
+            on_release=self._end_stream,
+        )
+        self._begin_stream()
+        return stream
 
     def ping(self) -> bool:
         """Pings the database connection to verify liveness and network connectivity."""
@@ -1954,6 +2115,9 @@ class Session(_SessionBase):
                     statement=statement,
                 )
             except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
                 if (
@@ -2511,6 +2675,7 @@ class AsyncSession(_SessionBase):
         optimization_level: str | None = None,
         backend: str = "auto",
         pool_size: int = 10,
+        acquire_timeout: float | None = None,
         circuit_cooldown_seconds: float = 30.0,
         circuit_failure_threshold: int = 1,
         fallback: str | None = None,
@@ -2534,6 +2699,8 @@ class AsyncSession(_SessionBase):
                 uses the native Rust async network engine (`voyager-drivers`) over raw sockets with connection
                 pooling and direct wire-to-Arrow streaming, falling back to 'bridge' if unavailable.
             pool_size: Connection pool capacity for native network engine connections (default 10).
+            acquire_timeout: Seconds to wait for a pooled connection before raising ``PoolExhausted``
+                (native ``None`` keeps the pool default of 30 seconds).
             circuit_cooldown_seconds: Cooldown duration in seconds before attempting to probe native re-enablement.
             circuit_failure_threshold: Number of consecutive transient failures before opening the circuit breaker (default 1).
             fallback: Strategy when connection initialization fails (e.g. fallback="mock" for testing).
@@ -2555,6 +2722,7 @@ class AsyncSession(_SessionBase):
             optimization_level=optimization_level,
             backend=backend,
             pool_size=pool_size,
+            acquire_timeout=acquire_timeout,
             is_async=True,
             circuit_cooldown_seconds=circuit_cooldown_seconds,
             circuit_failure_threshold=circuit_failure_threshold,
@@ -2657,6 +2825,9 @@ class AsyncSession(_SessionBase):
                 self._record_native_success()
                 return self._native_execution_result(native_res, stmt, q_obj)
             except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
                 if (
@@ -2717,6 +2888,9 @@ class AsyncSession(_SessionBase):
                 self._record_native_success()
                 return _stream_to_polars(native_res.stream)
             except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
                 if (
@@ -2771,6 +2945,9 @@ class AsyncSession(_SessionBase):
                 self._record_native_success()
                 return _stream_to_arrow(native_res.stream)
             except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
                 if (
@@ -2788,6 +2965,87 @@ class AsyncSession(_SessionBase):
             return await arrow_execute(stmt, params)
         res = await self.execute(query_or_statement, parameters)
         return res.to_arrow()
+
+    def stream(
+        self,
+        query_or_statement: Query | CompiledQuery | str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        fetch_size: int = DEFAULT_STREAM_FETCH_SIZE,
+        as_format: str = "dicts",
+    ) -> AsyncResultStream:
+        """Streams a query with a bounded ``fetch_size``-row buffer.
+
+        The returned :class:`~voyager_ogm.stream.AsyncResultStream` is an async
+        context manager, so the query opens on ``__aenter__`` or when awaited::
+
+            async with session.stream(query, fetch_size=1_000) as stream:
+                async for batch in stream:
+                    await process(batch)
+
+            stream = await session.stream(query)
+
+        Args:
+            query_or_statement: Voyager Query, CompiledQuery, or raw statement string.
+            parameters: Query parameters dictionary (if statement is a string).
+            fetch_size: Maximum rows per batch (default 1,000).
+            as_format: Batch format: ``"dicts"``, ``"arrow"``, or ``"polars"``.
+
+        Returns:
+            A lazy :class:`~voyager_ogm.stream.AsyncResultStream` of batches.
+
+        Raises:
+            ValueError: If ``fetch_size`` is below 1 or ``as_format`` is unknown.
+        """
+        if fetch_size < 1:
+            raise ValueError("fetch_size must be at least 1")
+        _validate_stream_format(as_format)
+        stmt, params, _ = self._prepare_statement(query_or_statement, parameters)
+
+        active = self._active_transaction
+        if active is not None:
+            return active._stream_prepared(stmt, params, fetch_size=fetch_size, as_format=as_format)
+
+        async def opener() -> Any:
+            should_try_native = (
+                self._native_client is not None
+                and self._requested_backend in ("native", "auto")
+                and self._circuit_router.should_route_native()
+            )
+            if should_try_native:
+                try:
+                    native_stream = await self._native_client.stream(stmt, params, fetch_size)
+                except Exception as e:
+                    pool_exhausted = self._enrich_pool_exhausted(e)
+                    if pool_exhausted is not None:
+                        raise pool_exhausted from e
+                    if self._requested_backend == "native" or _is_query_semantic_error(e):
+                        raise
+                    if (
+                        isinstance(self._bridge, (MockBridge, AsyncMockBridge))
+                        and not self._is_explicit_mock
+                    ):
+                        raise RuntimeError(
+                            f"Native backend stream failed: {e}. No official database driver "
+                            "available for fallback."
+                        ) from e
+                    self._record_native_failure(e)
+                else:
+                    self._record_native_success()
+                    return native_stream
+
+            bridge = self._require_bridge("AsyncSession.stream() fallback")
+            return await open_async_bridge_stream(bridge, stmt, params, fetch_size)
+
+        return AsyncResultStream(
+            opener,
+            statement=stmt,
+            dialect=self._dialect,
+            as_format=as_format,
+            on_open=self._begin_stream,
+            on_release=self._end_stream,
+            on_error=self._record_native_failure,
+        )
 
     async def ping(self) -> bool:
         """Pings the database connection asynchronously to verify liveness."""
@@ -2889,6 +3147,9 @@ class AsyncSession(_SessionBase):
                     statement=statement,
                 )
             except Exception as e:
+                pool_exhausted = self._enrich_pool_exhausted(e)
+                if pool_exhausted is not None:
+                    raise pool_exhausted from e
                 if self._requested_backend == "native" or _is_query_semantic_error(e):
                     raise
                 if (

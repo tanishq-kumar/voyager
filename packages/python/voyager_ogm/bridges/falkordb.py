@@ -13,7 +13,9 @@ import polars as pl
 
 from voyager_ogm.bridges.base import (
     BridgeResult,
+    BufferedBridgeStream,
     BulkExecutionResult,
+    SyncBridgeStreamAsAsync,
     validate_pagination_parameters,
 )
 from voyager_ogm.codecs import normalize_uuid, point_param_map, records_to_polars
@@ -187,6 +189,28 @@ class FalkorDBBridge:
             records.append(rec)
         return BridgeResult(records, columns=col_names)
 
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> BufferedBridgeStream:
+        """Slices a fully-buffered FalkorDB result into ``fetch_size``-row batches.
+
+        RESP ``GRAPH.QUERY`` returns the complete result set in one reply and
+        FalkorDB has no server-side cursor, so the decoded rows are already in
+        memory by the time the first batch is yielded.
+
+        Args:
+            statement: Cypher statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per yielded batch.
+
+        Returns:
+            A buffered stream over the decoded result rows.
+        """
+        return BufferedBridgeStream.from_records(self.execute(statement, parameters), fetch_size)
+
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> pl.DataFrame:
@@ -301,6 +325,28 @@ class AsyncFalkorDBBridge:
     ) -> list[dict[str, Any]]:
         """Asynchronously executes query."""
         return await asyncio.to_thread(self.sync_bridge.execute, statement, parameters)
+
+    async def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> SyncBridgeStreamAsAsync:
+        """Slices a fully-buffered FalkorDB result into batches off the event loop.
+
+        FalkorDB has no server-side cursor: the complete RESP result is decoded
+        before the first batch, so this stream is not constant-memory.
+
+        Args:
+            statement: Cypher statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per yielded batch.
+
+        Returns:
+            An async wrapper over the buffered bridge stream.
+        """
+        stream = await asyncio.to_thread(self.sync_bridge.stream, statement, parameters, fetch_size)
+        return SyncBridgeStreamAsAsync(stream, offload=True)
 
     async def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None

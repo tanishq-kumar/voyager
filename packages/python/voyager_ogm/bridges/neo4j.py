@@ -12,8 +12,11 @@ from typing import Any
 import polars as pl
 
 from voyager_ogm.bridges.base import (
+    AsyncBridgeStream,
     BridgeResult,
+    BridgeStreamChunk,
     BulkExecutionResult,
+    GeneratorBridgeStream,
     _infer_record_columns,
     validate_pagination_parameters,
 )
@@ -216,6 +219,13 @@ def _bolt_bridge_result(keys: tuple[str, ...], records: list[dict[str, Any]]) ->
     return BridgeResult(records, columns=cols)
 
 
+async def _await_if_needed(value: Any) -> Any:
+    """Awaits ``value`` when it is awaitable, so sync and async drivers share one path."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
 def _bolt_execute(runner: Any, statement: str, parameters: dict[str, Any] | None) -> BridgeResult:
     """Runs one Bolt statement through ``runner`` and normalizes its records once."""
     validate_pagination_parameters(statement, parameters)
@@ -267,6 +277,55 @@ class Neo4jBoltBridge:
         session_kwargs = {"database": self.database} if self.database else {}
         with self.driver.session(**session_kwargs) as session:
             return _bolt_execute(session.run, statement, parameters)
+
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> GeneratorBridgeStream:
+        """Opens a pull-based server-side Bolt stream over a leased driver session.
+
+        The official driver pulls ``fetch_size`` records at a time from the open
+        result and sends ``DISCARD`` when the stream is closed early, so only one
+        chunk is resident in Python memory.
+
+        Args:
+            statement: Cypher statement.
+            parameters: Query parameters.
+            fetch_size: Maximum records pulled per batch.
+
+        Returns:
+            A server-streaming bridge stream yielding record dictionaries.
+        """
+        validate_pagination_parameters(statement, parameters)
+        fetch_size = max(1, int(fetch_size))
+        session_kwargs = {"database": self.database} if self.database else {}
+        session = self.driver.session(fetch_size=fetch_size, **session_kwargs)
+        try:
+            result = session.run(statement, _adapt_bolt_parameters(parameters or {}))
+        except BaseException:
+            session.close()
+            raise
+
+        columns = _bolt_result_keys(result)
+
+        def _chunks() -> Any:
+            buffer: list[dict[str, Any]] = []
+            for record in result:
+                buffer.append(_normalize_bolt_record(record))
+                if len(buffer) >= fetch_size:
+                    yield BridgeStreamChunk(buffer, columns=columns)
+                    buffer = []
+            if buffer:
+                yield BridgeStreamChunk(buffer, columns=columns)
+
+        return GeneratorBridgeStream(
+            _chunks(),
+            columns=columns,
+            is_server_streaming=True,
+            close_callback=session.close,
+        )
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -367,6 +426,8 @@ class Neo4jBoltTransaction:
         """
         self._session = driver.session(**({"database": database} if database else {}))
         self._state = "ACTIVE"
+        self._open_stream = False
+        self._active_stream: Any = None
         try:
             self._tx = self._session.begin_transaction()
         except Exception:
@@ -408,6 +469,75 @@ class Neo4jBoltTransaction:
         except Exception:
             pass
 
+    def _ensure_no_open_stream(self) -> None:
+        """Fails fast when a stream is open on this transaction."""
+        if self._open_stream:
+            raise RuntimeError(
+                "an active stream is open on this transaction; close or exhaust it first"
+            )
+
+    def _clear_open_stream(self) -> None:
+        """Clears the open-stream fail-fast flag."""
+        self._open_stream = False
+        self._active_stream = None
+
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> GeneratorBridgeStream:
+        """Opens a pull-based stream on the transaction's driver transaction.
+
+        Args:
+            statement: Cypher statement.
+            parameters: Query parameters.
+            fetch_size: Maximum records pulled per batch.
+
+        Returns:
+            A server-streaming bridge stream yielding record dictionaries.
+        """
+        if self._state == "FAILED":
+            raise RuntimeError("transaction is aborted; roll back before executing more statements")
+        if not self.is_active:
+            raise ValueError("Cannot execute query on inactive transaction")
+        self._ensure_no_open_stream()
+        validate_pagination_parameters(statement, parameters)
+        fetch_size = max(1, int(fetch_size))
+        try:
+            result = self._tx.run(statement, _adapt_bolt_parameters(parameters or {}))
+        except BaseException:
+            self._mark_failed()
+            raise
+        columns = _bolt_result_keys(result)
+
+        def _chunks() -> Any:
+            buffer: list[dict[str, Any]] = []
+            for record in result:
+                buffer.append(_normalize_bolt_record(record))
+                if len(buffer) >= fetch_size:
+                    yield BridgeStreamChunk(buffer, columns=columns)
+                    buffer = []
+            if buffer:
+                yield BridgeStreamChunk(buffer, columns=columns)
+
+        def _close() -> None:
+            try:
+                result.consume()
+            finally:
+                self._clear_open_stream()
+
+        self._open_stream = True
+        stream = GeneratorBridgeStream(
+            _chunks(),
+            columns=columns,
+            is_server_streaming=True,
+            close_callback=_close,
+            gc_callback=self._clear_open_stream,
+        )
+        self._active_stream = stream
+        return stream
+
     def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
@@ -416,6 +546,7 @@ class Neo4jBoltTransaction:
             raise RuntimeError("transaction is aborted; roll back before executing more statements")
         if not self.is_active:
             raise ValueError("Cannot execute query on inactive transaction")
+        self._ensure_no_open_stream()
         validate_pagination_parameters(statement, parameters)
         try:
             return _bolt_execute(self._tx.run, statement, parameters)
@@ -439,6 +570,7 @@ class Neo4jBoltTransaction:
             raise RuntimeError("transaction is aborted; roll back before executing more statements")
         if not self.is_active:
             raise ValueError("Cannot execute bulk plan on inactive transaction")
+        self._ensure_no_open_stream()
         start_time = time.perf_counter()
         statement = ""
         total_records = 0
@@ -473,6 +605,7 @@ class Neo4jBoltTransaction:
 
     def commit(self) -> None:
         """Commits the Bolt transaction and closes the driver session."""
+        self._ensure_no_open_stream()
         if self._state == "FAILED":
             raise RuntimeError("transaction is aborted; roll back instead of committing")
         if not self.is_active:
@@ -490,6 +623,14 @@ class Neo4jBoltTransaction:
         """Rolls the Bolt transaction back and closes the driver session."""
         if self._state not in ("ACTIVE", "FAILED"):
             raise ValueError("Cannot rollback inactive transaction")
+        stream = self._active_stream
+        self._active_stream = None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self._open_stream = False
         try:
             self._tx.rollback()
             self._state = "ROLLED_BACK"
@@ -549,6 +690,62 @@ class AsyncNeo4jBoltBridge:
         session_kwargs = {"database": self.database} if self.database else {}
         async with self.driver.session(**session_kwargs) as session:
             return await _bolt_execute_async(session.run, statement, parameters)
+
+    async def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> AsyncBridgeStream:
+        """Opens a pull-based server-side Bolt stream on an async driver session.
+
+        Args:
+            statement: Cypher statement.
+            parameters: Query parameters.
+            fetch_size: Maximum records pulled per batch.
+
+        Returns:
+            An async server-streaming bridge stream yielding record dictionaries.
+        """
+        validate_pagination_parameters(statement, parameters)
+        fetch_size = max(1, int(fetch_size))
+        session_kwargs = {"database": self.database} if self.database else {}
+        session = self.driver.session(fetch_size=fetch_size, **session_kwargs)
+        try:
+            result = await _await_if_needed(
+                session.run(statement, _adapt_bolt_parameters(parameters or {}))
+            )
+            keys = await _await_if_needed(result.keys()) if hasattr(result, "keys") else ()
+        except BaseException:
+            await _await_if_needed(session.close())
+            raise
+
+        columns = tuple(str(key) for key in keys)
+
+        async def _chunks() -> Any:
+            buffer: list[dict[str, Any]] = []
+            if hasattr(result, "__aiter__"):
+                async for record in result:
+                    buffer.append(_normalize_bolt_record(record))
+                    if len(buffer) >= fetch_size:
+                        yield BridgeStreamChunk(buffer, columns=columns)
+                        buffer = []
+            else:
+                records = await _await_if_needed(result.data())
+                for record in records:
+                    buffer.append(_normalize_bolt_record(record))
+                    if len(buffer) >= fetch_size:
+                        yield BridgeStreamChunk(buffer, columns=columns)
+                        buffer = []
+            if buffer:
+                yield BridgeStreamChunk(buffer, columns=columns)
+
+        return AsyncBridgeStream(
+            _chunks(),
+            columns=columns,
+            is_server_streaming=True,
+            close_callback=session.close,
+        )
 
     async def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -663,6 +860,8 @@ class AsyncNeo4jBoltTransaction:
         self._session = session
         self._tx = tx
         self._state = "ACTIVE"
+        self._open_stream = False
+        self._active_stream: Any = None
 
     @property
     def state(self) -> str:
@@ -698,6 +897,87 @@ class AsyncNeo4jBoltTransaction:
         except Exception:
             pass
 
+    def _ensure_no_open_stream(self) -> None:
+        """Fails fast when a stream is open on this transaction."""
+        if self._open_stream:
+            raise RuntimeError(
+                "an active stream is open on this transaction; close or exhaust it first"
+            )
+
+    def _clear_open_stream(self) -> None:
+        """Clears the open-stream fail-fast flag."""
+        self._open_stream = False
+        self._active_stream = None
+
+    async def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> AsyncBridgeStream:
+        """Opens a pull-based stream on the async driver transaction.
+
+        Args:
+            statement: Cypher statement.
+            parameters: Query parameters.
+            fetch_size: Maximum records pulled per batch.
+
+        Returns:
+            An async server-streaming bridge stream yielding record dictionaries.
+        """
+        if self._state == "FAILED":
+            raise RuntimeError("transaction is aborted; roll back before executing more statements")
+        if not self.is_active:
+            raise ValueError("Cannot execute query on inactive transaction")
+        self._ensure_no_open_stream()
+        validate_pagination_parameters(statement, parameters)
+        fetch_size = max(1, int(fetch_size))
+        try:
+            result = await _await_if_needed(
+                self._tx.run(statement, _adapt_bolt_parameters(parameters or {}))
+            )
+            keys = await _await_if_needed(result.keys()) if hasattr(result, "keys") else ()
+        except BaseException:
+            self._mark_failed()
+            raise
+        columns = tuple(str(key) for key in keys)
+
+        async def _chunks() -> Any:
+            buffer: list[dict[str, Any]] = []
+            if hasattr(result, "__aiter__"):
+                async for record in result:
+                    buffer.append(_normalize_bolt_record(record))
+                    if len(buffer) >= fetch_size:
+                        yield BridgeStreamChunk(buffer, columns=columns)
+                        buffer = []
+            else:
+                records = await _await_if_needed(result.data())
+                for record in records:
+                    buffer.append(_normalize_bolt_record(record))
+                    if len(buffer) >= fetch_size:
+                        yield BridgeStreamChunk(buffer, columns=columns)
+                        buffer = []
+            if buffer:
+                yield BridgeStreamChunk(buffer, columns=columns)
+
+        async def _close() -> None:
+            try:
+                if hasattr(result, "consume"):
+                    await _await_if_needed(result.consume())
+            finally:
+                self._clear_open_stream()
+
+        self._open_stream = True
+        stream = AsyncBridgeStream(
+            _chunks(),
+            columns=columns,
+            is_server_streaming=True,
+            close_callback=_close,
+            gc_callback=self._clear_open_stream,
+        )
+        self._active_stream = stream
+        return stream
+
     async def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
@@ -706,6 +986,7 @@ class AsyncNeo4jBoltTransaction:
             raise RuntimeError("transaction is aborted; roll back before executing more statements")
         if not self.is_active:
             raise ValueError("Cannot execute query on inactive transaction")
+        self._ensure_no_open_stream()
         validate_pagination_parameters(statement, parameters)
         try:
             return await _bolt_execute_async(self._tx.run, statement, parameters)
@@ -729,6 +1010,7 @@ class AsyncNeo4jBoltTransaction:
             raise RuntimeError("transaction is aborted; roll back before executing more statements")
         if not self.is_active:
             raise ValueError("Cannot execute bulk plan on inactive transaction")
+        self._ensure_no_open_stream()
         start_time = time.perf_counter()
         statement = ""
         total_records = 0
@@ -763,6 +1045,7 @@ class AsyncNeo4jBoltTransaction:
 
     async def commit(self) -> None:
         """Commits the transaction and closes the driver session."""
+        self._ensure_no_open_stream()
         if self._state == "FAILED":
             raise RuntimeError("transaction is aborted; roll back instead of committing")
         if not self.is_active:
@@ -780,6 +1063,14 @@ class AsyncNeo4jBoltTransaction:
         """Rolls the transaction back and closes the driver session."""
         if self._state not in ("ACTIVE", "FAILED"):
             raise ValueError("Cannot rollback inactive transaction")
+        stream = self._active_stream
+        self._active_stream = None
+        if stream is not None:
+            try:
+                await stream.close()
+            except Exception:
+                pass
+        self._open_stream = False
         try:
             await self._tx.rollback()
             self._state = "ROLLED_BACK"

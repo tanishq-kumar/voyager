@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import operator
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -103,6 +105,398 @@ class BridgeResult(list[dict[str, Any]]):
     def columns(self) -> tuple[str, ...]:
         """Ordered projection column names from the driver metadata."""
         return self._columns
+
+
+class BridgeStreamChunk:
+    """One bounded batch of bridge rows, with lazy dictionary or Arrow output.
+
+    DuckDB streams keep the raw Arrow record batch so ``to_dicts()`` reuses the
+    driver's Arrow-to-Python decoding, while ``to_record_batch()`` returns the
+    canonical Voyager Arrow batch. Buffered and driver-cursor bridges store row
+    dictionaries directly.
+    """
+
+    def __init__(
+        self,
+        records: Sequence[dict[str, Any]] | None = None,
+        *,
+        columns: Sequence[str] = (),
+        arrow_batch: Any = None,
+        decode_records: Callable[[], Sequence[dict[str, Any]]] | None = None,
+    ) -> None:
+        """Initializes a stream chunk.
+
+        Args:
+            records: Row dictionaries, when already decoded.
+            columns: Projected column names.
+            arrow_batch: Canonical Arrow record batch, when the chunk is Arrow-backed.
+            decode_records: Lazy dictionary decoder for Arrow-backed chunks.
+        """
+        self._records = list(records) if records is not None else None
+        self._columns = tuple(str(column) for column in columns)
+        self._arrow_batch = arrow_batch
+        self._decode_records = decode_records
+
+    @property
+    def columns(self) -> list[str]:
+        """Projected column names."""
+        return list(self._columns)
+
+    @property
+    def num_rows(self) -> int:
+        """Number of rows in this chunk."""
+        if self._records is not None:
+            return len(self._records)
+        if self._arrow_batch is not None:
+            return int(self._arrow_batch.num_rows)
+        return 0
+
+    def to_dicts(self) -> list[dict[str, Any]]:
+        """Returns this chunk as row dictionaries."""
+        if self._records is None:
+            if self._decode_records is not None:
+                self._records = list(self._decode_records())
+            elif self._arrow_batch is not None:
+                import pyarrow as pa
+
+                self._records = pa.Table.from_batches([self._arrow_batch]).to_pylist()
+            else:
+                self._records = []
+        return self._records
+
+    def to_record_batch(self) -> Any:
+        """Returns this chunk as a single canonical ``pyarrow.RecordBatch``."""
+        import pyarrow as pa
+
+        if self._arrow_batch is not None:
+            return self._arrow_batch
+        records = self.to_dicts()
+        if not records:
+            return pa.RecordBatch.from_arrays(
+                [pa.array([], type=pa.null()) for _ in self._columns], names=list(self._columns)
+            )
+        return pa.RecordBatch.from_pylist(records)
+
+
+class BridgeStream:
+    """Synchronous pull-based bridge stream base class.
+
+    Subclasses pull rows from a driver cursor; ``close()`` runs the owner's
+    cleanup callback (closing a driver session or named cursor). ``__del__``
+    only clears local state and calls an optional garbage-collection callback:
+    it never performs network or blocking I/O.
+    """
+
+    def __init__(
+        self,
+        *,
+        columns: Sequence[str],
+        is_server_streaming: bool,
+        close_callback: Callable[[], Any] | None = None,
+        gc_callback: Callable[[], Any] | None = None,
+    ) -> None:
+        """Initializes the stream base.
+
+        Args:
+            columns: Projected column names.
+            is_server_streaming: Whether the driver pulls rows from a server cursor.
+            close_callback: Cleanup run on exhaustion or explicit close.
+            gc_callback: Non-blocking local cleanup run when the stream is dropped.
+        """
+        self._columns = tuple(str(column) for column in columns)
+        self._is_server_streaming = bool(is_server_streaming)
+        self._close_callback = close_callback
+        self._gc_callback = gc_callback
+        self._closed = False
+
+    @property
+    def columns(self) -> list[str]:
+        """Projected column names."""
+        return list(self._columns)
+
+    @property
+    def is_server_streaming(self) -> bool:
+        """Whether the driver pulls rows incrementally from a server cursor."""
+        return self._is_server_streaming
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether the stream is exhausted or explicitly closed."""
+        return self._closed
+
+    def next_batch(self) -> BridgeStreamChunk | None:
+        """Pulls the next chunk, or returns ``None`` once exhausted."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Closes the stream and runs the owner's cleanup callback. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        callback = self._close_callback
+        self._close_callback = None
+        if callback is not None:
+            callback()
+
+    def __del__(self) -> None:
+        """Clears local state when a stream is dropped without being closed."""
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        self._close_callback = None
+        callback = getattr(self, "_gc_callback", None)
+        self._gc_callback = None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+
+class BufferedBridgeStream(BridgeStream):
+    """Client-side chunk slicer over an already-materialized bridge result."""
+
+    def __init__(
+        self,
+        records: Sequence[dict[str, Any]],
+        columns: Sequence[str],
+        fetch_size: int = 1_000,
+        *,
+        is_server_streaming: bool = False,
+        close_callback: Callable[[], Any] | None = None,
+        gc_callback: Callable[[], Any] | None = None,
+    ) -> None:
+        """Initializes a buffered stream over ``records``.
+
+        Args:
+            records: Materialized row dictionaries.
+            columns: Projected column names.
+            fetch_size: Maximum rows per yielded chunk.
+            is_server_streaming: Always ``False`` for buffered slicing.
+            close_callback: Cleanup run on exhaustion or explicit close.
+            gc_callback: Non-blocking local cleanup run when the stream is dropped.
+        """
+        super().__init__(
+            columns=columns,
+            is_server_streaming=is_server_streaming,
+            close_callback=close_callback,
+            gc_callback=gc_callback,
+        )
+        self._records = list(records)
+        self._fetch_size = max(1, int(fetch_size))
+        self._offset = 0
+
+    @classmethod
+    def from_records(
+        cls,
+        records: Sequence[dict[str, Any]],
+        fetch_size: int = 1_000,
+        *,
+        is_server_streaming: bool = False,
+        close_callback: Callable[[], Any] | None = None,
+        gc_callback: Callable[[], Any] | None = None,
+    ) -> BufferedBridgeStream:
+        """Builds a buffered stream, reading column metadata from the result when present.
+
+        Args:
+            records: Materialized row dictionaries.
+            fetch_size: Maximum rows per yielded chunk.
+            is_server_streaming: Whether the source used a server cursor.
+            close_callback: Cleanup run on exhaustion or explicit close.
+            gc_callback: Non-blocking local cleanup run when the stream is dropped.
+
+        Returns:
+            A buffered stream over ``records``.
+        """
+        columns = getattr(records, "columns", None)
+        if columns is None:
+            columns = _infer_record_columns(records)
+        return cls(
+            records,
+            columns,
+            fetch_size,
+            is_server_streaming=is_server_streaming,
+            close_callback=close_callback,
+            gc_callback=gc_callback,
+        )
+
+    def next_batch(self) -> BridgeStreamChunk | None:
+        """Returns the next slice of at most ``fetch_size`` rows."""
+        if self._closed:
+            return None
+        if self._offset >= len(self._records):
+            self.close()
+            return None
+        end = min(len(self._records), self._offset + self._fetch_size)
+        chunk = BridgeStreamChunk(self._records[self._offset : end], columns=self._columns)
+        self._offset = end
+        return chunk
+
+
+class GeneratorBridgeStream(BridgeStream):
+    """Bridge stream backed by a generator of chunks (driver cursors, server streams)."""
+
+    def __init__(
+        self,
+        chunks: Iterator[BridgeStreamChunk],
+        *,
+        columns: Sequence[str],
+        is_server_streaming: bool,
+        close_callback: Callable[[], Any] | None = None,
+        gc_callback: Callable[[], Any] | None = None,
+    ) -> None:
+        """Initializes a generator-backed stream.
+
+        Args:
+            chunks: Iterator yielding decoded chunks.
+            columns: Projected column names.
+            is_server_streaming: Whether the driver pulls rows from a server cursor.
+            close_callback: Cleanup run on exhaustion or explicit close.
+            gc_callback: Non-blocking local cleanup run when the stream is dropped.
+        """
+        super().__init__(
+            columns=columns,
+            is_server_streaming=is_server_streaming,
+            close_callback=close_callback,
+            gc_callback=gc_callback,
+        )
+        self._chunks = chunks
+
+    def next_batch(self) -> BridgeStreamChunk | None:
+        """Pulls the next chunk from the underlying generator."""
+        if self._closed:
+            return None
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            self.close()
+            return None
+
+
+class AsyncBridgeStream:
+    """Asynchronous pull-based bridge stream backed by an async generator."""
+
+    def __init__(
+        self,
+        chunks: AsyncIterator[BridgeStreamChunk],
+        *,
+        columns: Sequence[str],
+        is_server_streaming: bool,
+        close_callback: Callable[[], Any] | None = None,
+        gc_callback: Callable[[], Any] | None = None,
+    ) -> None:
+        """Initializes an async generator-backed stream.
+
+        Args:
+            chunks: Async iterator yielding decoded chunks.
+            columns: Projected column names.
+            is_server_streaming: Whether the driver pulls rows from a server cursor.
+            close_callback: Cleanup run on exhaustion or explicit close.
+            gc_callback: Non-blocking local cleanup run when the stream is dropped.
+        """
+        self._columns = tuple(str(column) for column in columns)
+        self._is_server_streaming = bool(is_server_streaming)
+        self._chunks = chunks
+        self._close_callback = close_callback
+        self._gc_callback = gc_callback
+        self._closed = False
+
+    @property
+    def columns(self) -> list[str]:
+        """Projected column names."""
+        return list(self._columns)
+
+    @property
+    def is_server_streaming(self) -> bool:
+        """Whether the driver pulls rows incrementally from a server cursor."""
+        return self._is_server_streaming
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether the stream is exhausted or explicitly closed."""
+        return self._closed
+
+    async def next_batch(self) -> BridgeStreamChunk | None:
+        """Pulls the next chunk from the async generator."""
+        if self._closed:
+            return None
+        try:
+            return await self._chunks.__anext__()
+        except StopAsyncIteration:
+            await self.close()
+            return None
+
+    async def close(self) -> None:
+        """Closes the stream and runs the owner's cleanup callback. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        callback = self._close_callback
+        self._close_callback = None
+        if callback is not None:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+
+    def __del__(self) -> None:
+        """Clears local state when a stream is dropped without being closed."""
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        self._close_callback = None
+        callback = getattr(self, "_gc_callback", None)
+        self._gc_callback = None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+
+class SyncBridgeStreamAsAsync:
+    """Adapts a synchronous bridge stream to the async stream protocol.
+
+    ``offload=True`` runs every pull and close on a worker thread, matching how
+    the existing async PostgreSQL and DuckDB bridges execute statements.
+    """
+
+    def __init__(self, stream: BridgeStream, *, offload: bool = True) -> None:
+        """Wraps ``stream``.
+
+        Args:
+            stream: Synchronous bridge stream.
+            offload: Run pulls and close in ``asyncio.to_thread``.
+        """
+        self._stream = stream
+        self._offload = offload
+
+    @property
+    def columns(self) -> list[str]:
+        """Projected column names."""
+        return self._stream.columns
+
+    @property
+    def is_server_streaming(self) -> bool:
+        """Whether the wrapped driver pulls rows incrementally from the server."""
+        return self._stream.is_server_streaming
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether the wrapped stream is exhausted or explicitly closed."""
+        return self._stream.is_closed
+
+    async def next_batch(self) -> BridgeStreamChunk | None:
+        """Pulls the next chunk, optionally on a worker thread."""
+        if self._offload:
+            return await asyncio.to_thread(self._stream.next_batch)
+        return self._stream.next_batch()
+
+    async def close(self) -> None:
+        """Closes the wrapped stream, optionally on a worker thread."""
+        if self._offload:
+            await asyncio.to_thread(self._stream.close)
+            return
+        self._stream.close()
 
 
 @runtime_checkable

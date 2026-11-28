@@ -10,7 +10,9 @@ import polars as pl
 
 from voyager_ogm.bridges.base import (
     BridgeResult,
+    BufferedBridgeStream,
     BulkExecutionResult,
+    SyncBridgeStreamAsAsync,
     _infer_record_columns,
     _validate_savepoint_name,
     validate_graph_name,
@@ -33,6 +35,7 @@ class MockTransaction:
         self._bridge = bridge
         self._state = "ACTIVE"
         self._savepoints: dict[str, int] = {}
+        self._open_stream = False
 
     @property
     def state(self) -> str:
@@ -49,12 +52,52 @@ class MockTransaction:
         """Mock transactions support in-memory savepoints."""
         return True
 
+    def _ensure_no_open_stream(self) -> None:
+        """Fails fast when a stream is open on this mock transaction."""
+        if self._open_stream:
+            raise RuntimeError(
+                "an active stream is open on this transaction; close or exhaust it first"
+            )
+
+    def _clear_open_stream(self) -> None:
+        """Clears the open-stream fail-fast flag."""
+        self._open_stream = False
+
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> BufferedBridgeStream:
+        """Slices the next canned mock result into ``fetch_size``-row batches.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per yielded batch.
+
+        Returns:
+            A buffered stream over the mock rows.
+        """
+        if not self.is_active:
+            raise ValueError("Cannot execute query on inactive transaction")
+        self._ensure_no_open_stream()
+        records = self._bridge.execute(statement, parameters)
+        self._open_stream = True
+        return BufferedBridgeStream.from_records(
+            records,
+            fetch_size,
+            close_callback=self._clear_open_stream,
+            gc_callback=self._clear_open_stream,
+        )
+
     def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         """Executes a statement through the mock bridge."""
         if not self.is_active:
             raise ValueError("Cannot execute query on inactive transaction")
+        self._ensure_no_open_stream()
         return self._bridge.execute(statement, parameters)
 
     def execute_to_polars(
@@ -63,6 +106,7 @@ class MockTransaction:
         """Executes a statement through the mock bridge and returns a DataFrame."""
         if not self.is_active:
             raise ValueError("Cannot execute query on inactive transaction")
+        self._ensure_no_open_stream()
         return self._bridge.execute_to_polars(statement, parameters)
 
     def execute_bulk(
@@ -73,10 +117,12 @@ class MockTransaction:
         """Executes a bulk plan through the mock bridge."""
         if not self.is_active:
             raise ValueError("Cannot execute bulk plan on inactive transaction")
+        self._ensure_no_open_stream()
         return self._bridge.execute_bulk(plan_or_statement, batches)
 
     def commit(self) -> None:
         """Marks the mock transaction committed."""
+        self._ensure_no_open_stream()
         if not self.is_active:
             raise ValueError("Cannot commit inactive transaction")
         self._state = "COMMITTED"
@@ -175,6 +221,25 @@ class MockBridge:
                 )
             return BridgeResult(res, columns=cols)
         return BridgeResult([], columns=())
+
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> BufferedBridgeStream:
+        """Records the query and slices the next canned result into batches.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per yielded batch.
+
+        Returns:
+            A buffered stream over the canned result rows.
+        """
+        records = self.execute(statement, parameters)
+        return BufferedBridgeStream.from_records(records, fetch_size)
 
     def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -370,6 +435,26 @@ class AsyncMockBridge:
             List of record dictionaries.
         """
         return self.sync_mock.execute(statement, parameters)
+
+    async def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> SyncBridgeStreamAsAsync:
+        """Slices the next canned mock result into asynchronous batches.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per yielded batch.
+
+        Returns:
+            An async wrapper over the buffered mock stream.
+        """
+        return SyncBridgeStreamAsAsync(
+            self.sync_mock.stream(statement, parameters, fetch_size), offload=False
+        )
 
     async def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None

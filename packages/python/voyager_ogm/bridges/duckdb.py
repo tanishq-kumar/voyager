@@ -20,6 +20,7 @@ from voyager_ogm.bridges._duckdb_arrow import (
     _DUCKDB_JSON_TYPE_IDS,
     _DUCKDB_TIMETZ_TYPE_IDS,
     _duckdb_array_child_dtype,
+    _duckdb_arrow_batch_to_canonical,
     _duckdb_arrow_table_to_canonical,
     _duckdb_complete_pending,
     _duckdb_description_has_interval,
@@ -36,7 +37,10 @@ from voyager_ogm.bridges._duckdb_arrow import (
 )
 from voyager_ogm.bridges.base import (
     BridgeResult,
+    BridgeStreamChunk,
+    BufferedBridgeStream,
     BulkExecutionResult,
+    SyncBridgeStreamAsAsync,
     validate_pagination_parameters,
 )
 from voyager_ogm.codecs import (
@@ -295,6 +299,122 @@ def _adapt_duckdb_parameters(statement: str, params: dict[str, Any]) -> dict[str
     }
 
 
+class DuckDbArrowStream:
+    """Pull-based DuckDB stream backed by ``relation.to_arrow_reader(batch_size)``.
+
+    Each batch is returned in canonical Voyager Arrow form (identical to
+    ``execute_to_arrow()``), while ``to_dicts()`` decodes the raw DuckDB batch so
+    dictionary values match ``execute()`` for ``UUID``, ``JSON``, ``INTERVAL``,
+    ``TIMETZ``, and ``HUGEINT`` columns.
+    """
+
+    def __init__(
+        self,
+        reader: Any,
+        description: Sequence[Any],
+        *,
+        cursor: Any = None,
+        on_close: Callable[[], None] | None = None,
+    ) -> None:
+        """Wraps an open DuckDB Arrow record batch reader.
+
+        Args:
+            reader: DuckDB ``RecordBatchReader``.
+            description: DuckDB relation description with column type objects.
+            cursor: Child cursor to close with the reader, or ``None`` inside a transaction.
+            on_close: Non-blocking callback run when the stream is closed or dropped.
+        """
+        self._reader = reader
+        self._description = tuple(description)
+        self._columns = tuple(str(item[0]) for item in description)
+        self._cursor = cursor
+        self._on_close = on_close
+        self._closed = False
+
+    @property
+    def columns(self) -> list[str]:
+        """Projected column names."""
+        return list(self._columns)
+
+    @property
+    def is_server_streaming(self) -> bool:
+        """DuckDB streams rows from the Arrow record batch reader."""
+        return True
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether the stream is exhausted or explicitly closed."""
+        return self._closed
+
+    def next_batch(self) -> BridgeStreamChunk | None:
+        """Pulls the next canonical batch, or returns ``None`` once exhausted."""
+        if self._closed:
+            return None
+        reader = self._reader
+        if reader is None:
+            self._closed = True
+            return None
+        try:
+            batch = reader.read_next_batch()
+        except StopIteration:
+            self.close()
+            return None
+        except BaseException:
+            self.close()
+            raise
+        canonical = _duckdb_arrow_batch_to_canonical(batch, self._description)
+
+        def _decode() -> Sequence[dict[str, Any]]:
+            import pyarrow as pa
+
+            return _records_from_duckdb_arrow(self._description, pa.Table.from_batches([batch]))
+
+        return BridgeStreamChunk(
+            columns=self._columns,
+            arrow_batch=canonical,
+            decode_records=_decode,
+        )
+
+    def close(self) -> None:
+        """Closes the Arrow reader and child cursor. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        reader = self._reader
+        self._reader = None
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
+        cursor = self._cursor
+        self._cursor = None
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        callback = self._on_close
+        self._on_close = None
+        if callback is not None:
+            callback()
+
+    def __del__(self) -> None:
+        """Clears local state without blocking I/O when the stream is dropped unclosed."""
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        self._reader = None
+        self._cursor = None
+        callback = getattr(self, "_on_close", None)
+        self._on_close = None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+
 class DuckDbBridge:
     """Synchronous DuckDB driver bridge with zero-copy Polars / Arrow output."""
 
@@ -540,6 +660,65 @@ class DuckDbBridge:
                         return _records_from_duckdb_arrow(relation_description, arrow_table)
         return _records_from_duckdb_rows(description, rel.fetchall())
 
+    def _open_arrow_stream(
+        self,
+        connection: Any,
+        stmt: str,
+        params: dict[str, Any],
+        fetch_size: int,
+        *,
+        cursor: Any = None,
+        on_close: Callable[[], None] | None = None,
+    ) -> Any:
+        """Opens ``relation.to_arrow_reader(batch_size)`` on ``connection``."""
+        relation = connection.sql(stmt, params=params or None)
+        if relation is None:
+            if cursor is not None:
+                cursor.close()
+            return BufferedBridgeStream.from_records([], fetch_size)
+        description = _duckdb_relation_description(relation)
+        if not description:
+            if cursor is not None:
+                cursor.close()
+            return BufferedBridgeStream.from_records([], fetch_size)
+        projection = _duckdb_timetz_projection(description)
+        if projection is not None:
+            relation = relation.project(projection)
+        reader = relation.to_arrow_reader(batch_size=fetch_size)
+        return DuckDbArrowStream(reader, description, cursor=cursor, on_close=on_close)
+
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> Any:
+        """Opens a DuckDB Arrow record batch stream over an isolated child cursor.
+
+        A child cursor owns its own active result slot, so other queries may run
+        on the main connection while the stream is open. Batches contain exactly
+        ``fetch_size`` rows (except the last) and are canonicalized per batch
+        exactly like :meth:`execute_to_arrow`.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per Arrow record batch.
+
+        Returns:
+            A DuckDB Arrow batch stream or an empty buffered stream.
+        """
+        self._ensure_duckpgq_for_statement(statement)
+        stmt, params = self._format_pgq_statement(statement, parameters or {})
+        params = _adapt_duckdb_parameters(stmt, params)
+        fetch_size = max(1, int(fetch_size))
+        stream_con = self.con.cursor()
+        try:
+            return self._open_arrow_stream(stream_con, stmt, params, fetch_size, cursor=stream_con)
+        except BaseException:
+            stream_con.close()
+            raise
+
     def execute_to_arrow(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
         """Executes a query and returns an Arrow table with Voyager's export types.
 
@@ -775,6 +954,8 @@ class DuckDbBridgeTransaction:
                 f"a transaction (DuckDB has no nested transactions): {exc}"
             ) from exc
         self._state = "ACTIVE"
+        self._open_stream = False
+        self._active_stream: Any = None
 
     @property
     def state(self) -> str:
@@ -802,11 +983,58 @@ class DuckDbBridgeTransaction:
         if not self.is_active:
             raise ValueError("Cannot execute query on inactive transaction")
 
+    def _ensure_no_open_stream(self) -> None:
+        """Fails fast when a stream is open on this transaction's connection."""
+        if self._open_stream:
+            raise RuntimeError(
+                "an active stream is open on this transaction; close or exhaust it first"
+            )
+
+    def _clear_open_stream(self) -> None:
+        """Clears the open-stream fail-fast flag."""
+        self._open_stream = False
+        self._active_stream = None
+
+    def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> Any:
+        """Opens a DuckDB Arrow stream on this transaction's own connection.
+
+        Running on ``self._bridge.con`` (not a child cursor) makes the stream
+        observe uncommitted writes from earlier statements in the transaction.
+        While it is open, other statements and ``commit()`` fail fast.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per Arrow record batch.
+
+        Returns:
+            A DuckDB Arrow batch stream or an empty buffered stream.
+        """
+        self._ensure_executable()
+        self._ensure_no_open_stream()
+        bridge = self._bridge
+        bridge._ensure_duckpgq_for_statement(statement)
+        stmt, params = bridge._format_pgq_statement(statement, parameters or {})
+        params = _adapt_duckdb_parameters(stmt, params)
+        fetch_size = max(1, int(fetch_size))
+        stream = bridge._open_arrow_stream(
+            bridge.con, stmt, params, fetch_size, on_close=self._clear_open_stream
+        )
+        self._open_stream = True
+        self._active_stream = stream
+        return stream
+
     def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         """Executes a statement inside the transaction through the DuckPGQ bridge."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         try:
             return self._bridge.execute(statement, parameters)
         except BaseException:
@@ -818,6 +1046,7 @@ class DuckDbBridgeTransaction:
     ) -> pl.DataFrame:
         """Executes a statement through the DuckPGQ bridge and returns Polars."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         try:
             return self._bridge.execute_to_polars(statement, parameters)
         except BaseException:
@@ -827,6 +1056,7 @@ class DuckDbBridgeTransaction:
     def execute_to_arrow(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
         """Executes a statement through the DuckPGQ bridge and returns Arrow."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         try:
             return self._bridge.execute_to_arrow(statement, parameters)
         except BaseException:
@@ -840,6 +1070,7 @@ class DuckDbBridgeTransaction:
     ) -> BulkExecutionResult:
         """Executes a bulk plan inside the transaction."""
         self._ensure_executable()
+        self._ensure_no_open_stream()
         try:
             return self._bridge.execute_bulk(plan_or_statement, batches)
         except BaseException:
@@ -848,6 +1079,7 @@ class DuckDbBridgeTransaction:
 
     def commit(self) -> None:
         """Commits the transaction."""
+        self._ensure_no_open_stream()
         if self._state == "FAILED":
             raise RuntimeError("transaction is aborted; roll back instead of committing")
         if not self.is_active:
@@ -860,9 +1092,17 @@ class DuckDbBridgeTransaction:
             raise
 
     def rollback(self) -> None:
-        """Rolls the transaction back."""
+        """Rolls the transaction back, closing any open stream first."""
         if self._state not in ("ACTIVE", "FAILED"):
             raise ValueError("Cannot rollback inactive transaction")
+        stream = self._active_stream
+        self._active_stream = None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self._open_stream = False
         try:
             self._bridge.con.execute("ROLLBACK")
             self._state = "ROLLED_BACK"
@@ -918,6 +1158,25 @@ class AsyncDuckDbBridge:
             List of record dictionaries.
         """
         return await asyncio.to_thread(self.sync_bridge.execute, statement, parameters)
+
+    async def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> SyncBridgeStreamAsAsync:
+        """Opens a DuckDB Arrow record batch stream off the event loop.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per Arrow record batch.
+
+        Returns:
+            An async wrapper over the DuckDB Arrow batch stream.
+        """
+        stream = await asyncio.to_thread(self.sync_bridge.stream, statement, parameters, fetch_size)
+        return SyncBridgeStreamAsAsync(stream, offload=True)
 
     async def execute_to_polars(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -990,6 +1249,29 @@ class AsyncDuckDbBridgeTransaction:
     def supports_savepoints(self) -> bool:
         """DuckDB has no savepoints."""
         return False
+
+    async def stream(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None = None,
+        fetch_size: int = 1_000,
+    ) -> SyncBridgeStreamAsAsync:
+        """Opens an Arrow stream on the transaction's own connection.
+
+        Args:
+            statement: Query statement.
+            parameters: Query parameters.
+            fetch_size: Maximum rows per Arrow record batch.
+
+        Returns:
+            An async wrapper over the transaction's DuckDB Arrow batch stream.
+        """
+        try:
+            stream = await asyncio.to_thread(self._sync.stream, statement, parameters, fetch_size)
+        except asyncio.CancelledError:
+            self._sync._mark_failed()
+            raise
+        return SyncBridgeStreamAsAsync(stream, offload=True)
 
     async def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
