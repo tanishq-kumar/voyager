@@ -518,18 +518,18 @@ fn classify_scalar(val: &ResultValue, tz_cache: &mut HashMap<String, bool>) -> O
             ResultTimezone::Zone { id, is_local } => {
                 if *is_local {
                     if resolve_local_datetime_utc(dt.seconds, id).is_some() {
-                        return Some(ScalarKind::DateTimeZone(Some(id.clone())));
+                        return Some(ScalarKind::DateTimeZone(Some(id.to_string())));
                     }
                     return Some(ScalarKind::DateTimeZone(None));
                 }
-                let valid = if let Some(&cached) = tz_cache.get(id) {
+                let valid = if let Some(&cached) = tz_cache.get(id.as_ref()) {
                     cached
                 } else {
                     let v = is_valid_arrow_tz(id);
-                    tz_cache.insert(id.clone(), v);
+                    tz_cache.insert(id.to_string(), v);
                     v
                 };
-                Some(ScalarKind::DateTimeZone(valid.then(|| id.clone())))
+                Some(ScalarKind::DateTimeZone(valid.then(|| id.to_string())))
             }
         },
         ResultValue::Duration(_) => Some(ScalarKind::Duration),
@@ -1508,14 +1508,20 @@ fn build_json_column(
 ) -> Result<(Field, ArrayRef)> {
     let count = values.len();
     let mut builder = StringBuilder::with_capacity(count, count * 64);
+    let mut json_buf: Vec<u8> = Vec::with_capacity(256);
     for v in values {
         match v {
             None => builder.append_null(),
             Some(ResultValue::Json(raw)) => builder.append_value(&**raw),
             Some(other) => {
-                let json_str = serde_json::to_string(&other.to_canonical_json())
-                    .unwrap_or_else(|_| "null".to_string());
-                builder.append_value(&json_str);
+                json_buf.clear();
+                match serde_json::to_writer(&mut json_buf, &other.as_canonical_json()) {
+                    Ok(()) => {
+                        let s = std::str::from_utf8(&json_buf).unwrap_or("null");
+                        builder.append_value(s);
+                    }
+                    Err(_) => builder.append_value("null"),
+                }
             }
         }
     }
@@ -1710,6 +1716,19 @@ pub fn canonicalize_field_metadata(field: &Field) -> Field {
     };
 
     Field::new(field.name(), new_dt, field.is_nullable()).with_metadata(meta)
+}
+
+/// Builds a single Arrow [`Field`] and [`ArrayRef`] directly from a column-major
+/// slice of [`ResultValue`]s, avoiding an intermediate row-major matrix and transpose.
+pub fn build_result_column(
+    name: &str,
+    values: &[ResultValue],
+    hint: &ColumnHint,
+    tz_cache: &mut HashMap<String, bool>,
+) -> Result<(Field, ArrayRef)> {
+    let col_buf: Vec<Option<&ResultValue>> =
+        values.iter().map(|v| (!v.is_null()).then_some(v)).collect();
+    build_column_values(name, &col_buf, hint, tz_cache)
 }
 
 /// Converts tabular [`ResultValue`] rows into an Apache Arrow [`RecordBatch`].

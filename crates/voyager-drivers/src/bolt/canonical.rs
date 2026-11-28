@@ -48,3 +48,20 @@ pub fn build_bolt_record_batch(
         .collect();
     values_to_record_batch(columns, &result_rows)
 }
+
+/// Converts owned [`BoltValue`] records into an Apache Arrow [`RecordBatch`] by
+/// moving each cell into [`ResultValue`] once, returning the converted rows only
+/// when the resulting batch contains JSON-encoded columns that need raw rows for
+/// lossless Python hydration.
+pub fn build_bolt_record_batch_owned(
+    columns: &[String],
+    records: Vec<Vec<BoltValue>>,
+) -> Result<(RecordBatch, Option<Vec<Vec<ResultValue>>>)> {
+    let result_rows: Vec<Vec<ResultValue>> = records
+        .into_iter()
+        .map(|row| row.into_iter().map(ResultValue::from).collect())
+        .collect();
+    let batch = values_to_record_batch(columns, &result_rows)?;
+    let retained = batch_needs_raw_rows(&batch).then_some(result_rows);
+    Ok((batch, retained))
+}

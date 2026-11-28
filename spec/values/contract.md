@@ -124,6 +124,11 @@ heterogeneous container).
   `FixedSizeBinary(16)` items, not a list of UUID strings; `Map<String, Point>`
   has a canonicalized value field; a struct field that holds JSON says
   `voyager.encoding=json` on that child field.
+- A container uses its native Arrow shape (`List`, `LargeList`,
+  `FixedSizeList`, `Map`, `Struct`, or `Union`) when its leaves are homogeneous
+  typed values. A heterogeneous list or dynamic map that cannot be expressed as
+  a single uniform child type uses the `voyager.encoding=json` fallback in
+  section 5 instead.
 - Every Arrow builder, native or Python, propagates `voyager.*` and
   `ARROW:extension:name` metadata recursively onto the child fields of
   `List`, `LargeList`, `FixedSizeList`, `Map`, `Struct`, and `Union`. Metadata

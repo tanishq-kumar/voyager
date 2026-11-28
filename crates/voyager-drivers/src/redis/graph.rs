@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::bolt::{
     BoltDate, BoltDuration, BoltLocalDateTime, BoltLocalTime, BoltNode, BoltPath, BoltPoint2D,
-    BoltRelationship, BoltUnboundRelationship, BoltValue, build_bolt_record_batch,
+    BoltRelationship, BoltUnboundRelationship, BoltValue,
 };
 use crate::engine::{QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
@@ -713,30 +713,29 @@ impl FalkorCompactResult {
         false
     }
 
-    /// Converts compact rows into unified [`BoltValue`]s and builds an Arrow [`QueryResult`].
+    /// Converts compact rows into [`ResultValue`]s once and builds an Arrow [`QueryResult`].
     pub fn to_query_result(&self, schema: &FalkorGraphSchema) -> Result<QueryResult> {
         let summary = self.statistics.to_query_summary();
         if self.columns.is_empty() {
             return Ok(QueryResult::empty(summary));
         }
 
-        let mut bolt_rows = Vec::with_capacity(self.rows.len());
+        let mut result_rows = Vec::with_capacity(self.rows.len());
         for row in &self.rows {
-            let mut bolt_row = Vec::with_capacity(row.len());
+            let mut result_row = Vec::with_capacity(row.len());
             for cell in row {
-                bolt_row.push(decode_compact_cell(cell, schema)?);
+                result_row.push(crate::value::result::ResultValue::from(
+                    decode_compact_cell(cell, schema)?,
+                ));
             }
-            bolt_rows.push(bolt_row);
+            result_rows.push(result_row);
         }
 
-        let batch = build_bolt_record_batch(&self.columns, &bolt_rows)?;
+        let batch = crate::value::arrow::values_to_record_batch(&self.columns, &result_rows)?;
+        let needs_raw = crate::value::arrow::batch_needs_raw_rows(&batch);
         let result = QueryResult::new(self.columns.clone(), vec![batch], summary);
-        if result
-            .batches
-            .iter()
-            .any(crate::bolt::canonical::batch_needs_bolt_rows)
-        {
-            Ok(result.with_bolt_rows(bolt_rows))
+        if needs_raw {
+            Ok(result.with_result_rows(result_rows))
         } else {
             Ok(result)
         }

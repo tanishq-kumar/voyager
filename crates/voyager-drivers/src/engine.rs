@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::bolt::BoltValue;
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
+use crate::value::result::ResultValue;
 
 /// Execution summary metrics and mutation counters returned after query execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +74,9 @@ pub struct QueryResult {
     /// Optional raw Bolt rows retained alongside Arrow batches so nested
     /// entities, maps, and mixed lists preserve full temporal/binary/float fidelity.
     pub bolt_rows: Option<Arc<Vec<Vec<BoltValue>>>>,
+    /// Optional pre-converted [`ResultValue`] rows retained alongside Arrow batches
+    /// so Bolt/FalkorDB results avoid a second `BoltValue` -> `ResultValue` copy in PyO3.
+    pub result_rows: Option<Arc<Vec<Vec<ResultValue>>>>,
 }
 
 impl QueryResult {
@@ -84,12 +88,19 @@ impl QueryResult {
             summary,
             age_columns: Vec::new(),
             bolt_rows: None,
+            result_rows: None,
         }
     }
 
     /// Attaches raw [`BoltValue`] rows for lossless nested entity/container conversion.
     pub fn with_bolt_rows(mut self, rows: Vec<Vec<BoltValue>>) -> Self {
         self.bolt_rows = Some(Arc::new(rows));
+        self
+    }
+
+    /// Attaches pre-converted [`ResultValue`] rows for zero-copy nested entity/container conversion.
+    pub fn with_result_rows(mut self, rows: Vec<Vec<ResultValue>>) -> Self {
+        self.result_rows = Some(Arc::new(rows));
         self
     }
 
@@ -101,6 +112,7 @@ impl QueryResult {
             summary,
             age_columns: Vec::new(),
             bolt_rows: None,
+            result_rows: None,
         }
     }
 

@@ -122,7 +122,7 @@
     "path": "*",
     "value_kind": "time_offset",
     "category": "fallback",
-    "reason": "Arrow JSON/List/Map encoding omits scalar voyager.type=time_tz metadata inside nested containers and entities, surfacing ISO str.",
+    "reason": "Arrow JSON map and entity encodings serialize nested offset times as ISO strings.",
     "match": "actual str"
   },
   {
@@ -131,7 +131,7 @@
     "path": "*",
     "value_kind": "datetime_offset",
     "category": "fallback",
-    "reason": "Arrow JSON/List/Map encoding omits scalar voyager.type=datetime_tz metadata inside nested containers and entities, surfacing ISO str.",
+    "reason": "Arrow JSON map and entity encodings serialize nested offset datetimes as ISO strings.",
     "match": "actual str"
   },
   {
@@ -248,7 +248,7 @@
     "path": "*",
     "value_kind": "list",
     "category": "fallback",
-    "reason": "Arrow JSON/List/Map/Entity encodings serialize date elements inside lists as ISO strings.",
+    "reason": "Arrow JSON map and entity encodings serialize date elements inside lists as ISO strings.",
     "match": "actual str"
   },
   {
@@ -257,7 +257,7 @@
     "path": "*",
     "value_kind": "list",
     "category": "fallback",
-    "reason": "Polars JSON/List/Map/Entity encodings serialize date elements inside lists as ISO strings.",
+    "reason": "Polars JSON map and entity encodings serialize date elements inside lists as ISO strings.",
     "match": "actual str"
   },
   {
@@ -455,7 +455,7 @@
     "path": "*",
     "value_kind": "datetime_offset",
     "category": "fallback",
-    "reason": "Arrow JSON/List/Map/Entity encodings omit scalar voyager.type=datetime_tz metadata and serialize nested offset datetimes as ISO strings.",
+    "reason": "Arrow JSON map and entity encodings serialize nested offset datetimes as ISO strings.",
     "match": "actual str"
   },
   {
@@ -500,7 +500,7 @@
     "path": "*",
     "value_kind": "list",
     "category": "fallback",
-    "reason": "Arrow JSON/List/Map/Entity encodings serialize date elements inside lists as ISO strings.",
+    "reason": "Arrow JSON map and entity encodings serialize date elements inside lists as ISO strings.",
     "match": "actual str"
   },
   {
@@ -509,7 +509,7 @@
     "path": "*",
     "value_kind": "list",
     "category": "fallback",
-    "reason": "Polars JSON/List/Map/Entity encodings serialize date elements inside lists as ISO strings.",
+    "reason": "Polars JSON map and entity encodings serialize date elements inside lists as ISO strings.",
     "match": "actual str"
   },
   {
@@ -667,15 +667,6 @@
   },
   {
     "engine": "pg19",
-    "backend": "native_arrow",
-    "path": "nested_list",
-    "value_kind": "time_offset",
-    "category": "fallback",
-    "reason": "Arrow List<Utf8> omits scalar voyager.type=time_tz metadata on timetz[] elements, surfacing ISO strings.",
-    "match": "actual str"
-  },
-  {
-    "engine": "pg19",
     "backend": "native_polars",
     "path": "*",
     "value_kind": "uuid",
@@ -829,15 +820,6 @@
   },
   {
     "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "*",
-    "value_kind": "uuid",
-    "category": "fallback",
-    "reason": "DuckDB Arrow export exposes UUID columns as fixed_size_binary[16] (ARROW:extension:name=arrow.uuid), so Voyager bridge_arrow returns bytes while the official DuckDB client returns uuid.UUID.",
-    "match": "type mismatch: actual bytes"
-  },
-  {
-    "engine": "duckdb",
     "backend": "bridge_polars",
     "path": "*",
     "value_kind": "uuid",
@@ -847,29 +829,11 @@
   },
   {
     "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "nested_map",
-    "value_kind": "uuid",
-    "category": "fallback",
-    "reason": "DuckDB Arrow export exposes MAP(VARCHAR, UUID) as map<string, fixed_size_binary[16]> (nested arrow.uuid), which PyArrow materializes as a list of (key, bytes) pairs while the official client returns dict.",
-    "match": "type mismatch: actual list"
-  },
-  {
-    "engine": "duckdb",
     "backend": "bridge_polars",
     "path": "nested_map",
     "value_kind": "uuid",
     "category": "fallback",
     "reason": "DuckDB Polars export exposes MAP(VARCHAR, UUID) as List(Struct({'key': String, 'value': Binary})) while the official DuckDB client returns dict.",
-    "match": "type mismatch: actual list"
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "nested_map",
-    "value_kind": "json_doc",
-    "category": "fallback",
-    "reason": "DuckDB Arrow export exposes MAP(VARCHAR, JSON) as map<string, string> (nested voyager.encoding=json), which PyArrow materializes as a list of (key, str) pairs while the official client returns dict.",
     "match": "type mismatch: actual list"
   },
   {
@@ -883,39 +847,12 @@
   },
   {
     "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "nested_list",
-    "value_kind": "json_doc",
-    "category": "fallback",
-    "reason": "DuckDB Arrow export exposes JSON[] as list<utf8> with voyager.encoding=json on the nested item field; _extract_arrow_cell only forwards top-level metadata, so bridge_arrow surfaces raw JSON strings.",
-    "match": "type mismatch: actual str"
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "nested_struct",
-    "value_kind": "json_doc",
-    "category": "fallback",
-    "reason": "DuckDB Arrow export exposes STRUCT(..., JSON) with voyager.encoding=json on the nested child field; _extract_arrow_cell only forwards top-level metadata, so bridge_arrow surfaces raw JSON strings.",
-    "match": "type mismatch: actual str"
-  },
-  {
-    "engine": "duckdb",
     "backend": "bridge_polars",
     "path": "nested_struct",
     "value_kind": "json_doc",
     "category": "fallback",
     "reason": "Polars strips Arrow voyager.encoding=json field metadata inside STRUCT(..., JSON), surfacing raw JSON strings while the official DuckDB client returns decoded JSON.",
     "match": "type mismatch: actual str"
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "nested_array",
-    "value_kind": "uuid",
-    "category": "fallback",
-    "reason": "DuckDB Arrow export exposes UUID[N] as fixed_size_list<fixed_size_binary[16]> (list of bytes) while the official DuckDB client returns a tuple of uuid.UUID.",
-    "match": "type mismatch: actual list"
   },
   {
     "engine": "duckdb",
@@ -928,30 +865,12 @@
   },
   {
     "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "nested_array",
-    "value_kind": "json_doc",
-    "category": "fallback",
-    "reason": "DuckDB Arrow export exposes JSON[N] as fixed_size_list<utf8> (list of JSON strings) while the official DuckDB client returns a tuple of decoded JSON.",
-    "match": "type mismatch: actual list"
-  },
-  {
-    "engine": "duckdb",
     "backend": "bridge_polars",
     "path": "nested_array",
     "value_kind": "json_doc",
     "category": "fallback",
     "reason": "DuckDB Polars export exposes JSON[N] as Array(String, N) (list of JSON strings) while the official DuckDB client returns a tuple of decoded JSON.",
     "match": "type mismatch: actual list"
-  },
-  {
-    "engine": "duckdb",
-    "backend": "bridge_arrow",
-    "path": "nested_union",
-    "value_kind": "json_doc",
-    "category": "fallback",
-    "reason": "DuckDB Arrow export exposes UNION(..., JSON) with voyager.encoding=json on the union member field; _extract_arrow_cell only forwards top-level metadata, so bridge_arrow surfaces raw JSON strings.",
-    "match": "type mismatch: actual str"
   },
   {
     "engine": "duckdb",

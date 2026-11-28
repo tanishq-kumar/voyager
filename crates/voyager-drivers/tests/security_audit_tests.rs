@@ -1,6 +1,9 @@
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::io::Cursor;
+use voyager_drivers::bolt::decode_result::{
+    BoltResultDecoder, decode_bolt_record_frame, decode_result_value_slice,
+};
 use voyager_drivers::bolt::packstream::{BoltValue, PackStream};
 use voyager_drivers::bolt::stream::{MAX_BOLT_MESSAGE_SIZE, read_message_frame_buffered};
 use voyager_drivers::client::connect_any;
@@ -103,6 +106,71 @@ fn test_packstream_recursion_depth_limit_rejected() {
         safe_res.is_ok(),
         "Payload within depth limit should decode successfully"
     );
+}
+
+#[test]
+fn test_direct_result_decoder_security_limits() {
+    // 1. Oversized declared lengths (List32, Map32, Struct16, String32, Bytes32)
+    let list_bomb: &[u8] = &[0xD6, 0xFF, 0xFF, 0xFF, 0xFF];
+    let err = decode_result_value_slice(list_bomb).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ClaimedSizeExceedsBuffer);
+
+    let map_bomb: &[u8] = &[0xDA, 0xFF, 0xFF, 0xFF, 0xFF];
+    let err = decode_result_value_slice(map_bomb).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ClaimedSizeExceedsBuffer);
+
+    let struct_bomb: &[u8] = &[0xDD, 0xFF, 0xFF, 0x4E];
+    let err = decode_result_value_slice(struct_bomb).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ClaimedSizeExceedsBuffer);
+
+    let str_bomb: &[u8] = &[0xD2, 0xFF, 0xFF, 0xFF, 0xFF];
+    assert!(matches!(
+        decode_result_value_slice(str_bomb),
+        Err(NetError::ProtocolError(_))
+    ));
+
+    let bytes_bomb: &[u8] = &[0xCE, 0xFF, 0xFF, 0xFF, 0xFF];
+    assert!(matches!(
+        decode_result_value_slice(bytes_bomb),
+        Err(NetError::ProtocolError(_))
+    ));
+
+    // 2. Over-deep nesting (> MAX_PACKSTREAM_DEPTH = 64) on List, Map, Struct, and RECORD
+    let mut deep_list = vec![0x91; 70];
+    deep_list.push(0x01);
+    let err = decode_result_value_slice(&deep_list).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("exceeded maximum nesting depth of 64")
+    );
+
+    let mut deep_map = Vec::with_capacity(70 * 3 + 1);
+    for _ in 0..70 {
+        deep_map.extend_from_slice(&[0xA1, 0x81, b'k']);
+    }
+    deep_map.push(0x01);
+    let err = decode_result_value_slice(&deep_map).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("exceeded maximum nesting depth of 64")
+    );
+
+    let mut deep_record = vec![0xB1, 0x71, 0x91];
+    deep_record.extend(vec![0x91; 64]);
+    deep_record.push(0x01);
+    let err = decode_bolt_record_frame(&deep_record).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("exceeded maximum nesting depth of 64")
+    );
+
+    // 3. Invalid UTF-8 rejected cleanly
+    let mut decoder = BoltResultDecoder::new();
+    let bad_utf8_record: &[u8] = &[0xB1, 0x71, 0x91, 0x82, 0xFF, 0xFE];
+    assert!(matches!(
+        decoder.decode_record_frame(bad_utf8_record),
+        Err(NetError::ProtocolError(_))
+    ));
 }
 
 #[test]

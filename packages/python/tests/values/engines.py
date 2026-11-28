@@ -473,8 +473,71 @@ def _falkordb_expr_and_param(val: Any, value_kind: str, var: str = "$v") -> tupl
     return var, val
 
 
+ARROW_META_TREE_PREFIX = " |meta-tree| "
+
+
+def _arrow_field_metadata(field: pa.Field) -> dict[str, str]:
+    """Returns a decoded copy of an Arrow field's metadata mapping."""
+    return {
+        k.decode("utf-8", "replace"): v.decode("utf-8", "replace")
+        for k, v in (field.metadata or {}).items()
+    }
+
+
+def _arrow_field_tree(field: pa.Field) -> dict[str, Any]:
+    """Recursively summarizes one Arrow field and all of its child fields."""
+    arrow_type = field.type
+    node: dict[str, Any] = {
+        "name": field.name,
+        "type": str(arrow_type),
+        "metadata": _arrow_field_metadata(field),
+        "kind": "scalar",
+    }
+    if pa.types.is_fixed_size_list(arrow_type):
+        node["kind"] = "fixed_size_list"
+        node["children"] = [_arrow_field_tree(arrow_type.value_field)]
+    elif pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        node["kind"] = "list"
+        node["children"] = [_arrow_field_tree(arrow_type.value_field)]
+    elif pa.types.is_map(arrow_type):
+        node["kind"] = "map"
+        node["children"] = [
+            _arrow_field_tree(arrow_type.key_field),
+            _arrow_field_tree(arrow_type.item_field),
+        ]
+    elif pa.types.is_struct(arrow_type):
+        node["kind"] = "struct"
+        node["children"] = [
+            _arrow_field_tree(arrow_type.field(index)) for index in range(arrow_type.num_fields)
+        ]
+    elif pa.types.is_union(arrow_type):
+        node["kind"] = "union"
+        node["children"] = [
+            _arrow_field_tree(arrow_type.field(index)) for index in range(arrow_type.num_fields)
+        ]
+        node["type_codes"] = list(arrow_type.type_codes)
+    return node
+
+
+def _tree_has_metadata(node: dict[str, Any]) -> bool:
+    """Returns whether ``node`` or any descendant carries Arrow field metadata."""
+    if node.get("metadata"):
+        return True
+    return any(_tree_has_metadata(child) for child in node.get("children", []))
+
+
+def _tree_has_descendant_metadata(node: dict[str, Any]) -> bool:
+    """Returns whether a child (at any depth) carries Arrow field metadata."""
+    return any(_tree_has_metadata(child) for child in node.get("children", []))
+
+
 def _extract_arrow_cell(table: pa.Table, col_name: str) -> tuple[Any, str]:
-    """Extracts ``(python_value, arrow_type_summary)`` from row 0 of a PyArrow Table."""
+    """Extracts ``(python_value, arrow_type_summary)`` from row 0 of a PyArrow Table.
+
+    When a nested child field carries Voyager metadata, the summary appends a
+    machine-readable tree after :data:`ARROW_META_TREE_PREFIX` so tests can verify
+    and honor recursive metadata instead of only the top-level field.
+    """
     field = table.schema.field(col_name)
     meta = ""
     if field.metadata:
@@ -484,6 +547,11 @@ def _extract_arrow_cell(table: pa.Table, col_name: str) -> tuple[Any, str]:
         )
         meta = f" [{meta_str}]"
     arrow_type_desc = f"{field.type}{meta}"
+    tree = _arrow_field_tree(field)
+    if _tree_has_descendant_metadata(tree):
+        arrow_type_desc += ARROW_META_TREE_PREFIX + json.dumps(
+            tree, sort_keys=True, separators=(",", ":")
+        )
     col = table.column(col_name)
     raw = col[0].as_py() if table.num_rows > 0 else None
     return raw, arrow_type_desc

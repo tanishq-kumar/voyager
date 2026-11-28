@@ -7,6 +7,7 @@
 pub mod canonical;
 #[cfg(feature = "bolt")]
 pub mod connection;
+pub mod decode_result;
 #[cfg(feature = "bolt")]
 pub mod messages;
 pub mod packstream;
@@ -24,6 +25,9 @@ pub use canonical::{
 
 #[cfg(feature = "bolt")]
 pub use connection::{BOLT_MAGIC_PREAMBLE, BOLT_PROPOSED_VERSIONS, BoltConnection, BoltVersion};
+pub use decode_result::{
+    BoltResultDecoder, decode_bolt_record_frame, decode_result_value_slice, peek_bolt_message_tag,
+};
 #[cfg(feature = "bolt")]
 pub use messages::{BoltRequest, BoltResponse};
 pub use packstream::{
@@ -33,8 +37,8 @@ pub use packstream::{
 };
 #[cfg(feature = "bolt")]
 pub use stream::{
-    DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, encode_chunks, read_message_frame,
-    read_message_frame_buffered, write_message_frame,
+    BoltFrame, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, encode_chunks, read_message_frame,
+    read_message_frame_borrowed, read_message_frame_buffered, write_message_frame,
 };
 #[cfg(feature = "testkit")]
 pub use stub_server::BoltStubServer;

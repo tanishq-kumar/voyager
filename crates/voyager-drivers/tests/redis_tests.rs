@@ -964,6 +964,7 @@ fn test_falkordb_compact_temporal_errors_tag15_timestamp_and_bolt_rows() {
     .to_query_result(&schema)
     .unwrap();
     assert!(scalar_res.bolt_rows.is_none());
+    assert!(scalar_res.result_rows.is_none());
 
     let mixed_res = FalkorCompactResult {
         columns: vec!["xs".to_string()],
@@ -982,5 +983,5 @@ fn test_falkordb_compact_temporal_errors_tag15_timestamp_and_bolt_rows() {
     }
     .to_query_result(&schema)
     .unwrap();
-    assert!(mixed_res.bolt_rows.is_some());
+    assert!(mixed_res.result_rows.is_some());
 }

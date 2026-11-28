@@ -6,6 +6,7 @@
 //! (enforced at compile time below).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::bolt::packstream::{
     BoltDateTimeZoneId, BoltNode, BoltPath, BoltRelationship, BoltValue,
@@ -27,7 +28,7 @@ pub enum ResultTimezone {
     /// (`0x66`) local wall-clock seconds rather than UTC epoch seconds.
     Zone {
         /// IANA timezone identifier (for example `"Europe/Berlin"`).
-        id: String,
+        id: Arc<str>,
         /// `true` for legacy Bolt v4 (`0x66`) local wall-clock timestamps.
         is_local: bool,
     },
@@ -92,28 +93,112 @@ impl ResultDateTime {
     }
 }
 
+/// Compact key-value map for [`ResultValue`] maps and graph entity properties.
+///
+/// Stores entries in a flat contiguous `Box<[(Arc<str>, ResultValue)]>` slice instead of
+/// a `HashMap`, avoiding per-entity SipHash overhead and hash table allocation waste on
+/// typical small property maps while preserving order-independent [`PartialEq`] and
+/// exact key-value semantics.
+#[derive(Debug, Clone, Default)]
+pub struct ResultMap(Box<[(Arc<str>, ResultValue)]>);
+
+impl ResultMap {
+    /// Creates an empty map without heap allocation.
+    #[inline]
+    pub fn new() -> Self {
+        Self(Box::from([]))
+    }
+
+    /// Creates a map from already-deduplicated `(key, value)` entries.
+    #[inline]
+    pub fn from_entries(entries: Vec<(Arc<str>, ResultValue)>) -> Self {
+        Self(entries.into_boxed_slice())
+    }
+
+    /// Returns the number of entries in this map.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` if this map contains no entries.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterates over `(key, value)` pairs in stored order.
+    #[inline]
+    pub fn iter(&self) -> std::slice::Iter<'_, (Arc<str>, ResultValue)> {
+        self.0.iter()
+    }
+
+    /// Looks up a value by key name.
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<&ResultValue> {
+        self.0
+            .iter()
+            .find(|(k, _)| k.as_ref() == key)
+            .map(|(_, v)| v)
+    }
+}
+
+impl PartialEq for ResultMap {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        if self.0.len() <= 16 {
+            self.0.iter().all(|(k, v)| other.get(k.as_ref()) == Some(v))
+        } else {
+            let other_map: HashMap<&str, &ResultValue> =
+                other.0.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+            self.0
+                .iter()
+                .all(|(k, v)| other_map.get(k.as_ref()).copied() == Some(v))
+        }
+    }
+}
+
+impl FromIterator<(Arc<str>, ResultValue)> for ResultMap {
+    fn from_iter<T: IntoIterator<Item = (Arc<str>, ResultValue)>>(iter: T) -> Self {
+        let entries: Vec<(Arc<str>, ResultValue)> = iter.into_iter().collect();
+        Self(entries.into_boxed_slice())
+    }
+}
+
+impl<'a> IntoIterator for &'a ResultMap {
+    type Item = &'a (Arc<str>, ResultValue);
+    type IntoIter = std::slice::Iter<'a, (Arc<str>, ResultValue)>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// Graph node decoded into [`ResultValue`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResultNode {
     /// Internal integer node identifier.
     pub id: i64,
-    /// Node labels.
-    pub labels: Vec<String>,
-    /// Property key-value map.
-    pub properties: HashMap<String, ResultValue>,
+    /// Node labels (internable across rows via [`Arc<str>`]).
+    pub labels: Vec<Arc<str>>,
+    /// Property key-value map (keys internable across rows via [`Arc<str>`]).
+    pub properties: ResultMap,
     /// Optional string element identifier (Bolt v5+).
-    pub element_id: Option<String>,
+    pub element_id: Option<Arc<str>>,
 }
 
 impl ResultNode {
     /// Converts this node into the canonical kind-tagged JSON object.
     pub fn to_canonical_json(&self) -> serde_json::Value {
-        let mut labels = self.labels.clone();
-        labels.sort();
+        let mut labels: Vec<&str> = self.labels.iter().map(AsRef::as_ref).collect();
+        labels.sort_unstable();
 
         let mut props = serde_json::Map::with_capacity(self.properties.len());
         for (k, v) in &self.properties {
-            props.insert(k.clone(), v.to_canonical_json());
+            props.insert(k.to_string(), v.to_canonical_json());
         }
 
         let mut obj = serde_json::Map::with_capacity(5);
@@ -125,13 +210,18 @@ impl ResultNode {
         obj.insert(
             "element_id".to_string(),
             match &self.element_id {
-                Some(eid) => serde_json::Value::String(eid.clone()),
+                Some(eid) => serde_json::Value::String(eid.to_string()),
                 None => serde_json::Value::Null,
             },
         );
         obj.insert(
             "labels".to_string(),
-            serde_json::Value::Array(labels.into_iter().map(serde_json::Value::String).collect()),
+            serde_json::Value::Array(
+                labels
+                    .into_iter()
+                    .map(|l| serde_json::Value::String(l.to_owned()))
+                    .collect(),
+            ),
         );
         obj.insert("properties".to_string(), serde_json::Value::Object(props));
         serde_json::Value::Object(obj)
@@ -147,16 +237,16 @@ pub struct ResultRelationship {
     pub start_node_id: i64,
     /// End node integer identifier.
     pub end_node_id: i64,
-    /// Relationship type label.
-    pub rel_type: String,
-    /// Property key-value map.
-    pub properties: HashMap<String, ResultValue>,
+    /// Relationship type label (internable across rows via [`Arc<str>`]).
+    pub rel_type: Arc<str>,
+    /// Property key-value map (keys internable across rows via [`Arc<str>`]).
+    pub properties: ResultMap,
     /// Optional string element identifier (Bolt v5+).
-    pub element_id: Option<String>,
+    pub element_id: Option<Arc<str>>,
     /// Optional start node element identifier (Bolt v5+).
-    pub start_element_id: Option<String>,
+    pub start_element_id: Option<Arc<str>>,
     /// Optional end node element identifier (Bolt v5+).
-    pub end_element_id: Option<String>,
+    pub end_element_id: Option<Arc<str>>,
 }
 
 impl ResultRelationship {
@@ -164,7 +254,7 @@ impl ResultRelationship {
     pub fn to_canonical_json(&self) -> serde_json::Value {
         let mut props = serde_json::Map::with_capacity(self.properties.len());
         for (k, v) in &self.properties {
-            props.insert(k.clone(), v.to_canonical_json());
+            props.insert(k.to_string(), v.to_canonical_json());
         }
 
         let mut obj = serde_json::Map::with_capacity(9);
@@ -176,13 +266,13 @@ impl ResultRelationship {
         obj.insert(
             "element_id".to_string(),
             match &self.element_id {
-                Some(eid) => serde_json::Value::String(eid.clone()),
+                Some(eid) => serde_json::Value::String(eid.to_string()),
                 None => serde_json::Value::Null,
             },
         );
         obj.insert(
             "type".to_string(),
-            serde_json::Value::String(self.rel_type.clone()),
+            serde_json::Value::String(self.rel_type.to_string()),
         );
         obj.insert(
             "start_id".to_string(),
@@ -196,13 +286,13 @@ impl ResultRelationship {
         if let Some(ref start_eid) = self.start_element_id {
             obj.insert(
                 "start_element_id".to_string(),
-                serde_json::Value::String(start_eid.clone()),
+                serde_json::Value::String(start_eid.to_string()),
             );
         }
         if let Some(ref end_eid) = self.end_element_id {
             obj.insert(
                 "end_element_id".to_string(),
-                serde_json::Value::String(end_eid.clone()),
+                serde_json::Value::String(end_eid.to_string()),
             );
         }
         serde_json::Value::Object(obj)
@@ -215,11 +305,11 @@ pub struct ResultUnboundRelationship {
     /// Internal integer identifier.
     pub id: i64,
     /// Relationship type label.
-    pub rel_type: String,
+    pub rel_type: Arc<str>,
     /// Property key-value map.
-    pub properties: HashMap<String, ResultValue>,
+    pub properties: ResultMap,
     /// Optional string element identifier.
-    pub element_id: Option<String>,
+    pub element_id: Option<Arc<str>>,
 }
 
 /// Graph path decoded into [`ResultValue`], with ordered nodes and bound relationships.
@@ -330,7 +420,7 @@ pub enum ResultValue {
     /// Ordered list of result values.
     List(Box<[ResultValue]>),
     /// Key-value map of result values.
-    Map(Box<HashMap<String, ResultValue>>),
+    Map(ResultMap),
     /// Graph node entity.
     Node(Box<ResultNode>),
     /// Graph relationship entity.
@@ -381,6 +471,12 @@ impl ResultValue {
         let sec = (secs_of_day % 60) as u32;
         let time_part = format_time_string(h, min, sec, nanoseconds, None);
         format!("{y:04}-{m:02}-{d:02}T{time_part}")
+    }
+
+    /// Returns a zero-DOM [`serde::Serialize`] view producing JSON byte-identical to
+    /// [`Self::to_canonical_json`].
+    pub fn as_canonical_json(&self) -> CanonicalJson<'_> {
+        CanonicalJson(self)
     }
 
     /// Converts this value into the canonical JSON fallback representation per `spec/values/contract.md`.
@@ -477,7 +573,7 @@ impl ResultValue {
             Self::Map(map) => {
                 let mut obj = serde_json::Map::with_capacity(map.len());
                 for (k, v) in map.iter() {
-                    obj.insert(k.clone(), v.to_canonical_json());
+                    obj.insert(k.to_string(), v.to_canonical_json());
                 }
                 serde_json::Value::Object(obj)
             }
@@ -504,13 +600,13 @@ impl From<&BoltNode> for ResultNode {
     fn from(node: &BoltNode) -> Self {
         Self {
             id: node.id,
-            labels: node.labels.clone(),
+            labels: node.labels.iter().map(|s| Arc::from(s.as_str())).collect(),
             properties: node
                 .properties
                 .iter()
-                .map(|(k, v)| (k.clone(), ResultValue::from(v)))
+                .map(|(k, v)| (Arc::from(k.as_str()), ResultValue::from(v)))
                 .collect(),
-            element_id: node.element_id.clone(),
+            element_id: node.element_id.as_deref().map(Arc::from),
         }
     }
 }
@@ -519,13 +615,13 @@ impl From<BoltNode> for ResultNode {
     fn from(node: BoltNode) -> Self {
         Self {
             id: node.id,
-            labels: node.labels,
+            labels: node.labels.into_iter().map(Arc::from).collect(),
             properties: node
                 .properties
                 .into_iter()
-                .map(|(k, v)| (k, ResultValue::from(v)))
+                .map(|(k, v)| (Arc::from(k), ResultValue::from(v)))
                 .collect(),
-            element_id: node.element_id,
+            element_id: node.element_id.map(Arc::from),
         }
     }
 }
@@ -536,15 +632,15 @@ impl From<&BoltRelationship> for ResultRelationship {
             id: rel.id,
             start_node_id: rel.start_node_id,
             end_node_id: rel.end_node_id,
-            rel_type: rel.rel_type.clone(),
+            rel_type: Arc::from(rel.rel_type.as_str()),
             properties: rel
                 .properties
                 .iter()
-                .map(|(k, v)| (k.clone(), ResultValue::from(v)))
+                .map(|(k, v)| (Arc::from(k.as_str()), ResultValue::from(v)))
                 .collect(),
-            element_id: rel.element_id.clone(),
-            start_element_id: rel.start_element_id.clone(),
-            end_element_id: rel.end_element_id.clone(),
+            element_id: rel.element_id.as_deref().map(Arc::from),
+            start_element_id: rel.start_element_id.as_deref().map(Arc::from),
+            end_element_id: rel.end_element_id.as_deref().map(Arc::from),
         }
     }
 }
@@ -555,15 +651,15 @@ impl From<BoltRelationship> for ResultRelationship {
             id: rel.id,
             start_node_id: rel.start_node_id,
             end_node_id: rel.end_node_id,
-            rel_type: rel.rel_type,
+            rel_type: Arc::from(rel.rel_type),
             properties: rel
                 .properties
                 .into_iter()
-                .map(|(k, v)| (k, ResultValue::from(v)))
+                .map(|(k, v)| (Arc::from(k), ResultValue::from(v)))
                 .collect(),
-            element_id: rel.element_id,
-            start_element_id: rel.start_element_id,
-            end_element_id: rel.end_element_id,
+            element_id: rel.element_id.map(Arc::from),
+            start_element_id: rel.start_element_id.map(Arc::from),
+            end_element_id: rel.end_element_id.map(Arc::from),
         }
     }
 }
@@ -605,15 +701,15 @@ impl From<&BoltPath> for ResultPath {
                         id: unbound_rel.id,
                         start_node_id: start_node.id,
                         end_node_id: end_node.id,
-                        rel_type: unbound_rel.rel_type.clone(),
+                        rel_type: Arc::from(unbound_rel.rel_type.as_str()),
                         properties: unbound_rel
                             .properties
                             .iter()
-                            .map(|(k, v)| (k.clone(), ResultValue::from(v)))
+                            .map(|(k, v)| (Arc::from(k.as_str()), ResultValue::from(v)))
                             .collect(),
-                        element_id: unbound_rel.element_id.clone(),
-                        start_element_id: start_node.element_id.clone(),
-                        end_element_id: end_node.element_id.clone(),
+                        element_id: unbound_rel.element_id.as_deref().map(Arc::from),
+                        start_element_id: start_node.element_id.as_deref().map(Arc::from),
+                        end_element_id: end_node.element_id.as_deref().map(Arc::from),
                     });
                     current_node_idx = next_node_idx;
                 }
@@ -633,7 +729,7 @@ impl From<&BoltDateTimeZoneId> for ResultDateTime {
             seconds: dtz.seconds,
             nanoseconds: dtz.nanoseconds,
             tz: ResultTimezone::Zone {
-                id: dtz.zone_id.clone(),
+                id: Arc::from(dtz.zone_id.as_str()),
                 is_local: dtz.is_local,
             },
         }
@@ -656,11 +752,11 @@ impl From<&BoltValue> for ResultValue {
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             ),
-            BoltValue::Map(map) => Self::Map(Box::new(
+            BoltValue::Map(map) => Self::Map(
                 map.iter()
-                    .map(|(k, v)| (k.clone(), Self::from(v)))
+                    .map(|(k, v)| (Arc::from(k.as_str()), Self::from(v)))
                     .collect(),
-            )),
+            ),
             BoltValue::Structure { tag, fields } => Self::Structure(Box::new(ResultStructure {
                 tag: *tag,
                 fields: fields.iter().map(Self::from).collect(),
@@ -721,9 +817,11 @@ impl From<BoltValue> for ResultValue {
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             ),
-            BoltValue::Map(map) => Self::Map(Box::new(
-                map.into_iter().map(|(k, v)| (k, Self::from(v))).collect(),
-            )),
+            BoltValue::Map(map) => Self::Map(
+                map.into_iter()
+                    .map(|(k, v)| (Arc::from(k), Self::from(v)))
+                    .collect(),
+            ),
             BoltValue::Structure { tag, fields } => Self::Structure(Box::new(ResultStructure {
                 tag,
                 fields: fields.into_iter().map(Self::from).collect(),
@@ -761,7 +859,7 @@ impl From<BoltValue> for ResultValue {
                 seconds: dtz.seconds,
                 nanoseconds: dtz.nanoseconds,
                 tz: ResultTimezone::Zone {
-                    id: dtz.zone_id,
+                    id: Arc::from(dtz.zone_id),
                     is_local: dtz.is_local,
                 },
             })),
@@ -771,6 +869,371 @@ impl From<BoltValue> for ResultValue {
                 seconds: d.seconds,
                 nanoseconds: d.nanoseconds,
             })),
+        }
+    }
+}
+
+/// Zero-DOM [`serde::Serialize`] view over [`ResultValue`] that emits the exact
+/// canonical JSON bytes of [`ResultValue::to_canonical_json`] without building an
+/// intermediate [`serde_json::Value`] tree.
+pub struct CanonicalJson<'a>(pub &'a ResultValue);
+
+struct FiniteF64(f64);
+
+impl serde::Serialize for FiniteF64 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.is_finite() {
+            serializer.serialize_f64(self.0)
+        } else {
+            serializer.serialize_unit()
+        }
+    }
+}
+
+struct SortedLabels<'a>(&'a [Arc<str>]);
+
+impl serde::Serialize for SortedLabels<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        if self.0.len() <= 1 || self.0.windows(2).all(|w| w[0] <= w[1]) {
+            let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+            for label in self.0 {
+                seq.serialize_element(label.as_ref())?;
+            }
+            seq.end()
+        } else {
+            let mut sorted: Vec<&str> = self.0.iter().map(AsRef::as_ref).collect();
+            sorted.sort_unstable();
+            let mut seq = serializer.serialize_seq(Some(sorted.len()))?;
+            for label in sorted {
+                seq.serialize_element(label)?;
+            }
+            seq.end()
+        }
+    }
+}
+
+struct CanonicalMap<'a>(&'a ResultMap);
+
+impl serde::Serialize for CanonicalMap<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0 {
+            map.serialize_entry(k.as_ref(), &CanonicalJson(v))?;
+        }
+        map.end()
+    }
+}
+
+struct CanonicalNode<'a>(&'a ResultNode);
+
+impl serde::Serialize for CanonicalNode<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(5))?;
+        map.serialize_entry("kind", META_KIND_NODE)?;
+        map.serialize_entry("id", &self.0.id)?;
+        map.serialize_entry("element_id", &self.0.element_id.as_deref())?;
+        map.serialize_entry("labels", &SortedLabels(&self.0.labels))?;
+        map.serialize_entry("properties", &CanonicalMap(&self.0.properties))?;
+        map.end()
+    }
+}
+
+struct CanonicalRelationship<'a>(&'a ResultRelationship);
+
+impl serde::Serialize for CanonicalRelationship<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let len = 7
+            + usize::from(self.0.start_element_id.is_some())
+            + usize::from(self.0.end_element_id.is_some());
+        let mut map = serializer.serialize_map(Some(len))?;
+        map.serialize_entry("kind", META_KIND_RELATIONSHIP)?;
+        map.serialize_entry("id", &self.0.id)?;
+        map.serialize_entry("element_id", &self.0.element_id.as_deref())?;
+        map.serialize_entry("type", self.0.rel_type.as_ref())?;
+        map.serialize_entry("start_id", &self.0.start_node_id)?;
+        map.serialize_entry("end_id", &self.0.end_node_id)?;
+        map.serialize_entry("properties", &CanonicalMap(&self.0.properties))?;
+        if let Some(ref start_eid) = self.0.start_element_id {
+            map.serialize_entry("start_element_id", start_eid.as_ref())?;
+        }
+        if let Some(ref end_eid) = self.0.end_element_id {
+            map.serialize_entry("end_element_id", end_eid.as_ref())?;
+        }
+        map.end()
+    }
+}
+
+struct CanonicalPath<'a>(&'a ResultPath);
+
+impl serde::Serialize for CanonicalPath<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        struct NodeSlice<'a>(&'a [ResultNode]);
+        impl serde::Serialize for NodeSlice<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                for n in self.0 {
+                    seq.serialize_element(&CanonicalNode(n))?;
+                }
+                seq.end()
+            }
+        }
+        struct RelSlice<'a>(&'a [ResultRelationship]);
+        impl serde::Serialize for RelSlice<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                for r in self.0 {
+                    seq.serialize_element(&CanonicalRelationship(r))?;
+                }
+                seq.end()
+            }
+        }
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("kind", META_KIND_PATH)?;
+        map.serialize_entry("nodes", &NodeSlice(&self.0.nodes))?;
+        map.serialize_entry("relationships", &RelSlice(&self.0.relationships))?;
+        map.end()
+    }
+}
+
+impl serde::Serialize for CanonicalJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            ResultValue::Null => serializer.serialize_unit(),
+            ResultValue::Bool(b) => serializer.serialize_bool(*b),
+            ResultValue::Int(i) => serializer.serialize_i64(*i),
+            ResultValue::Float(f) => FiniteF64(*f).serialize(serializer),
+            ResultValue::Bytes(bytes) => {
+                let mut seq = serializer.serialize_seq(Some(bytes.len()))?;
+                for b in bytes.iter() {
+                    seq.serialize_element(b)?;
+                }
+                seq.end()
+            }
+            ResultValue::Str(s) | ResultValue::Decimal(s) => serializer.serialize_str(s),
+            ResultValue::Uuid(bytes) => serializer.serialize_str(&format_uuid_bytes(bytes)),
+            ResultValue::Json(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(parsed) => parsed.serialize(serializer),
+                Err(_) => serializer.serialize_str(raw),
+            },
+            ResultValue::Date(days) => {
+                serializer.serialize_str(&ResultValue::format_date_days(*days))
+            }
+            ResultValue::LocalTime(nanos) => {
+                serializer.serialize_str(&ResultValue::format_local_time_nanos(*nanos))
+            }
+            ResultValue::Time {
+                nanoseconds,
+                tz_offset_seconds,
+            } => serializer.serialize_str(&ResultValue::format_time_offset(
+                *nanoseconds,
+                *tz_offset_seconds,
+            )),
+            ResultValue::LocalDateTime {
+                seconds,
+                nanoseconds,
+            } => serializer
+                .serialize_str(&ResultValue::format_local_datetime(*seconds, *nanoseconds)),
+            ResultValue::DateTime(dt) => serializer.serialize_str(&dt.to_iso_string()),
+            ResultValue::Duration(dur) => serializer.serialize_str(&format_iso_duration(
+                dur.months,
+                dur.days,
+                dur.seconds,
+                dur.nanoseconds,
+            )),
+            ResultValue::Point2D(pt) => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("srid", &pt.srid)?;
+                map.serialize_entry("x", &FiniteF64(pt.x))?;
+                map.serialize_entry("y", &FiniteF64(pt.y))?;
+                map.end()
+            }
+            ResultValue::Point3D(pt) => {
+                let mut map = serializer.serialize_map(Some(4))?;
+                map.serialize_entry("srid", &pt.srid)?;
+                map.serialize_entry("x", &FiniteF64(pt.x))?;
+                map.serialize_entry("y", &FiniteF64(pt.y))?;
+                map.serialize_entry("z", &FiniteF64(pt.z))?;
+                map.end()
+            }
+            ResultValue::List(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items.iter() {
+                    seq.serialize_element(&CanonicalJson(item))?;
+                }
+                seq.end()
+            }
+            ResultValue::Map(map) => CanonicalMap(map).serialize(serializer),
+            ResultValue::Node(node) => CanonicalNode(node).serialize(serializer),
+            ResultValue::Relationship(rel) => CanonicalRelationship(rel).serialize(serializer),
+            ResultValue::Path(path) => CanonicalPath(path).serialize(serializer),
+            ResultValue::Structure(s) => {
+                struct FieldSlice<'a>(&'a [ResultValue]);
+                impl serde::Serialize for FieldSlice<'_> {
+                    fn serialize<S: serde::Serializer>(
+                        &self,
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error> {
+                        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                        for f in self.0 {
+                            seq.serialize_element(&CanonicalJson(f))?;
+                        }
+                        seq.end()
+                    }
+                }
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("tag", &s.tag)?;
+                map.serialize_entry("fields", &FieldSlice(&s.fields))?;
+                map.end()
+            }
+            ResultValue::TypedText(tt) => serializer.serialize_str(&tt.text),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::META_TYPE_DECIMAL;
+
+    fn assert_canonical_json_identical(val: &ResultValue) {
+        let via_dom = serde_json::to_string(&val.to_canonical_json()).unwrap();
+        let via_stream = serde_json::to_string(&val.as_canonical_json()).unwrap();
+        assert_eq!(via_stream, via_dom, "mismatch for {val:?}");
+    }
+
+    #[test]
+    fn canonical_json_stream_is_byte_identical_to_dom() {
+        let node_props = ResultMap::from_entries(vec![
+            (Arc::from("name"), ResultValue::Str("Alice".into())),
+            (Arc::from("age"), ResultValue::Int(30)),
+        ]);
+        let node = ResultNode {
+            id: 7,
+            labels: vec![Arc::from("Zebra"), Arc::from("Alpha")],
+            properties: node_props,
+            element_id: Some(Arc::from("4:abc:7")),
+        };
+        let node_no_eid = ResultNode {
+            id: 8,
+            labels: vec![Arc::from("Only")],
+            properties: ResultMap::new(),
+            element_id: None,
+        };
+        let rel_props =
+            ResultMap::from_entries(vec![(Arc::from("weight"), ResultValue::Float(1.5))]);
+        let rel = ResultRelationship {
+            id: 11,
+            start_node_id: 7,
+            end_node_id: 8,
+            rel_type: Arc::from("KNOWS"),
+            properties: rel_props,
+            element_id: Some(Arc::from("5:abc:11")),
+            start_element_id: Some(Arc::from("4:abc:7")),
+            end_element_id: Some(Arc::from("4:abc:8")),
+        };
+        let rel_minimal = ResultRelationship {
+            id: 12,
+            start_node_id: 7,
+            end_node_id: 8,
+            rel_type: Arc::from("LIKES"),
+            properties: ResultMap::new(),
+            element_id: None,
+            start_element_id: None,
+            end_element_id: None,
+        };
+        let path = ResultPath {
+            nodes: vec![node.clone(), node_no_eid.clone()],
+            relationships: vec![rel.clone()],
+        };
+
+        let map = ResultMap::from_entries(vec![
+            (Arc::from("a"), ResultValue::Int(1)),
+            (Arc::from("b"), ResultValue::Float(f64::NAN)),
+            (Arc::from("c"), ResultValue::Float(f64::INFINITY)),
+            (Arc::from("d"), ResultValue::Float(f64::NEG_INFINITY)),
+            (Arc::from("e"), ResultValue::Float(-0.0)),
+        ]);
+
+        let cases = vec![
+            ResultValue::Null,
+            ResultValue::Bool(true),
+            ResultValue::Int(-42),
+            ResultValue::Float(3.125),
+            ResultValue::Float(-0.0),
+            ResultValue::Float(f64::NAN),
+            ResultValue::Float(f64::INFINITY),
+            ResultValue::Float(f64::NEG_INFINITY),
+            ResultValue::Bytes(vec![0, 1, 255].into_boxed_slice()),
+            ResultValue::Str("hello \"world\"\n".into()),
+            ResultValue::Decimal("12345.67890".into()),
+            ResultValue::Uuid([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+            ResultValue::Json(r#"{ "k" : [1, true, null] }"#.into()),
+            ResultValue::Json("not valid json".into()),
+            ResultValue::Date(19_723),
+            ResultValue::LocalTime(12 * 3_600 * 1_000_000_000 + 123_456_789),
+            ResultValue::Time {
+                nanoseconds: 9 * 3_600 * 1_000_000_000,
+                tz_offset_seconds: 7_200,
+            },
+            ResultValue::LocalDateTime {
+                seconds: 1_700_000_000,
+                nanoseconds: 500_000,
+            },
+            ResultValue::DateTime(Box::new(ResultDateTime {
+                seconds: 1_700_000_000,
+                nanoseconds: 250_000,
+                tz: ResultTimezone::Offset(-18_000),
+            })),
+            ResultValue::DateTime(Box::new(ResultDateTime {
+                seconds: 1_700_000_000,
+                nanoseconds: 0,
+                tz: ResultTimezone::Zone {
+                    id: Arc::from("Europe/Berlin"),
+                    is_local: false,
+                },
+            })),
+            ResultValue::Duration(Box::new(DurationParts {
+                months: 14,
+                days: 3,
+                seconds: 45,
+                nanoseconds: 123_000,
+            })),
+            ResultValue::Point2D(Box::new(Point2D {
+                srid: 4326,
+                x: 12.5,
+                y: f64::NAN,
+            })),
+            ResultValue::Point3D(Box::new(Point3D {
+                srid: 4979,
+                x: 1.0,
+                y: 2.0,
+                z: f64::INFINITY,
+            })),
+            ResultValue::List(vec![ResultValue::Int(1), ResultValue::Null].into_boxed_slice()),
+            ResultValue::Map(map),
+            ResultValue::Node(Box::new(node)),
+            ResultValue::Node(Box::new(node_no_eid)),
+            ResultValue::Relationship(Box::new(rel)),
+            ResultValue::Relationship(Box::new(rel_minimal)),
+            ResultValue::Path(Box::new(path)),
+            ResultValue::Structure(Box::new(ResultStructure {
+                tag: 0x4E,
+                fields: vec![ResultValue::Int(1), ResultValue::Str("x".into())],
+            })),
+            ResultValue::TypedText(Box::new(ResultTypedText {
+                meta_type: META_TYPE_DECIMAL,
+                text: "99.99".into(),
+            })),
+        ];
+
+        for case in &cases {
+            assert_canonical_json_identical(case);
         }
     }
 }

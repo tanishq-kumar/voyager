@@ -712,6 +712,20 @@ impl PackStream {
         Self::decode_with_depth(buf, 0)
     }
 
+    /// Decodes a single PackStream value directly into [`crate::value::result::ResultValue`]
+    /// from a byte slice without constructing an intermediate [`BoltValue`].
+    pub fn decode_result_slice(data: &[u8]) -> Result<(crate::value::result::ResultValue, usize)> {
+        super::decode_result::decode_result_value_slice(data)
+    }
+
+    /// Decodes a Bolt `RECORD` (`0x71`) frame directly into a row of
+    /// [`crate::value::result::ResultValue`]s without constructing intermediate [`BoltValue`]s.
+    pub fn decode_record_result_slice(
+        frame: &[u8],
+    ) -> Result<Vec<crate::value::result::ResultValue>> {
+        super::decode_result::decode_bolt_record_frame(frame)
+    }
+
     /// Decodes a `BoltValue` from a byte buffer slice tracking nesting recursion depth.
     pub fn decode_with_depth(buf: &mut Bytes, depth: usize) -> Result<BoltValue> {
         if depth > MAX_PACKSTREAM_DEPTH {
@@ -1181,10 +1195,13 @@ impl PackStream {
                 len
             )));
         }
-        let bytes = buf.split_to(len);
-        let s = std::str::from_utf8(&bytes)
+        let slice = buf.get(..len).ok_or_else(|| {
+            NetError::ProtocolError(format!("Unexpected EOF reading String of length {}", len))
+        })?;
+        let s = std::str::from_utf8(slice)
             .map_err(|e| NetError::ProtocolError(format!("Invalid UTF-8 string: {}", e)))?
-            .to_string();
+            .to_owned();
+        buf.advance(len);
         Ok(BoltValue::String(s))
     }
 
@@ -1195,7 +1212,14 @@ impl PackStream {
                 len
             )));
         }
-        let bytes = buf.split_to(len).to_vec();
+        let slice = buf.get(..len).ok_or_else(|| {
+            NetError::ProtocolError(format!(
+                "Unexpected EOF reading byte buffer of length {}",
+                len
+            ))
+        })?;
+        let bytes = slice.to_vec();
+        buf.advance(len);
         Ok(BoltValue::Bytes(bytes))
     }
 
@@ -1289,35 +1313,32 @@ impl PackStream {
         }
     }
 
-    fn decode_node_structure(fields: Vec<BoltValue>) -> Result<BoltValue> {
-        if fields.len() < 3 {
+    fn decode_node_structure(mut fields: Vec<BoltValue>) -> Result<BoltValue> {
+        if fields.len() < 3 || !matches!(fields.first(), Some(BoltValue::Integer(_))) {
             return Ok(BoltValue::Structure { tag: 0x4E, fields });
         }
-        let id = match fields.first() {
-            Some(BoltValue::Integer(i)) => *i,
-            _ => return Ok(BoltValue::Structure { tag: 0x4E, fields }),
+        let mut iter = fields.drain(..);
+        let id = match iter.next() {
+            Some(BoltValue::Integer(i)) => i,
+            _ => unreachable!(),
         };
-        let labels = match fields.get(1) {
+        let labels = match iter.next() {
             Some(BoltValue::List(l)) => l
-                .iter()
+                .into_iter()
                 .filter_map(|v| match v {
-                    BoltValue::String(s) => Some(s.clone()),
+                    BoltValue::String(s) => Some(s),
                     _ => None,
                 })
                 .collect(),
             _ => Vec::new(),
         };
-        let properties = match fields.get(2) {
-            Some(BoltValue::Map(m)) => m.clone(),
+        let properties = match iter.next() {
+            Some(BoltValue::Map(m)) => m,
             _ => HashMap::new(),
         };
-        let element_id = if fields.len() >= 4 {
-            match fields.get(3) {
-                Some(BoltValue::String(s)) => Some(s.clone()),
-                _ => None,
-            }
-        } else {
-            None
+        let element_id = match iter.next() {
+            Some(BoltValue::String(s)) => Some(s),
+            _ => None,
         };
 
         Ok(BoltValue::Node(BoltNode {
@@ -1328,45 +1349,46 @@ impl PackStream {
         }))
     }
 
-    fn decode_relationship_structure(fields: Vec<BoltValue>) -> Result<BoltValue> {
-        if fields.len() < 5 {
+    fn decode_relationship_structure(mut fields: Vec<BoltValue>) -> Result<BoltValue> {
+        if fields.len() < 5 || !matches!(fields.first(), Some(BoltValue::Integer(_))) {
             return Ok(BoltValue::Structure { tag: 0x52, fields });
         }
-        let id = match fields.first() {
-            Some(BoltValue::Integer(i)) => *i,
-            _ => return Ok(BoltValue::Structure { tag: 0x52, fields }),
+        let has_element_ids = fields.len() >= 8;
+        let mut iter = fields.drain(..);
+        let id = match iter.next() {
+            Some(BoltValue::Integer(i)) => i,
+            _ => unreachable!(),
         };
-        let start_node_id = match fields.get(1) {
-            Some(BoltValue::Integer(i)) => *i,
+        let start_node_id = match iter.next() {
+            Some(BoltValue::Integer(i)) => i,
             _ => 0,
         };
-        let end_node_id = match fields.get(2) {
-            Some(BoltValue::Integer(i)) => *i,
+        let end_node_id = match iter.next() {
+            Some(BoltValue::Integer(i)) => i,
             _ => 0,
         };
-        let rel_type = match fields.get(3) {
-            Some(BoltValue::String(s)) => s.clone(),
+        let rel_type = match iter.next() {
+            Some(BoltValue::String(s)) => s,
             _ => String::new(),
         };
-        let properties = match fields.get(4) {
-            Some(BoltValue::Map(m)) => m.clone(),
+        let properties = match iter.next() {
+            Some(BoltValue::Map(m)) => m,
             _ => HashMap::new(),
         };
-        let (element_id, start_element_id, end_element_id) = if fields.len() >= 8 {
-            (
-                fields
-                    .get(5)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                fields
-                    .get(6)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                fields
-                    .get(7)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-            )
+        let (element_id, start_element_id, end_element_id) = if has_element_ids {
+            let e1 = match iter.next() {
+                Some(BoltValue::String(s)) => Some(s),
+                _ => None,
+            };
+            let e2 = match iter.next() {
+                Some(BoltValue::String(s)) => Some(s),
+                _ => None,
+            };
+            let e3 = match iter.next() {
+                Some(BoltValue::String(s)) => Some(s),
+                _ => None,
+            };
+            (e1, e2, e3)
         } else {
             (None, None, None)
         };
@@ -1383,42 +1405,47 @@ impl PackStream {
         }))
     }
 
-    fn decode_path_structure(fields: Vec<BoltValue>) -> Result<BoltValue> {
+    fn decode_path_structure(mut fields: Vec<BoltValue>) -> Result<BoltValue> {
         if fields.len() < 3 {
             return Ok(BoltValue::Structure { tag: 0x50, fields });
         }
-        let nodes = match fields.first() {
+        let mut iter = fields.drain(..);
+        let nodes = match iter.next() {
             Some(BoltValue::List(l)) => l
-                .iter()
+                .into_iter()
                 .filter_map(|v| match v {
-                    BoltValue::Node(n) => Some(n.clone()),
+                    BoltValue::Node(n) => Some(n),
                     _ => None,
                 })
                 .collect(),
             _ => Vec::new(),
         };
-        let relationships = match fields.get(1) {
+        let relationships = match iter.next() {
             Some(BoltValue::List(l)) => l
-                .iter()
+                .into_iter()
                 .filter_map(|v| match v {
-                    BoltValue::Structure { tag: 0x72, fields } => {
+                    BoltValue::Structure {
+                        tag: 0x72,
+                        mut fields,
+                    } => {
                         if fields.len() >= 3 {
-                            let id = match fields.first() {
-                                Some(BoltValue::Integer(i)) => *i,
+                            let mut riter = fields.drain(..);
+                            let id = match riter.next() {
+                                Some(BoltValue::Integer(i)) => i,
                                 _ => 0,
                             };
-                            let rel_type = match fields.get(1) {
-                                Some(BoltValue::String(s)) => s.clone(),
+                            let rel_type = match riter.next() {
+                                Some(BoltValue::String(s)) => s,
                                 _ => String::new(),
                             };
-                            let properties = match fields.get(2) {
-                                Some(BoltValue::Map(m)) => m.clone(),
+                            let properties = match riter.next() {
+                                Some(BoltValue::Map(m)) => m,
                                 _ => HashMap::new(),
                             };
-                            let element_id = fields
-                                .get(3)
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
+                            let element_id = match riter.next() {
+                                Some(BoltValue::String(s)) => Some(s),
+                                _ => None,
+                            };
                             Some(BoltUnboundRelationship {
                                 id,
                                 rel_type,
@@ -1434,11 +1461,11 @@ impl PackStream {
                 .collect(),
             _ => Vec::new(),
         };
-        let sequence = match fields.get(2) {
+        let sequence = match iter.next() {
             Some(BoltValue::List(l)) => l
-                .iter()
+                .into_iter()
                 .filter_map(|v| match v {
-                    BoltValue::Integer(i) => Some(*i),
+                    BoltValue::Integer(i) => Some(i),
                     _ => None,
                 })
                 .collect(),

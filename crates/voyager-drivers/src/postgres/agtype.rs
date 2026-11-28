@@ -1674,11 +1674,11 @@ fn json_to_result_value(val: &serde_json::Value) -> ResultValue {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         ),
-        serde_json::Value::Object(obj) => ResultValue::Map(Box::new(
+        serde_json::Value::Object(obj) => ResultValue::Map(
             obj.iter()
-                .map(|(k, v)| (k.clone(), json_to_result_value(v)))
+                .map(|(k, v)| (std::sync::Arc::from(k.as_str()), json_to_result_value(v)))
                 .collect(),
-        )),
+        ),
     }
 }
 
@@ -1686,12 +1686,12 @@ fn age_vertex_to_result_node(v: AgeVertex) -> ResultNode {
     let labels = if v.label.is_empty() {
         Vec::new()
     } else {
-        vec![v.label]
+        vec![std::sync::Arc::from(v.label)]
     };
     let properties = v
         .properties
         .into_iter()
-        .map(|(k, val)| (k, json_to_result_value(&val)))
+        .map(|(k, val)| (std::sync::Arc::from(k), json_to_result_value(&val)))
         .collect();
     ResultNode {
         id: v.id,
@@ -1705,13 +1705,13 @@ fn age_edge_to_result_rel(e: AgeEdge) -> ResultRelationship {
     let properties = e
         .properties
         .into_iter()
-        .map(|(k, val)| (k, json_to_result_value(&val)))
+        .map(|(k, val)| (std::sync::Arc::from(k), json_to_result_value(&val)))
         .collect();
     ResultRelationship {
         id: e.id,
         start_node_id: e.start_id,
         end_node_id: e.end_id,
-        rel_type: e.label,
+        rel_type: std::sync::Arc::from(e.label),
         properties,
         element_id: None,
         start_element_id: None,
@@ -1744,9 +1744,11 @@ impl From<AgeValue> for ResultValue {
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             ),
-            AgeValue::Map(map) => Self::Map(Box::new(
-                map.into_iter().map(|(k, v)| (k, Self::from(v))).collect(),
-            )),
+            AgeValue::Map(map) => Self::Map(
+                map.into_iter()
+                    .map(|(k, v)| (std::sync::Arc::from(k), Self::from(v)))
+                    .collect(),
+            ),
         }
     }
 }
@@ -2074,21 +2076,32 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
     let num_rows = rows.len();
     let num_cols = column_names.len();
 
-    let mut result_rows: Vec<Vec<ResultValue>> = (0..num_rows)
-        .map(|_| vec![ResultValue::Null; num_cols])
-        .collect();
-    let mut hints: Vec<ColumnHint> = Vec::with_capacity(num_cols);
+    let mut fields: Vec<arrow_schema::Field> = Vec::with_capacity(num_cols);
+    let mut arrays: Vec<arrow_array::ArrayRef> = Vec::with_capacity(num_cols);
+    let mut tz_cache: HashMap<String, bool> = HashMap::new();
+    let mut col_values: Vec<ResultValue> = Vec::with_capacity(num_rows);
     let mut fallback_columns: Vec<(usize, i32)> = Vec::new();
 
     for (col_idx, name) in column_names.iter().enumerate() {
+        col_values.clear();
+
         if age_columns.get(col_idx).copied().unwrap_or(false) {
-            for (row_idx, row) in rows.iter().enumerate() {
+            for row in rows {
                 if let Some(raw) = row.get(col_idx).and_then(|v| v.as_deref()) {
                     let parsed = parse_agtype(raw)?;
-                    result_rows[row_idx][col_idx] = ResultValue::from(parsed);
+                    col_values.push(ResultValue::from(parsed));
+                } else {
+                    col_values.push(ResultValue::Null);
                 }
             }
-            hints.push(ColumnHint::Age);
+            let (field, array) = crate::value::arrow::build_result_column(
+                name,
+                &col_values,
+                &ColumnHint::Age,
+                &mut tz_cache,
+            )?;
+            fields.push(field);
+            arrays.push(array);
             continue;
         }
 
@@ -2121,8 +2134,8 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
                     }
                 }
 
-                if mixed_depth {
-                    for (row_idx, cell) in parsed_cells.into_iter().enumerate() {
+                let hint = if mixed_depth {
+                    for cell in parsed_cells {
                         if let Some(parsed) = cell {
                             let text = serde_json::to_string(&pg_array_to_json(&parsed, elem_oid))
                                 .map_err(|error| {
@@ -2130,8 +2143,9 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
                                         "Failed to encode PostgreSQL array column {name:?} as JSON: {error}"
                                     ))
                                 })?;
-                            result_rows[row_idx][col_idx] =
-                                ResultValue::Json(text.into_boxed_str());
+                            col_values.push(ResultValue::Json(text.into_boxed_str()));
+                        } else {
+                            col_values.push(ResultValue::Null);
                         }
                     }
                     let meta_type = match elem_oid {
@@ -2139,37 +2153,55 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
                         2950 => Some(META_TYPE_UUID),
                         _ => None,
                     };
-                    hints.push(ColumnHint::JsonColumn { meta_type });
                     if collect_bolt_rows {
                         fallback_columns.push((col_idx, elem_oid));
                     }
+                    ColumnHint::JsonColumn { meta_type }
                 } else {
                     let depth = depth.unwrap_or(1);
-                    for (row_idx, cell) in parsed_cells.into_iter().enumerate() {
+                    for cell in parsed_cells {
                         if let Some(parsed) = cell {
-                            result_rows[row_idx][col_idx] =
-                                pg_array_value_to_result(&parsed, elem_oid, name)?;
+                            col_values.push(pg_array_value_to_result(&parsed, elem_oid, name)?);
+                        } else {
+                            col_values.push(ResultValue::Null);
                         }
                     }
                     let elem_hint = pg_oid_column_hint(elem_oid, typmod)
                         .unwrap_or(ColumnHint::PgEmptyTyped(EmptyColumnKind::Str));
-                    hints.push(ColumnHint::PgArray {
+                    ColumnHint::PgArray {
                         depth,
                         elem_hint: Box::new(elem_hint),
-                    });
-                }
+                    }
+                };
+                let (field, array) = crate::value::arrow::build_result_column(
+                    name,
+                    &col_values,
+                    &hint,
+                    &mut tz_cache,
+                )?;
+                fields.push(field);
+                arrays.push(array);
                 continue;
             }
 
             if let Some(hint) = pg_oid_column_hint(oid, typmod) {
-                for (row_idx, row) in rows.iter().enumerate() {
+                for row in rows {
                     if let Some(raw) = row.get(col_idx).and_then(|v| v.as_deref())
                         && let Some(val) = decode_pg_scalar_cell(raw, oid, name)?
                     {
-                        result_rows[row_idx][col_idx] = val;
+                        col_values.push(val);
+                    } else {
+                        col_values.push(ResultValue::Null);
                     }
                 }
-                hints.push(hint);
+                let (field, array) = crate::value::arrow::build_result_column(
+                    name,
+                    &col_values,
+                    &hint,
+                    &mut tz_cache,
+                )?;
+                fields.push(field);
+                arrays.push(array);
                 continue;
             }
         }
@@ -2202,9 +2234,9 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
             }
         }
 
-        for (row_idx, row) in rows.iter().enumerate() {
+        for row in rows {
             if let Some(val) = row.get(col_idx).and_then(|v| v.as_deref()) {
-                result_rows[row_idx][col_idx] = if !has_non_null {
+                let rv = if !has_non_null {
                     ResultValue::Null
                 } else if can_be_int {
                     clean_agtype_string(val)
@@ -2222,9 +2254,19 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
                 } else {
                     ResultValue::Str(val.into())
                 };
+                col_values.push(rv);
+            } else {
+                col_values.push(ResultValue::Null);
             }
         }
-        hints.push(ColumnHint::Auto);
+        let (field, array) = crate::value::arrow::build_result_column(
+            name,
+            &col_values,
+            &ColumnHint::Auto,
+            &mut tz_cache,
+        )?;
+        fields.push(field);
+        arrays.push(array);
     }
 
     let bolt_rows = if collect_bolt_rows && !fallback_columns.is_empty() {
@@ -2243,7 +2285,8 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
         None
     };
 
-    let batch = values_to_record_batch_with_hints(column_names, &result_rows, &hints)?;
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+    let batch = RecordBatch::try_new(schema, arrays).map_err(NetError::ArrowError)?;
     Ok((batch, bolt_rows))
 }
 
