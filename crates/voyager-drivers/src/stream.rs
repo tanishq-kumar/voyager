@@ -17,13 +17,13 @@ use crate::value::arrow::{ColumnHint, values_to_record_batch_with_hints};
 use crate::value::result::ResultValue;
 
 /// Default number of rows requested per wire pull/execute chunk.
-pub const DEFAULT_STREAM_FETCH_SIZE: usize = 1_000;
+pub const DEFAULT_STREAM_FETCH_SIZE: usize = 4_000;
 
 /// Configuration for a pull-based query stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StreamOptions {
-    /// Maximum rows fetched per round-trip (`>= 1`; defaults to `1_000`).
+    /// Maximum rows fetched per round-trip (`>= 1`; defaults to `4_000`).
     pub fetch_size: usize,
 }
 

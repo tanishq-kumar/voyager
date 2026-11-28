@@ -1704,14 +1704,14 @@ async fn test_bolt_stream_early_close_sends_discard_and_reuses_connection() {
         .unwrap();
     let first = stream.next_chunk().await.unwrap().expect("chunk 1");
     assert_eq!(first.num_rows(), 100);
-    assert_eq!(stub.pull_count(), 1);
     assert_eq!(stub.discard_count(), 0);
 
     stream.close().await.unwrap();
     // Idempotent second close
     stream.close().await.unwrap();
     assert!(stream.is_closed());
-    assert_eq!(stub.pull_count(), 1);
+    // Chunk 1 prefetched chunk 2 before returning; close() drained chunk 2 then sent DISCARD.
+    assert_eq!(stub.pull_count(), 2);
     assert_eq!(stub.discard_count(), 1);
     assert_eq!(client.pool().active_count(), 0);
     assert_eq!(client.pool().idle_count(), 1);
@@ -2060,6 +2060,23 @@ async fn test_bolt_v3_fallback_and_memgraph_discard_quirk_and_timeout_cancel() {
         write_message_frame(&mut mg_server, &wire).await.unwrap();
         let _ = mg_server.flush().await;
 
+        // Chunk 1 prefetches chunk 2 before returning; serve chunk 2 with has_more=true
+        // so close_stream drains it and then sends DISCARD.
+        let mut pull2_frame = read_message_frame(&mut mg_server).await.unwrap();
+        let pull2_msg = PackStream::decode(&mut pull2_frame).unwrap();
+        assert!(matches!(pull2_msg, BoltValue::Structure { tag: 0x3F, .. }));
+        let mut pull2_wire = Vec::new();
+        pull2_wire.extend_from_slice(&frame_resp(&BoltResponse::Record {
+            fields: vec![BoltValue::Integer(2)],
+        }));
+        pull2_wire.extend_from_slice(&frame_resp(&BoltResponse::Success {
+            metadata: HashMap::from([("has_more".to_string(), BoltValue::Boolean(true))]),
+        }));
+        write_message_frame(&mut mg_server, &pull2_wire)
+            .await
+            .unwrap();
+        let _ = mg_server.flush().await;
+
         let mut discard_frame = read_message_frame(&mut mg_server).await.unwrap();
         let discard_msg = PackStream::decode(&mut discard_frame).unwrap();
         assert!(matches!(
@@ -2140,4 +2157,73 @@ async fn test_bolt_v3_fallback_and_memgraph_discard_quirk_and_timeout_cancel() {
     assert!(!conn_to.is_valid());
     assert!(!to_cursor.is_wire_clean());
     to_srv.abort();
+}
+
+#[tokio::test]
+async fn test_bolt_stream_prefetch_early_close_and_drop() {
+    use voyager_drivers::bolt::BoltStubServer;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(
+        &stub.uri(),
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+
+    // 1. Prefetch + early close when prefetched chunk still has_more=true:
+    //    close() drains the in-flight chunk 2 and sends exactly 1 DISCARD, reusing the conn.
+    let mut s1 = client
+        .stream("STREAM ROWS 500", &HashMap::new(), StreamOptions::new(100))
+        .await
+        .unwrap();
+    let c1 = s1.next_chunk().await.unwrap().expect("chunk 1");
+    assert_eq!(c1.num_rows(), 100);
+    assert_eq!(stub.discard_count(), 0);
+    s1.close().await.unwrap();
+    assert_eq!(stub.pull_count(), 2);
+    assert_eq!(stub.discard_count(), 1);
+    assert_eq!(stub.connection_count(), 1);
+    assert_eq!(client.pool().idle_count(), 1);
+
+    // 2. Prefetch + early close when prefetched chunk IS the final chunk (has_more=false):
+    //    close() drains chunk 2, sees has_more=false, sends 0 DISCARDs, and reuses the conn.
+    let mut s2 = client
+        .stream("STREAM ROWS 150", &HashMap::new(), StreamOptions::new(100))
+        .await
+        .unwrap();
+    let c2 = s2.next_chunk().await.unwrap().expect("chunk 1");
+    assert_eq!(c2.num_rows(), 100);
+    s2.close().await.unwrap();
+    assert_eq!(stub.pull_count(), 4);
+    assert_eq!(stub.discard_count(), 1);
+    assert_eq!(stub.connection_count(), 1);
+
+    // Follow-up query reuses the same connection without RESET
+    let ok = client
+        .execute_rows("RETURN 1", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(ok.row_count(), 2);
+    assert_eq!(stub.connection_count(), 1);
+    assert_eq!(stub.reset_count(), 0);
+
+    // 3. Prefetch + Drop without close(): marks connection broken so next query opens conn #2.
+    {
+        let mut s3 = client
+            .stream("STREAM ROWS 500", &HashMap::new(), StreamOptions::new(100))
+            .await
+            .unwrap();
+        let c3 = s3.next_chunk().await.unwrap().expect("chunk 1");
+        assert_eq!(c3.num_rows(), 100);
+    }
+    let after_drop = client
+        .execute_rows("RETURN 2", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(after_drop.row_count(), 2);
+    assert_eq!(stub.connection_count(), 2);
+
+    client.close().await;
 }

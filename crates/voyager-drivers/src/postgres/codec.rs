@@ -1,6 +1,6 @@
 //! PostgreSQL asynchronous message framing, encoder, and decoder.
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{NetError, Result};
@@ -49,6 +49,50 @@ where
         msg.encode(&mut buf)?;
     }
     writer.write_all(&buf).await.map_err(NetError::IoError)?;
+    writer.flush().await.map_err(NetError::IoError)?;
+    Ok(())
+}
+
+/// Encodes and writes an `Execute(portal, max_rows)` + `Flush` pair into a reusable
+/// buffer and sends both in a single `write_all` + `flush` syscall without allocating.
+pub async fn write_execute_flush<W>(
+    writer: &mut W,
+    buf: &mut BytesMut,
+    portal: &str,
+    max_rows: i32,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if portal.as_bytes().contains(&0) {
+        return Err(NetError::ProtocolError(
+            "PostgreSQL Execute portal contains interior NUL byte".to_string(),
+        ));
+    }
+    let body_len = portal
+        .len()
+        .checked_add(5)
+        .and_then(|n| n.checked_add(4))
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| {
+            NetError::ProtocolError("PostgreSQL Execute message length overflow".to_string())
+        })?;
+    buf.clear();
+    if buf.capacity() > 64 * 1024 {
+        *buf = BytesMut::with_capacity(256);
+    }
+    buf.reserve(5 + portal.len() + 5 + 5);
+    // Execute ('E')
+    buf.put_u8(b'E');
+    buf.put_i32(body_len);
+    buf.put_slice(portal.as_bytes());
+    buf.put_u8(0);
+    buf.put_i32(max_rows);
+    // Flush ('H')
+    buf.put_u8(b'H');
+    buf.put_i32(4);
+
+    writer.write_all(buf).await.map_err(NetError::IoError)?;
     writer.flush().await.map_err(NetError::IoError)?;
     Ok(())
 }

@@ -4175,7 +4175,7 @@ impl PyNativeClient {
     }
 
     /// Synchronously opens a pull-based result stream over a pooled connection.
-    #[pyo3(signature = (query, params=None, fetch_size=1_000))]
+    #[pyo3(signature = (query, params=None, fetch_size=4_000))]
     fn stream_sync<'py>(
         &self,
         py: Python<'py>,
@@ -4199,7 +4199,7 @@ impl PyNativeClient {
     }
 
     /// Asynchronously opens a pull-based result stream over a pooled connection.
-    #[pyo3(signature = (query, params=None, fetch_size=1_000))]
+    #[pyo3(signature = (query, params=None, fetch_size=4_000))]
     fn stream<'py>(
         &self,
         py: Python<'py>,
@@ -4568,7 +4568,7 @@ impl PyNativeTransaction {
     }
 
     /// Synchronously opens a pull-based result stream inside this transaction.
-    #[pyo3(signature = (query, params=None, fetch_size=1_000))]
+    #[pyo3(signature = (query, params=None, fetch_size=4_000))]
     fn stream_sync(
         &self,
         py: Python<'_>,
@@ -4599,7 +4599,7 @@ impl PyNativeTransaction {
     }
 
     /// Asynchronously opens a pull-based result stream inside this transaction.
-    #[pyo3(signature = (query, params=None, fetch_size=1_000))]
+    #[pyo3(signature = (query, params=None, fetch_size=4_000))]
     fn stream<'py>(
         &self,
         py: Python<'py>,
@@ -5109,6 +5109,24 @@ async fn pull_next_chunk_guarded(
     }
 }
 
+async fn pull_next_dicts_guarded(
+    inner: Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+    state: Arc<AtomicU8>,
+    summary: Arc<parking_lot::Mutex<voyager_drivers::QuerySummary>>,
+) -> PyResult<Option<Py<PyList>>> {
+    let mut guard = StreamFutureGuard::new(inner.clone(), state.clone());
+    let result = pull_next_chunk_async(&inner, &state, &summary).await;
+    guard.disarm();
+    match result {
+        Ok(Some(chunk)) => Python::attach(|py| {
+            let list = values::result_rows_to_py_dicts(&chunk.columns, &chunk.rows, py)?;
+            Ok(Some(list.unbind()))
+        }),
+        Ok(None) => Ok(None),
+        Err(err) => Err(err.into_py_err()),
+    }
+}
+
 struct NativeArrowStreamReader {
     locked_schema: Arc<arrow_schema::Schema>,
     pending_first: Option<arrow_array::RecordBatch>,
@@ -5397,6 +5415,38 @@ impl PyNativeResultStream {
         let summary = self.summary.clone();
         tokio_future_into_py(py, async move {
             pull_next_chunk_guarded(inner, state, summary).await
+        })
+    }
+
+    /// Synchronously pulls the next chunk directly as a Python `list[dict]`, or `None` when exhausted.
+    fn next_dicts_sync<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {
+        if self.state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE {
+            return Ok(None);
+        }
+        let result = py.detach(|| {
+            get_tokio_runtime().block_on(pull_next_chunk_async(
+                &self.inner,
+                &self.state,
+                &self.summary,
+            ))
+        });
+        match result {
+            Ok(Some(chunk)) => {
+                let list = values::result_rows_to_py_dicts(&chunk.columns, &chunk.rows, py)?;
+                Ok(Some(list))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(err.into_py_err()),
+        }
+    }
+
+    /// Asynchronously pulls the next chunk directly as a Python `list[dict]`, or `None` when exhausted.
+    fn next_dicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        let summary = self.summary.clone();
+        tokio_future_into_py(py, async move {
+            pull_next_dicts_guarded(inner, state, summary).await
         })
     }
 
