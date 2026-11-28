@@ -72,3 +72,4 @@ pub use redis::{
 };
 pub use tls::{NetStream, SslMode, SslNegotiation, TLS_AVAILABLE, TlsOptions, TlsVerification};
 pub use uri::{DatabaseProtocol, ParsedUri};
+pub use value::{ResultValue, values_to_record_batch};
