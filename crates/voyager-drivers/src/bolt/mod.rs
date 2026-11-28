@@ -24,7 +24,9 @@ pub use canonical::{
 };
 
 #[cfg(feature = "bolt")]
-pub use connection::{BOLT_MAGIC_PREAMBLE, BOLT_PROPOSED_VERSIONS, BoltConnection, BoltVersion};
+pub use connection::{
+    BOLT_MAGIC_PREAMBLE, BOLT_PROPOSED_VERSIONS, BoltConnection, BoltStreamCursor, BoltVersion,
+};
 pub use decode_result::{
     BoltResultDecoder, decode_bolt_record_frame, decode_result_value_slice, peek_bolt_message_tag,
 };

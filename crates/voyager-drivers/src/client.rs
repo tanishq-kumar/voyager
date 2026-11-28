@@ -16,6 +16,7 @@ use crate::pool::ConnectionPool;
 use crate::postgres::PostgresConnection;
 #[cfg(feature = "redis")]
 use crate::redis::RedisConnection;
+use crate::stream::{ResultStream, StreamOptions};
 use crate::uri::{DatabaseProtocol, ParsedUri};
 
 /// Extra connection intent that is not encoded in the URI.
@@ -196,6 +197,29 @@ impl NativeClient {
         let mut conn = self.pool.acquire().await?;
         conn.execute_with_mode(query, params, ResultMode::Arrow)
             .await
+    }
+
+    /// Opens a pull-based result stream over a pooled connection.
+    ///
+    /// Server-streaming protocols (Bolt 4.0+) retain the leased connection until
+    /// the stream is exhausted or closed. Buffered protocols (FalkorDB, Bolt v3)
+    /// release the pooled connection immediately on open.
+    pub async fn stream(
+        &self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        options: StreamOptions,
+    ) -> Result<ResultStream<Box<dyn AsyncConnection>>> {
+        let _ = options.validate_fetch_size()?;
+        let mut conn = self.pool.acquire().await?;
+        let cursor = conn.open_stream(query, params, &options).await?;
+        let leased = if cursor.is_server_streaming() {
+            Some(conn)
+        } else {
+            drop(conn);
+            None
+        };
+        Ok(ResultStream::new(leased, cursor))
     }
 
     /// Leases one pooled connection and begins an explicit transaction on it.

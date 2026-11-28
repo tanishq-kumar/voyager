@@ -15,14 +15,23 @@ use super::packstream::{BoltValue, PackStream};
 use super::stream::{encode_chunks, read_message_frame, write_message_frame};
 use crate::error::{NetError, Result};
 
+#[derive(Clone)]
+struct StubCounters {
+    reset_count: Arc<AtomicUsize>,
+    run_count: Arc<AtomicUsize>,
+    pull_count: Arc<AtomicUsize>,
+    discard_count: Arc<AtomicUsize>,
+    begin_count: Arc<AtomicUsize>,
+    commit_count: Arc<AtomicUsize>,
+    hello_count: Arc<AtomicUsize>,
+}
+
 /// Scripted mock Bolt server simulating database responses and error injection over raw TCP.
 pub struct BoltStubServer {
     addr: SocketAddr,
     server_task: JoinHandle<()>,
-    reset_count: Arc<AtomicUsize>,
-    run_count: Arc<AtomicUsize>,
+    counters: StubCounters,
     connection_count: Arc<AtomicUsize>,
-    hello_count: Arc<AtomicUsize>,
 }
 
 impl BoltStubServer {
@@ -35,14 +44,18 @@ impl BoltStubServer {
             .local_addr()
             .map_err(|e| NetError::ConnectionFailed(format!("Failed to get local addr: {}", e)))?;
 
-        let reset_count = Arc::new(AtomicUsize::new(0));
-        let run_count = Arc::new(AtomicUsize::new(0));
+        let counters = StubCounters {
+            reset_count: Arc::new(AtomicUsize::new(0)),
+            run_count: Arc::new(AtomicUsize::new(0)),
+            pull_count: Arc::new(AtomicUsize::new(0)),
+            discard_count: Arc::new(AtomicUsize::new(0)),
+            begin_count: Arc::new(AtomicUsize::new(0)),
+            commit_count: Arc::new(AtomicUsize::new(0)),
+            hello_count: Arc::new(AtomicUsize::new(0)),
+        };
         let connection_count = Arc::new(AtomicUsize::new(0));
-        let hello_count = Arc::new(AtomicUsize::new(0));
-        let reset_clone = reset_count.clone();
-        let run_clone = run_count.clone();
+        let counters_clone = counters.clone();
         let connection_clone = connection_count.clone();
-        let hello_clone = hello_count.clone();
 
         let server_task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
@@ -50,11 +63,9 @@ impl BoltStubServer {
                 // Without TCP_NODELAY the scripted responses hit Linux delayed
                 // ACK, adding ~41 ms to every loopback test query.
                 let _ = socket.set_nodelay(true);
-                let resets = reset_clone.clone();
-                let runs = run_clone.clone();
-                let hellos = hello_clone.clone();
+                let conn_counters = counters_clone.clone();
                 tokio::spawn(async move {
-                    let _ = Self::handle_connection(&mut socket, resets, runs, hellos).await;
+                    let _ = Self::handle_connection(&mut socket, conn_counters).await;
                 });
             }
         });
@@ -62,21 +73,39 @@ impl BoltStubServer {
         Ok(Self {
             addr,
             server_task,
-            reset_count,
-            run_count,
+            counters,
             connection_count,
-            hello_count,
         })
     }
 
     /// Returns the total number of Bolt `RESET` messages received by this stub server.
     pub fn reset_count(&self) -> usize {
-        self.reset_count.load(Ordering::SeqCst)
+        self.counters.reset_count.load(Ordering::SeqCst)
     }
 
     /// Returns the total number of Bolt `RUN` messages received by this stub server.
     pub fn run_count(&self) -> usize {
-        self.run_count.load(Ordering::SeqCst)
+        self.counters.run_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the total number of Bolt `PULL` messages received by this stub server.
+    pub fn pull_count(&self) -> usize {
+        self.counters.pull_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the total number of Bolt `DISCARD` messages received by this stub server.
+    pub fn discard_count(&self) -> usize {
+        self.counters.discard_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the total number of Bolt `BEGIN` messages received by this stub server.
+    pub fn begin_count(&self) -> usize {
+        self.counters.begin_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the total number of Bolt `COMMIT` messages received by this stub server.
+    pub fn commit_count(&self) -> usize {
+        self.counters.commit_count.load(Ordering::SeqCst)
     }
 
     /// Returns the total number of TCP connections accepted by this stub server.
@@ -86,7 +115,7 @@ impl BoltStubServer {
 
     /// Returns the total number of Bolt `HELLO` messages received by this stub server.
     pub fn hello_count(&self) -> usize {
-        self.hello_count.load(Ordering::SeqCst)
+        self.counters.hello_count.load(Ordering::SeqCst)
     }
 
     /// Returns the socket address `127.0.0.1:port` of the running stub server.
@@ -99,12 +128,14 @@ impl BoltStubServer {
         format!("bolt://{}", self.addr)
     }
 
-    async fn handle_connection(
-        socket: &mut TcpStream,
-        reset_count: Arc<AtomicUsize>,
-        run_count: Arc<AtomicUsize>,
-        hello_count: Arc<AtomicUsize>,
-    ) -> Result<()> {
+    fn parse_query_directive(query: &str, keyword: &str) -> Option<usize> {
+        let idx = query.find(keyword)?;
+        let rest = &query[idx + keyword.len()..];
+        let token = rest.split_whitespace().next()?;
+        token.parse::<usize>().ok()
+    }
+
+    async fn handle_connection(socket: &mut TcpStream, counters: StubCounters) -> Result<()> {
         // 1. Read 20-byte Handshake
         let mut handshake = [0u8; 20];
         socket
@@ -131,7 +162,7 @@ impl BoltStubServer {
         // 2. Read HELLO
         let mut frame = read_message_frame(socket).await?;
         let _hello_val = PackStream::decode(&mut frame)?;
-        hello_count.fetch_add(1, Ordering::SeqCst);
+        counters.hello_count.fetch_add(1, Ordering::SeqCst);
 
         // Reply SUCCESS to HELLO
         let mut hello_meta = HashMap::new();
@@ -152,6 +183,16 @@ impl BoltStubServer {
         .await?;
 
         let mut in_failed_state = false;
+        let mut in_transaction = false;
+        let mut next_qid: i64 = 0;
+        let mut active_qid: Option<i64> = None;
+        let mut first_pull_pending = false;
+        let mut total_rows: usize = 2;
+        let mut cursor_pos: usize = 0;
+        let mut use_default_two_rows = true;
+        let mut fail_after_row: Option<usize> = None;
+        let mut wire_buf = BytesMut::with_capacity(4096);
+        let mut payload_buf = BytesMut::with_capacity(512);
 
         // 3. Message loop
         loop {
@@ -179,14 +220,63 @@ impl BoltStubServer {
                 }
 
                 match tag {
+                    0x11 => {
+                        // BEGIN request
+                        counters.begin_count.fetch_add(1, Ordering::SeqCst);
+                        in_transaction = true;
+                        next_qid = 0;
+                        active_qid = None;
+                        Self::send_response(
+                            socket,
+                            &BoltResponse::Success {
+                                metadata: HashMap::new(),
+                            },
+                        )
+                        .await?;
+                    }
+                    0x12 => {
+                        // COMMIT request
+                        counters.commit_count.fetch_add(1, Ordering::SeqCst);
+                        in_transaction = false;
+                        active_qid = None;
+                        first_pull_pending = false;
+                        let mut commit_meta = HashMap::new();
+                        commit_meta.insert(
+                            "bookmark".to_string(),
+                            BoltValue::String("stub:bookmark-1".to_string()),
+                        );
+                        Self::send_response(
+                            socket,
+                            &BoltResponse::Success {
+                                metadata: commit_meta,
+                            },
+                        )
+                        .await?;
+                    }
+                    0x13 => {
+                        // ROLLBACK request
+                        in_transaction = false;
+                        active_qid = None;
+                        first_pull_pending = false;
+                        Self::send_response(
+                            socket,
+                            &BoltResponse::Success {
+                                metadata: HashMap::new(),
+                            },
+                        )
+                        .await?;
+                    }
                     0x10 => {
                         // RUN request
-                        run_count.fetch_add(1, Ordering::SeqCst);
+                        counters.run_count.fetch_add(1, Ordering::SeqCst);
                         let query = fields.first().and_then(|v| v.as_str()).unwrap_or("");
                         let mut run_meta = HashMap::new();
 
-                        if query.contains("FAIL") {
+                        let fail_mid = Self::parse_query_directive(query, "FAIL_MID_STREAM ");
+                        if fail_mid.is_none() && query.contains("FAIL") {
                             in_failed_state = true;
+                            active_qid = None;
+                            first_pull_pending = false;
                             let mut fail_meta = HashMap::new();
                             fail_meta.insert(
                                 "code".to_string(),
@@ -206,12 +296,34 @@ impl BoltStubServer {
                             )
                             .await?;
                         } else {
-                            // Column fields
+                            if let Some(rows_n) = Self::parse_query_directive(query, "ROWS ") {
+                                total_rows = rows_n;
+                                use_default_two_rows = false;
+                            } else if fail_mid.is_some() {
+                                total_rows = 500;
+                                use_default_two_rows = false;
+                            } else {
+                                total_rows = 2;
+                                use_default_two_rows = true;
+                            }
+                            cursor_pos = 0;
+                            fail_after_row = fail_mid;
+                            first_pull_pending = true;
+
                             let fields_list = vec![
                                 BoltValue::String("name".to_string()),
                                 BoltValue::String("age".to_string()),
                             ];
                             run_meta.insert("fields".to_string(), BoltValue::List(fields_list));
+                            run_meta.insert("t_first".to_string(), BoltValue::Integer(1));
+                            if in_transaction {
+                                let qid = next_qid;
+                                next_qid += 1;
+                                active_qid = Some(qid);
+                                run_meta.insert("qid".to_string(), BoltValue::Integer(qid));
+                            } else {
+                                active_qid = None;
+                            }
                             Self::send_response(
                                 socket,
                                 &BoltResponse::Success { metadata: run_meta },
@@ -220,34 +332,205 @@ impl BoltStubServer {
                         }
                     }
                     0x3F => {
-                        // PULL request -> return 2 mock records + SUCCESS
-                        let rec1 = vec![
-                            BoltValue::String("Alice".to_string()),
-                            BoltValue::Integer(30),
-                        ];
-                        let rec2 =
-                            vec![BoltValue::String("Bob".to_string()), BoltValue::Integer(25)];
+                        // PULL request
+                        counters.pull_count.fetch_add(1, Ordering::SeqCst);
+                        let extra = fields.first().and_then(|v| match v {
+                            BoltValue::Map(m) => Some(m),
+                            _ => None,
+                        });
+                        let req_n = extra
+                            .and_then(|m| m.get("n"))
+                            .and_then(|v| match v {
+                                BoltValue::Integer(n) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(-1);
+                        let req_qid = extra.and_then(|m| m.get("qid")).and_then(|v| match v {
+                            BoltValue::Integer(q) => Some(*q),
+                            _ => None,
+                        });
 
-                        Self::send_response(socket, &BoltResponse::Record { fields: rec1 }).await?;
-                        Self::send_response(socket, &BoltResponse::Record { fields: rec2 }).await?;
+                        let is_first_pull = first_pull_pending;
+                        first_pull_pending = false;
+                        if in_transaction
+                            && let Some(expected_qid) = active_qid
+                            && !is_first_pull
+                            && req_qid != Some(expected_qid)
+                        {
+                            in_failed_state = true;
+                            active_qid = None;
+                            let mut fail_meta = HashMap::new();
+                            fail_meta.insert(
+                                "code".to_string(),
+                                BoltValue::String("Neo.ClientError.Request.Invalid".to_string()),
+                            );
+                            fail_meta.insert(
+                                "message".to_string(),
+                                BoltValue::String(format!(
+                                    "Expected qid {expected_qid}, got {req_qid:?}"
+                                )),
+                            );
+                            Self::send_response(
+                                socket,
+                                &BoltResponse::Failure {
+                                    metadata: fail_meta,
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
 
-                        let mut pull_meta = HashMap::new();
+                        let remaining = total_rows.saturating_sub(cursor_pos);
+                        let to_send = if req_n < 0 {
+                            remaining
+                        } else {
+                            (req_n as usize).min(remaining)
+                        };
+
+                        let mut failed_mid = false;
+                        let actual_send = if let Some(limit) = fail_after_row
+                            && cursor_pos + to_send >= limit
+                        {
+                            failed_mid = true;
+                            limit.saturating_sub(cursor_pos)
+                        } else {
+                            to_send
+                        };
+
+                        wire_buf.clear();
+                        for offset in 0..actual_send {
+                            let idx = cursor_pos + offset;
+                            let rec = if use_default_two_rows && idx < 2 {
+                                if idx == 0 {
+                                    vec![
+                                        BoltValue::String("Alice".to_string()),
+                                        BoltValue::Integer(30),
+                                    ]
+                                } else {
+                                    vec![
+                                        BoltValue::String("Bob".to_string()),
+                                        BoltValue::Integer(25),
+                                    ]
+                                }
+                            } else {
+                                vec![
+                                    BoltValue::String(format!("row_{idx}")),
+                                    BoltValue::Integer(idx as i64),
+                                ]
+                            };
+                            Self::encode_response_into(
+                                &BoltResponse::Record { fields: rec },
+                                &mut payload_buf,
+                                &mut wire_buf,
+                            );
+                        }
+                        cursor_pos += actual_send;
+
+                        if failed_mid {
+                            in_failed_state = true;
+                            active_qid = None;
+                            let mut fail_meta = HashMap::new();
+                            fail_meta.insert(
+                                "code".to_string(),
+                                BoltValue::String(
+                                    "Neo.ClientError.Statement.ArithmeticError".to_string(),
+                                ),
+                            );
+                            fail_meta.insert(
+                                "message".to_string(),
+                                BoltValue::String("/ by zero".to_string()),
+                            );
+                            Self::encode_response_into(
+                                &BoltResponse::Failure {
+                                    metadata: fail_meta,
+                                },
+                                &mut payload_buf,
+                                &mut wire_buf,
+                            );
+                        } else {
+                            let has_more = cursor_pos < total_rows;
+                            let mut pull_meta = HashMap::new();
+                            pull_meta.insert("has_more".to_string(), BoltValue::Boolean(has_more));
+                            if !has_more {
+                                active_qid = None;
+                                let mut stats_map = HashMap::new();
+                                stats_map
+                                    .insert("nodes-created".to_string(), BoltValue::Integer(0));
+                                pull_meta.insert("stats".to_string(), BoltValue::Map(stats_map));
+                                pull_meta.insert("t_last".to_string(), BoltValue::Integer(2));
+                            }
+                            Self::encode_response_into(
+                                &BoltResponse::Success {
+                                    metadata: pull_meta,
+                                },
+                                &mut payload_buf,
+                                &mut wire_buf,
+                            );
+                        }
+                        write_message_frame(socket, &wire_buf).await?;
+                    }
+                    0x2F => {
+                        // DISCARD request
+                        counters.discard_count.fetch_add(1, Ordering::SeqCst);
+                        let extra = fields.first().and_then(|v| match v {
+                            BoltValue::Map(m) => Some(m),
+                            _ => None,
+                        });
+                        let req_qid = extra.and_then(|m| m.get("qid")).and_then(|v| match v {
+                            BoltValue::Integer(q) => Some(*q),
+                            _ => None,
+                        });
+                        if in_transaction
+                            && let Some(expected_qid) = active_qid
+                            && req_qid != Some(expected_qid)
+                        {
+                            in_failed_state = true;
+                            active_qid = None;
+                            let mut fail_meta = HashMap::new();
+                            fail_meta.insert(
+                                "code".to_string(),
+                                BoltValue::String("Neo.ClientError.Request.Invalid".to_string()),
+                            );
+                            fail_meta.insert(
+                                "message".to_string(),
+                                BoltValue::String(format!(
+                                    "Expected qid {expected_qid} on DISCARD, got {req_qid:?}"
+                                )),
+                            );
+                            Self::send_response(
+                                socket,
+                                &BoltResponse::Failure {
+                                    metadata: fail_meta,
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        cursor_pos = total_rows;
+                        active_qid = None;
+                        first_pull_pending = false;
+                        let mut discard_meta = HashMap::new();
                         let mut stats_map = HashMap::new();
                         stats_map.insert("nodes-created".to_string(), BoltValue::Integer(0));
-                        pull_meta.insert("stats".to_string(), BoltValue::Map(stats_map));
-                        pull_meta.insert("t_last".to_string(), BoltValue::Integer(2));
+                        discard_meta.insert("stats".to_string(), BoltValue::Map(stats_map));
+                        discard_meta.insert("t_last".to_string(), BoltValue::Integer(2));
                         Self::send_response(
                             socket,
                             &BoltResponse::Success {
-                                metadata: pull_meta,
+                                metadata: discard_meta,
                             },
                         )
                         .await?;
                     }
                     0x0F => {
                         // RESET request -> clear failed state and reply SUCCESS
-                        reset_count.fetch_add(1, Ordering::SeqCst);
+                        counters.reset_count.fetch_add(1, Ordering::SeqCst);
                         in_failed_state = false;
+                        in_transaction = false;
+                        active_qid = None;
+                        first_pull_pending = false;
+                        cursor_pos = total_rows;
+                        fail_after_row = None;
                         Self::send_response(
                             socket,
                             &BoltResponse::Success {
@@ -277,7 +560,7 @@ impl BoltStubServer {
         Ok(())
     }
 
-    async fn send_response(socket: &mut TcpStream, resp: &BoltResponse) -> Result<()> {
+    fn encode_response_into(resp: &BoltResponse, payload: &mut BytesMut, chunk_buf: &mut BytesMut) {
         let val = match resp {
             BoltResponse::Success { metadata } => BoltValue::Structure {
                 tag: 0x70,
@@ -297,12 +580,15 @@ impl BoltStubServer {
             },
         };
 
+        payload.clear();
+        PackStream::encode(&val, payload);
+        encode_chunks(payload, chunk_buf);
+    }
+
+    async fn send_response(socket: &mut TcpStream, resp: &BoltResponse) -> Result<()> {
         let mut payload = BytesMut::new();
-        PackStream::encode(&val, &mut payload);
-
         let mut chunk_buf = BytesMut::new();
-        encode_chunks(&payload, &mut chunk_buf);
-
+        Self::encode_response_into(resp, &mut payload, &mut chunk_buf);
         write_message_frame(socket, &chunk_buf).await
     }
 }

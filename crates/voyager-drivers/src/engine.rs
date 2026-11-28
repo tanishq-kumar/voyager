@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::bolt::BoltValue;
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
+use crate::stream::{ResultChunk, StreamCursor, StreamOptions};
 use crate::value::arrow::{ColumnHint, values_to_record_batch_with_hints};
 use crate::value::result::ResultValue;
 
@@ -346,6 +347,56 @@ pub trait AsyncConnection: Send + Sync {
     fn supports_savepoints(&self) -> bool {
         false
     }
+
+    /// Opens a pull-based result stream cursor for `query` using `options`.
+    ///
+    /// The default implementation executes the query in [`ResultMode::Rows`] and
+    /// returns a [`StreamCursor::Buffered`] client-side chunk slicer.
+    async fn open_stream(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        options: &StreamOptions,
+    ) -> Result<StreamCursor> {
+        let fetch_size = options.validate_fetch_size()?;
+        let result = self
+            .execute_with_mode(query, params, ResultMode::Rows)
+            .await?;
+        Ok(StreamCursor::from_query_result(result, fetch_size))
+    }
+
+    /// Pulls the next bounded chunk of rows from an open [`StreamCursor`], or `Ok(None)` when exhausted.
+    async fn next_stream_chunk(
+        &mut self,
+        cursor: &mut StreamCursor,
+    ) -> Result<Option<ResultChunk>> {
+        match cursor {
+            StreamCursor::Buffered(_) => Ok(cursor.next_buffered_chunk()),
+            #[cfg(feature = "bolt")]
+            StreamCursor::Bolt(_) => Err(NetError::ProtocolError(
+                "Bolt stream cursor passed to non-Bolt connection".to_string(),
+            )),
+        }
+    }
+
+    /// Closes an open [`StreamCursor`], discarding any unread server-side rows.
+    async fn close_stream(&mut self, cursor: &mut StreamCursor) -> Result<()> {
+        match cursor {
+            StreamCursor::Buffered(_) => {
+                cursor.close_buffered();
+                Ok(())
+            }
+            #[cfg(feature = "bolt")]
+            StreamCursor::Bolt(_) => Err(NetError::ProtocolError(
+                "Bolt stream cursor passed to non-Bolt connection".to_string(),
+            )),
+        }
+    }
+
+    /// Timeout applied when closing an active stream cursor (defaults to 5 seconds).
+    fn stream_close_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
 }
 
 #[async_trait]
@@ -429,6 +480,30 @@ impl AsyncConnection for Box<dyn AsyncConnection> {
 
     fn supports_savepoints(&self) -> bool {
         (**self).supports_savepoints()
+    }
+
+    async fn open_stream(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        options: &StreamOptions,
+    ) -> Result<StreamCursor> {
+        (**self).open_stream(query, params, options).await
+    }
+
+    async fn next_stream_chunk(
+        &mut self,
+        cursor: &mut StreamCursor,
+    ) -> Result<Option<ResultChunk>> {
+        (**self).next_stream_chunk(cursor).await
+    }
+
+    async fn close_stream(&mut self, cursor: &mut StreamCursor) -> Result<()> {
+        (**self).close_stream(cursor).await
+    }
+
+    fn stream_close_timeout(&self) -> std::time::Duration {
+        (**self).stream_close_timeout()
     }
 }
 

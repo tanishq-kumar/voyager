@@ -6,6 +6,7 @@ use crate::engine::{AsyncConnection, QueryResult, QuerySummary, ResultMode};
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
 use crate::pool::PooledConnection;
+use crate::stream::{ResultChunk, StreamCursor, StreamOptions, TransactionStream};
 
 /// Lifecycle state of a native transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub struct NativeTransaction<C: AsyncConnection + 'static> {
     conn: Option<PooledConnection<C>>,
     state: NativeTransactionState,
     supports_savepoints: bool,
+    has_open_stream: bool,
     summary: QuerySummary,
 }
 
@@ -59,6 +61,7 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
             conn: Some(conn),
             state: NativeTransactionState::Active,
             supports_savepoints,
+            has_open_stream: false,
             summary: QuerySummary::empty(),
         })
     }
@@ -76,6 +79,11 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
     /// Returns `true` when this transaction supports real savepoints.
     pub fn supports_savepoints(&self) -> bool {
         self.supports_savepoints
+    }
+
+    /// Returns `true` while a streaming cursor is active on this transaction.
+    pub fn has_open_stream(&self) -> bool {
+        self.has_open_stream
     }
 
     /// Returns the accumulated mutation summary for the transaction.
@@ -97,6 +105,12 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
                     "Transaction is already completed".to_string(),
                 ));
             }
+        }
+        if self.has_open_stream {
+            return Err(NetError::TransactionError(
+                "An active stream is open on this transaction; close or exhaust it first"
+                    .to_string(),
+            ));
         }
         self.conn.as_mut().ok_or_else(|| {
             NetError::TransactionError("Transaction has no leased connection".to_string())
@@ -179,6 +193,144 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
             .await
     }
 
+    /// Opens a pull-based result stream borrowing this transaction.
+    ///
+    /// Rejects concurrent statements, `commit()`, or another stream while open.
+    pub async fn stream(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        options: StreamOptions,
+    ) -> Result<TransactionStream<'_, C>> {
+        let cursor = self.open_stream_cursor(query, params, &options).await?;
+        Ok(TransactionStream::new(self, cursor))
+    }
+
+    /// Low-level helper opening a [`StreamCursor`] inside this transaction while enforcing
+    /// [`Self::has_open_stream`]. Intended for wrapper types such as PyO3 bindings.
+    pub async fn open_stream_cursor(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        options: &StreamOptions,
+    ) -> Result<StreamCursor> {
+        let _ = options.validate_fetch_size()?;
+        let conn = self.active_conn()?;
+        match conn.open_stream(query, params, options).await {
+            Ok(cursor) => {
+                self.has_open_stream = true;
+                Ok(cursor)
+            }
+            Err(err) => {
+                self.state = NativeTransactionState::Failed;
+                Err(err)
+            }
+        }
+    }
+
+    /// Low-level helper pulling the next chunk from an open transaction [`StreamCursor`].
+    pub async fn next_stream_chunk(
+        &mut self,
+        cursor: &mut StreamCursor,
+    ) -> Result<Option<ResultChunk>> {
+        match self.state {
+            NativeTransactionState::Active => {}
+            NativeTransactionState::Failed => {
+                return Err(NetError::TransactionError(
+                    "transaction is aborted; roll back before executing more statements"
+                        .to_string(),
+                ));
+            }
+            NativeTransactionState::Committed | NativeTransactionState::RolledBack => {
+                return Err(NetError::TransactionError(
+                    "Transaction is already completed".to_string(),
+                ));
+            }
+        }
+        let conn = self.conn.as_mut().ok_or_else(|| {
+            NetError::TransactionError("Transaction has no leased connection".to_string())
+        })?;
+        match conn.next_stream_chunk(cursor).await {
+            Ok(Some(chunk)) => Ok(Some(chunk)),
+            Ok(None) => {
+                if self.has_open_stream {
+                    self.accumulate(cursor.summary());
+                    self.has_open_stream = false;
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                if !cursor.is_wire_clean() {
+                    conn.mark_broken();
+                }
+                self.state = NativeTransactionState::Failed;
+                self.has_open_stream = false;
+                Err(err)
+            }
+        }
+    }
+
+    /// Low-level helper closing an open transaction [`StreamCursor`].
+    pub async fn close_stream_cursor(&mut self, cursor: &mut StreamCursor) -> Result<()> {
+        if !self.has_open_stream {
+            return Ok(());
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            self.has_open_stream = false;
+            return Ok(());
+        };
+        if !cursor.is_wire_clean() {
+            let close_timeout = conn.stream_close_timeout();
+            let res = tokio::time::timeout(close_timeout, conn.close_stream(cursor)).await;
+            match res {
+                Ok(Ok(())) => {
+                    self.accumulate(cursor.summary());
+                    self.has_open_stream = false;
+                    Ok(())
+                }
+                Ok(Err(err)) => {
+                    if !cursor.is_wire_clean() {
+                        conn.mark_broken();
+                    }
+                    self.state = NativeTransactionState::Failed;
+                    self.has_open_stream = false;
+                    Err(err)
+                }
+                Err(_) => {
+                    conn.mark_broken();
+                    self.state = NativeTransactionState::Failed;
+                    self.has_open_stream = false;
+                    Err(NetError::Timeout(format!(
+                        "Closing stream timed out after {:?}",
+                        close_timeout
+                    )))
+                }
+            }
+        } else {
+            let res = conn.close_stream(cursor).await;
+            self.accumulate(cursor.summary());
+            self.has_open_stream = false;
+            res
+        }
+    }
+
+    /// Synchronously aborts an unclosed server-streaming cursor when its wrapper drops without `close()`.
+    pub fn abort_stream_on_drop(&mut self) {
+        if let Some(conn) = self.conn.as_mut() {
+            conn.mark_broken();
+        }
+        self.state = NativeTransactionState::Failed;
+        self.has_open_stream = false;
+    }
+
+    /// Clears `has_open_stream` and accumulates summary when a clean/buffered cursor drops without `close()`.
+    pub(crate) fn clear_clean_stream(&mut self, cursor: &StreamCursor) {
+        if self.has_open_stream {
+            self.accumulate(cursor.summary());
+            self.has_open_stream = false;
+        }
+    }
+
     /// Commits the transaction and returns its accumulated mutation summary.
     pub async fn commit(&mut self) -> Result<QuerySummary> {
         match self.state {
@@ -193,6 +345,12 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
                     "Transaction is already completed".to_string(),
                 ));
             }
+        }
+        if self.has_open_stream {
+            return Err(NetError::TransactionError(
+                "An active stream is open on this transaction; close or exhaust it first"
+                    .to_string(),
+            ));
         }
         let mut conn = self.conn.take().ok_or_else(|| {
             NetError::TransactionError("Transaction has no leased connection".to_string())
@@ -224,6 +382,18 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
         let mut conn = self.conn.take().ok_or_else(|| {
             NetError::TransactionError("Transaction has no leased connection".to_string())
         })?;
+        if self.has_open_stream {
+            self.has_open_stream = false;
+            conn.mark_broken();
+            drop(conn);
+            self.state = NativeTransactionState::RolledBack;
+            return Ok(());
+        }
+        if conn.is_broken() {
+            drop(conn);
+            self.state = NativeTransactionState::RolledBack;
+            return Ok(());
+        }
         // A failed Bolt transaction was already aborted by RESET, so there is
         // no server-side transaction left to roll back. PostgreSQL keeps the
         // failed transaction open and does accept ROLLBACK.
@@ -277,6 +447,12 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
                     "Transaction is already completed".to_string(),
                 ));
             }
+        }
+        if self.has_open_stream {
+            return Err(NetError::TransactionError(
+                "An active stream is open on this transaction; close or exhaust it first"
+                    .to_string(),
+            ));
         }
         let conn = self.conn.as_mut().ok_or_else(|| {
             NetError::TransactionError("Transaction has no leased connection".to_string())

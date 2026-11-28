@@ -397,6 +397,31 @@ pub(crate) fn encode_pull_all_message(buf: &mut BytesMut) {
     buf.put_slice(&[0xB1, 0x3F, 0xA1, 0x81, b'n', 0xFF]);
 }
 
+#[inline]
+fn encode_stream_control_message(tag: u8, n: i64, qid: Option<i64>, buf: &mut BytesMut) {
+    PackStream::encode_struct_header(tag, 1, buf);
+    let map_len = 1 + usize::from(qid.is_some());
+    PackStream::encode_map_header(map_len, buf);
+    PackStream::encode_string("n", buf);
+    PackStream::encode_integer(n, buf);
+    if let Some(qid) = qid {
+        PackStream::encode_string("qid", buf);
+        PackStream::encode_integer(qid, buf);
+    }
+}
+
+/// Encodes a Bolt `PULL {"n": n, ["qid": qid]}` message directly into `buf` without allocating.
+#[inline]
+pub(crate) fn encode_pull_message(n: i64, qid: Option<i64>, buf: &mut BytesMut) {
+    encode_stream_control_message(0x3F, n, qid, buf);
+}
+
+/// Encodes a Bolt `DISCARD {"n": n, ["qid": qid]}` message directly into `buf` without allocating.
+#[inline]
+pub(crate) fn encode_discard_message(n: i64, qid: Option<i64>, buf: &mut BytesMut) {
+    encode_stream_control_message(0x2F, n, qid, buf);
+}
+
 /// Bolt protocol response messages returned by the database server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoltResponse {
