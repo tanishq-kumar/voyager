@@ -6,13 +6,15 @@ the native Rust client. Tests skip automatically when containers are absent.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 from typing import Any
 
 import pytest
 from conftest import get_test_host
 from conftest import is_port_open as _port_open
-from voyager_ogm import Session
+from voyager_ogm import AsyncSession, Session
 
 pytestmark = pytest.mark.live
 
@@ -315,3 +317,119 @@ def test_live_age_savepoint_rollback(path: str) -> None:
             harness.cleanup()
         finally:
             session.close()
+
+
+PG19_PORT = int(os.environ.get("VOYAGER_TEST_PG19_PORT", "5456"))
+PG19_TABLE = "zz_tx_456_users"
+
+
+def _require_live_async_engine(engine: str) -> str:
+    """Skips if the requested live engine is unreachable and returns its native URI."""
+    if engine == "neo4j":
+        if not _port_open(HOST, 7687):
+            pytest.skip(f"Neo4j container not available on {HOST}:7687")
+        return f"bolt://neo4j:voyagerpass123@{HOST}:7687?connect_timeout=2"
+    if engine == "pg19":
+        if not _port_open(HOST, PG19_PORT):
+            pytest.skip(f"PostgreSQL 19 container not available on {HOST}:{PG19_PORT}")
+        return f"postgresql://postgres:voyagerpass123@{HOST}:{PG19_PORT}/voyager_graph?connect_timeout=2"
+    raise ValueError(f"Unsupported engine: {engine}")
+
+
+async def _async_setup_and_cleanup(
+    session: AsyncSession, engine: str, create_table: bool = False
+) -> None:
+    if engine == "neo4j":
+        await session.execute("MATCH (n:ZzTx456User) DETACH DELETE n")
+        return
+    if create_table:
+        await session.execute(f"DROP TABLE IF EXISTS {PG19_TABLE}")
+        await session.execute(f"CREATE TABLE {PG19_TABLE} (name TEXT PRIMARY KEY)")
+    else:
+        await session.execute(f"DROP TABLE IF EXISTS {PG19_TABLE}")
+
+
+async def _async_insert(session: AsyncSession, engine: str, name: str, via_tx: Any = None) -> None:
+    target = via_tx if via_tx is not None else session
+    if engine == "neo4j":
+        await target.execute("CREATE (:ZzTx456User {name: $name})", {"name": name})
+    else:
+        await target.execute(f"INSERT INTO {PG19_TABLE} (name) VALUES ($name)", {"name": name})
+
+
+async def _async_names(session: AsyncSession, engine: str) -> set[str]:
+    if engine == "neo4j":
+        rows = (await session.execute("MATCH (n:ZzTx456User) RETURN n.name AS name")).all()
+    else:
+        rows = (await session.execute(f"SELECT name FROM {PG19_TABLE}")).all()
+    return {str(row["name"]) for row in rows}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["neo4j", "pg19"])
+async def test_live_async_concurrent_tasks_do_not_hijack_and_all_commit(engine: str) -> None:
+    """Live #456 regression on Neo4j and PG19: task isolation, N concurrent tx, and serialized statements."""
+    uri = _require_live_async_engine(engine)
+    dialect = "cypher" if engine == "neo4j" else "sql_pgq"
+    session = AsyncSession(uri, dialect=dialect, backend="native", pool_size=8)
+    try:
+        await _async_setup_and_cleanup(session, engine, create_table=True)
+
+        # 1. Task 2 execute() must not join Task 1's open transaction.
+        tx1_open = asyncio.Event()
+        task2_done = asyncio.Event()
+
+        async def task1() -> None:
+            with pytest.raises(RuntimeError, match="abort_tx1"):
+                async with session.transaction():
+                    await _async_insert(session, engine, "zz_tx1_rolled_back")
+                    tx1_open.set()
+                    await task2_done.wait()
+                    raise RuntimeError("abort_tx1")
+
+        async def task2() -> None:
+            await tx1_open.wait()
+            await _async_insert(session, engine, "zz_task2_autocommit")
+            task2_done.set()
+
+        await asyncio.gather(task1(), task2())
+        assert await _async_names(session, engine) == {"zz_task2_autocommit"}
+
+        # 2. N concurrent tasks each open and commit their own transaction on one AsyncSession.
+        task_count = 4
+        open_count = 0
+        all_open = asyncio.Event()
+
+        async def worker(idx: int) -> None:
+            nonlocal open_count
+            async with session.transaction():
+                open_count += 1
+                if open_count == task_count:
+                    all_open.set()
+                await all_open.wait()
+                await _async_insert(session, engine, f"zz_concurrent_{idx}_a")
+                await asyncio.sleep(0.01)
+                await _async_insert(session, engine, f"zz_concurrent_{idx}_b")
+
+        await asyncio.gather(*(worker(i) for i in range(task_count)))
+        expected = {"zz_task2_autocommit"}
+        for i in range(task_count):
+            expected.add(f"zz_concurrent_{i}_a")
+            expected.add(f"zz_concurrent_{i}_b")
+        assert await _async_names(session, engine) == expected
+
+        # 3. Concurrent statements on one AsyncTransaction are serialized safely.
+        async with session.transaction() as tx:
+            await asyncio.gather(
+                _async_insert(session, engine, "zz_serial_1"),
+                _async_insert(session, engine, "zz_serial_2", via_tx=tx),
+                _async_insert(session, engine, "zz_serial_3"),
+                _async_insert(session, engine, "zz_serial_4", via_tx=tx),
+            )
+        expected.update({"zz_serial_1", "zz_serial_2", "zz_serial_3", "zz_serial_4"})
+        assert await _async_names(session, engine) == expected
+    finally:
+        try:
+            await _async_setup_and_cleanup(session, engine, create_table=False)
+        finally:
+            await session.close()

@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import gc
+import operator
+import threading
+import weakref
 from types import SimpleNamespace
 from typing import Any
 
@@ -774,3 +779,353 @@ async def test_async_native_transaction_route():
         "MATCH (n) RETURN n",
     ]
     assert tx.state == "COMMITTED"
+
+
+class _ConcurrentNativeTransaction:
+    """Fake native transaction that rejects overlapping calls and tracks concurrency."""
+
+    def __init__(self, tx_id: int) -> None:
+        self.tx_id = tx_id
+        self.queries: list[tuple[str, dict[str, Any] | None]] = []
+        self.state = "ACTIVE"
+        self.is_active = True
+        self.supports_savepoints = False
+        self._in_flight = False
+        self.max_concurrent = 0
+        self._active_count = 0
+
+    async def execute(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
+        if self._in_flight:
+            raise RuntimeError("Transaction is not active; overlapping execute detected")
+        if self.state != "ACTIVE":
+            raise RuntimeError("Transaction is not active")
+        self._in_flight = True
+        self._active_count += 1
+        self.max_concurrent = max(self.max_concurrent, self._active_count)
+        try:
+            await asyncio.sleep(0.01)
+            self.queries.append((statement, parameters))
+            return _FakeNativeResult()
+        finally:
+            self._active_count -= 1
+            self._in_flight = False
+
+    async def commit(self) -> None:
+        if self._in_flight:
+            raise RuntimeError("Transaction is not active; overlapping commit detected")
+        self.state = "COMMITTED"
+        self.is_active = False
+
+    async def rollback(self) -> None:
+        self.state = "ROLLED_BACK"
+        self.is_active = False
+
+
+class _ConcurrentNativeClient:
+    """Fake native client supporting independent concurrent transactions and autocommit."""
+
+    def __init__(self) -> None:
+        self.autocommit_queries: list[tuple[str, dict[str, Any] | None]] = []
+        self.transactions: list[_ConcurrentNativeTransaction] = []
+
+    async def execute(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
+        self.autocommit_queries.append((statement, parameters))
+        return _FakeNativeResult()
+
+    def execute_sync(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
+        self.autocommit_queries.append((statement, parameters))
+        return _FakeNativeResult()
+
+    async def begin_transaction(self) -> _ConcurrentNativeTransaction:
+        tx = _ConcurrentNativeTransaction(len(self.transactions))
+        self.transactions.append(tx)
+        return tx
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_async_task2_execute_does_not_join_task1_transaction():
+    native = _ConcurrentNativeClient()
+    session = AsyncSession(bridge=native, dialect="cypher", backend="native")
+    tx1_open = asyncio.Event()
+    task2_done = asyncio.Event()
+
+    async def task1() -> None:
+        with pytest.raises(RuntimeError, match="rollback tx1"):
+            async with session.transaction() as tx1:
+                assert session._active_transaction is tx1
+                await session.execute("IN_TX1")
+                tx1_open.set()
+                await task2_done.wait()
+                raise RuntimeError("rollback tx1")
+
+    async def task2() -> None:
+        await tx1_open.wait()
+        assert session._active_transaction is None
+        await session.execute("OUTSIDE_TX")
+        task2_done.set()
+
+    await asyncio.gather(task1(), task2())
+
+    assert len(native.transactions) == 1
+    assert native.transactions[0].state == "ROLLED_BACK"
+    assert [q for q, _ in native.transactions[0].queries] == ["IN_TX1"]
+    assert [q for q, _ in native.autocommit_queries] == ["OUTSIDE_TX"]
+    _assert_no_active(session)
+
+
+@pytest.mark.asyncio
+async def test_async_concurrent_tasks_each_commit_own_transaction():
+    native = _ConcurrentNativeClient()
+    session = AsyncSession(bridge=native, dialect="cypher", backend="native")
+    task_count = 8
+    barrier_count = 0
+    all_open = asyncio.Event()
+
+    async def worker(idx: int) -> str:
+        nonlocal barrier_count
+        async with session.transaction() as tx:
+            assert session._active_transaction is tx
+            barrier_count += 1
+            if barrier_count == task_count:
+                all_open.set()
+            await all_open.wait()
+            await session.execute(f"TASK_{idx}_STMT_1")
+            await asyncio.sleep(0)
+            await session.execute(f"TASK_{idx}_STMT_2")
+        return tx.state
+
+    states = await asyncio.gather(*(worker(i) for i in range(task_count)))
+
+    assert all(state == "COMMITTED" for state in states)
+    assert len(native.transactions) == task_count
+    assert all(tx.state == "COMMITTED" for tx in native.transactions)
+    recorded_pairs = {tuple(q for q, _ in tx.queries) for tx in native.transactions}
+    assert recorded_pairs == {(f"TASK_{i}_STMT_1", f"TASK_{i}_STMT_2") for i in range(task_count)}
+    assert native.autocommit_queries == []
+    _assert_no_active(session)
+
+
+@pytest.mark.asyncio
+async def test_async_concurrent_statements_on_one_transaction_are_serialized():
+    native = _ConcurrentNativeClient()
+    session = AsyncSession(bridge=native, dialect="cypher", backend="native")
+
+    async with session.transaction() as tx:
+        await asyncio.gather(
+            session.execute("Q1"),
+            session.execute("Q2"),
+            tx.execute("Q3"),
+            tx.execute("Q4"),
+            session.execute("Q5"),
+            tx.execute("Q6"),
+        )
+
+    assert len(native.transactions) == 1
+    driver_tx = native.transactions[0]
+    assert driver_tx.state == "COMMITTED"
+    assert driver_tx.max_concurrent == 1
+    assert sorted(q for q, _ in driver_tx.queries) == ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6"]
+    _assert_no_active(session)
+
+
+def test_sync_threads_do_not_hijack_shared_session_transaction():
+    class _SyncThreadTx:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+            self.state = "ACTIVE"
+            self.is_active = True
+            self.supports_savepoints = False
+
+        def execute_sync(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
+            self.queries.append(statement)
+            return _FakeNativeResult()
+
+        def commit_sync(self) -> None:
+            self.state = "COMMITTED"
+            self.is_active = False
+
+        def rollback_sync(self) -> None:
+            self.state = "ROLLED_BACK"
+            self.is_active = False
+
+    class _SyncThreadClient:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.autocommit_queries: list[str] = []
+            self.transactions: list[_SyncThreadTx] = []
+
+        def execute_sync(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
+            with self.lock:
+                self.autocommit_queries.append(statement)
+            return _FakeNativeResult()
+
+        def begin_transaction_sync(self) -> _SyncThreadTx:
+            tx = _SyncThreadTx()
+            with self.lock:
+                self.transactions.append(tx)
+            return tx
+
+        def close(self) -> None:
+            pass
+
+    native = _SyncThreadClient()
+    session = Session(bridge=native, dialect="cypher", backend="native")
+    tx1_open = threading.Event()
+    t2_done = threading.Event()
+    errors: list[BaseException] = []
+
+    def thread1() -> None:
+        try:
+            with session.transaction():
+                session.execute("T1_Q1")
+                tx1_open.set()
+                assert t2_done.wait(timeout=5)
+                session.execute("T1_Q2")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def thread2() -> None:
+        try:
+            assert tx1_open.wait(timeout=5)
+            assert session._active_transaction is None
+            session.execute("T2_AUTOCOMMIT")
+            with session.transaction():
+                session.execute("T2_TX")
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            t2_done.set()
+
+    t1 = threading.Thread(target=thread1)
+    t2 = threading.Thread(target=thread2)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert not errors
+    assert native.autocommit_queries == ["T2_AUTOCOMMIT"]
+    assert len(native.transactions) == 2
+    assert all(tx.state == "COMMITTED" for tx in native.transactions)
+    assert {tuple(tx.queries) for tx in native.transactions} == {
+        ("T1_Q1", "T1_Q2"),
+        ("T2_TX",),
+    }
+    _assert_no_active(session)
+
+
+def test_sync_1000_sessions_do_not_leak_contextvars_or_transactions():
+    from voyager_ogm.session import _ACTIVE_TRANSACTIONS
+
+    before_ctx_len = len(contextvars.copy_context())
+    session_refs: list[weakref.ref[Session]] = []
+    tx_refs: list[weakref.ref[Any]] = []
+
+    def run_once(idx: int) -> None:
+        session = Session(bridge=MockBridge(), dialect="cypher")
+        session_refs.append(weakref.ref(session))
+        if idx % 3 == 0:
+            try:
+                with session.transaction() as tx:
+                    tx_refs.append(weakref.ref(tx))
+                    session.execute("RETURN 1")
+                    raise RuntimeError("boom")
+            except RuntimeError:
+                pass
+        else:
+            with session.transaction() as tx:
+                tx_refs.append(weakref.ref(tx))
+                session.execute("RETURN 1")
+
+    for i in range(1000):
+        run_once(i)
+
+    gc.collect()
+
+    assert all(ref() is None for ref in session_refs)
+    assert all(ref() is None for ref in tx_refs)
+    assert _ACTIVE_TRANSACTIONS.get() == {}
+    assert len(contextvars.copy_context()) <= before_ctx_len + 1
+
+
+@pytest.mark.asyncio
+async def test_async_1000_sessions_do_not_leak_contextvars_or_transactions():
+    from voyager_ogm.session import _ACTIVE_TRANSACTIONS
+
+    before_ctx_len = len(contextvars.copy_context())
+    session_refs: list[weakref.ref[AsyncSession]] = []
+    tx_refs: list[weakref.ref[Any]] = []
+
+    async def run_once(idx: int) -> None:
+        session = AsyncSession(bridge=AsyncMockBridge(), dialect="cypher")
+        session_refs.append(weakref.ref(session))
+        if idx % 3 == 0:
+            try:
+                async with session.transaction() as tx:
+                    tx_refs.append(weakref.ref(tx))
+                    await session.execute("RETURN 1")
+                    raise RuntimeError("boom")
+            except RuntimeError:
+                pass
+        else:
+            async with session.transaction() as tx:
+                tx_refs.append(weakref.ref(tx))
+                await session.execute("RETURN 1")
+
+    for i in range(1000):
+        await run_once(i)
+
+    gc.collect()
+
+    assert all(ref() is None for ref in session_refs)
+    assert all(ref() is None for ref in tx_refs)
+    assert _ACTIVE_TRANSACTIONS.get() == {}
+    assert len(contextvars.copy_context()) <= before_ctx_len + 1
+
+
+@pytest.mark.asyncio
+async def test_active_transactions_copy_on_write_and_clear_on_cancel_and_error():
+    from voyager_ogm.session import _ACTIVE_TRANSACTIONS
+
+    session1 = AsyncSession(bridge=AsyncMockBridge(), dialect="cypher")
+    session2 = AsyncSession(bridge=AsyncMockBridge(), dialect="cypher")
+
+    async with session1.transaction() as tx1:
+        parent_map = _ACTIVE_TRANSACTIONS.get()
+        assert parent_map[session1._tx_token] is tx1
+        with pytest.raises(TypeError):
+            operator.setitem(parent_map, 999999, None)
+
+        async def child_worker() -> None:
+            async with session2.transaction() as tx2:
+                child_map = _ACTIVE_TRANSACTIONS.get()
+                assert child_map[session1._tx_token] is tx1
+                assert child_map[session2._tx_token] is tx2
+                assert session2._tx_token not in parent_map
+            assert session2._tx_token not in _ACTIVE_TRANSACTIONS.get()
+
+        await asyncio.create_task(child_worker())
+        assert _ACTIVE_TRANSACTIONS.get() is parent_map
+
+    assert _ACTIVE_TRANSACTIONS.get() == {}
+
+    started = asyncio.Event()
+
+    async def cancelled_owner() -> None:
+        async with session1.transaction():
+            assert session1._tx_token in _ACTIVE_TRANSACTIONS.get()
+            started.set()
+            await asyncio.sleep(10)
+
+    owner_task = asyncio.create_task(cancelled_owner())
+    await started.wait()
+    owner_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner_task
+
+    assert _ACTIVE_TRANSACTIONS.get() == {}
+    _assert_no_active(session1)
+    _assert_no_active(session2)
