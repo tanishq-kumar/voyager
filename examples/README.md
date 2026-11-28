@@ -165,3 +165,9 @@ just examples-live
 | :-: | :--- | :--- | :--- | :--- |
 | 30 | [`30_live_neo4j_execution.py`](python/30_live_neo4j_execution.py) | Real Bolt connection to live Neo4j (7687), OGM model definitions, schema constraints, high-throughput OGM bulk seeding, query execution, and path visualization. | Neo4j container (`docker compose -f containers/compose.yaml up -d neo4j`), `neo4j` extra | `uv run python examples/python/30_live_neo4j_execution.py` |
 | 31 | [`31_live_multi_engine_execution.py`](python/31_live_multi_engine_execution.py) | Live multi-engine query execution across Memgraph (port 7688), FalkorDB (port 6379), and Apache AGE (port 5455), with OGM cleanup, seeding, and clean offline skips. | Container(s) via Compose, `neo4j`, `falkordb`, `psycopg` extras | `uv run python examples/python/31_live_multi_engine_execution.py` |
+
+### Phase 7: Large Result Streaming
+
+| # | File | What It Teaches | Prerequisites | Run Command |
+| :-: | :--- | :--- | :--- | :--- |
+| 33 | [`33_result_streaming.py`](python/33_result_streaming.py) | Bounded `Session.stream()` / `AsyncSession.stream()` / `Transaction.stream()` batches, `iter_rows()`, `to_arrow_reader()`, Polars batches, flat-memory Parquet export vs `execute()`, transaction fail-fast, and optional live Neo4j/PostgreSQL 19 streaming. | None (embedded DuckDB); Neo4j/PG19 optional for the live section | `uv run python examples/python/33_result_streaming.py` |

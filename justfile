@@ -562,6 +562,7 @@ examples-python:
     uv run python examples/python/26_query_path_visualization.py
     uv run python examples/python/27_marimo_graphrag_demo.py
     uv run python examples/python/29_native_rust_builder.py
+    uv run python examples/python/33_result_streaming.py
 
 # Run live code examples (requires running database containers via `just up` or Compose runner)
 examples-live:
