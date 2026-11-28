@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 
 use crate::config::Auth;
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
@@ -20,6 +19,7 @@ use crate::uri::ParsedUri;
 /// Connection to a Redis / FalkorDB server implementing [`AsyncConnection`].
 pub struct RedisConnection {
     stream: NetStream,
+    socket_probe: Option<std::net::TcpStream>,
     uri: ParsedUri,
     buffer: BytesMut,
     is_resp3: bool,
@@ -65,15 +65,12 @@ impl RedisConnection {
 
     async fn connect_raw(uri: &ParsedUri, tls_options: &TlsOptions) -> Result<Self> {
         let socket_addr = uri.socket_addr();
-        let stream = TcpStream::connect(&socket_addr).await.map_err(|e| {
+        let (stream, socket_probe) = crate::tls::connect_tcp(&socket_addr).await.map_err(|e| {
             NetError::ConnectionFailed(format!(
                 "Failed to connect to Redis/FalkorDB host at {}: {}",
                 socket_addr, e
             ))
         })?;
-
-        // Disable Nagle's algorithm for low-latency graph query execution
-        let _ = stream.set_nodelay(true);
 
         let stream = match TlsVerification::for_mode(uri.tls) {
             Some(verification) => {
@@ -101,6 +98,7 @@ impl RedisConnection {
 
         let mut conn = Self {
             stream,
+            socket_probe: Some(socket_probe),
             uri: uri.clone(),
             buffer: BytesMut::with_capacity(8192),
             is_resp3: false,
@@ -496,6 +494,12 @@ impl AsyncConnection for RedisConnection {
 
     fn is_valid(&self) -> bool {
         self.is_valid
+    }
+
+    fn is_locally_alive(&self) -> bool {
+        self.is_valid
+            && self.buffer.is_empty()
+            && crate::tls::is_stream_locally_alive(&self.stream, self.socket_probe.as_ref())
     }
 
     fn is_in_transaction(&self) -> bool {

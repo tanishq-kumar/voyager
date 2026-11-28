@@ -486,6 +486,87 @@ impl NetStream {
             Self::Tls(stream) => stream.get_ref().0,
         }
     }
+
+    /// Checks whether the underlying socket appears open and free of unexpected unread data
+    /// without blocking or sending any network round-trip.
+    pub fn is_locally_alive(&self) -> bool {
+        is_stream_locally_alive(self, None)
+    }
+}
+
+/// Connects a TCP socket to `addr` with `SO_KEEPALIVE` and `TCP_NODELAY` enabled,
+/// returning the async Tokio stream alongside a cloned `std::net::TcpStream` probe
+/// handle for non-blocking `MSG_PEEK` liveness checks independent of Tokio's readiness cache.
+#[cfg(any(feature = "bolt", feature = "postgres", feature = "redis"))]
+pub(crate) async fn connect_tcp(addr: &str) -> io::Result<(TcpStream, std::net::TcpStream)> {
+    let mut last_err = None;
+    let mut resolved = false;
+    for sock_addr in tokio::net::lookup_host(addr).await? {
+        resolved = true;
+        let socket = match sock_addr {
+            std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
+        let _ = socket.set_keepalive(true);
+        match socket.connect(sock_addr).await {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                let std_stream = stream.into_std()?;
+                let probe = std_stream.try_clone()?;
+                let tokio_stream = TcpStream::from_std(std_stream)?;
+                return Ok((tokio_stream, probe));
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if !resolved {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Could not resolve socket address '{addr}'"),
+        ));
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("Failed to connect to '{addr}'"),
+        )
+    }))
+}
+
+/// Performs a zero-round-trip local liveness check on `stream` (and its `std::net::TcpStream`
+/// probe if available), rejecting peer EOF, socket errors, TLS close/pending-plaintext,
+/// and unexpected unread bytes on an idle connection.
+pub(crate) fn is_stream_locally_alive(
+    stream: &NetStream,
+    probe: Option<&std::net::TcpStream>,
+) -> bool {
+    #[cfg(feature = "tls")]
+    if let NetStream::Tls(tls) = stream
+        && !tls.get_ref().1.wants_read()
+    {
+        return false;
+    }
+
+    if let Some(std_tcp) = probe {
+        if !matches!(std_tcp.take_error(), Ok(None)) {
+            return false;
+        }
+        let mut buf = [0u8; 1];
+        return matches!(
+            std_tcp.peek(&mut buf),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock
+        );
+    }
+
+    let tcp = stream.tcp();
+    if !matches!(tcp.take_error(), Ok(None)) {
+        return false;
+    }
+    let mut buf = [0u8; 1];
+    matches!(
+        tcp.try_read(&mut buf),
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock
+    )
 }
 
 impl From<TcpStream> for NetStream {
@@ -1450,5 +1531,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("/nonexistent/ca.pem"), "{error}");
+    }
+
+    #[cfg(any(feature = "bolt", feature = "postgres", feature = "redis"))]
+    #[tokio::test]
+    async fn connect_tcp_enables_keepalive_and_local_liveness_detects_eof_and_unread_bytes() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpSocket};
+
+        let sock = TcpSocket::new_v4().unwrap();
+        sock.set_keepalive(true).unwrap();
+        assert!(sock.keepalive().unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_task = tokio::spawn(async move {
+            let (s1, _) = listener.accept().await.unwrap();
+            let (s2, _) = listener.accept().await.unwrap();
+            (s1, s2, listener)
+        });
+
+        let (stream1, probe1) = connect_tcp(&addr.to_string()).await.unwrap();
+        let (stream2, probe2) = connect_tcp(&addr.to_string()).await.unwrap();
+        let (mut srv1, mut srv2, _listener) = accept_task.await.unwrap();
+
+        let net1 = NetStream::Plain(stream1);
+        let net2 = NetStream::Plain(stream2);
+        assert!(is_stream_locally_alive(&net1, Some(&probe1)));
+        assert!(is_stream_locally_alive(&net2, Some(&probe2)));
+
+        // 1. Peer closes socket -> local liveness check detects EOF immediately (0 RTT).
+        srv1.shutdown().await.unwrap();
+        drop(srv1);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!is_stream_locally_alive(&net1, Some(&probe1)));
+
+        // 2. Peer sends unexpected bytes on idle socket -> rejected as unsafe to reuse.
+        srv2.write_all(b"UNEXPECTED").await.unwrap();
+        srv2.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!is_stream_locally_alive(&net2, Some(&probe2)));
     }
 }

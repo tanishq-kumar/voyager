@@ -236,6 +236,12 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
 
     /// Acquires a connection from the pool, waiting up to `acquire_timeout`.
     pub async fn acquire(&self) -> Result<PooledConnection<C>> {
+        Ok(self.acquire_with_probe_status().await?.0)
+    }
+
+    /// Acquires a connection from the pool and reports whether a liveness ping was already
+    /// sent during checkout.
+    pub(crate) async fn acquire_with_probe_status(&self) -> Result<(PooledConnection<C>, bool)> {
         self.inner
             .metrics
             .acquire_count
@@ -261,7 +267,7 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     match self.inner.semaphore.clone().try_acquire_owned() {
                         Ok(permit) => {
                             drop(waiters);
-                            return self.obtain_with_permit(permit).await;
+                            return self.obtain_with_permit(permit, None).await;
                         }
                         Err(_) => {
                             waiters.push_back(tx);
@@ -272,10 +278,18 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                 // Await direct handover with timeout
                 match timeout(acquire_timeout, rx).await {
                     Ok(Ok(Handover::Connection(pooled))) => {
-                        return Ok(pooled);
+                        let created_at = pooled.created_at;
+                        let (conn, permit_opt) = pooled.into_parts();
+                        let Some(permit) = permit_opt else {
+                            return Err(NetError::Closed(
+                                "Handover connection was missing its lease permit".to_string(),
+                            ));
+                        };
+                        let candidate = conn.map(|c| (c, created_at, Instant::now()));
+                        return self.obtain_with_permit(permit, candidate).await;
                     }
                     Ok(Ok(Handover::Permit(permit))) => {
-                        return self.obtain_with_permit(permit).await;
+                        return self.obtain_with_permit(permit, None).await;
                     }
                     Ok(Err(_)) => {
                         return Err(NetError::Closed(
@@ -300,18 +314,30 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
         };
 
         // 3. We have a permit from the fast path
-        self.obtain_with_permit(permit).await
+        self.obtain_with_permit(permit, None).await
     }
 
-    /// Obtains a pooled connection using an already acquired semaphore permit.
+    /// Obtains a pooled connection using an already acquired semaphore permit, optionally
+    /// validating an initial direct-handover candidate first.
     async fn obtain_with_permit(
         &self,
         permit: OwnedSemaphorePermit,
-    ) -> Result<PooledConnection<C>> {
+        mut initial_candidate: Option<(C, Instant, Instant)>,
+    ) -> Result<(PooledConnection<C>, bool)> {
         struct AcquireGuard<'a, C: AsyncConnection + 'static> {
             pool: &'a Arc<PoolInner<C>>,
             permit: Option<OwnedSemaphorePermit>,
             in_flight_idle: Option<C>,
+        }
+
+        impl<C: AsyncConnection + 'static> AcquireGuard<'_, C> {
+            async fn discard_in_flight(&mut self, counter: &AtomicU64) {
+                counter.fetch_add(1, Ordering::Relaxed);
+                if let Some(mut conn) = self.in_flight_idle.take() {
+                    self.pool.total_connections.fetch_sub(1, Ordering::SeqCst);
+                    let _ = conn.close().await;
+                }
+            }
         }
 
         impl<C: AsyncConnection + 'static> Drop for AcquireGuard<'_, C> {
@@ -341,12 +367,53 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                 ));
             }
 
-            let maybe_idle = self.inner.idle_queue.lock().pop_front();
-            if let Some(idle) = maybe_idle {
+            let candidate = if let Some(handed_over) = initial_candidate.take() {
+                Some(handed_over)
+            } else {
                 let now = Instant::now();
-                let created_at = idle.created_at;
-                let last_used_at = idle.last_used_at;
-                guard.in_flight_idle = Some(idle.conn);
+                let mut expired_front = Vec::new();
+                let popped = {
+                    let mut queue = self.inner.idle_queue.lock();
+                    // Evict oldest expired connections from the front so LIFO reuse does not
+                    // leave stale idle sockets pinned at the head of the queue.
+                    while let Some(front) = queue.front() {
+                        let expired_idle = self
+                            .inner
+                            .config
+                            .idle_timeout
+                            .is_some_and(|to| now.duration_since(front.last_used_at) > to);
+                        let expired_life = self
+                            .inner
+                            .config
+                            .max_lifetime
+                            .is_some_and(|max| now.duration_since(front.created_at) > max);
+                        if expired_idle || expired_life {
+                            if let Some(entry) = queue.pop_front() {
+                                self.inner
+                                    .metrics
+                                    .connections_evicted
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
+                                expired_front.push(entry.conn);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    // Hand out the most recently returned idle connection (LIFO).
+                    queue
+                        .pop_back()
+                        .map(|idle| (idle.conn, idle.created_at, idle.last_used_at))
+                };
+                for mut expired_conn in expired_front {
+                    let _ = expired_conn.close().await;
+                }
+                popped
+            };
+
+            if let Some((conn, created_at, last_used_at)) = candidate {
+                let now = Instant::now();
+                guard.in_flight_idle = Some(conn);
 
                 // Check max lifetime
                 if self
@@ -356,14 +423,9 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     .is_some_and(|max| now.duration_since(created_at) > max)
                 {
                     debug!("Evicting connection exceeding max lifetime");
-                    self.inner
-                        .metrics
-                        .connections_evicted
-                        .fetch_add(1, Ordering::Relaxed);
-                    if let Some(mut conn) = guard.in_flight_idle.take() {
-                        self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                        let _ = conn.close().await;
-                    }
+                    guard
+                        .discard_in_flight(&self.inner.metrics.connections_evicted)
+                        .await;
                     continue;
                 }
 
@@ -375,19 +437,36 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     .is_some_and(|to| now.duration_since(last_used_at) > to)
                 {
                     debug!("Evicting idle connection exceeding idle timeout");
-                    self.inner
-                        .metrics
-                        .connections_evicted
-                        .fetch_add(1, Ordering::Relaxed);
-                    if let Some(mut conn) = guard.in_flight_idle.take() {
-                        self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                        let _ = conn.close().await;
-                    }
+                    guard
+                        .discard_in_flight(&self.inner.metrics.connections_evicted)
+                        .await;
                     continue;
                 }
 
-                // Check liveness probe if test_on_acquire is enabled
-                if self.inner.config.test_on_acquire {
+                // Zero-round-trip local liveness check (peer EOF/RST, TLS close, unread data)
+                let locally_alive = guard
+                    .in_flight_idle
+                    .as_ref()
+                    .expect("in-flight idle connection present")
+                    .is_locally_alive();
+                if !locally_alive {
+                    warn!("Connection failed local liveness check, discarding");
+                    guard
+                        .discard_in_flight(&self.inner.metrics.connections_failed_health_check)
+                        .await;
+                    continue;
+                }
+
+                // Check liveness probe when test_on_acquire is enabled or idle age exceeds threshold
+                let should_ping = self.inner.config.test_on_acquire
+                    || self
+                        .inner
+                        .config
+                        .test_on_idle_after
+                        .is_some_and(|after| now.duration_since(last_used_at) > after);
+                let mut was_pinged = false;
+                if should_ping {
+                    was_pinged = true;
                     let probe_ok = {
                         let conn = guard
                             .in_flight_idle
@@ -397,14 +476,9 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     };
                     if !probe_ok {
                         warn!("Connection failed liveness probe, discarding");
-                        self.inner
-                            .metrics
-                            .connections_failed_health_check
-                            .fetch_add(1, Ordering::Relaxed);
-                        if let Some(mut conn) = guard.in_flight_idle.take() {
-                            self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                            let _ = conn.close().await;
-                        }
+                        guard
+                            .discard_in_flight(&self.inner.metrics.connections_failed_health_check)
+                            .await;
                         continue;
                     }
                 }
@@ -425,14 +499,9 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     };
                     if !reset_ok {
                         warn!("Connection failed transaction reset or is invalid, discarding");
-                        self.inner
-                            .metrics
-                            .connections_failed_health_check
-                            .fetch_add(1, Ordering::Relaxed);
-                        if let Some(mut conn) = guard.in_flight_idle.take() {
-                            self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                            let _ = conn.close().await;
-                        }
+                        guard
+                            .discard_in_flight(&self.inner.metrics.connections_failed_health_check)
+                            .await;
                         continue;
                     }
                 } else if !guard
@@ -442,26 +511,24 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     .is_valid()
                 {
                     warn!("Connection is marked invalid, discarding");
-                    self.inner
-                        .metrics
-                        .connections_failed_health_check
-                        .fetch_add(1, Ordering::Relaxed);
-                    if let Some(mut conn) = guard.in_flight_idle.take() {
-                        self.inner.total_connections.fetch_sub(1, Ordering::SeqCst);
-                        let _ = conn.close().await;
-                    }
+                    guard
+                        .discard_in_flight(&self.inner.metrics.connections_failed_health_check)
+                        .await;
                     continue;
                 }
 
                 let conn = guard.in_flight_idle.take();
                 let permit = guard.permit.take();
-                return Ok(PooledConnection {
-                    conn,
-                    created_at,
-                    is_broken: false,
-                    pool: Some(self.inner.clone()),
-                    _permit: permit,
-                });
+                return Ok((
+                    PooledConnection {
+                        conn,
+                        created_at,
+                        is_broken: false,
+                        pool: Some(self.inner.clone()),
+                        _permit: permit,
+                    },
+                    was_pinged,
+                ));
             } else {
                 // No idle connections in queue, create a fresh connection
                 let conn = self.inner.factory.create().await?;
@@ -471,13 +538,16 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     .fetch_add(1, Ordering::Relaxed);
                 self.inner.total_connections.fetch_add(1, Ordering::SeqCst);
                 let permit = guard.permit.take();
-                return Ok(PooledConnection {
-                    conn: Some(conn),
-                    created_at: Instant::now(),
-                    is_broken: false,
-                    pool: Some(self.inner.clone()),
-                    _permit: permit,
-                });
+                return Ok((
+                    PooledConnection {
+                        conn: Some(conn),
+                        created_at: Instant::now(),
+                        is_broken: false,
+                        pool: Some(self.inner.clone()),
+                        _permit: permit,
+                    },
+                    false,
+                ));
             }
         }
     }

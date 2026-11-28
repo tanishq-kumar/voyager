@@ -173,8 +173,11 @@ impl NativeClient {
 
     /// Sends a lightweight liveness probe ping to the database.
     pub async fn ping(&self) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        conn.ping().await
+        let (mut conn, already_pinged) = self.pool.acquire_with_probe_status().await?;
+        if !already_pinged {
+            conn.ping().await?;
+        }
+        Ok(())
     }
 
     /// Closes the connection pool and evicts all active connections.

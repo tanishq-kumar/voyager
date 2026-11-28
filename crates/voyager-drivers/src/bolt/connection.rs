@@ -6,7 +6,6 @@ use bytes::BytesMut;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -45,6 +44,8 @@ pub struct BoltVersion {
 /// Physical asynchronous Bolt connection managing socket I/O, PackStream framing, and state.
 pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = NetStream> {
     stream: S,
+    socket_probe: Option<std::net::TcpStream>,
+    local_alive_check: fn(&S, Option<&std::net::TcpStream>) -> bool,
     read_buf: BytesMut,
     frame_buf: Vec<u8>,
     version: BoltVersion,
@@ -113,12 +114,9 @@ impl BoltConnection<NetStream> {
         mode: crate::config::TlsMode,
     ) -> Result<Self> {
         let addr = uri.socket_addr();
-        let stream = TcpStream::connect(&addr).await.map_err(|e| {
+        let (stream, socket_probe) = crate::tls::connect_tcp(&addr).await.map_err(|e| {
             NetError::ConnectionFailed(format!("Failed to connect to {}: {}", addr, e))
         })?;
-
-        // Disable Nagle's algorithm to eliminate 40-200ms delayed-ACK packet stalls
-        let _ = stream.set_nodelay(true);
 
         // Bolt starts TLS before the handshake preamble.
         let mut stream = match TlsVerification::for_mode(mode) {
@@ -181,6 +179,8 @@ impl BoltConnection<NetStream> {
 
         let mut conn = Self {
             stream,
+            socket_probe: Some(socket_probe),
+            local_alive_check: crate::tls::is_stream_locally_alive,
             read_buf: BytesMut::with_capacity(65536),
             frame_buf: Vec::new(),
             version,
@@ -323,6 +323,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
     pub fn from_stream(stream: S, version: BoltVersion) -> Self {
         Self {
             stream,
+            socket_probe: None,
+            local_alive_check: |_, _| true,
             read_buf: BytesMut::with_capacity(65536),
             frame_buf: Vec::new(),
             version,
@@ -1029,6 +1031,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
 
     fn is_valid(&self) -> bool {
         self.is_valid
+    }
+
+    fn is_locally_alive(&self) -> bool {
+        self.is_valid
+            && self.read_buf.is_empty()
+            && (self.local_alive_check)(&self.stream, self.socket_probe.as_ref())
     }
 
     fn protocol_version(&self) -> Option<String> {

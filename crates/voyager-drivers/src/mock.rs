@@ -30,12 +30,16 @@ pub struct MockConnection {
     pub fail_reset: bool,
     /// If true, calls to `execute()` will return an error to simulate query execution failure.
     pub fail_execute: bool,
+    /// If true, calls to `is_locally_alive()` will return false to simulate a dead socket.
+    pub fail_local_check: bool,
     /// Shared log of executed queries and parameter maps.
     pub executed_queries: ExecutedQueryLog,
     /// Queue of canned query results to return sequentially on calls to `execute()`.
     pub canned_results: CannedResultQueue,
     /// Counter tracking number of times `reset()` was invoked.
     pub reset_count: Arc<AtomicUsize>,
+    /// Counter tracking number of times `ping()` was invoked.
+    pub ping_count: Arc<AtomicUsize>,
     /// Rows committed by this connection, shared through the factory store.
     committed_rows: Arc<Mutex<Vec<String>>>,
     /// Rows written inside the current transaction and not yet committed.
@@ -51,9 +55,11 @@ impl MockConnection {
             fail_ping: false,
             fail_reset: false,
             fail_execute: false,
+            fail_local_check: false,
             executed_queries: Arc::new(Mutex::new(Vec::new())),
             canned_results: Arc::new(Mutex::new(VecDeque::new())),
             reset_count: Arc::new(AtomicUsize::new(0)),
+            ping_count: Arc::new(AtomicUsize::new(0)),
             committed_rows: Arc::new(Mutex::new(Vec::new())),
             pending_rows: Vec::new(),
         }
@@ -67,6 +73,11 @@ impl MockConnection {
     /// Returns the number of times `reset()` was called on this connection.
     pub fn reset_count(&self) -> usize {
         self.reset_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the number of times `ping()` was called on this connection.
+    pub fn ping_count(&self) -> usize {
+        self.ping_count.load(Ordering::SeqCst)
     }
 
     /// Queues a canned query result to be returned on the next execution.
@@ -122,6 +133,7 @@ impl AsyncConnection for MockConnection {
     }
 
     async fn ping(&mut self) -> Result<()> {
+        self.ping_count.fetch_add(1, Ordering::SeqCst);
         if !self.is_valid || self.fail_ping {
             Err(NetError::ConnectionFailed(
                 "Mock connection ping failed".to_string(),
@@ -146,6 +158,10 @@ impl AsyncConnection for MockConnection {
 
     fn is_valid(&self) -> bool {
         self.is_valid
+    }
+
+    fn is_locally_alive(&self) -> bool {
+        self.is_valid && !self.fail_local_check
     }
 
     fn is_in_transaction(&self) -> bool {

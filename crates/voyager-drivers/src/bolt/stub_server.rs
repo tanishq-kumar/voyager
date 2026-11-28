@@ -3,6 +3,8 @@
 use bytes::BytesMut;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -17,6 +19,8 @@ use crate::error::{NetError, Result};
 pub struct BoltStubServer {
     addr: SocketAddr,
     server_task: JoinHandle<()>,
+    reset_count: Arc<AtomicUsize>,
+    run_count: Arc<AtomicUsize>,
 }
 
 impl BoltStubServer {
@@ -29,18 +33,40 @@ impl BoltStubServer {
             .local_addr()
             .map_err(|e| NetError::ConnectionFailed(format!("Failed to get local addr: {}", e)))?;
 
+        let reset_count = Arc::new(AtomicUsize::new(0));
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let reset_clone = reset_count.clone();
+        let run_clone = run_count.clone();
+
         let server_task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 // Without TCP_NODELAY the scripted responses hit Linux delayed
                 // ACK, adding ~41 ms to every loopback test query.
                 let _ = socket.set_nodelay(true);
+                let resets = reset_clone.clone();
+                let runs = run_clone.clone();
                 tokio::spawn(async move {
-                    let _ = Self::handle_connection(&mut socket).await;
+                    let _ = Self::handle_connection(&mut socket, resets, runs).await;
                 });
             }
         });
 
-        Ok(Self { addr, server_task })
+        Ok(Self {
+            addr,
+            server_task,
+            reset_count,
+            run_count,
+        })
+    }
+
+    /// Returns the total number of Bolt `RESET` messages received by this stub server.
+    pub fn reset_count(&self) -> usize {
+        self.reset_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the total number of Bolt `RUN` messages received by this stub server.
+    pub fn run_count(&self) -> usize {
+        self.run_count.load(Ordering::SeqCst)
     }
 
     /// Returns the socket address `127.0.0.1:port` of the running stub server.
@@ -53,7 +79,11 @@ impl BoltStubServer {
         format!("bolt://{}", self.addr)
     }
 
-    async fn handle_connection(socket: &mut TcpStream) -> Result<()> {
+    async fn handle_connection(
+        socket: &mut TcpStream,
+        reset_count: Arc<AtomicUsize>,
+        run_count: Arc<AtomicUsize>,
+    ) -> Result<()> {
         // 1. Read 20-byte Handshake
         let mut handshake = [0u8; 20];
         socket
@@ -129,6 +159,7 @@ impl BoltStubServer {
                 match tag {
                     0x10 => {
                         // RUN request
+                        run_count.fetch_add(1, Ordering::SeqCst);
                         let query = fields.first().and_then(|v| v.as_str()).unwrap_or("");
                         let mut run_meta = HashMap::new();
 
@@ -193,6 +224,7 @@ impl BoltStubServer {
                     }
                     0x0F => {
                         // RESET request -> clear failed state and reply SUCCESS
+                        reset_count.fetch_add(1, Ordering::SeqCst);
                         in_failed_state = false;
                         Self::send_response(
                             socket,
