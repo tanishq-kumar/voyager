@@ -324,7 +324,7 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
     }
 
     /// Clears `has_open_stream` and accumulates summary when a clean/buffered cursor drops without `close()`.
-    pub(crate) fn clear_clean_stream(&mut self, cursor: &StreamCursor) {
+    pub fn clear_clean_stream(&mut self, cursor: &StreamCursor) {
         if self.has_open_stream {
             self.accumulate(cursor.summary());
             self.has_open_stream = false;
