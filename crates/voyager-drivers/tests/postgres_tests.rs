@@ -1300,3 +1300,864 @@ async fn test_pg_row_decoder_security_limits_depth_ragged_invalid_and_utf8() {
     drop(conn);
     server.await.unwrap();
 }
+
+#[test]
+fn test_pg_backend_message_decodes_portal_suspended() {
+    let msg = BackendMessage::decode(b's', bytes::Bytes::new()).expect("PortalSuspended");
+    assert_eq!(msg, BackendMessage::PortalSuspended);
+}
+
+#[tokio::test]
+async fn test_pg_stream_portal_suspended_early_close_errors_and_hints() {
+    use bytes::BufMut;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::postgres::PostgresConnection;
+    use voyager_drivers::value::result::ResultValue;
+    use voyager_drivers::{
+        AsyncConnection, ConnectionFactory, ConnectionPool, NativeClient, NetError, ParsedUri,
+        StreamOptions,
+    };
+
+    let _ = std::any::type_name::<PoolConfig>();
+
+    fn pg_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(msg_type);
+        out.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn rd_payload(fields: &[(&str, i32, i32)]) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.put_i16(fields.len() as i16);
+        for (name, oid, typmod) in fields {
+            payload.put_slice(name.as_bytes());
+            payload.put_u8(0);
+            payload.put_i32(0);
+            payload.put_i16(0);
+            payload.put_i32(*oid);
+            payload.put_i16(-1);
+            payload.put_i32(*typmod);
+            payload.put_i16(0);
+        }
+        payload.to_vec()
+    }
+
+    fn dr_bytes(values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.put_i16(values.len() as i16);
+        for val in values {
+            match val {
+                Some(b) => {
+                    payload.put_i32(b.len() as i32);
+                    payload.put_slice(b);
+                }
+                None => payload.put_i32(-1),
+            }
+        }
+        payload.to_vec()
+    }
+
+    fn error_frame(code: &str, message: &str) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.extend_from_slice(b"SERROR\0");
+        payload.put_u8(b'C');
+        payload.extend_from_slice(code.as_bytes());
+        payload.put_u8(0);
+        payload.put_u8(b'M');
+        payload.extend_from_slice(message.as_bytes());
+        payload.put_u8(0);
+        payload.put_u8(0);
+        pg_frame(b'E', &payload)
+    }
+
+    fn read_frontend_tags(buf: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 5 <= buf.len() {
+            let tag = buf[pos];
+            let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]])
+                as usize;
+            if pos + 1 + len > buf.len() {
+                break;
+            }
+            out.push((tag, buf[pos + 5..pos + 1 + len].to_vec()));
+            pos += 1 + len;
+        }
+        out
+    }
+
+    type RecordedFrontendRequests = Arc<parking_lot::Mutex<Vec<Vec<(u8, Vec<u8>)>>>>;
+
+    // 1. Multi-chunk PortalSuspended + unconstrained NUMERIC + AGE + early close + close-before-chunk-1 + 42601 + mid-stream error + 26000 retry
+    let recorded_requests: RecordedFrontendRequests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let req_log = recorded_requests.clone();
+
+    let typmod_10_2 = ((10 << 16) | 2) + 4;
+    let schema = rd_payload(&[
+        ("id", 23, -1),
+        ("num_uncon", 1700, -1),
+        ("num_fixed", 1700, typmod_10_2),
+        ("age_v", 16400, -1),
+    ]);
+
+    let mut s1_chunk1 = Vec::new();
+    s1_chunk1.extend_from_slice(&pg_frame(b'1', &[])); // ParseComplete
+    s1_chunk1.extend_from_slice(&pg_frame(b'2', &[])); // BindComplete
+    s1_chunk1.extend_from_slice(&pg_frame(b'T', &schema));
+    s1_chunk1.extend_from_slice(&pg_frame(
+        b'D',
+        &dr_bytes(&[
+            Some(b"1"),
+            Some(b"1.5"),
+            Some(b"10.20"),
+            Some(br#"{"id":1,"label":"Person","properties":{"name":"Ada"}}::vertex"#),
+        ]),
+    ));
+    s1_chunk1.extend_from_slice(&pg_frame(
+        b'D',
+        &dr_bytes(&[Some(b"2"), Some(b"2.0"), Some(b"20.00"), Some(b"42")]),
+    ));
+    s1_chunk1.extend_from_slice(&pg_frame(b's', &[])); // PortalSuspended
+
+    let mut s1_chunk2 = Vec::new();
+    s1_chunk2.extend_from_slice(&pg_frame(
+        b'D',
+        &dr_bytes(&[Some(b"3"), Some(b"3.123456"), Some(b"30.50"), None]),
+    ));
+    s1_chunk2.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+    // Close(P) + Sync arrives next; let's split s1_chunk2 and close_reply cleanly.
+
+    let mut close_ok = Vec::new();
+    close_ok.extend_from_slice(&pg_frame(b'3', &[])); // CloseComplete
+    close_ok.extend_from_slice(&pg_frame(b'Z', b"I")); // ReadyForQuery
+
+    // Stream 2 (early close after chunk 1): Bind + Describe + Execute + Flush -> chunk 1
+    let mut s2_chunk1 = Vec::new();
+    s2_chunk1.extend_from_slice(&pg_frame(b'1', &[]));
+    s2_chunk1.extend_from_slice(&pg_frame(b'2', &[]));
+    s2_chunk1.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("id", 23, -1)])));
+    s2_chunk1.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"10")])));
+    s2_chunk1.extend_from_slice(&pg_frame(b's', &[]));
+
+    // Stream 3 (close before chunk 1): open returns RowDescription while Execute returns PortalSuspended
+    let mut s3_open_and_inflight = Vec::new();
+    s3_open_and_inflight.extend_from_slice(&pg_frame(b'1', &[]));
+    s3_open_and_inflight.extend_from_slice(&pg_frame(b'2', &[]));
+    s3_open_and_inflight.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("id", 23, -1)])));
+    s3_open_and_inflight.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"99")])));
+    s3_open_and_inflight.extend_from_slice(&pg_frame(b's', &[]));
+
+    // Stream 4 (multi-statement 42601 on Parse, then Sync -> ReadyForQuery)
+    let s4_parse_err = error_frame(
+        "42601",
+        "cannot insert multiple commands into a prepared statement",
+    );
+    let s4_sync_ok = pg_frame(b'Z', b"I");
+
+    // Stream 5 (mid-stream ErrorResponse on chunk 2, then Sync -> ReadyForQuery)
+    let mut s5_chunk1 = Vec::new();
+    s5_chunk1.extend_from_slice(&pg_frame(b'1', &[]));
+    s5_chunk1.extend_from_slice(&pg_frame(b'2', &[]));
+    s5_chunk1.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("q", 23, -1)])));
+    s5_chunk1.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"10")])));
+    s5_chunk1.extend_from_slice(&pg_frame(b's', &[]));
+
+    let mut s5_chunk2_err = Vec::new();
+    s5_chunk2_err.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"5")])));
+    s5_chunk2_err.extend_from_slice(&error_frame("22012", "division by zero"));
+    let s5_sync_ok = pg_frame(b'Z', b"I");
+
+    // Stream 6 (26000 stale statement retry on cached statement hit from Stream 2!)
+    // First attempt sends Bind without Parse -> server sends 26000, client sends Sync -> ReadyForQuery,
+    // then client retries with Parse -> Bind -> Describe -> Execute -> Flush -> CommandComplete, then Close(P) + Sync!
+    let s6_26000 = error_frame(
+        "26000",
+        "prepared statement \"voyager_stmt_1\" does not exist",
+    );
+    let s6_sync_ok = pg_frame(b'Z', b"I");
+    let mut s6_retry_ok = Vec::new();
+    s6_retry_ok.extend_from_slice(&pg_frame(b'1', &[]));
+    s6_retry_ok.extend_from_slice(&pg_frame(b'2', &[]));
+    s6_retry_ok.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("id", 23, -1)])));
+    s6_retry_ok.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"77")])));
+    s6_retry_ok.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+
+    // Follow-up simple query to confirm connection reuse
+    let mut ping_ok = Vec::new();
+    ping_ok.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("ok", 23, -1)])));
+    ping_ok.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"1")])));
+    ping_ok.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+    ping_ok.extend_from_slice(&pg_frame(b'Z', b"I"));
+
+    let script = vec![
+        s1_chunk1,
+        s1_chunk2,
+        close_ok.clone(),
+        s2_chunk1,
+        close_ok.clone(),
+        s3_open_and_inflight,
+        close_ok.clone(),
+        s4_parse_err,
+        s4_sync_ok,
+        s5_chunk1,
+        s5_chunk2_err,
+        s5_sync_ok,
+        s6_26000,
+        s6_sync_ok,
+        s6_retry_ok,
+        close_ok,
+        ping_ok,
+    ];
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let _ = server_stream.set_nodelay(true);
+        let mut startup = [0u8; 512];
+        let _ = server_stream.read(&mut startup).await.unwrap();
+        let mut auth_ok = BytesMut::new();
+        auth_ok.put_i32(0);
+        let mut hello = pg_frame(b'R', &auth_ok);
+        hello.extend_from_slice(&pg_frame(b'K', &[0; 8]));
+        hello.extend_from_slice(&pg_frame(b'Z', b"I"));
+        server_stream.write_all(&hello).await.unwrap();
+        server_stream.flush().await.unwrap();
+
+        // AGE setup (2 queries)
+        for idx in 0..2 {
+            let mut buf = [0u8; 1024];
+            let _ = server_stream.read(&mut buf).await.unwrap();
+            let mut resp = Vec::new();
+            if idx == 1 {
+                resp.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("oid", 26, -1)])));
+                resp.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"16400")])));
+                resp.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+            } else {
+                resp.extend_from_slice(&pg_frame(b'C', b"OK\0"));
+            }
+            resp.extend_from_slice(&pg_frame(b'Z', b"I"));
+            server_stream.write_all(&resp).await.unwrap();
+            server_stream.flush().await.unwrap();
+        }
+
+        for reply in script {
+            let mut buf = [0u8; 4096];
+            let n = server_stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "unexpected client EOF before script finished");
+            req_log.lock().push(read_frontend_tags(&buf[..n]));
+            server_stream.write_all(&reply).await.unwrap();
+            server_stream.flush().await.unwrap();
+        }
+    });
+
+    struct StaticFactory(tokio::sync::Mutex<Option<PostgresConnection>>);
+    #[async_trait::async_trait]
+    impl ConnectionFactory<PostgresConnection> for StaticFactory {
+        async fn create(&self) -> voyager_drivers::Result<PostgresConnection> {
+            self.0
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| NetError::ConnectionFailed("only one conn".to_string()))
+        }
+    }
+
+    let uri = ParsedUri::parse(&format!(
+        "age://postgres@{addr}/voyager_graph?sslmode=disable"
+    ))
+    .unwrap();
+    let conn = PostgresConnection::connect_with_age(&uri, true)
+        .await
+        .unwrap();
+    let pool = ConnectionPool::new(
+        PoolConfig::new().with_min_idle(0).with_max_size(1),
+        Arc::new(StaticFactory(tokio::sync::Mutex::new(Some(conn)))),
+    );
+
+    // 1. Multi-chunk PortalSuspended + unconstrained NUMERIC + AGE + Close+Sync on exhaustion
+    let mut lease1 = pool.acquire().await.unwrap();
+    let mut cursor1 = lease1
+        .open_stream(
+            "SELECT id, num_uncon, num_fixed, age_v FROM t",
+            &HashMap::new(),
+            &StreamOptions::new(2),
+        )
+        .await
+        .unwrap();
+    assert!(cursor1.is_server_streaming());
+    assert!(!cursor1.is_wire_clean());
+    assert!(lease1.has_active_portal());
+    assert!(!lease1.is_valid(), "suspended portal must never look valid");
+    assert!(
+        !lease1.is_locally_alive(),
+        "suspended portal must never look locally alive"
+    );
+
+    let c1 = lease1
+        .next_stream_chunk(&mut cursor1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c1.num_rows(), 2);
+    assert!(!cursor1.is_wire_clean());
+    assert!(lease1.has_active_portal());
+
+    let c2 = lease1
+        .next_stream_chunk(&mut cursor1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c2.num_rows(), 1);
+    assert!(cursor1.is_wire_clean());
+    assert!(!lease1.has_active_portal());
+    assert!(lease1.is_valid());
+
+    // Unconstrained NUMERIC produces identical Utf8 + voyager.type=decimal schema across chunks
+    let b1 = c1.to_record_batch().unwrap();
+    let b2 = c2.to_record_batch().unwrap();
+    assert_eq!(b1.schema().field(1), b2.schema().field(1));
+    assert_eq!(
+        b1.schema().field(1).data_type(),
+        &arrow_schema::DataType::Utf8
+    );
+    assert_eq!(
+        b1.schema()
+            .field(1)
+            .metadata()
+            .get("voyager.type")
+            .map(String::as_str),
+        Some("decimal")
+    );
+    assert!(
+        !b1.schema()
+            .field(1)
+            .metadata()
+            .contains_key("voyager.encoding")
+    );
+    assert_eq!(
+        b1.schema().field(2).data_type(),
+        &arrow_schema::DataType::Decimal128(38, 2)
+    );
+    assert_eq!(b1.schema().field(2), b2.schema().field(2));
+    assert!(matches!(c1.rows[0][3], ResultValue::Node(_)));
+    assert!(
+        lease1
+            .next_stream_chunk(&mut cursor1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(lease1);
+
+    // 2. Early close after chunk 1 sends Close('P') + Sync and reuses same connection
+    {
+        let mut l = pool.acquire().await.unwrap();
+        let mut cur = l
+            .open_stream(
+                "SELECT id FROM big",
+                &HashMap::new(),
+                &StreamOptions::new(1),
+            )
+            .await
+            .unwrap();
+        let s2c1 = l.next_stream_chunk(&mut cur).await.unwrap().unwrap();
+        assert_eq!(s2c1.num_rows(), 1);
+        l.close_stream(&mut cur).await.unwrap();
+        assert!(cur.is_wire_clean());
+        assert!(!l.has_active_portal());
+    }
+    assert_eq!(pool.active_count(), 0);
+    assert_eq!(pool.idle_count(), 1);
+
+    // 3. Close before chunk 1 drains in-flight Execute then sends Close('P') + Sync
+    {
+        let mut l = pool.acquire().await.unwrap();
+        let mut cur = l
+            .open_stream(
+                "SELECT id FROM unread",
+                &HashMap::new(),
+                &StreamOptions::new(1),
+            )
+            .await
+            .unwrap();
+        l.close_stream(&mut cur).await.unwrap();
+        assert!(cur.is_wire_clean());
+        assert!(!l.has_active_portal());
+    }
+    assert_eq!(pool.idle_count(), 1);
+
+    // 4. Multi-statement SQL (42601) returns clear hint and recovers via Sync
+    {
+        let mut l = pool.acquire().await.unwrap();
+        let err = l
+            .open_stream(
+                "SELECT 1; SELECT 2;",
+                &HashMap::new(),
+                &StreamOptions::new(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("42601"), "got: {err}");
+        assert!(
+            err.to_string().contains("single SQL statement"),
+            "got: {err}"
+        );
+        assert!(l.is_valid());
+    }
+
+    // 5. Mid-stream ErrorResponse drains Sync -> ReadyForQuery and reuses same connection
+    {
+        let mut l = pool.acquire().await.unwrap();
+        let mut cur = l
+            .open_stream("SELECT 10 / x", &HashMap::new(), &StreamOptions::new(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            l.next_stream_chunk(&mut cur)
+                .await
+                .unwrap()
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        let mid_err = l.next_stream_chunk(&mut cur).await.unwrap_err();
+        assert!(
+            mid_err.to_string().contains("division by zero"),
+            "got: {mid_err}"
+        );
+        assert!(cur.is_wire_clean());
+        assert!(l.is_valid());
+    }
+    assert_eq!(pool.idle_count(), 1);
+
+    // 6. Stale cached statement (26000) retries once on idle open_stream using cached query from #2
+    {
+        let mut l = pool.acquire().await.unwrap();
+        let mut cur = l
+            .open_stream(
+                "SELECT id FROM big",
+                &HashMap::new(),
+                &StreamOptions::new(1),
+            )
+            .await
+            .unwrap();
+        let s6c1 = l.next_stream_chunk(&mut cur).await.unwrap().unwrap();
+        assert_eq!(s6c1.rows[0][0], ResultValue::Int(77));
+        assert!(l.next_stream_chunk(&mut cur).await.unwrap().is_none());
+    }
+
+    // 7. Follow-up simple query on the exact same pooled connection succeeds
+    {
+        let mut l = pool.acquire().await.unwrap();
+        let ok = l.execute("SELECT 1 AS ok", &HashMap::new()).await.unwrap();
+        assert_eq!(ok.row_count(), 1);
+    }
+    assert_eq!(pool.metrics().connections_created, 1);
+
+    // Verify wire protocol tags for open_stream (Parse+Bind+Describe+Execute+Flush, NO Sync!)
+    // and Close('P') + Sync on exhaustion/close
+    {
+        let reqs = recorded_requests.lock();
+        let s1_open_tags: Vec<u8> = reqs[0].iter().map(|(t, _)| *t).collect();
+        assert_eq!(s1_open_tags, vec![b'P', b'B', b'D', b'E', b'H']);
+        assert!(!s1_open_tags.contains(&b'S'));
+        let s1_next_tags: Vec<u8> = reqs[1].iter().map(|(t, _)| *t).collect();
+        assert_eq!(s1_next_tags, vec![b'E', b'H']);
+        let s1_close_tags: Vec<u8> = reqs[2].iter().map(|(t, _)| *t).collect();
+        assert_eq!(s1_close_tags, vec![b'C', b'S']);
+        assert_eq!(reqs[2][0].1[0], b'P'); // Close target_type = 'P' (portal)
+
+        // Stream 6 first attempt skipped Parse (hit cache), then retried with Parse after Sync
+        let s6_hit_tags: Vec<u8> = reqs[12].iter().map(|(t, _)| *t).collect();
+        assert_eq!(s6_hit_tags, vec![b'B', b'D', b'E', b'H']);
+        let s6_sync_tags: Vec<u8> = reqs[13].iter().map(|(t, _)| *t).collect();
+        assert_eq!(s6_sync_tags, vec![b'S']);
+        let s6_retry_tags: Vec<u8> = reqs[14].iter().map(|(t, _)| *t).collect();
+        assert_eq!(s6_retry_tags, vec![b'P', b'B', b'D', b'E', b'H']);
+    }
+
+    pool.close().await;
+    server.await.unwrap();
+
+    // 8. Drop marks broken without blocking I/O AND prepared_statement_cache_size=0 uses unnamed ""
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_clone = accepted.clone();
+    let parse_names: Arc<parking_lot::Mutex<Vec<String>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let parse_names_clone = parse_names.clone();
+
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    let server2 = tokio::spawn(async move {
+        for conn_idx in 0..2 {
+            let (mut s, _) = listener2.accept().await.unwrap();
+            accepted_clone.fetch_add(1, Ordering::SeqCst);
+            let mut startup = [0u8; 512];
+            let _ = s.read(&mut startup).await.unwrap();
+            let mut auth_ok = BytesMut::new();
+            auth_ok.put_i32(0);
+            let mut hello = pg_frame(b'R', &auth_ok);
+            hello.extend_from_slice(&pg_frame(b'K', &[0; 8]));
+            hello.extend_from_slice(&pg_frame(b'Z', b"I"));
+            s.write_all(&hello).await.unwrap();
+            s.flush().await.unwrap();
+
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            for (tag, payload) in read_frontend_tags(&buf[..n]) {
+                if tag == b'P' {
+                    let nul = payload.iter().position(|&b| b == 0).unwrap();
+                    parse_names_clone
+                        .lock()
+                        .push(String::from_utf8_lossy(&payload[..nul]).into_owned());
+                }
+            }
+
+            if conn_idx == 0 {
+                let mut open_resp = Vec::new();
+                open_resp.extend_from_slice(&pg_frame(b'1', &[]));
+                open_resp.extend_from_slice(&pg_frame(b'2', &[]));
+                open_resp.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("id", 23, -1)])));
+                open_resp.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"1")])));
+                open_resp.extend_from_slice(&pg_frame(b's', &[]));
+                s.write_all(&open_resp).await.unwrap();
+                s.flush().await.unwrap();
+                // Client drops ResultStream without Close/Sync -> server observes EOF cleanly.
+                let mut eof_buf = [0u8; 64];
+                let eof_n = s.read(&mut eof_buf).await.unwrap();
+                assert_eq!(
+                    eof_n, 0,
+                    "Drop must close socket without sending wire bytes"
+                );
+            } else {
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("ok", 23, -1)])));
+                resp.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"2")])));
+                resp.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+                resp.extend_from_slice(&pg_frame(b'Z', b"I"));
+                s.write_all(&resp).await.unwrap();
+                s.flush().await.unwrap();
+            }
+        }
+    });
+
+    let uri2 = format!(
+        "postgresql://postgres@{addr2}/postgres?sslmode=disable&prepared_statement_cache_size=0"
+    );
+    let client2 = NativeClient::new(
+        &uri2,
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+    let mut dropped_stream = client2
+        .stream("SELECT id FROM t", &HashMap::new(), StreamOptions::new(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        dropped_stream
+            .next_chunk()
+            .await
+            .unwrap()
+            .unwrap()
+            .num_rows(),
+        1
+    );
+    drop(dropped_stream); // Synchronous Drop without close() -> marks broken & drops socket
+    assert_eq!(client2.pool().total_count(), 0);
+
+    // Next query opens replacement connection transparently
+    let res2 = client2
+        .execute_rows("SELECT 2 AS ok", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(res2.row_count(), 1);
+
+    client2.close().await;
+    server2.await.unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    assert_eq!(parse_names.lock().as_slice(), &[""]);
+}
+
+#[tokio::test]
+async fn test_pg_stream_tx_failfast_0a000_nodata_and_cancel() {
+    use bytes::BufMut;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, NetError, ParamValue, StreamOptions};
+
+    fn pg_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(msg_type);
+        out.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn rd_one(name: &str, oid: i32) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.put_i16(1);
+        payload.put_slice(name.as_bytes());
+        payload.put_u8(0);
+        payload.put_i32(0);
+        payload.put_i16(0);
+        payload.put_i32(oid);
+        payload.put_i16(-1);
+        payload.put_i32(-1);
+        payload.put_i16(0);
+        pg_frame(b'T', &payload)
+    }
+
+    fn dr_one(bytes: &[u8]) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.put_i16(1);
+        payload.put_i32(bytes.len() as i32);
+        payload.put_slice(bytes);
+        pg_frame(b'D', &payload)
+    }
+
+    fn error_frame(code: &str, message: &str) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.extend_from_slice(b"SERROR\0");
+        payload.put_u8(b'C');
+        payload.extend_from_slice(code.as_bytes());
+        payload.put_u8(0);
+        payload.put_u8(b'M');
+        payload.extend_from_slice(message.as_bytes());
+        payload.put_u8(0);
+        payload.put_u8(0);
+        pg_frame(b'E', &payload)
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        // Conn 1: 0A000 retry on idle, NoData DML, Tx1 (stream + early close + follow-up + COMMIT),
+        // Tx2 (mid-stream ErrorResponse -> ReadyForQuery('E') + ROLLBACK).
+        let (mut s1, _) = listener.accept().await.unwrap();
+        let mut startup = [0u8; 512];
+        let _ = s1.read(&mut startup).await.unwrap();
+        let mut auth_ok = BytesMut::new();
+        auth_ok.put_i32(0);
+        let mut hello = pg_frame(b'R', &auth_ok);
+        hello.extend_from_slice(&pg_frame(b'K', &[0; 8]));
+        hello.extend_from_slice(&pg_frame(b'Z', b"I"));
+        s1.write_all(&hello).await.unwrap();
+        s1.flush().await.unwrap();
+
+        let script: Vec<Vec<u8>> = vec![
+            // 1. Prime cache for "SELECT id FROM tbl WHERE id >= $1"
+            [
+                pg_frame(b'1', &[]),
+                pg_frame(b'2', &[]),
+                rd_one("id", 23),
+                dr_one(b"1"),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat(),
+            // 2. open_stream cache hit -> 0A000 -> Sync -> retry with Close(S)+Parse+Bind+Describe+Execute+Flush -> Close(P)+Sync
+            error_frame("0A000", "cached plan must not change result type"),
+            pg_frame(b'Z', b"I"),
+            [
+                pg_frame(b'3', &[]), // CloseComplete for stale statement
+                pg_frame(b'1', &[]),
+                pg_frame(b'2', &[]),
+                rd_one("id", 23),
+                dr_one(b"2"),
+                pg_frame(b'C', b"SELECT 1\0"),
+            ]
+            .concat(),
+            [pg_frame(b'3', &[]), pg_frame(b'Z', b"I")].concat(),
+            // 3. NoData DML stream ("INSERT INTO t VALUES (1)")
+            [
+                pg_frame(b'1', &[]),
+                pg_frame(b'2', &[]),
+                pg_frame(b'n', &[]), // NoData
+                pg_frame(b'C', b"INSERT 0 3\0"),
+            ]
+            .concat(),
+            [pg_frame(b'3', &[]), pg_frame(b'Z', b"I")].concat(),
+            // 4. Tx1: BEGIN; -> stream -> early close -> follow-up SELECT -> COMMIT;
+            [pg_frame(b'C', b"BEGIN\0"), pg_frame(b'Z', b"T")].concat(),
+            [
+                pg_frame(b'1', &[]),
+                pg_frame(b'2', &[]),
+                rd_one("x", 23),
+                dr_one(b"10"),
+                pg_frame(b's', &[]),
+            ]
+            .concat(),
+            [pg_frame(b'3', &[]), pg_frame(b'Z', b"T")].concat(),
+            [
+                rd_one("ok", 23),
+                dr_one(b"99"),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"T"),
+            ]
+            .concat(),
+            [pg_frame(b'C', b"COMMIT\0"), pg_frame(b'Z', b"I")].concat(),
+            // 5. Tx2: BEGIN; -> stream chunk 1 ok -> chunk 2 ErrorResponse -> Sync -> ReadyForQuery('E') -> ROLLBACK;
+            [pg_frame(b'C', b"BEGIN\0"), pg_frame(b'Z', b"T")].concat(),
+            [
+                pg_frame(b'1', &[]),
+                pg_frame(b'2', &[]),
+                rd_one("x", 23),
+                dr_one(b"1"),
+                pg_frame(b's', &[]),
+            ]
+            .concat(),
+            error_frame("22012", "division by zero"),
+            pg_frame(b'Z', b"E"),
+            [pg_frame(b'C', b"ROLLBACK\0"), pg_frame(b'Z', b"I")].concat(),
+        ];
+
+        for reply in script {
+            let mut buf = [0u8; 4096];
+            let n = s1.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            s1.write_all(&reply).await.unwrap();
+            s1.flush().await.unwrap();
+        }
+
+        // Conn 2: mid-flight timeout cancel on chunk 2 stalls forever, forcing replacement
+        let (mut s2, _) = listener.accept().await.unwrap();
+        let _ = s2.read(&mut startup).await.unwrap();
+        s2.write_all(&hello).await.unwrap();
+        s2.flush().await.unwrap();
+
+        let mut buf = [0u8; 4096];
+        let _ = s2.read(&mut buf).await.unwrap();
+        let chunk1 = [
+            pg_frame(b'1', &[]),
+            pg_frame(b'2', &[]),
+            rd_one("x", 23),
+            dr_one(b"1"),
+            pg_frame(b's', &[]),
+        ]
+        .concat();
+        s2.write_all(&chunk1).await.unwrap();
+        s2.flush().await.unwrap();
+
+        // Read Execute for chunk 2 and stall until client drops socket on timeout
+        let _ = s2.read(&mut buf).await.unwrap();
+        let mut eof_buf = [0u8; 16];
+        let _ = s2.read(&mut eof_buf).await;
+    });
+
+    let uri = format!("postgresql://postgres@{addr}/postgres?sslmode=disable");
+    let client = NativeClient::new(
+        &uri,
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+
+    let p = HashMap::from([("v".to_string(), ParamValue::Json(serde_json::json!(1)))]);
+    let _ = client
+        .execute_rows("SELECT id FROM tbl WHERE id >= $v", &p)
+        .await
+        .unwrap();
+
+    // 2. 0A000 retry on idle open_stream
+    let mut s_0a = client
+        .stream(
+            "SELECT id FROM tbl WHERE id >= $v",
+            &p,
+            StreamOptions::new(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s_0a.next_chunk().await.unwrap().unwrap().num_rows(), 1);
+    assert!(s_0a.next_chunk().await.unwrap().is_none());
+
+    // 3. NoData DML stream accumulates summary
+    let mut s_dml = client
+        .stream(
+            "INSERT INTO t VALUES (1)",
+            &HashMap::new(),
+            StreamOptions::new(10),
+        )
+        .await
+        .unwrap();
+    assert!(s_dml.columns().is_empty());
+    assert!(s_dml.next_chunk().await.unwrap().is_none());
+    assert_eq!(s_dml.summary().nodes_created, 3);
+
+    // 4. Tx1: fail-fast guard, early close, follow-up statement, COMMIT
+    let mut tx1 = client.begin_transaction().await.unwrap();
+    let mut cur1 = tx1
+        .open_stream_cursor("SELECT x FROM t", &HashMap::new(), &StreamOptions::new(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        tx1.execute_rows("SELECT 1", &HashMap::new()).await,
+        Err(NetError::TransactionError(ref m)) if m.contains("active stream")
+    ));
+    assert!(matches!(
+        tx1.commit().await,
+        Err(NetError::TransactionError(ref m)) if m.contains("active stream")
+    ));
+    assert_eq!(
+        tx1.next_stream_chunk(&mut cur1)
+            .await
+            .unwrap()
+            .unwrap()
+            .num_rows(),
+        1
+    );
+    tx1.close_stream_cursor(&mut cur1).await.unwrap();
+    let follow = tx1
+        .execute_rows("SELECT 99 AS ok", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(follow.row_count(), 1);
+    tx1.commit().await.unwrap();
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 5. Tx2: mid-stream ErrorResponse inside tx transitions to Failed, rollback reuses conn
+    let mut tx2 = client.begin_transaction().await.unwrap();
+    let mut cur2 = tx2
+        .open_stream_cursor("SELECT x FROM t", &HashMap::new(), &StreamOptions::new(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        tx2.next_stream_chunk(&mut cur2)
+            .await
+            .unwrap()
+            .unwrap()
+            .num_rows(),
+        1
+    );
+    let tx_err = tx2.next_stream_chunk(&mut cur2).await.unwrap_err();
+    assert!(tx_err.to_string().contains("division by zero"));
+    assert!(!tx2.has_open_stream());
+    tx2.rollback().await.unwrap();
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 6. Mid-flight tokio::time::timeout cancel marks cursor un-reusable and replaces socket
+    client.close().await;
+    let client2 = NativeClient::new(
+        &uri,
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+    let mut slow = client2
+        .stream("SELECT x FROM slow", &HashMap::new(), StreamOptions::new(1))
+        .await
+        .unwrap();
+    assert_eq!(slow.next_chunk().await.unwrap().unwrap().num_rows(), 1);
+    let cancelled = tokio::time::timeout(Duration::from_millis(20), slow.next_chunk()).await;
+    assert!(cancelled.is_err());
+    let close_after_cancel = slow.close().await.unwrap_err();
+    assert!(matches!(close_after_cancel, NetError::Closed(_)));
+    assert_eq!(client2.pool().total_count(), 0);
+
+    client2.close().await;
+    server.await.unwrap();
+}

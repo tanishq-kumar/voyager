@@ -11,6 +11,8 @@ use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
 use crate::native_transaction::NativeTransaction;
 use crate::pool::PooledConnection;
+#[cfg(feature = "postgres")]
+use crate::postgres::PostgresStreamCursor;
 use crate::value::arrow::{ColumnHint, values_to_record_batch_with_hints};
 use crate::value::result::ResultValue;
 
@@ -173,6 +175,9 @@ pub enum StreamCursor {
     /// Native Bolt v4+/v5+ `PULL` / `DISCARD` streaming cursor.
     #[cfg(feature = "bolt")]
     Bolt(BoltStreamCursor),
+    /// Native PostgreSQL / Apache AGE named-portal streaming cursor.
+    #[cfg(feature = "postgres")]
+    Postgres(PostgresStreamCursor),
     /// Client-side chunk slicer for protocols without wire cursors (FalkorDB, Bolt v3, Mock).
     Buffered(BufferedStreamCursor),
 }
@@ -193,6 +198,8 @@ impl StreamCursor {
         match self {
             #[cfg(feature = "bolt")]
             Self::Bolt(c) => c.is_wire_clean(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(c) => c.is_wire_clean(),
             Self::Buffered(_) => true,
         }
     }
@@ -202,6 +209,8 @@ impl StreamCursor {
         match self {
             #[cfg(feature = "bolt")]
             Self::Bolt(c) => c.is_finished(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(c) => c.is_finished(),
             Self::Buffered(c) => c.is_finished(),
         }
     }
@@ -211,6 +220,8 @@ impl StreamCursor {
         match self {
             #[cfg(feature = "bolt")]
             Self::Bolt(c) => c.columns(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(c) => c.columns(),
             Self::Buffered(c) => &c.columns,
         }
     }
@@ -220,6 +231,8 @@ impl StreamCursor {
         match self {
             #[cfg(feature = "bolt")]
             Self::Bolt(c) => c.column_hints(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(c) => c.column_hints(),
             Self::Buffered(c) => &c.column_hints,
         }
     }
@@ -229,6 +242,8 @@ impl StreamCursor {
         match self {
             #[cfg(feature = "bolt")]
             Self::Bolt(c) => c.summary(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(c) => c.summary(),
             Self::Buffered(c) => &c.summary,
         }
     }
@@ -239,6 +254,8 @@ impl StreamCursor {
             Self::Buffered(c) => c.next_chunk(),
             #[cfg(feature = "bolt")]
             Self::Bolt(_) => None,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => None,
         }
     }
 
@@ -248,6 +265,8 @@ impl StreamCursor {
             Self::Buffered(c) => c.close(),
             #[cfg(feature = "bolt")]
             Self::Bolt(_) => {}
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => {}
         }
     }
 }

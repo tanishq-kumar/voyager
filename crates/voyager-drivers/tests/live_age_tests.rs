@@ -483,3 +483,225 @@ async fn test_live_age_execute_rows_and_arrow_equivalence() {
         .await;
     client.close().await;
 }
+
+#[tokio::test]
+async fn test_live_age_stream_lifecycle_early_close_tx_and_hints() {
+    if get_age_connection().await.is_none() {
+        return;
+    }
+
+    use std::time::Duration;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::value::result::ResultValue;
+    use voyager_drivers::{NativeClient, NetError, ParamValue, StreamOptions};
+
+    let client = NativeClient::new(
+        AGE_URI,
+        Some(
+            PoolConfig::new()
+                .with_min_idle(0)
+                .with_max_size(1)
+                .with_acquire_timeout(Duration::from_secs(5)),
+        ),
+    )
+    .unwrap();
+
+    let graph_name = "zz_stage4_458_age";
+    let _ = client
+        .execute_rows(
+            &format!("SELECT * FROM ag_catalog.drop_graph('{graph_name}', true);"),
+            &HashMap::new(),
+        )
+        .await;
+    client
+        .execute_rows(
+            &format!("SELECT * FROM ag_catalog.create_graph('{graph_name}');"),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    client
+        .execute_rows(
+            &format!(
+                "SELECT * FROM cypher('{graph_name}', $$ UNWIND range(1, 250) AS i CREATE (:Person {{idx: i, name: 'P' + toString(i)}}) $$) as (v agtype);"
+            ),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    async fn fetch_pid(c: &NativeClient) -> i64 {
+        let res = c
+            .execute_rows("SELECT pg_backend_pid() AS pid", &HashMap::new())
+            .await
+            .unwrap();
+        match res.result_rows.as_ref().unwrap()[0][0] {
+            ResultValue::Int(pid) => pid,
+            ref other => panic!("expected Int backend_pid, got {other:?}"),
+        }
+    }
+    let initial_pid = fetch_pid(&client).await;
+
+    // 1. Multi-chunk AGE stream matches execute_rows().to_record_batch() schema/hints
+    let q_vertices = format!(
+        "SELECT * FROM cypher('{graph_name}', $$ MATCH (p:Person) RETURN p.idx, p ORDER BY p.idx $$) as (idx agtype, p agtype);"
+    );
+    let expected_batch = client
+        .execute_rows(&q_vertices, &HashMap::new())
+        .await
+        .unwrap()
+        .to_record_batch()
+        .unwrap()
+        .unwrap();
+
+    let mut full_stream = client
+        .stream(&q_vertices, &HashMap::new(), StreamOptions::new(100))
+        .await
+        .unwrap();
+    assert!(full_stream.is_server_streaming());
+    assert_eq!(full_stream.columns(), &["idx".to_string(), "p".to_string()]);
+    let mut chunk_sizes = Vec::new();
+    while let Some(chunk) = full_stream.next_chunk().await.unwrap() {
+        chunk_sizes.push(chunk.num_rows());
+        let batch = chunk.to_record_batch().unwrap();
+        assert_eq!(batch.schema(), expected_batch.schema());
+        assert!(matches!(chunk.rows[0][1], ResultValue::Node(_)));
+    }
+    assert_eq!(chunk_sizes, vec![100, 100, 50]);
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 2. Early close on parameterized AGE %s stream reuses same backend_pid
+    let q_param = format!(
+        "SELECT * FROM cypher('{graph_name}', $$ MATCH (p:Person) WHERE p.idx >= $min_idx RETURN p $$ , %s) as (p agtype);"
+    );
+    let params = HashMap::from([(
+        "min_idx".to_string(),
+        ParamValue::Json(serde_json::json!(1)),
+    )]);
+    let mut early_stream = client
+        .stream(&q_param, &params, StreamOptions::new(50))
+        .await
+        .unwrap();
+    let c1 = early_stream.next_chunk().await.unwrap().unwrap();
+    assert_eq!(c1.num_rows(), 50);
+    early_stream.close().await.unwrap();
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 3. Explicit transaction AGE stream + fail-fast + follow-up + COMMIT
+    let mut tx = client.begin_transaction().await.unwrap();
+    let mut cursor = tx
+        .open_stream_cursor(&q_param, &params, &StreamOptions::new(50))
+        .await
+        .unwrap();
+    let err_concurrent = tx
+        .execute_rows("SELECT 1 AS ok", &HashMap::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_concurrent, NetError::TransactionError(ref m) if m.contains("active stream"))
+    );
+    let tx_c1 = tx.next_stream_chunk(&mut cursor).await.unwrap().unwrap();
+    assert_eq!(tx_c1.num_rows(), 50);
+    tx.close_stream_cursor(&mut cursor).await.unwrap();
+    let follow = tx
+        .execute_rows(
+            &format!(
+                "SELECT * FROM cypher('{graph_name}', $$ MATCH (p:Person) WHERE p.idx = 1 RETURN p.name $$) as (name agtype);"
+            ),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(follow.row_count(), 1);
+    tx.commit().await.unwrap();
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    let _ = client
+        .execute_rows(
+            &format!("SELECT * FROM ag_catalog.drop_graph('{graph_name}', true);"),
+            &HashMap::new(),
+        )
+        .await;
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_live_age_stream_ttfb_1k_vs_100k() {
+    if get_age_connection().await.is_none() {
+        return;
+    }
+
+    use std::time::Instant;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    let client = NativeClient::new(AGE_URI, None).unwrap();
+    client.ping().await.unwrap();
+
+    let graph_name = "zz_stage4_458_age_ttfb";
+    let _ = client
+        .execute_rows(
+            &format!("SELECT * FROM ag_catalog.drop_graph('{graph_name}', true);"),
+            &HashMap::new(),
+        )
+        .await;
+    client
+        .execute_rows(
+            &format!("SELECT * FROM ag_catalog.create_graph('{graph_name}');"),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let q_1k = format!(
+        "SELECT * FROM cypher('{graph_name}', $$ UNWIND range(1, 1000) AS i RETURN i $$) as (i agtype);"
+    );
+    let t0_1k = Instant::now();
+    let mut s_1k = client
+        .stream(&q_1k, &HashMap::new(), StreamOptions::new(1_000))
+        .await
+        .unwrap();
+    let first_1k = s_1k.next_chunk().await.unwrap().unwrap();
+    let ttfb_1k = t0_1k.elapsed();
+    assert_eq!(first_1k.num_rows(), 1_000);
+    while s_1k.next_chunk().await.unwrap().is_some() {}
+
+    let q_100k = format!(
+        "SELECT * FROM cypher('{graph_name}', $$ UNWIND range(1, 100000) AS i RETURN i $$) as (i agtype);"
+    );
+    let t0_100k = Instant::now();
+    let mut s_100k = client
+        .stream(&q_100k, &HashMap::new(), StreamOptions::new(1_000))
+        .await
+        .unwrap();
+    let first_100k = s_100k.next_chunk().await.unwrap().unwrap();
+    let ttfb_100k = t0_100k.elapsed();
+    assert_eq!(first_100k.num_rows(), 1_000);
+    let mut total_100k = first_100k.num_rows();
+    while let Some(c) = s_100k.next_chunk().await.unwrap() {
+        total_100k += c.num_rows();
+    }
+    let ttlb_100k = t0_100k.elapsed();
+    assert_eq!(total_100k, 100_000);
+
+    eprintln!(
+        "[age stream] ttfb_1k={:?}, ttfb_100k={:?}, ttlb_100k={:?}",
+        ttfb_1k, ttfb_100k, ttlb_100k
+    );
+    assert!(
+        ttfb_100k.as_secs_f64() < ttlb_100k.as_secs_f64() * 0.25,
+        "100k AGE TTFB {:?} was not well below TTLB {:?}",
+        ttfb_100k,
+        ttlb_100k
+    );
+
+    let _ = client
+        .execute_rows(
+            &format!("SELECT * FROM ag_catalog.drop_graph('{graph_name}', true);"),
+            &HashMap::new(),
+        )
+        .await;
+    client.close().await;
+}

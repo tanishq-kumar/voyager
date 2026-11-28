@@ -61,10 +61,10 @@ pub use pool::{ConnectionPool, PoolMetricsSnapshot, PooledConnection};
 #[cfg(feature = "postgres")]
 pub use postgres::{
     AgeEdge, AgePath, AgeValue, AgeVertex, AuthenticationRequest, BackendMessage, FieldDescription,
-    FrontendMessage, PgDiagnostic, PostgresConnection, PostgresTransaction, ScramClient,
-    StartupMessage, TransactionStatus, age_value_to_arrow_json, age_value_to_canonical_json,
-    clean_agtype_string, compute_md5_password, parse_agtype, rows_to_record_batch,
-    rows_to_record_batch_with_age_columns,
+    FrontendMessage, PgDiagnostic, PostgresConnection, PostgresStreamCursor, PostgresTransaction,
+    ScramClient, StartupMessage, TransactionStatus, age_value_to_arrow_json,
+    age_value_to_canonical_json, clean_agtype_string, compute_md5_password, parse_agtype,
+    rows_to_record_batch, rows_to_record_batch_with_age_columns,
 };
 #[cfg(feature = "redis")]
 pub use redis::{

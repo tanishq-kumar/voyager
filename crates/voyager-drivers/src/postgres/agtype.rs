@@ -3,6 +3,7 @@
 use arrow_array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::bolt::packstream::{
     BoltDate, BoltDateTime, BoltDuration, BoltLocalDateTime, BoltLocalTime, BoltTime, ymd_to_days,
@@ -1758,12 +1759,24 @@ impl From<AgeValue> for ResultValue {
     }
 }
 
-fn pg_oid_column_hint(oid: i32, typmod: Option<i32>) -> Option<ColumnHint> {
+fn pg_numeric_typmod_is_fixed(typmod: Option<i32>) -> bool {
+    typmod.is_some_and(|t| t >= 4 && ((t - 4) & 0xffff) as i16 >= 0)
+}
+
+fn pg_oid_column_hint_with_mode(
+    oid: i32,
+    typmod: Option<i32>,
+    streaming: bool,
+) -> Option<ColumnHint> {
     match oid {
         16 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Bool)),
         20 | 21 | 23 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Int)),
         700 | 701 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Float)),
-        1700 => Some(ColumnHint::PgDecimal { typmod }),
+        1700 => Some(if streaming && !pg_numeric_typmod_is_fixed(typmod) {
+            ColumnHint::PgDecimalText
+        } else {
+            ColumnHint::PgDecimal { typmod }
+        }),
         2950 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Uuid)),
         17 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Bytes)),
         1082 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Date)),
@@ -1776,6 +1789,10 @@ fn pg_oid_column_hint(oid: i32, typmod: Option<i32>) -> Option<ColumnHint> {
         19 | 25 | 869 | 1042 | 1043 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Str)),
         _ => None,
     }
+}
+
+fn pg_oid_column_hint(oid: i32, typmod: Option<i32>) -> Option<ColumnHint> {
+    pg_oid_column_hint_with_mode(oid, typmod, false)
 }
 
 fn decode_pg_scalar_cell(raw: &str, oid: i32, field_name: &str) -> Result<Option<ResultValue>> {
@@ -2018,6 +2035,7 @@ fn clean_agtype_cow(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+#[derive(Debug)]
 enum PgColumnDecoder {
     Age,
     Array {
@@ -2039,6 +2057,7 @@ enum PgColumnDecoder {
     },
 }
 
+#[derive(Debug)]
 enum PgDecodedStorage {
     Rows(Vec<Vec<ResultValue>>),
     Columns(Vec<Vec<ResultValue>>),
@@ -2046,9 +2065,14 @@ enum PgDecodedStorage {
 
 /// Streaming PostgreSQL `DataRow` decoder targeting [`ResultValue`] directly
 /// from `&[u8]` slices without per-cell `String` allocations.
+#[derive(Debug)]
 pub(crate) struct PgRowDecoder {
     mode: ResultMode,
+    streaming: bool,
     columns: Vec<String>,
+    cached_columns: Arc<[String]>,
+    cached_hints: Arc<[ColumnHint]>,
+    has_dynamic_hints: bool,
     col_decoders: Vec<PgColumnDecoder>,
     storage: PgDecodedStorage,
 }
@@ -2061,10 +2085,35 @@ impl PgRowDecoder {
         };
         Self {
             mode,
+            streaming: false,
             columns: Vec::new(),
+            cached_columns: Arc::from(Vec::new()),
+            cached_hints: Arc::from(Vec::new()),
+            has_dynamic_hints: false,
             col_decoders: Vec::new(),
             storage,
         }
+    }
+
+    pub(crate) fn new_stream() -> Self {
+        Self {
+            mode: ResultMode::Rows,
+            streaming: true,
+            columns: Vec::new(),
+            cached_columns: Arc::from(Vec::new()),
+            cached_hints: Arc::from(Vec::new()),
+            has_dynamic_hints: false,
+            col_decoders: Vec::new(),
+            storage: PgDecodedStorage::Rows(Vec::new()),
+        }
+    }
+
+    pub(crate) fn columns_arc(&self) -> Arc<[String]> {
+        self.cached_columns.clone()
+    }
+
+    pub(crate) fn column_hints_arc(&self) -> Arc<[ColumnHint]> {
+        self.cached_hints.clone()
     }
 
     pub(crate) fn set_schema(
@@ -2077,15 +2126,25 @@ impl PgRowDecoder {
         let num_cols = columns.len();
         self.col_decoders.clear();
         self.col_decoders.reserve(num_cols);
+        let mut base_hints = Vec::with_capacity(num_cols);
+        let mut has_dynamic = false;
 
         for col_idx in 0..num_cols {
             if age_columns.get(col_idx).copied().unwrap_or(false) {
                 self.col_decoders.push(PgColumnDecoder::Age);
+                base_hints.push(ColumnHint::Age);
                 continue;
             }
             if let Some(&oid) = field_types.get(col_idx) {
                 let typmod = field_type_modifiers.get(col_idx).copied();
                 if let Some(elem_oid) = pg_array_element_oid(oid) {
+                    has_dynamic = true;
+                    let elem_hint = pg_oid_column_hint_with_mode(elem_oid, typmod, self.streaming)
+                        .unwrap_or(ColumnHint::PgEmptyTyped(EmptyColumnKind::Str));
+                    base_hints.push(ColumnHint::PgArray {
+                        depth: 1,
+                        elem_hint: Box::new(elem_hint),
+                    });
                     self.col_decoders.push(PgColumnDecoder::Array {
                         elem_oid,
                         typmod,
@@ -2094,12 +2153,15 @@ impl PgRowDecoder {
                     });
                     continue;
                 }
-                if let Some(hint) = pg_oid_column_hint(oid, typmod) {
+                if let Some(hint) = pg_oid_column_hint_with_mode(oid, typmod, self.streaming) {
+                    base_hints.push(hint.clone());
                     self.col_decoders
                         .push(PgColumnDecoder::TypedScalar { oid, hint });
                     continue;
                 }
             }
+            has_dynamic = true;
+            base_hints.push(ColumnHint::Auto);
             self.col_decoders.push(PgColumnDecoder::Untyped {
                 raw_cells: Vec::new(),
                 has_non_null: false,
@@ -2109,6 +2171,9 @@ impl PgRowDecoder {
             });
         }
 
+        self.cached_columns = Arc::from(columns.as_slice());
+        self.cached_hints = Arc::from(base_hints);
+        self.has_dynamic_hints = has_dynamic;
         self.columns = columns;
         if self.mode == ResultMode::Arrow {
             self.storage = PgDecodedStorage::Columns(vec![Vec::new(); num_cols]);
@@ -2219,6 +2284,71 @@ impl PgRowDecoder {
         Ok(())
     }
 
+    pub(crate) fn take_chunk(&mut self) -> Option<crate::stream::ResultChunk> {
+        let PgDecodedStorage::Rows(ref mut rows_buf) = self.storage else {
+            return None;
+        };
+        if rows_buf.is_empty() {
+            return None;
+        }
+        let mut rows = std::mem::take(rows_buf);
+        if !self.has_dynamic_hints {
+            return Some(crate::stream::ResultChunk::new(
+                self.cached_columns.clone(),
+                rows,
+                self.cached_hints.clone(),
+            ));
+        }
+
+        let num_cols = self.columns.len();
+        let mut column_hints = Vec::with_capacity(num_cols);
+        for (col_idx, decoder) in self.col_decoders.iter_mut().enumerate() {
+            let hint =
+                resolve_decoder_hint_and_untyped(col_idx, decoder, self.streaming, &mut rows, None);
+            column_hints.push(hint);
+        }
+        Some(crate::stream::ResultChunk::new(
+            self.cached_columns.clone(),
+            rows,
+            Arc::from(column_hints),
+        ))
+    }
+
+    pub(crate) fn discard_partial_chunk(&mut self) {
+        match &mut self.storage {
+            PgDecodedStorage::Rows(rows) => rows.clear(),
+            PgDecodedStorage::Columns(cols) => {
+                for col in cols {
+                    col.clear();
+                }
+            }
+        }
+        for decoder in &mut self.col_decoders {
+            match decoder {
+                PgColumnDecoder::Array {
+                    depth, mixed_depth, ..
+                } => {
+                    *depth = None;
+                    *mixed_depth = false;
+                }
+                PgColumnDecoder::Untyped {
+                    raw_cells,
+                    has_non_null,
+                    can_be_int,
+                    can_be_float,
+                    can_be_bool,
+                } => {
+                    raw_cells.clear();
+                    *has_non_null = false;
+                    *can_be_int = true;
+                    *can_be_float = true;
+                    *can_be_bool = true;
+                }
+                PgColumnDecoder::Age | PgColumnDecoder::TypedScalar { .. } => {}
+            }
+        }
+    }
+
     pub(crate) fn finish(mut self, summary: QuerySummary) -> Result<QueryResult> {
         if self.columns.is_empty() {
             return Ok(match self.mode {
@@ -2233,66 +2363,19 @@ impl PgRowDecoder {
         let mut column_hints = Vec::with_capacity(num_cols);
 
         for (col_idx, decoder) in self.col_decoders.iter_mut().enumerate() {
-            let hint = match decoder {
-                PgColumnDecoder::Age => ColumnHint::Age,
-                PgColumnDecoder::Array {
-                    elem_oid,
-                    typmod,
-                    depth,
-                    mixed_depth,
-                } => {
-                    if *mixed_depth {
-                        let meta_type = match *elem_oid {
-                            1700 => Some(META_TYPE_DECIMAL),
-                            2950 => Some(META_TYPE_UUID),
-                            _ => None,
-                        };
-                        ColumnHint::PgMixedArray { meta_type }
-                    } else {
-                        let elem_hint = pg_oid_column_hint(*elem_oid, *typmod)
-                            .unwrap_or(ColumnHint::PgEmptyTyped(EmptyColumnKind::Str));
-                        ColumnHint::PgArray {
-                            depth: depth.unwrap_or(1),
-                            elem_hint: Box::new(elem_hint),
-                        }
-                    }
+            let hint = match &mut self.storage {
+                PgDecodedStorage::Rows(rows) => {
+                    resolve_decoder_hint_and_untyped(col_idx, decoder, self.streaming, rows, None)
                 }
-                PgColumnDecoder::TypedScalar { hint, .. } => hint.clone(),
-                PgColumnDecoder::Untyped {
-                    raw_cells,
-                    has_non_null,
-                    can_be_int,
-                    can_be_float,
-                    can_be_bool,
-                } => {
-                    let cells = std::mem::take(raw_cells);
-                    match &mut self.storage {
-                        PgDecodedStorage::Rows(rows) => {
-                            for (row_idx, bytes_opt) in cells.into_iter().enumerate() {
-                                rows[row_idx][col_idx] = resolve_untyped_cell(
-                                    bytes_opt.as_deref(),
-                                    *has_non_null,
-                                    *can_be_int,
-                                    *can_be_float,
-                                    *can_be_bool,
-                                );
-                            }
-                        }
-                        PgDecodedStorage::Columns(cols) => {
-                            let mut resolved = Vec::with_capacity(cells.len());
-                            for bytes_opt in cells {
-                                resolved.push(resolve_untyped_cell(
-                                    bytes_opt.as_deref(),
-                                    *has_non_null,
-                                    *can_be_int,
-                                    *can_be_float,
-                                    *can_be_bool,
-                                ));
-                            }
-                            cols[col_idx] = resolved;
-                        }
-                    }
-                    ColumnHint::Auto
+                PgDecodedStorage::Columns(cols) => {
+                    let mut empty_rows = Vec::new();
+                    resolve_decoder_hint_and_untyped(
+                        col_idx,
+                        decoder,
+                        self.streaming,
+                        &mut empty_rows,
+                        Some(&mut cols[col_idx]),
+                    )
                 }
             };
             column_hints.push(hint);
@@ -2333,6 +2416,81 @@ impl PgRowDecoder {
                 };
                 Ok(QueryResult::new(self.columns, batches, summary))
             }
+        }
+    }
+}
+
+fn resolve_decoder_hint_and_untyped(
+    col_idx: usize,
+    decoder: &mut PgColumnDecoder,
+    streaming: bool,
+    rows: &mut [Vec<ResultValue>],
+    arrow_col: Option<&mut Vec<ResultValue>>,
+) -> ColumnHint {
+    match decoder {
+        PgColumnDecoder::Age => ColumnHint::Age,
+        PgColumnDecoder::Array {
+            elem_oid,
+            typmod,
+            depth,
+            mixed_depth,
+        } => {
+            let chunk_depth = depth.take().unwrap_or(1);
+            let is_mixed = std::mem::take(mixed_depth);
+            if is_mixed {
+                let meta_type = match *elem_oid {
+                    1700 => Some(META_TYPE_DECIMAL),
+                    2950 => Some(META_TYPE_UUID),
+                    _ => None,
+                };
+                ColumnHint::PgMixedArray { meta_type }
+            } else {
+                let elem_hint = pg_oid_column_hint_with_mode(*elem_oid, *typmod, streaming)
+                    .unwrap_or(ColumnHint::PgEmptyTyped(EmptyColumnKind::Str));
+                ColumnHint::PgArray {
+                    depth: chunk_depth,
+                    elem_hint: Box::new(elem_hint),
+                }
+            }
+        }
+        PgColumnDecoder::TypedScalar { hint, .. } => hint.clone(),
+        PgColumnDecoder::Untyped {
+            raw_cells,
+            has_non_null,
+            can_be_int,
+            can_be_float,
+            can_be_bool,
+        } => {
+            let cells = std::mem::take(raw_cells);
+            let non_null = std::mem::take(has_non_null);
+            let is_int = std::mem::replace(can_be_int, true);
+            let is_float = std::mem::replace(can_be_float, true);
+            let is_bool = std::mem::replace(can_be_bool, true);
+
+            if let Some(col_vec) = arrow_col {
+                let mut resolved = Vec::with_capacity(cells.len());
+                for bytes_opt in cells {
+                    resolved.push(resolve_untyped_cell(
+                        bytes_opt.as_deref(),
+                        non_null,
+                        is_int,
+                        is_float,
+                        is_bool,
+                    ));
+                }
+                *col_vec = resolved;
+            } else {
+                for (row_idx, bytes_opt) in cells.into_iter().enumerate() {
+                    rows[row_idx][col_idx] = resolve_untyped_cell(
+                        bytes_opt.as_deref(),
+                        non_null,
+                        is_int,
+                        is_float,
+                        is_bool,
+                    );
+                }
+            }
+            ColumnHint::Auto
         }
     }
 }

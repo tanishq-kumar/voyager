@@ -598,6 +598,8 @@ pub enum BackendMessage {
     DataRow(Vec<Option<Bytes>>),
     /// SQL command execution complete (`'C'`).
     CommandComplete(String),
+    /// Named portal execution suspended after `max_rows` (`'s'`).
+    PortalSuspended,
     /// Server error response (`'E'`).
     ErrorResponse(PgDiagnostic),
     /// Server notice / warning response (`'N'`).
@@ -802,6 +804,7 @@ impl BackendMessage {
                 let tag = read_cstring(&mut payload)?;
                 Ok(Self::CommandComplete(tag))
             }
+            b's' => Ok(Self::PortalSuspended),
             b'E' => {
                 let diagnostic = decode_diagnostic(&mut payload)?;
                 Ok(Self::ErrorResponse(diagnostic))
