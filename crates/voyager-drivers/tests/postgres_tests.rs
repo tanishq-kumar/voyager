@@ -1436,13 +1436,18 @@ async fn test_pg_stream_portal_suspended_early_close_errors_and_hints() {
     close_ok.extend_from_slice(&pg_frame(b'3', &[])); // CloseComplete
     close_ok.extend_from_slice(&pg_frame(b'Z', b"I")); // ReadyForQuery
 
-    // Stream 2 (early close after chunk 1): Bind + Describe + Execute + Flush -> chunk 1
+    // Stream 2 (early close after chunk 1): Bind + Describe + Execute + Flush -> chunk 1,
+    // which prefetches chunk 2 ([E, H]); close() drains chunk 2 then sends Close(P) + Sync.
     let mut s2_chunk1 = Vec::new();
     s2_chunk1.extend_from_slice(&pg_frame(b'1', &[]));
     s2_chunk1.extend_from_slice(&pg_frame(b'2', &[]));
     s2_chunk1.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("id", 23, -1)])));
     s2_chunk1.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"10")])));
     s2_chunk1.extend_from_slice(&pg_frame(b's', &[]));
+
+    let mut s2_prefetched_chunk2 = Vec::new();
+    s2_prefetched_chunk2.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"11")])));
+    s2_prefetched_chunk2.extend_from_slice(&pg_frame(b's', &[]));
 
     // Stream 3 (close before chunk 1): open returns RowDescription while Execute returns PortalSuspended
     let mut s3_open_and_inflight = Vec::new();
@@ -1499,6 +1504,7 @@ async fn test_pg_stream_portal_suspended_early_close_errors_and_hints() {
         s1_chunk2,
         close_ok.clone(),
         s2_chunk1,
+        s2_prefetched_chunk2,
         close_ok.clone(),
         s3_open_and_inflight,
         close_ok.clone(),
@@ -1774,11 +1780,11 @@ async fn test_pg_stream_portal_suspended_early_close_errors_and_hints() {
         assert_eq!(reqs[2][0].1[0], b'P'); // Close target_type = 'P' (portal)
 
         // Stream 6 first attempt skipped Parse (hit cache), then retried with Parse after Sync
-        let s6_hit_tags: Vec<u8> = reqs[12].iter().map(|(t, _)| *t).collect();
+        let s6_hit_tags: Vec<u8> = reqs[13].iter().map(|(t, _)| *t).collect();
         assert_eq!(s6_hit_tags, vec![b'B', b'D', b'E', b'H']);
-        let s6_sync_tags: Vec<u8> = reqs[13].iter().map(|(t, _)| *t).collect();
+        let s6_sync_tags: Vec<u8> = reqs[14].iter().map(|(t, _)| *t).collect();
         assert_eq!(s6_sync_tags, vec![b'S']);
-        let s6_retry_tags: Vec<u8> = reqs[14].iter().map(|(t, _)| *t).collect();
+        let s6_retry_tags: Vec<u8> = reqs[15].iter().map(|(t, _)| *t).collect();
         assert_eq!(s6_retry_tags, vec![b'P', b'B', b'D', b'E', b'H']);
     }
 
@@ -1828,12 +1834,20 @@ async fn test_pg_stream_portal_suspended_early_close_errors_and_hints() {
                 open_resp.extend_from_slice(&pg_frame(b's', &[]));
                 s.write_all(&open_resp).await.unwrap();
                 s.flush().await.unwrap();
-                // Client drops ResultStream without Close/Sync -> server observes EOF cleanly.
+                // Chunk 1 prefetches Execute+Flush before returning; then Drop closes socket
+                // without sending Close/Sync, so the server observes [E, H] followed by EOF.
+                let mut pf_buf = [0u8; 64];
+                let pf_n = s.read(&mut pf_buf).await.unwrap();
+                let pf_tags: Vec<u8> = read_frontend_tags(&pf_buf[..pf_n])
+                    .into_iter()
+                    .map(|(t, _)| t)
+                    .collect();
+                assert_eq!(pf_tags, vec![b'E', b'H']);
                 let mut eof_buf = [0u8; 64];
                 let eof_n = s.read(&mut eof_buf).await.unwrap();
                 assert_eq!(
                     eof_n, 0,
-                    "Drop must close socket without sending wire bytes"
+                    "Drop must close socket without sending Close/Sync bytes"
                 );
             } else {
                 let mut resp = Vec::new();
@@ -1984,7 +1998,7 @@ async fn test_pg_stream_tx_failfast_0a000_nodata_and_cancel() {
             ]
             .concat(),
             [pg_frame(b'3', &[]), pg_frame(b'Z', b"I")].concat(),
-            // 4. Tx1: BEGIN; -> stream -> early close -> follow-up SELECT -> COMMIT;
+            // 4. Tx1: BEGIN; -> stream -> prefetch chunk 2 -> early close -> follow-up SELECT -> COMMIT;
             [pg_frame(b'C', b"BEGIN\0"), pg_frame(b'Z', b"T")].concat(),
             [
                 pg_frame(b'1', &[]),
@@ -1994,6 +2008,7 @@ async fn test_pg_stream_tx_failfast_0a000_nodata_and_cancel() {
                 pg_frame(b's', &[]),
             ]
             .concat(),
+            [dr_one(b"11"), pg_frame(b's', &[])].concat(),
             [pg_frame(b'3', &[]), pg_frame(b'Z', b"T")].concat(),
             [
                 rd_one("ok", 23),
@@ -2159,5 +2174,228 @@ async fn test_pg_stream_tx_failfast_0a000_nodata_and_cancel() {
     assert_eq!(client2.pool().total_count(), 0);
 
     client2.close().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_pg_stream_prefetch_early_close_and_drop() {
+    use bytes::{BufMut, BytesMut};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    fn pg_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(tag);
+        out.extend_from_slice(&(4 + payload.len() as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn rd_one(name: &str, oid: i32) -> Vec<u8> {
+        let mut p = BytesMut::new();
+        p.put_i16(1);
+        p.extend_from_slice(name.as_bytes());
+        p.put_u8(0);
+        p.put_i32(0);
+        p.put_i16(0);
+        p.put_i32(oid);
+        p.put_i16(4);
+        p.put_i32(-1);
+        p.put_i16(0);
+        pg_frame(b'T', &p)
+    }
+
+    fn dr_one(val: &[u8]) -> Vec<u8> {
+        let mut p = BytesMut::new();
+        p.put_i16(1);
+        p.put_i32(val.len() as i32);
+        p.extend_from_slice(val);
+        pg_frame(b'D', &p)
+    }
+
+    fn read_frontend_tags(mut slice: &[u8]) -> Vec<u8> {
+        let mut tags = Vec::new();
+        while slice.len() >= 5 {
+            let tag = slice[0];
+            let len = i32::from_be_bytes([slice[1], slice[2], slice[3], slice[4]]) as usize;
+            if len < 4 || slice.len() < 1 + len {
+                break;
+            }
+            tags.push(tag);
+            slice = &slice[1 + len..];
+        }
+        tags
+    }
+
+    let close_count = Arc::new(AtomicUsize::new(0));
+    let close_count_srv = close_count.clone();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_srv = accepted.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        // Conn 1: prefetch + early close -> follow-up query -> prefetch + Drop (EOF)
+        {
+            let (mut s, _) = listener.accept().await.unwrap();
+            accepted_srv.fetch_add(1, Ordering::SeqCst);
+            let mut startup = [0u8; 512];
+            let _ = s.read(&mut startup).await.unwrap();
+            let mut auth_ok = BytesMut::new();
+            auth_ok.put_i32(0);
+            let mut hello = pg_frame(b'R', &auth_ok);
+            hello.extend_from_slice(&pg_frame(b'K', &[0; 8]));
+            hello.extend_from_slice(&pg_frame(b'Z', b"I"));
+            s.write_all(&hello).await.unwrap();
+            s.flush().await.unwrap();
+
+            let mut buf = [0u8; 4096];
+            // 1. open_stream [P, B, D, E, H]
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(
+                read_frontend_tags(&buf[..n]),
+                vec![b'P', b'B', b'D', b'E', b'H']
+            );
+            let chunk1 = [
+                pg_frame(b'1', &[]),
+                pg_frame(b'2', &[]),
+                rd_one("g", 23),
+                dr_one(b"1"),
+                pg_frame(b's', &[]),
+            ]
+            .concat();
+            s.write_all(&chunk1).await.unwrap();
+            s.flush().await.unwrap();
+
+            // 2. prefetched [E, H] sent before chunk 1 returned
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(read_frontend_tags(&buf[..n]), vec![b'E', b'H']);
+            let chunk2 = [dr_one(b"2"), pg_frame(b's', &[])].concat();
+            s.write_all(&chunk2).await.unwrap();
+            s.flush().await.unwrap();
+
+            // 3. close() drains chunk 2 then sends [C('P'), S]
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(read_frontend_tags(&buf[..n]), vec![b'C', b'S']);
+            close_count_srv.fetch_add(1, Ordering::SeqCst);
+            let close_ok = [pg_frame(b'3', &[]), pg_frame(b'Z', b"I")].concat();
+            s.write_all(&close_ok).await.unwrap();
+            s.flush().await.unwrap();
+
+            // 4. follow-up query reuses conn 1
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(read_frontend_tags(&buf[..n]), vec![b'Q']);
+            let ok = [
+                rd_one("ok", 23),
+                dr_one(b"1"),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat();
+            s.write_all(&ok).await.unwrap();
+            s.flush().await.unwrap();
+
+            // 5. second stream (cache hit [B, D, E, H]) -> chunk 1 -> prefetch [E, H] -> Drop (EOF)
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(read_frontend_tags(&buf[..n]), vec![b'B', b'D', b'E', b'H']);
+            let s2_c1 = [
+                pg_frame(b'2', &[]),
+                rd_one("g", 23),
+                dr_one(b"10"),
+                pg_frame(b's', &[]),
+            ]
+            .concat();
+            s.write_all(&s2_c1).await.unwrap();
+            s.flush().await.unwrap();
+
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(read_frontend_tags(&buf[..n]), vec![b'E', b'H']);
+            let eof = s.read(&mut buf).await.unwrap();
+            assert_eq!(eof, 0, "Drop must close socket without Close/Sync");
+        }
+
+        // Conn 2: follow-up query after Drop opens a new connection
+        {
+            let (mut s, _) = listener.accept().await.unwrap();
+            accepted_srv.fetch_add(1, Ordering::SeqCst);
+            let mut startup = [0u8; 512];
+            let _ = s.read(&mut startup).await.unwrap();
+            let mut auth_ok = BytesMut::new();
+            auth_ok.put_i32(0);
+            let mut hello = pg_frame(b'R', &auth_ok);
+            hello.extend_from_slice(&pg_frame(b'K', &[0; 8]));
+            hello.extend_from_slice(&pg_frame(b'Z', b"I"));
+            s.write_all(&hello).await.unwrap();
+            s.flush().await.unwrap();
+
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(read_frontend_tags(&buf[..n]), vec![b'Q']);
+            let ok = [
+                rd_one("ok", 23),
+                dr_one(b"2"),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat();
+            s.write_all(&ok).await.unwrap();
+            s.flush().await.unwrap();
+        }
+    });
+
+    let uri = format!("postgresql://user@127.0.0.1:{}/postgres", addr.port());
+    let client = NativeClient::new(
+        &uri,
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+
+    // 1. Prefetch + early close reuses connection and sends exactly 1 Close+Sync
+    let mut s1 = client
+        .stream(
+            "SELECT g FROM generate_series(1, 10) AS g",
+            &HashMap::new(),
+            StreamOptions::new(1),
+        )
+        .await
+        .unwrap();
+    let c1 = s1.next_chunk().await.unwrap().expect("chunk 1");
+    assert_eq!(c1.num_rows(), 1);
+    s1.close().await.unwrap();
+    assert_eq!(close_count.load(Ordering::SeqCst), 1);
+
+    let follow1 = client
+        .execute_rows("SELECT 1 AS ok", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(follow1.row_count(), 1);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    // 2. Prefetch + Drop marks connection broken; next query opens conn #2
+    {
+        let mut s2 = client
+            .stream(
+                "SELECT g FROM generate_series(1, 10) AS g",
+                &HashMap::new(),
+                StreamOptions::new(1),
+            )
+            .await
+            .unwrap();
+        let c2 = s2.next_chunk().await.unwrap().expect("chunk 1");
+        assert_eq!(c2.num_rows(), 1);
+    }
+    let follow2 = client
+        .execute_rows("SELECT 2 AS ok", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(follow2.row_count(), 1);
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    assert_eq!(close_count.load(Ordering::SeqCst), 1);
+
+    client.close().await;
     server.await.unwrap();
 }

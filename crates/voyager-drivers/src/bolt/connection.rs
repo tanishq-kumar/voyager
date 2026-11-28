@@ -1329,22 +1329,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         }))
     }
 
+    async fn send_pull(&mut self, fetch_size: i64, qid: Option<i64>) -> Result<()> {
+        clear_reusable_buf(&mut self.write_buf, 128);
+        clear_reusable_buf(&mut self.msg_buf, 64);
+        encode_pull_message(fetch_size, qid, &mut self.msg_buf);
+        encode_chunks(&self.msg_buf, &mut self.write_buf);
+        write_message_frame(&mut self.stream, &self.write_buf).await
+    }
+
     async fn next_stream_chunk_io(
         &mut self,
         cursor: &mut BoltStreamCursor,
     ) -> Result<Option<ResultChunk>> {
         let mut empty_has_more_rounds = 0u8;
+        let row_cap = cursor.fetch_size.clamp(0, 4_096) as usize;
         loop {
             if !cursor.pull_in_flight {
-                clear_reusable_buf(&mut self.write_buf, 128);
-                clear_reusable_buf(&mut self.msg_buf, 64);
-                encode_pull_message(cursor.fetch_size, cursor.qid, &mut self.msg_buf);
-                encode_chunks(&self.msg_buf, &mut self.write_buf);
-                write_message_frame(&mut self.stream, &self.write_buf).await?;
+                self.send_pull(cursor.fetch_size, cursor.qid).await?;
                 cursor.pull_in_flight = true;
             }
 
-            let mut rows = Vec::new();
+            let mut rows = Vec::with_capacity(row_cap);
             self.decoder.clear();
 
             loop {
@@ -1434,6 +1439,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             }
 
             if !rows.is_empty() {
+                if cursor.has_more && !cursor.pull_in_flight {
+                    // Prefetch the next chunk while keeping at most one PULL in flight so the
+                    // server streams the next batch while the caller processes or hydrates this one.
+                    self.send_pull(cursor.fetch_size, cursor.qid).await?;
+                    cursor.pull_in_flight = true;
+                }
                 if self.frame_buf.capacity() > MAX_RETAINED_WRITE_BUF_CAPACITY {
                     self.frame_buf = Vec::new();
                 }

@@ -35,7 +35,7 @@ __all__ = [
     "StreamFormat",
 ]
 
-DEFAULT_STREAM_FETCH_SIZE = 1_000
+DEFAULT_STREAM_FETCH_SIZE = 4_000
 """Default number of rows requested per wire pull, portal execute, or Arrow batch."""
 
 StreamFormat = Literal["dicts", "arrow", "polars"]
@@ -72,7 +72,8 @@ def _chunk_to_dicts(chunk: Any) -> list[dict[str, Any]]:
     """Converts one raw chunk into row dictionaries."""
     to_dicts = getattr(chunk, "to_dicts", None)
     if callable(to_dicts):
-        return list(to_dicts())
+        result = to_dicts()
+        return result if isinstance(result, list) else list(result)
     return []
 
 
@@ -193,6 +194,12 @@ class ResultStream:
         self._on_error = on_error
         self._closed = False
         self._reader_created = False
+        self._is_native_sync = _is_native_sync_source(source)
+        self._next_dicts_sync = (
+            getattr(source, "next_dicts_sync", None) if self._is_native_sync else None
+        )
+        if not callable(self._next_dicts_sync):
+            self._next_dicts_sync = None
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -260,10 +267,38 @@ class ResultStream:
 
     def __next__(self) -> Any:
         """Pulls and formats the next batch, or raises ``StopIteration``."""
+        if self._as_format == "dicts" and self._next_dicts_sync is not None:
+            batch = self._next_dicts_batch()
+            if batch is None:
+                raise StopIteration
+            return batch
         chunk = self._next_chunk()
         if chunk is None:
             raise StopIteration
         return _format_chunk(chunk, self._as_format)
+
+    def _next_dicts_batch(self) -> list[dict[str, Any]] | None:
+        """Fast path pulling one native dict batch directly without an ArrowStream wrapper."""
+        if self._closed:
+            return None
+        next_dicts = self._next_dicts_sync
+        if next_dicts is None:
+            return None
+        try:
+            batch = next_dicts()
+        except BaseException as exc:
+            self._release.release()
+            if self._on_error is not None and isinstance(exc, Exception):
+                try:
+                    self._on_error(exc)
+                except Exception:
+                    pass
+            raise
+        if batch is None:
+            self._closed = True
+            self._release.release()
+            return None
+        return batch
 
     def _next_chunk(self) -> Any:
         """Pulls one raw chunk and releases the lease when the wire is drained."""
@@ -273,7 +308,7 @@ class ResultStream:
         if source is None:
             return None
         try:
-            if _is_native_sync_source(source):
+            if self._is_native_sync:
                 chunk = source.next_chunk_sync()
             else:
                 chunk = source.next_batch()
@@ -293,6 +328,12 @@ class ResultStream:
 
     def iter_rows(self) -> Iterator[dict[str, Any]]:
         """Yields one dictionary per row regardless of the configured batch format."""
+        if self._next_dicts_sync is not None:
+            while True:
+                batch = self._next_dicts_batch()
+                if batch is None:
+                    return
+                yield from batch
         while True:
             chunk = self._next_chunk()
             if chunk is None:
@@ -301,6 +342,12 @@ class ResultStream:
 
     def iter_batches(self) -> Iterator[Any]:
         """Yields batches in the configured format (alias for plain iteration)."""
+        if self._as_format == "dicts" and self._next_dicts_sync is not None:
+            while True:
+                batch = self._next_dicts_batch()
+                if batch is None:
+                    return
+                yield batch
         while True:
             chunk = self._next_chunk()
             if chunk is None:
@@ -479,6 +526,8 @@ class AsyncResultStream:
         self._source: Any = None
         self._opened = False
         self._closed = False
+        self._is_native_async = False
+        self._next_dicts: Callable[[], Any] | None = None
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -528,6 +577,9 @@ class AsyncResultStream:
             return self
         self._source = await self._opener()
         self._opened = True
+        self._is_native_async = _is_native_async_source(self._source)
+        next_dicts = getattr(self._source, "next_dicts", None) if self._is_native_async else None
+        self._next_dicts = next_dicts if callable(next_dicts) else None
         if self._on_open is not None:
             callback = self._on_open
             self._on_open = None
@@ -566,10 +618,41 @@ class AsyncResultStream:
 
     async def __anext__(self) -> Any:
         """Pulls and formats the next batch, or raises ``StopAsyncIteration``."""
+        if self._as_format == "dicts":
+            if self._source is None and not self._closed:
+                await self.open()
+            if self._next_dicts is not None:
+                batch = await self._next_dicts_batch()
+                if batch is None:
+                    raise StopAsyncIteration
+                return batch
         chunk = await self._next_chunk()
         if chunk is None:
             raise StopAsyncIteration
         return _format_chunk(chunk, self._as_format)
+
+    async def _next_dicts_batch(self) -> list[dict[str, Any]] | None:
+        """Fast path pulling one native dict batch directly without an ArrowStream wrapper."""
+        if self._closed:
+            return None
+        next_dicts = self._next_dicts
+        if next_dicts is None:
+            return None
+        try:
+            batch = await next_dicts()
+        except BaseException as exc:
+            self._release.release()
+            if self._on_error is not None and isinstance(exc, Exception):
+                try:
+                    self._on_error(exc)
+                except Exception:
+                    pass
+            raise
+        if batch is None:
+            self._closed = True
+            self._release.release()
+            return None
+        return batch
 
     async def _next_chunk(self) -> Any:
         """Pulls one raw chunk and releases the lease when the wire is drained."""
@@ -581,7 +664,7 @@ class AsyncResultStream:
         if source is None:
             return None
         try:
-            if _is_native_async_source(source):
+            if self._is_native_async:
                 chunk = await source.next_chunk()
             else:
                 result = source.next_batch()
@@ -602,6 +685,16 @@ class AsyncResultStream:
 
     async def iter_rows(self) -> AsyncIterator[dict[str, Any]]:
         """Yields one dictionary per row regardless of the configured batch format."""
+        if self._source is None and not self._closed:
+            await self.open()
+        if self._next_dicts is not None:
+            while True:
+                batch = await self._next_dicts_batch()
+                if batch is None:
+                    return
+                for row in batch:
+                    yield row
+            return
         while True:
             chunk = await self._next_chunk()
             if chunk is None:
@@ -611,6 +704,16 @@ class AsyncResultStream:
 
     async def iter_batches(self) -> AsyncIterator[Any]:
         """Yields batches in the configured format (alias for async iteration)."""
+        if self._as_format == "dicts":
+            if self._source is None and not self._closed:
+                await self.open()
+            if self._next_dicts is not None:
+                while True:
+                    batch = await self._next_dicts_batch()
+                    if batch is None:
+                        return
+                    yield batch
+                return
         while True:
             chunk = await self._next_chunk()
             if chunk is None:

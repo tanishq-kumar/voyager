@@ -19,8 +19,8 @@ use crate::postgres::agtype::{
 };
 use crate::postgres::auth::{ScramClient, compute_md5_password};
 use crate::postgres::codec::{
-    DEFAULT_READ_BUFFER_CAPACITY, read_backend_message, write_frontend_message,
-    write_frontend_messages, write_startup_message,
+    DEFAULT_READ_BUFFER_CAPACITY, read_backend_message, write_execute_flush,
+    write_frontend_message, write_frontend_messages, write_startup_message,
 };
 use crate::postgres::message::{
     AuthenticationRequest, BackendMessage, FrontendMessage, StartupMessage, TransactionStatus,
@@ -234,6 +234,7 @@ pub struct PostgresConnection {
     stream: NetStream,
     socket_probe: Option<std::net::TcpStream>,
     read_buf: BytesMut,
+    write_buf: BytesMut,
     uri: ParsedUri,
     server_parameters: HashMap<String, String>,
     backend_pid: i32,
@@ -503,6 +504,7 @@ impl PostgresConnection {
             stream,
             socket_probe: Some(socket_probe),
             read_buf: BytesMut::with_capacity(DEFAULT_READ_BUFFER_CAPACITY),
+            write_buf: BytesMut::with_capacity(256),
             uri: uri.clone(),
             server_parameters: HashMap::new(),
             backend_pid: 0,
@@ -1426,15 +1428,11 @@ impl PostgresConnection {
         let mut empty_suspended_rounds = 0u8;
         loop {
             if !cursor.execute_in_flight {
-                write_frontend_messages(
+                write_execute_flush(
                     &mut self.stream,
-                    &[
-                        FrontendMessage::Execute {
-                            portal: cursor.portal_name.clone(),
-                            max_rows: cursor.fetch_size,
-                        },
-                        FrontendMessage::Flush,
-                    ],
+                    &mut self.write_buf,
+                    &cursor.portal_name,
+                    cursor.fetch_size,
                 )
                 .await?;
                 cursor.execute_in_flight = true;
@@ -1454,7 +1452,6 @@ impl PostgresConnection {
                     BackendMessage::PortalSuspended => {
                         cursor.execute_in_flight = false;
                         cursor.has_more = true;
-                        self.is_broken = false;
                         break;
                     }
                     BackendMessage::CommandComplete(tag) => {
@@ -1520,6 +1517,20 @@ impl PostgresConnection {
                     cursor.failed = true;
                     return Err(err);
                 }
+            } else {
+                // Prefetch the next portal chunk while keeping at most one Execute in flight
+                // so PostgreSQL streams the next batch while the client processes/hydrates this one.
+                if !cursor.execute_in_flight {
+                    write_execute_flush(
+                        &mut self.stream,
+                        &mut self.write_buf,
+                        &cursor.portal_name,
+                        cursor.fetch_size,
+                    )
+                    .await?;
+                    cursor.execute_in_flight = true;
+                }
+                self.is_broken = false;
             }
 
             if let Some(chunk) = cursor.decoder.take_chunk() {
@@ -2196,6 +2207,7 @@ mod tests {
             stream: NetStream::Plain(stream),
             socket_probe: Some(probe),
             read_buf: BytesMut::new(),
+            write_buf: BytesMut::new(),
             uri: ParsedUri::parse("postgresql://user@127.0.0.1:1/postgres").unwrap(),
             server_parameters: HashMap::new(),
             backend_pid: 0,
