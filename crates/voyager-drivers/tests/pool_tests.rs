@@ -455,6 +455,50 @@ async fn test_bolt_stub_zero_ping_within_threshold_and_single_probe_ping() {
 }
 
 #[tokio::test]
+async fn test_bolt_stub_failed_query_reuses_connection_without_reconnect() {
+    use voyager_drivers::{BoltStubServer, NativeClient};
+
+    let stub = BoltStubServer::start().await.expect("stub server");
+    let client = NativeClient::new(
+        &stub.uri(),
+        Some(
+            PoolConfig::new()
+                .with_min_idle(0)
+                .with_max_size(1)
+                .with_test_on_idle_after(Some(Duration::from_secs(30))),
+        ),
+    )
+    .expect("client");
+
+    // A failed query leaves a deferred RESET unread on the socket. Returning the
+    // connection to the pool and checking it out again must consume that reply and
+    // reuse the same socket instead of evicting it on the local liveness check.
+    let error = client
+        .execute("RETURN FAIL", &HashMap::new())
+        .await
+        .expect_err("stub should fail this query");
+    assert!(!error.to_string().is_empty());
+
+    let result = client
+        .execute("RETURN 1 AS n", &HashMap::new())
+        .await
+        .expect("next query must reuse the connection");
+    assert!(!result.columns.is_empty());
+
+    assert_eq!(stub.connection_count(), 1, "must not open a new connection");
+    assert_eq!(stub.hello_count(), 1, "must not re-handshake");
+    assert_eq!(stub.run_count(), 2);
+    assert_eq!(client.pool().total_count(), 1);
+    let metrics = client.pool().metrics();
+    assert_eq!(metrics.connections_created, 1);
+    assert_eq!(
+        metrics.connections_failed_health_check, 0,
+        "the pending RESET reply is expected and must not count as a health failure"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
 async fn test_pool_handover_checks_max_lifetime_and_health() {
     // 1. Handover::Connection exceeding max_lifetime is rejected and replaced.
     let factory = Arc::new(MockConnectionFactory::new());

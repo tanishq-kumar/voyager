@@ -14,8 +14,8 @@ pub use agtype::{
 };
 pub use auth::{ScramClient, compute_md5_password, generate_client_nonce};
 pub use codec::{
-    DEFAULT_BUFFER_CAPACITY, MAX_PG_MESSAGE_SIZE, read_backend_message, write_frontend_message,
-    write_frontend_messages, write_startup_message,
+    DEFAULT_BUFFER_CAPACITY, DEFAULT_READ_BUFFER_CAPACITY, MAX_PG_MESSAGE_SIZE,
+    read_backend_message, write_frontend_message, write_frontend_messages, write_startup_message,
 };
 pub use connection::PostgresConnection;
 pub use message::{

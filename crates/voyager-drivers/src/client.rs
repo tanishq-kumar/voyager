@@ -24,6 +24,12 @@ pub struct ConnectOptions {
     /// Run Apache AGE setup (`LOAD 'age'; SET search_path = ...`) on every
     /// PostgreSQL connection, even when the URI has no AGE scheme or parameters.
     pub age: bool,
+    /// Overrides the PostgreSQL named prepared-statement cache capacity.
+    ///
+    /// `None` uses the URI parameter `prepared_statement_cache_size` or the
+    /// driver default (128). `Some(0)` disables caching, which is required
+    /// behind a transaction-pooling PgBouncer.
+    pub prepared_statement_cache_size: Option<usize>,
 }
 
 /// Asynchronously connects to any supported database protocol based on the URI scheme.
@@ -61,7 +67,10 @@ pub async fn connect_any_with_options(
         DatabaseProtocol::Postgres => {
             #[cfg(feature = "postgres")]
             {
-                let conn = PostgresConnection::connect_with_age(&parsed, options.age).await?;
+                let mut conn = PostgresConnection::connect_with_age(&parsed, options.age).await?;
+                if let Some(cache_size) = options.prepared_statement_cache_size {
+                    conn.set_prepared_statement_cache_size(cache_size);
+                }
                 Ok(Box::new(conn))
             }
             #[cfg(not(feature = "postgres"))]

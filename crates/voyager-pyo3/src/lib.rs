@@ -3861,7 +3861,10 @@ impl PyNativeClient {
         let client = voyager_drivers::NativeClient::new_with_options(
             uri,
             Some(pool_config),
-            voyager_drivers::ConnectOptions { age },
+            voyager_drivers::ConnectOptions {
+                age,
+                ..Default::default()
+            },
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { client })

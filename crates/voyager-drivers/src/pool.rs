@@ -457,6 +457,44 @@ impl<C: AsyncConnection + 'static> ConnectionPool<C> {
                     continue;
                 }
 
+                // Consume any deferred protocol acknowledgement left by a failure path
+                // (for example a Bolt RESET after a failed query) before leasing. If the
+                // peer rejected it or the socket failed, the connection is discarded; after
+                // consuming it, re-check the socket so a peer that closed meanwhile is seen.
+                let prepared_for_reuse = {
+                    let conn = guard
+                        .in_flight_idle
+                        .as_mut()
+                        .expect("in-flight idle connection present");
+                    // Bounded like the release-path reset: a peer that never answers
+                    // must not stall acquire().
+                    matches!(
+                        timeout(Duration::from_secs(2), conn.prepare_for_reuse()).await,
+                        Ok(Ok(()))
+                    ) && conn.is_valid()
+                };
+                if !prepared_for_reuse {
+                    warn!("Connection failed deferred reset before reuse, discarding");
+                    guard
+                        .discard_in_flight(&self.inner.metrics.connections_failed_health_check)
+                        .await;
+                    continue;
+                }
+                let alive_after_reuse_prep = guard
+                    .in_flight_idle
+                    .as_ref()
+                    .expect("in-flight idle connection present")
+                    .is_locally_alive();
+                if !alive_after_reuse_prep {
+                    warn!(
+                        "Connection failed local liveness check after deferred reset, discarding"
+                    );
+                    guard
+                        .discard_in_flight(&self.inner.metrics.connections_failed_health_check)
+                        .await;
+                    continue;
+                }
+
                 // Check liveness probe when test_on_acquire is enabled or idle age exceeds threshold
                 let should_ping = self.inner.config.test_on_acquire
                     || self

@@ -55,6 +55,8 @@ pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = NetS
     database: Option<String>,
     is_valid: bool,
     in_transaction: bool,
+    /// A `RESET` was written after a failure and its `SUCCESS` is still unread.
+    pending_reset: bool,
     server_agent: Option<String>,
     /// Last bookmark string received from the server.
     pub last_bookmark: Option<String>,
@@ -188,6 +190,7 @@ impl BoltConnection<NetStream> {
             database: db.map(str::to_string),
             is_valid: true,
             in_transaction: false,
+            pending_reset: false,
             server_agent: None,
             last_bookmark: None,
             last_metadata: None,
@@ -332,6 +335,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             database: None,
             is_valid: true,
             in_transaction: false,
+            pending_reset: false,
             server_agent: None,
             last_bookmark: None,
             last_metadata: None,
@@ -567,6 +571,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
 
         self.is_valid = false;
         write_message_frame(&mut self.stream, &write_buf).await?;
+        self.consume_pending_reset().await?;
 
         let mut collected_metadata = HashMap::new();
 
@@ -595,7 +600,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Query failed");
                 self.receive_response().await?;
-                self.reset_inner().await?;
+                self.send_deferred_reset().await?;
                 return Err(NetError::ProtocolError(format!("{}: {}", code, msg)));
             }
             other => {
@@ -637,7 +642,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Stream record failed");
-                    self.reset_inner().await?;
+                    self.send_deferred_reset().await?;
                     stream_err = Some((code.to_string(), msg.to_string()));
                     break QuerySummary::default();
                 }
@@ -688,6 +693,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         }
         self.is_valid = false;
         self.send_request(&BoltRequest::Begin { extra }).await?;
+        self.consume_pending_reset().await?;
         let resp = self.receive_response().await?;
         match resp {
             BoltResponse::Success { .. } => {
@@ -704,7 +710,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Begin transaction failed");
-                self.reset_inner().await?;
+                self.send_deferred_reset().await?;
                 Err(NetError::ProtocolError(format!("{}: {}", code, msg)))
             }
             other => Err(NetError::ProtocolError(format!(
@@ -724,6 +730,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
 
         self.is_valid = false;
         self.send_request(&BoltRequest::Commit).await?;
+        self.consume_pending_reset().await?;
         let resp = self.receive_response().await?;
         match resp {
             BoltResponse::Success { metadata } => {
@@ -748,7 +755,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Commit transaction failed");
-                self.reset_inner().await?;
+                self.send_deferred_reset().await?;
                 Err(NetError::ProtocolError(format!("{}: {}", code, msg)))
             }
             other => {
@@ -771,6 +778,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
 
         self.is_valid = false;
         self.send_request(&BoltRequest::Rollback).await?;
+        self.consume_pending_reset().await?;
         let resp = self.receive_response().await?;
         match resp {
             BoltResponse::Success { .. } => {
@@ -788,7 +796,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Rollback transaction failed");
-                self.reset_inner().await?;
+                self.send_deferred_reset().await?;
                 Err(NetError::ProtocolError(format!("{}: {}", code, msg)))
             }
             other => {
@@ -855,6 +863,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         // Send pipelined requests with sticky invalidation until terminal response
         self.is_valid = false;
         write_message_frame(&mut self.stream, &write_buf).await?;
+        // If the previous query failed, its RESET is already in flight; consume the
+        // acknowledgement now that this request is on the wire, adding no round trip.
+        self.consume_pending_reset().await?;
 
         // 2. Receive RUN response (Expect SUCCESS with column fields)
         let run_resp = self.receive_response().await?;
@@ -879,8 +890,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                     .unwrap_or("Query failed");
                 // Consume in-flight IGNORED response from pipelined PULL
                 self.receive_response().await?;
-                // Issue RESET to clear failure state
-                self.reset_inner().await?;
+                // Write RESET now; its acknowledgement is consumed by the next request.
+                self.send_deferred_reset().await?;
                 return Err(NetError::ProtocolError(format!("{}: {}", code, msg)));
             }
             other => {
@@ -934,7 +945,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Stream record failed");
-                    self.reset_inner().await?;
+                    self.send_deferred_reset().await?;
                     return Err(NetError::ProtocolError(format!("{}: {}", code, msg)));
                 }
                 other => {
@@ -963,9 +974,64 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             Ok(result)
         }
     }
+    /// Writes `RESET` after a failure without waiting for its `SUCCESS`.
+    ///
+    /// The next request is pipelined behind this `RESET`; [`consume_pending_reset`]
+    /// reads the acknowledgement just before the next response, so recovery does
+    /// not cost an extra synchronous round trip. The connection is left usable.
+    async fn send_deferred_reset(&mut self) -> Result<()> {
+        self.send_request(&BoltRequest::Reset).await?;
+        self.pending_reset = true;
+        self.in_transaction = false;
+        self.is_valid = true;
+        Ok(())
+    }
+
+    /// Consumes the acknowledgement of a deferred `RESET`, if one is outstanding.
+    async fn consume_pending_reset(&mut self) -> Result<()> {
+        if !self.pending_reset {
+            return Ok(());
+        }
+        self.pending_reset = false;
+        let resp = match self.receive_response().await {
+            Ok(resp) => resp,
+            Err(error) => {
+                self.is_valid = false;
+                return Err(error);
+            }
+        };
+        match resp {
+            BoltResponse::Success { .. } => {
+                self.in_transaction = false;
+                Ok(())
+            }
+            BoltResponse::Failure { metadata } => {
+                let msg = metadata
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Reset failed");
+                self.is_valid = false;
+                Err(NetError::ProtocolError(format!("RESET failed: {}", msg)))
+            }
+            other => {
+                self.is_valid = false;
+                Err(NetError::ProtocolError(format!(
+                    "Unexpected RESET response: {:?}",
+                    other
+                )))
+            }
+        }
+    }
+
     /// Sends `RESET` without requiring `is_valid == true`, used for failure recovery inside
     /// an already-locked in-flight request while keeping `is_valid` false if recovery fails.
     async fn reset_inner(&mut self) -> Result<()> {
+        // A deferred RESET already cleared the failure state; just collect its reply.
+        if self.pending_reset {
+            self.consume_pending_reset().await?;
+            self.is_valid = true;
+            return Ok(());
+        }
         self.is_valid = false;
         self.send_request(&BoltRequest::Reset).await?;
         let resp = self.receive_response().await?;
@@ -1029,14 +1095,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
         self.reset_inner().await
     }
 
+    async fn prepare_for_reuse(&mut self) -> Result<()> {
+        // Consume the deferred RESET acknowledgement before the pool leases this
+        // connection again. A failed RESET or a dead socket marks it invalid.
+        self.consume_pending_reset().await
+    }
+
     fn is_valid(&self) -> bool {
         self.is_valid
     }
 
     fn is_locally_alive(&self) -> bool {
+        // A pending RESET reply is expected unread bytes, not stray data; the pool
+        // consumes it through `prepare_for_reuse` and re-checks liveness afterwards.
         self.is_valid
             && self.read_buf.is_empty()
-            && (self.local_alive_check)(&self.stream, self.socket_probe.as_ref())
+            && (self.pending_reset
+                || (self.local_alive_check)(&self.stream, self.socket_probe.as_ref()))
     }
 
     fn protocol_version(&self) -> Option<String> {
