@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextvars
+import inspect
+import itertools
 import logging
 import time
 import warnings
 import weakref
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Generic, Literal, Self, TypedDict, TypeVar
 
 from voyager_ogm.bridge import (
@@ -45,6 +49,11 @@ from voyager_ogm.unit_of_work import UnitOfWork
 
 logger = logging.getLogger("voyager_ogm.session")
 _T_Session = TypeVar("_T_Session")
+_EMPTY_TRANSACTIONS: Mapping[int, Any] = MappingProxyType({})
+_ACTIVE_TRANSACTIONS: contextvars.ContextVar[Mapping[int, Any]] = contextvars.ContextVar(
+    "voyager_active_transactions", default=_EMPTY_TRANSACTIONS
+)
+_SESSION_TX_COUNTER = itertools.count(1)
 
 if TYPE_CHECKING:
     import polars as pl
@@ -826,7 +835,7 @@ class _SessionBase:
         self._pending_relationships: list[Any] = []
         self._last_relationship_results: list[ExecutionResult] = []
         self._is_async = is_async
-        self._active_transaction: Any = None
+        self._tx_token: int = next(_SESSION_TX_COUNTER)
 
         self._is_explicit_mock = (
             bridge is None
@@ -862,6 +871,47 @@ class _SessionBase:
             validate_graph_name(resolved_graph)
 
         self._graph_name = resolved_graph
+
+    @property
+    def _active_transaction(self) -> Any:
+        """Returns the active transaction bound to the current task or thread."""
+        tx = _ACTIVE_TRANSACTIONS.get().get(self._tx_token)
+        if tx is not None and getattr(tx, "_released", False):
+            self._active_transaction = None
+            return None
+        return tx
+
+    @_active_transaction.setter
+    def _active_transaction(self, value: Any) -> None:
+        """Binds or clears the active transaction for the current task or thread."""
+        current = _ACTIVE_TRANSACTIONS.get()
+        if value is None:
+            if self._tx_token not in current:
+                return
+            updated = dict(current)
+            updated.pop(self._tx_token, None)
+            _ACTIVE_TRANSACTIONS.set(MappingProxyType(updated) if updated else _EMPTY_TRANSACTIONS)
+            return
+        updated = dict(current)
+        updated[self._tx_token] = value
+        _ACTIVE_TRANSACTIONS.set(MappingProxyType(updated))
+
+    def _format_tx_result(
+        self,
+        tx: Any,
+        tx_result: Any,
+        statement: str,
+        query: Query | CompiledQuery | None,
+    ) -> ExecutionResult:
+        """Wraps a raw transaction execution result into an ExecutionResult."""
+        if tx.backend == "native":
+            return self._native_execution_result(tx_result, statement, query)
+        return ExecutionResult(
+            records=tx_result,
+            statement=statement,
+            query=query,
+            dialect=self._dialect,
+        )
 
     @property
     def graph_name(self) -> str | None:
@@ -1618,6 +1668,36 @@ class Session(_SessionBase):
         """
         return Transaction(self)
 
+    def _execute_on_transaction_sync(
+        self,
+        tx: Transaction,
+        query_or_statement: Query | CompiledQuery | str,
+        parameters: dict[str, Any] | None = None,
+    ) -> ExecutionResult:
+        """Executes a query directly on the given synchronous transaction."""
+        stmt, params, q_obj = self._prepare_statement(query_or_statement, parameters)
+        return self._format_tx_result(tx, tx._execute_sync(stmt, params), stmt, q_obj)
+
+    def _execute_to_polars_on_transaction_sync(
+        self,
+        tx: Transaction,
+        query_or_statement: Query | CompiledQuery | str,
+        parameters: dict[str, Any] | None = None,
+    ) -> pl.DataFrame:
+        """Executes a query directly on the given transaction and returns Polars."""
+        stmt, params, _ = self._prepare_statement(query_or_statement, parameters)
+        return tx._execute_to_polars_sync(stmt, params)
+
+    def _execute_to_arrow_on_transaction_sync(
+        self,
+        tx: Transaction,
+        query_or_statement: Query | CompiledQuery | str,
+        parameters: dict[str, Any] | None = None,
+    ) -> pa.Table:
+        """Executes a query directly on the given transaction and returns Arrow."""
+        stmt, params, _ = self._prepare_statement(query_or_statement, parameters)
+        return tx._execute_to_arrow_sync(stmt, params)
+
     def execute(
         self,
         query_or_statement: Query | CompiledQuery | str,
@@ -1636,15 +1716,7 @@ class Session(_SessionBase):
 
         active = self._active_transaction
         if active is not None:
-            tx_result = active._execute_sync(stmt, params)
-            if active.backend == "native":
-                return self._native_execution_result(tx_result, stmt, q_obj)
-            return ExecutionResult(
-                records=tx_result,
-                statement=stmt,
-                query=q_obj,
-                dialect=self._dialect,
-            )
+            return self._format_tx_result(active, active._execute_sync(stmt, params), stmt, q_obj)
 
         should_try_native = (
             self._native_client is not None
@@ -2399,6 +2471,9 @@ class Session(_SessionBase):
                 active.rollback()
             except Exception:
                 logger.warning("Failed to roll back active transaction during session close")
+            finally:
+                if self._active_transaction is active:
+                    self._active_transaction = None
         self.clear()
         if self._native_client is not None:
             self._native_client.close()
@@ -2510,6 +2585,37 @@ class AsyncSession(_SessionBase):
         """
         return AsyncTransaction(self)
 
+    async def _execute_on_transaction(
+        self,
+        tx: AsyncTransaction,
+        query_or_statement: Query | CompiledQuery | str,
+        parameters: dict[str, Any] | None = None,
+    ) -> ExecutionResult:
+        """Executes a query directly on the given asynchronous transaction."""
+        stmt, params, q_obj = self._prepare_statement(query_or_statement, parameters)
+        tx_result = await tx._execute(stmt, params)
+        return self._format_tx_result(tx, tx_result, stmt, q_obj)
+
+    async def _execute_to_polars_on_transaction(
+        self,
+        tx: AsyncTransaction,
+        query_or_statement: Query | CompiledQuery | str,
+        parameters: dict[str, Any] | None = None,
+    ) -> pl.DataFrame:
+        """Executes a query directly on the given async transaction and returns Polars."""
+        stmt, params, _ = self._prepare_statement(query_or_statement, parameters)
+        return await tx._execute_to_polars(stmt, params)
+
+    async def _execute_to_arrow_on_transaction(
+        self,
+        tx: AsyncTransaction,
+        query_or_statement: Query | CompiledQuery | str,
+        parameters: dict[str, Any] | None = None,
+    ) -> pa.Table:
+        """Executes a query directly on the given async transaction and returns Arrow."""
+        stmt, params, _ = self._prepare_statement(query_or_statement, parameters)
+        return await tx._execute_to_arrow(stmt, params)
+
     async def execute(
         self,
         query_or_statement: Query | CompiledQuery | str,
@@ -2529,14 +2635,7 @@ class AsyncSession(_SessionBase):
         active = self._active_transaction
         if active is not None:
             tx_result = await active._execute(stmt, params)
-            if active.backend == "native":
-                return self._native_execution_result(tx_result, stmt, q_obj)
-            return ExecutionResult(
-                records=tx_result,
-                statement=stmt,
-                query=q_obj,
-                dialect=self._dialect,
-            )
+            return self._format_tx_result(active, tx_result, stmt, q_obj)
 
         should_try_native = (
             self._native_client is not None
@@ -3274,9 +3373,18 @@ class AsyncSession(_SessionBase):
                 await active.rollback()
             except Exception:
                 logger.warning("Failed to roll back active transaction during session close")
+            finally:
+                if self._active_transaction is active:
+                    self._active_transaction = None
         self.clear()
         if self._native_client is not None:
-            self._native_client.close()
+            close_async = getattr(self._native_client, "close_async", None)
+            if callable(close_async):
+                res = close_async()
+                if inspect.isawaitable(res):
+                    await res
+            else:
+                self._native_client.close()
         if self._bridge is not None:
             await self._bridge.close()
 

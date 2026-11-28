@@ -10,6 +10,7 @@ commits or rolls back on context exit. The in-memory unit of work lives in
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -137,6 +138,8 @@ class Transaction:
         self._route: str | None = None
         self._unit_of_work: UnitOfWork | None = None
         self._begun = False
+        self._released = False
+        self._lock = threading.Lock()
         self.begin()
 
     def begin(self) -> Transaction:
@@ -149,26 +152,28 @@ class Transaction:
             RuntimeError: If the session already has an active transaction.
             NotImplementedError: If the selected backend has no transaction support.
         """
-        _check_no_active_transaction(self._session)
-        route = _select_route(self._session)
-        bridge = getattr(self._session, "_bridge", None)
-        if route == "native":
-            begin = getattr(self._session._native_client, "begin_transaction_sync", None)
-            if not callable(begin):
-                raise _begin_error(self._session, route, bridge)
-            self._driver_tx = begin()
-        else:
-            begin = getattr(bridge, "begin_transaction", None)
-            if not callable(begin):
-                raise _begin_error(self._session, route, bridge)
-            self._driver_tx = begin()
+        with self._lock:
+            _check_no_active_transaction(self._session)
+            route = _select_route(self._session)
+            bridge = getattr(self._session, "_bridge", None)
+            if route == "native":
+                begin = getattr(self._session._native_client, "begin_transaction_sync", None)
+                if not callable(begin):
+                    raise _begin_error(self._session, route, bridge)
+                self._driver_tx = begin()
+            else:
+                begin = getattr(bridge, "begin_transaction", None)
+                if not callable(begin):
+                    raise _begin_error(self._session, route, bridge)
+                self._driver_tx = begin()
 
-        self._route = route
-        if getattr(self._session, "identity_map_enabled", False):
-            self._unit_of_work = UnitOfWork(session=self._session)
-        self._session._active_transaction = self
-        self._begun = True
-        return self
+            self._route = route
+            if getattr(self._session, "identity_map_enabled", False):
+                self._unit_of_work = UnitOfWork(session=self._session)
+            self._session._active_transaction = self
+            self._begun = True
+            self._released = False
+            return self
 
     @property
     def state(self) -> str:
@@ -215,6 +220,9 @@ class Transaction:
             The session execution result.
         """
         self._ensure_can_execute()
+        direct = getattr(self._session, "_execute_on_transaction_sync", None)
+        if callable(direct):
+            return direct(self, query_or_statement, parameters)
         return self._session.execute(query_or_statement, parameters)
 
     def execute_to_polars(
@@ -222,6 +230,9 @@ class Transaction:
     ) -> Any:
         """Executes a query through this transaction and returns a Polars DataFrame."""
         self._ensure_can_execute()
+        direct = getattr(self._session, "_execute_to_polars_on_transaction_sync", None)
+        if callable(direct):
+            return direct(self, query_or_statement, parameters)
         return self._session.execute_to_polars(query_or_statement, parameters)
 
     def execute_to_arrow(
@@ -229,61 +240,69 @@ class Transaction:
     ) -> Any:
         """Executes a query through this transaction and returns an Arrow Table."""
         self._ensure_can_execute()
+        direct = getattr(self._session, "_execute_to_arrow_on_transaction_sync", None)
+        if callable(direct):
+            return direct(self, query_or_statement, parameters)
         return self._session.execute_to_arrow(query_or_statement, parameters)
 
     def _execute_sync(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement through the selected backend transaction."""
-        self._ensure_can_execute()
-        if self.backend == "native":
-            return self._driver_tx.execute_sync(statement, parameters)
-        return self._driver_tx.execute(statement, parameters)
+        with self._lock:
+            self._ensure_can_execute()
+            if self.backend == "native":
+                return self._driver_tx.execute_sync(statement, parameters)
+            return self._driver_tx.execute(statement, parameters)
 
     def _execute_to_polars_sync(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement and returns a Polars DataFrame."""
-        self._ensure_can_execute()
-        if self.backend == "native":
-            from voyager_ogm.session import _stream_to_polars
+        with self._lock:
+            self._ensure_can_execute()
+            if self.backend == "native":
+                from voyager_ogm.session import _stream_to_polars
 
-            result = self._driver_tx.execute_sync(statement, parameters)
-            return _stream_to_polars(result.stream)
-        return self._driver_tx.execute_to_polars(statement, parameters)
+                result = self._driver_tx.execute_sync(statement, parameters)
+                return _stream_to_polars(result.stream)
+            return self._driver_tx.execute_to_polars(statement, parameters)
 
     def _execute_to_arrow_sync(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement and returns an Arrow Table."""
-        self._ensure_can_execute()
-        if self.backend == "native":
-            from voyager_ogm.session import _stream_to_arrow
+        with self._lock:
+            self._ensure_can_execute()
+            if self.backend == "native":
+                from voyager_ogm.session import _stream_to_arrow
 
-            result = self._driver_tx.execute_sync(statement, parameters)
-            return _stream_to_arrow(result.stream)
-        arrow_execute = getattr(self._driver_tx, "execute_to_arrow", None)
-        if callable(arrow_execute):
-            return arrow_execute(statement, parameters)
-        return self._driver_tx.execute_to_polars(statement, parameters).to_arrow()
+                result = self._driver_tx.execute_sync(statement, parameters)
+                return _stream_to_arrow(result.stream)
+            arrow_execute = getattr(self._driver_tx, "execute_to_arrow", None)
+            if callable(arrow_execute):
+                return arrow_execute(statement, parameters)
+            return self._driver_tx.execute_to_polars(statement, parameters).to_arrow()
 
     def _execute_bulk_sync(self, plan: Any) -> BulkExecutionResult:
         """Executes every batch of a bulk plan through the transaction."""
-        self._ensure_can_execute()
-        if self.backend == "bridge":
-            return self._driver_tx.execute_bulk(plan)
+        with self._lock:
+            self._ensure_can_execute()
+            if self.backend == "bridge":
+                return self._driver_tx.execute_bulk(plan)
 
-        start_time = time.perf_counter()
-        total_batches = 0
-        total_records = 0
-        statement = plan.statement
-        for batch_item in plan:
-            total_batches += 1
-            total_records += len(batch_item.parameters.get("batch", []))
-            self._driver_tx.execute_sync(batch_item.statement, batch_item.parameters)
-        return BulkExecutionResult(
-            total_batches=total_batches,
-            total_records=total_records,
-            duration_seconds=time.perf_counter() - start_time,
-            statement=statement,
-        )
+            start_time = time.perf_counter()
+            total_batches = 0
+            total_records = 0
+            statement = plan.statement
+            for batch_item in plan:
+                total_batches += 1
+                total_records += len(batch_item.parameters.get("batch", []))
+                self._driver_tx.execute_sync(batch_item.statement, batch_item.parameters)
+            return BulkExecutionResult(
+                total_batches=total_batches,
+                total_records=total_records,
+                duration_seconds=time.perf_counter() - start_time,
+                statement=statement,
+            )
 
     def _release(self) -> None:
         """Clears the session's active-transaction pointer."""
+        self._released = True
         if getattr(self._session, "_active_transaction", None) is self:
             self._session._active_transaction = None
 
@@ -303,76 +322,81 @@ class Transaction:
 
     def commit(self) -> None:
         """Commits the database transaction and the paired unit of work."""
-        try:
-            if self.state == "FAILED":
-                # Fail closed, but still end the server-side transaction so the
-                # connection (especially psycopg after INERROR) is reusable.
-                try:
-                    self._rollback_driver()
-                except BaseException:
-                    pass
-                raise RuntimeError(_ABORTED_MESSAGE)
-            self._ensure_can_execute()
+        with self._lock:
             try:
-                self._commit_driver()
-            except BaseException:
-                # Best-effort rollback so a failed commit cannot leave an open
-                # server transaction behind. Never mask the original error.
+                if self.state == "FAILED":
+                    # Fail closed, but still end the server-side transaction so the
+                    # connection (especially psycopg after INERROR) is reusable.
+                    try:
+                        self._rollback_driver()
+                    except BaseException:
+                        pass
+                    raise RuntimeError(_ABORTED_MESSAGE)
+                self._ensure_can_execute()
                 try:
-                    self._rollback_driver()
+                    self._commit_driver()
                 except BaseException:
-                    pass
-                raise
-            if self._unit_of_work is not None:
-                self._unit_of_work.commit()
-        finally:
-            self._release()
+                    # Best-effort rollback so a failed commit cannot leave an open
+                    # server transaction behind. Never mask the original error.
+                    try:
+                        self._rollback_driver()
+                    except BaseException:
+                        pass
+                    raise
+                if self._unit_of_work is not None:
+                    self._unit_of_work.commit()
+            finally:
+                self._release()
 
     def rollback(self) -> None:
         """Rolls back the database transaction and restores tracked entities."""
-        try:
-            self._ensure_can_rollback()
-            self._rollback_driver()
-        finally:
-            if self._unit_of_work is not None:
-                self._unit_of_work.rollback()
-            self._release()
+        with self._lock:
+            try:
+                self._ensure_can_rollback()
+                self._rollback_driver()
+            finally:
+                if self._unit_of_work is not None:
+                    self._unit_of_work.rollback()
+                self._release()
 
     def create_savepoint(self, name: str) -> None:
         """Creates a real database savepoint (PostgreSQL/AGE only)."""
-        self._ensure_can_execute()
-        if not self.supports_savepoints:
-            raise _savepoint_error(self._driver_tx)
-        if self.backend == "native":
-            self._driver_tx.savepoint_sync(name)
-        else:
-            self._driver_tx.savepoint(name)
-        if self._unit_of_work is not None:
-            self._unit_of_work.create_savepoint(name)
+        with self._lock:
+            self._ensure_can_execute()
+            if not self.supports_savepoints:
+                raise _savepoint_error(self._driver_tx)
+            if self.backend == "native":
+                self._driver_tx.savepoint_sync(name)
+            else:
+                self._driver_tx.savepoint(name)
+            if self._unit_of_work is not None:
+                self._unit_of_work.create_savepoint(name)
 
     def rollback_to_savepoint(self, name: str) -> None:
         """Rolls the database and unit of work back to a named savepoint."""
-        self._ensure_can_execute()
-        if not self.supports_savepoints:
-            raise _savepoint_error(self._driver_tx)
-        if self.backend == "native":
-            self._driver_tx.rollback_to_savepoint_sync(name)
-        else:
-            self._driver_tx.rollback_to_savepoint(name)
-        if self._unit_of_work is not None:
-            self._unit_of_work.rollback_to_savepoint(name)
+        with self._lock:
+            self._ensure_can_execute()
+            if not self.supports_savepoints:
+                raise _savepoint_error(self._driver_tx)
+            if self.backend == "native":
+                self._driver_tx.rollback_to_savepoint_sync(name)
+            else:
+                self._driver_tx.rollback_to_savepoint(name)
+            if self._unit_of_work is not None:
+                self._unit_of_work.rollback_to_savepoint(name)
 
     def release_savepoint(self, name: str) -> None:
         """Releases a named database savepoint."""
-        self._ensure_can_execute()
-        if not self.supports_savepoints:
-            raise _savepoint_error(self._driver_tx)
-        if self.backend == "native":
-            self._driver_tx.release_savepoint_sync(name)
-        else:
-            self._driver_tx.release_savepoint(name)
-        if self._unit_of_work is not None:
-            self._unit_of_work.release_savepoint(name)
+        with self._lock:
+            self._ensure_can_execute()
+            if not self.supports_savepoints:
+                raise _savepoint_error(self._driver_tx)
+            if self.backend == "native":
+                self._driver_tx.release_savepoint_sync(name)
+            else:
+                self._driver_tx.release_savepoint(name)
+            if self._unit_of_work is not None:
+                self._unit_of_work.release_savepoint(name)
 
     def savepoint(self, name: str) -> TransactionSavepoint:
         """Creates a savepoint context manager.
@@ -401,16 +425,19 @@ class Transaction:
         exc_tb: TracebackType | None,
     ) -> None:
         """Commits on clean exit, or rolls back and re-raises on exception."""
-        if exc_type is not None:
+        try:
+            if exc_type is not None:
+                if self.state in ("ACTIVE", "FAILED"):
+                    try:
+                        self.rollback()
+                    except Exception:
+                        # The original statement/body exception must surface.
+                        pass
+                return
             if self.state in ("ACTIVE", "FAILED"):
-                try:
-                    self.rollback()
-                except Exception:
-                    # The original statement/body exception must surface.
-                    pass
-            return
-        if self.state in ("ACTIVE", "FAILED"):
-            self.commit()
+                self.commit()
+        finally:
+            self._release()
 
 
 class AsyncSavepointContext:
@@ -459,6 +486,8 @@ class AsyncTransaction:
         self._route: str | None = None
         self._unit_of_work: UnitOfWork | None = None
         self._begun = False
+        self._released = False
+        self._lock = asyncio.Lock()
 
     async def begin(self) -> AsyncTransaction:
         """Begins the database transaction.
@@ -466,25 +495,27 @@ class AsyncTransaction:
         Returns:
             This transaction.
         """
-        _check_no_active_transaction(self._session)
-        route = _select_route(self._session)
-        bridge = getattr(self._session, "_bridge", None)
-        if route == "native":
-            begin = getattr(self._session._native_client, "begin_transaction", None)
-            if not callable(begin):
-                raise _begin_error(self._session, route, bridge)
-        else:
-            begin = getattr(bridge, "begin_transaction", None)
-            if not callable(begin):
-                raise _begin_error(self._session, route, bridge)
+        async with self._lock:
+            _check_no_active_transaction(self._session)
+            route = _select_route(self._session)
+            bridge = getattr(self._session, "_bridge", None)
+            if route == "native":
+                begin = getattr(self._session._native_client, "begin_transaction", None)
+                if not callable(begin):
+                    raise _begin_error(self._session, route, bridge)
+            else:
+                begin = getattr(bridge, "begin_transaction", None)
+                if not callable(begin):
+                    raise _begin_error(self._session, route, bridge)
 
-        self._driver_tx = await begin()
-        self._route = route
-        if getattr(self._session, "identity_map_enabled", False):
-            self._unit_of_work = UnitOfWork(session=self._session)
-        self._session._active_transaction = self
-        self._begun = True
-        return self
+            self._driver_tx = await begin()
+            self._route = route
+            if getattr(self._session, "identity_map_enabled", False):
+                self._unit_of_work = UnitOfWork(session=self._session)
+            self._session._active_transaction = self
+            self._begun = True
+            self._released = False
+            return self
 
     @property
     def state(self) -> str:
@@ -525,6 +556,9 @@ class AsyncTransaction:
     ) -> Any:
         """Executes a query through this transaction."""
         self._ensure_can_execute()
+        direct = getattr(self._session, "_execute_on_transaction", None)
+        if callable(direct):
+            return await direct(self, query_or_statement, parameters)
         return await self._session.execute(query_or_statement, parameters)
 
     async def execute_to_polars(
@@ -532,6 +566,9 @@ class AsyncTransaction:
     ) -> Any:
         """Executes a query through this transaction and returns a Polars DataFrame."""
         self._ensure_can_execute()
+        direct = getattr(self._session, "_execute_to_polars_on_transaction", None)
+        if callable(direct):
+            return await direct(self, query_or_statement, parameters)
         return await self._session.execute_to_polars(query_or_statement, parameters)
 
     async def execute_to_arrow(
@@ -539,143 +576,158 @@ class AsyncTransaction:
     ) -> Any:
         """Executes a query through this transaction and returns an Arrow Table."""
         self._ensure_can_execute()
+        direct = getattr(self._session, "_execute_to_arrow_on_transaction", None)
+        if callable(direct):
+            return await direct(self, query_or_statement, parameters)
         return await self._session.execute_to_arrow(query_or_statement, parameters)
 
     async def _execute(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement through the selected backend transaction."""
-        self._ensure_can_execute()
-        try:
-            return await self._driver_tx.execute(statement, parameters)
-        except asyncio.CancelledError:
-            self._release()
-            raise
+        async with self._lock:
+            self._ensure_can_execute()
+            try:
+                return await self._driver_tx.execute(statement, parameters)
+            except asyncio.CancelledError:
+                self._release()
+                raise
 
     async def _execute_to_polars(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement and returns a Polars DataFrame."""
-        self._ensure_can_execute()
-        try:
-            if self.backend == "native":
-                from voyager_ogm.session import _stream_to_polars
+        async with self._lock:
+            self._ensure_can_execute()
+            try:
+                if self.backend == "native":
+                    from voyager_ogm.session import _stream_to_polars
 
-                result = await self._driver_tx.execute(statement, parameters)
-                return _stream_to_polars(result.stream)
-            return await self._driver_tx.execute_to_polars(statement, parameters)
-        except asyncio.CancelledError:
-            self._release()
-            raise
+                    result = await self._driver_tx.execute(statement, parameters)
+                    return _stream_to_polars(result.stream)
+                return await self._driver_tx.execute_to_polars(statement, parameters)
+            except asyncio.CancelledError:
+                self._release()
+                raise
 
     async def _execute_to_arrow(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement and returns an Arrow Table."""
-        self._ensure_can_execute()
-        try:
-            if self.backend == "native":
-                from voyager_ogm.session import _stream_to_arrow
+        async with self._lock:
+            self._ensure_can_execute()
+            try:
+                if self.backend == "native":
+                    from voyager_ogm.session import _stream_to_arrow
 
-                result = await self._driver_tx.execute(statement, parameters)
-                return _stream_to_arrow(result.stream)
-            arrow_execute = getattr(self._driver_tx, "execute_to_arrow", None)
-            if callable(arrow_execute):
-                return await arrow_execute(statement, parameters)
-            return (await self._driver_tx.execute_to_polars(statement, parameters)).to_arrow()
-        except asyncio.CancelledError:
-            self._release()
-            raise
+                    result = await self._driver_tx.execute(statement, parameters)
+                    return _stream_to_arrow(result.stream)
+                arrow_execute = getattr(self._driver_tx, "execute_to_arrow", None)
+                if callable(arrow_execute):
+                    return await arrow_execute(statement, parameters)
+                return (await self._driver_tx.execute_to_polars(statement, parameters)).to_arrow()
+            except asyncio.CancelledError:
+                self._release()
+                raise
 
     async def _execute_bulk(self, plan: Any) -> BulkExecutionResult:
         """Executes every batch of a bulk plan through the transaction."""
-        self._ensure_can_execute()
-        try:
-            if self.backend == "bridge":
-                return await self._driver_tx.execute_bulk(plan)
+        async with self._lock:
+            self._ensure_can_execute()
+            try:
+                if self.backend == "bridge":
+                    return await self._driver_tx.execute_bulk(plan)
 
-            start_time = time.perf_counter()
-            total_batches = 0
-            total_records = 0
-            statement = plan.statement
-            for batch_item in plan:
-                total_batches += 1
-                total_records += len(batch_item.parameters.get("batch", []))
-                await self._driver_tx.execute(batch_item.statement, batch_item.parameters)
-            return BulkExecutionResult(
-                total_batches=total_batches,
-                total_records=total_records,
-                duration_seconds=time.perf_counter() - start_time,
-                statement=statement,
-            )
-        except asyncio.CancelledError:
-            self._release()
-            raise
+                start_time = time.perf_counter()
+                total_batches = 0
+                total_records = 0
+                statement = plan.statement
+                for batch_item in plan:
+                    total_batches += 1
+                    total_records += len(batch_item.parameters.get("batch", []))
+                    await self._driver_tx.execute(batch_item.statement, batch_item.parameters)
+                return BulkExecutionResult(
+                    total_batches=total_batches,
+                    total_records=total_records,
+                    duration_seconds=time.perf_counter() - start_time,
+                    statement=statement,
+                )
+            except asyncio.CancelledError:
+                self._release()
+                raise
 
     def _release(self) -> None:
         """Clears the session's active-transaction pointer."""
+        self._released = True
         if getattr(self._session, "_active_transaction", None) is self:
             self._session._active_transaction = None
 
     async def commit(self) -> None:
         """Commits the database transaction and the paired unit of work."""
         try:
-            if self.state == "FAILED":
-                # Fail closed, but still end the server-side transaction so the
-                # connection (especially psycopg after INERROR) is reusable.
+            async with self._lock:
+                if self.state == "FAILED":
+                    # Fail closed, but still end the server-side transaction so the
+                    # connection (especially psycopg after INERROR) is reusable.
+                    try:
+                        await self._driver_tx.rollback()
+                    except BaseException:
+                        pass
+                    raise RuntimeError(_ABORTED_MESSAGE)
+                self._ensure_can_execute()
                 try:
-                    await self._driver_tx.rollback()
+                    await self._driver_tx.commit()
+                except asyncio.CancelledError:
+                    raise
                 except BaseException:
-                    pass
-                raise RuntimeError(_ABORTED_MESSAGE)
-            self._ensure_can_execute()
-            try:
-                await self._driver_tx.commit()
-            except asyncio.CancelledError:
-                raise
-            except BaseException:
-                # Best-effort rollback so a failed commit cannot leave an open
-                # server transaction behind. Never mask the original error.
-                try:
-                    await self._driver_tx.rollback()
-                except BaseException:
-                    pass
-                raise
-            if self._unit_of_work is not None:
-                self._unit_of_work.commit()
+                    # Best-effort rollback so a failed commit cannot leave an open
+                    # server transaction behind. Never mask the original error.
+                    try:
+                        await self._driver_tx.rollback()
+                    except BaseException:
+                        pass
+                    raise
+                if self._unit_of_work is not None:
+                    self._unit_of_work.commit()
         finally:
             self._release()
 
     async def rollback(self) -> None:
         """Rolls back the database transaction and restores tracked entities."""
         try:
-            self._ensure_can_rollback()
-            await self._driver_tx.rollback()
+            async with self._lock:
+                try:
+                    self._ensure_can_rollback()
+                    await self._driver_tx.rollback()
+                finally:
+                    if self._unit_of_work is not None:
+                        self._unit_of_work.rollback()
         finally:
-            if self._unit_of_work is not None:
-                self._unit_of_work.rollback()
             self._release()
 
     async def create_savepoint(self, name: str) -> None:
         """Creates a real database savepoint (PostgreSQL/AGE only)."""
-        self._ensure_can_execute()
-        if not self.supports_savepoints:
-            raise _savepoint_error(self._driver_tx)
-        await self._driver_tx.savepoint(name)
-        if self._unit_of_work is not None:
-            self._unit_of_work.create_savepoint(name)
+        async with self._lock:
+            self._ensure_can_execute()
+            if not self.supports_savepoints:
+                raise _savepoint_error(self._driver_tx)
+            await self._driver_tx.savepoint(name)
+            if self._unit_of_work is not None:
+                self._unit_of_work.create_savepoint(name)
 
     async def rollback_to_savepoint(self, name: str) -> None:
         """Rolls the database and unit of work back to a named savepoint."""
-        self._ensure_can_execute()
-        if not self.supports_savepoints:
-            raise _savepoint_error(self._driver_tx)
-        await self._driver_tx.rollback_to_savepoint(name)
-        if self._unit_of_work is not None:
-            self._unit_of_work.rollback_to_savepoint(name)
+        async with self._lock:
+            self._ensure_can_execute()
+            if not self.supports_savepoints:
+                raise _savepoint_error(self._driver_tx)
+            await self._driver_tx.rollback_to_savepoint(name)
+            if self._unit_of_work is not None:
+                self._unit_of_work.rollback_to_savepoint(name)
 
     async def release_savepoint(self, name: str) -> None:
         """Releases a named database savepoint."""
-        self._ensure_can_execute()
-        if not self.supports_savepoints:
-            raise _savepoint_error(self._driver_tx)
-        await self._driver_tx.release_savepoint(name)
-        if self._unit_of_work is not None:
-            self._unit_of_work.release_savepoint(name)
+        async with self._lock:
+            self._ensure_can_execute()
+            if not self.supports_savepoints:
+                raise _savepoint_error(self._driver_tx)
+            await self._driver_tx.release_savepoint(name)
+            if self._unit_of_work is not None:
+                self._unit_of_work.release_savepoint(name)
 
     def savepoint(self, name: str) -> AsyncSavepointContext:
         """Creates an async savepoint context manager."""
@@ -697,14 +749,17 @@ class AsyncTransaction:
         exc_tb: TracebackType | None,
     ) -> None:
         """Commits on clean exit, or rolls back and re-raises on exception."""
-        if exc_type is not None:
+        try:
+            if exc_type is not None:
+                if self.state in ("ACTIVE", "FAILED"):
+                    try:
+                        await self.rollback()
+                    except BaseException:
+                        # The original statement/body exception (including task
+                        # cancellation) must surface.
+                        pass
+                return
             if self.state in ("ACTIVE", "FAILED"):
-                try:
-                    await self.rollback()
-                except BaseException:
-                    # The original statement/body exception (including task
-                    # cancellation) must surface.
-                    pass
-            return
-        if self.state in ("ACTIVE", "FAILED"):
-            await self.commit()
+                await self.commit()
+        finally:
+            self._release()

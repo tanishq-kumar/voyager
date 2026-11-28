@@ -3744,9 +3744,67 @@ pub fn get_tokio_runtime() -> Arc<tokio::runtime::Runtime> {
             .expect("Failed to initialize fork-safe Tokio runtime for Voyager native client"),
     );
 
+    if let Some(old_rt) = guard.take() {
+        // After os.fork(), the parent's worker/blocking threads do not exist in
+        // the child; dropping the old Runtime would block forever waiting on them.
+        std::mem::forget(old_rt);
+    }
     *guard = Some(new_rt.clone());
     RUNTIME_PID.store(current_pid, AtomicOrdering::Release);
     new_rt
+}
+
+struct VoyagerTokioRuntime;
+
+tokio::task_local! {
+    static VOYAGER_TASK_LOCALS: std::cell::OnceCell<pyo3_async_runtimes::TaskLocals>;
+}
+
+impl pyo3_async_runtimes::generic::Runtime for VoyagerTokioRuntime {
+    type JoinError = tokio::task::JoinError;
+    type JoinHandle = tokio::task::JoinHandle<()>;
+
+    fn spawn<F>(fut: F) -> Self::JoinHandle
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        get_tokio_runtime().spawn(fut)
+    }
+
+    fn spawn_blocking<F>(f: F) -> Self::JoinHandle
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        get_tokio_runtime().spawn_blocking(f)
+    }
+}
+
+impl pyo3_async_runtimes::generic::ContextExt for VoyagerTokioRuntime {
+    fn scope<F, R>(
+        locals: pyo3_async_runtimes::TaskLocals,
+        fut: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send>>
+    where
+        F: std::future::Future<Output = R> + Send + 'static,
+    {
+        let cell = std::cell::OnceCell::new();
+        let _ = cell.set(locals);
+        Box::pin(VOYAGER_TASK_LOCALS.scope(cell, fut))
+    }
+
+    fn get_task_locals() -> Option<pyo3_async_runtimes::TaskLocals> {
+        VOYAGER_TASK_LOCALS
+            .try_with(|c| c.get().cloned())
+            .unwrap_or_default()
+    }
+}
+
+fn tokio_future_into_py<'py, F, T>(py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+where
+    F: std::future::Future<Output = PyResult<T>> + Send + 'static,
+    T: for<'a> pyo3::IntoPyObject<'a> + Send + 'static,
+{
+    pyo3_async_runtimes::generic::future_into_py::<VoyagerTokioRuntime, _, _>(py, fut)
 }
 
 /// Returns the process ID of the active Tokio runtime for fork-safety diagnostics.
@@ -3838,8 +3896,7 @@ impl PyNativeClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let params_map = py_dict_to_params(params)?;
         let client = self.client.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             let query_result = client
                 .execute(&query, &params_map)
                 .await
@@ -3860,8 +3917,7 @@ impl PyNativeClient {
     /// Asynchronously checks database connectivity.
     fn ping<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             client
                 .ping()
                 .await
@@ -3884,8 +3940,7 @@ impl PyNativeClient {
     /// Asynchronously leases one pooled connection and begins a native transaction.
     fn begin_transaction<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             let tx = client
                 .begin_transaction()
                 .await
@@ -3894,11 +3949,20 @@ impl PyNativeClient {
         })
     }
 
-    /// Closes the connection pool.
+    /// Closes the connection pool synchronously.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.client.clone();
         py.detach(|| get_tokio_runtime().block_on(async move { client.close().await }));
         Ok(())
+    }
+
+    /// Asynchronously closes the connection pool without blocking the event loop.
+    fn close_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        tokio_future_into_py(py, async move {
+            client.close().await;
+            Ok(())
+        })
     }
 }
 
@@ -4080,8 +4144,7 @@ impl PyNativeTransaction {
         let params_map = py_dict_to_params(params)?;
         let inner = self.inner.clone();
         let state = self.state.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             let mut guard = TxFutureGuard::new(inner.clone(), state.clone());
             let mut tx = match inner.lock().take() {
                 Some(tx) => tx,
@@ -4125,8 +4188,7 @@ impl PyNativeTransaction {
         self.ensure_active()?;
         let inner = self.inner.clone();
         let state = self.state.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             let mut guard = TxFutureGuard::new(inner.clone(), state.clone());
             let mut tx = match inner.lock().take() {
                 Some(tx) => tx,
@@ -4178,8 +4240,7 @@ impl PyNativeTransaction {
         self.ensure_rollback_allowed()?;
         let inner = self.inner.clone();
         let state = self.state.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             let mut guard = TxFutureGuard::new(inner.clone(), state.clone());
             let mut tx = match inner.lock().take() {
                 Some(tx) => tx,
@@ -4225,8 +4286,7 @@ impl PyNativeTransaction {
         self.ensure_savepoints()?;
         let inner = self.inner.clone();
         let state = self.state.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             let mut guard = TxFutureGuard::new(inner.clone(), state.clone());
             let mut tx = match inner.lock().take() {
                 Some(tx) => tx,
@@ -4269,8 +4329,7 @@ impl PyNativeTransaction {
         self.ensure_savepoints()?;
         let inner = self.inner.clone();
         let state = self.state.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             let mut guard = TxFutureGuard::new(inner.clone(), state.clone());
             let mut tx = match inner.lock().take() {
                 Some(tx) => tx,
@@ -4308,8 +4367,7 @@ impl PyNativeTransaction {
         self.ensure_savepoints()?;
         let inner = self.inner.clone();
         let state = self.state.clone();
-        let _ = get_tokio_runtime();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        tokio_future_into_py(py, async move {
             let mut guard = TxFutureGuard::new(inner.clone(), state.clone());
             let mut tx = match inner.lock().take() {
                 Some(tx) => tx,
