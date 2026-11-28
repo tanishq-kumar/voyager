@@ -668,3 +668,151 @@ def test_native_bolt_v4_0x66_local_zone_stub():
     finally:
         srv.close()
         t.join(timeout=2)
+
+
+def test_native_client_pool_health_and_idle_threshold_python() -> None:
+    """Verify NativeClient test_on_acquire / test_on_idle_after options and local EOF eviction."""
+    import socket
+    import struct
+    import threading
+    import time
+
+    from voyager_ogm import NativeClient, Session
+
+    with pytest.raises(ValueError, match="test_on_idle_after"):
+        NativeClient("bolt://127.0.0.1:7687", min_idle=0, test_on_idle_after=-1.0)
+    with pytest.raises(ValueError, match="test_on_idle_after"):
+        NativeClient("bolt://127.0.0.1:7687", min_idle=0, test_on_idle_after=float("nan"))
+
+    def _pack_chunks(msg: bytes) -> bytes:
+        return struct.pack("!H", len(msg)) + msg + b"\x00\x00"
+
+    def _read_msg(conn: socket.socket) -> bytes:
+        out = bytearray()
+        while True:
+            hdr = conn.recv(2)
+            if len(hdr) < 2:
+                return bytes(out)
+            sz = struct.unpack("!H", hdr)[0]
+            if sz == 0:
+                return bytes(out)
+            while sz > 0:
+                chunk = conn.recv(sz)
+                if not chunk:
+                    return bytes(out)
+                out.extend(chunk)
+                sz -= len(chunk)
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    port = srv.getsockname()[1]
+
+    stop_flag = threading.Event()
+    reset_count = 0
+    drop_after_first_query = threading.Event()
+    dropped_once = False
+    lock = threading.Lock()
+
+    def _handle(conn: socket.socket) -> None:
+        nonlocal reset_count, dropped_once
+        with conn:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if len(conn.recv(20)) < 20:
+                return
+            conn.sendall(bytes([0x00, 0x00, 0x04, 0x04]))
+            _read_msg(conn)  # HELLO
+            conn.sendall(_pack_chunks(b"\xb1\x70\xa0"))
+            while not stop_flag.is_set():
+                msg = _read_msg(conn)
+                if not msg:
+                    break
+                tag = msg[1] if len(msg) > 1 else 0
+                if tag == 0x10:  # RUN
+                    _read_msg(conn)  # PULL
+                    run_ok = b"\xb1\x70\xa1\x86fields\x91\x81v"
+                    rec = b"\xb1\x71\x91\x01"
+                    pull_ok = b"\xb1\x70\xa0"
+                    conn.sendall(_pack_chunks(run_ok) + _pack_chunks(rec) + _pack_chunks(pull_ok))
+                    with lock:
+                        should_drop = drop_after_first_query.is_set() and not dropped_once
+                        if should_drop:
+                            dropped_once = True
+                    if should_drop:
+                        break
+                elif tag == 0x0F:  # RESET
+                    with lock:
+                        reset_count += 1
+                    conn.sendall(_pack_chunks(b"\xb1\x70\xa0"))
+                elif tag == 0x02:  # GOODBYE
+                    break
+
+    def _accept_loop() -> None:
+        srv.settimeout(0.1)
+        while not stop_flag.is_set():
+            try:
+                conn, _ = srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=_handle, args=(conn,), daemon=True).start()
+
+    accept_t = threading.Thread(target=_accept_loop, daemon=True)
+    accept_t.start()
+    try:
+        # 1. Default: 0 RESETs within threshold, 1 RESET after idle > threshold.
+        client = NativeClient(
+            f"bolt://127.0.0.1:{port}",
+            min_idle=0,
+            max_size=1,
+            test_on_acquire=False,
+            test_on_idle_after=0.05,
+        )
+        try:
+            for _ in range(4):
+                assert client.execute_sync("RETURN 1 AS v", {}).to_dicts() == [{"v": 1}]
+            assert reset_count == 0
+            time.sleep(0.07)
+            assert client.execute_sync("RETURN 1 AS v", {}).to_dicts() == [{"v": 1}]
+            assert reset_count == 1
+        finally:
+            client.close()
+
+        # 2. Opt-in test_on_acquire=True sends RESET on every reused checkout.
+        before = reset_count
+        client_toa = NativeClient(
+            f"bolt://127.0.0.1:{port}",
+            min_idle=0,
+            max_size=1,
+            test_on_acquire=True,
+            test_on_idle_after=30.0,
+        )
+        try:
+            for _ in range(3):
+                client_toa.execute_sync("RETURN 1 AS v", {})
+            assert reset_count - before == 2
+        finally:
+            client_toa.close()
+
+        # 3. Session(backend="auto") recovers transparently from a server-closed idle socket.
+        drop_after_first_query.set()
+        sess = Session(
+            f"bolt://127.0.0.1:{port}",
+            dialect="cypher",
+            backend="auto",
+            fallback="mock",
+            pool_size=1,
+        )
+        try:
+            assert sess.execute("RETURN 1 AS v").all() == [{"v": 1}]
+            time.sleep(0.03)
+            assert sess.execute("RETURN 1 AS v").all() == [{"v": 1}]
+            assert sess.consecutive_native_failures == 0
+            assert sess.backend == "native"
+        finally:
+            sess.close()
+    finally:
+        stop_flag.set()
+        srv.close()
+        accept_t.join(timeout=2)

@@ -3831,11 +3831,31 @@ impl PyNativeClient {
     /// `age=True` runs Apache AGE setup on every PostgreSQL connection even when the URI
     /// does not name AGE, so a Session can select AGE through its dialect or graph name.
     #[new]
-    #[pyo3(signature = (uri, min_idle=1, max_size=10, age=false))]
-    fn new(uri: &str, min_idle: usize, max_size: usize, age: bool) -> PyResult<Self> {
+    #[pyo3(signature = (uri, min_idle=1, max_size=10, age=false, test_on_acquire=false, test_on_idle_after=Some(30.0)))]
+    fn new(
+        uri: &str,
+        min_idle: usize,
+        max_size: usize,
+        age: bool,
+        test_on_acquire: bool,
+        test_on_idle_after: Option<f64>,
+    ) -> PyResult<Self> {
+        let test_on_idle_after = match test_on_idle_after {
+            Some(secs) if secs.is_finite() && secs >= 0.0 => {
+                Some(std::time::Duration::from_secs_f64(secs))
+            }
+            Some(_) => {
+                return Err(PyValueError::new_err(
+                    "test_on_idle_after must be a non-negative finite number of seconds or None",
+                ));
+            }
+            None => None,
+        };
         let pool_config = voyager_drivers::PoolConfig {
             min_idle,
             max_size,
+            test_on_acquire,
+            test_on_idle_after,
             ..Default::default()
         };
         let client = voyager_drivers::NativeClient::new_with_options(

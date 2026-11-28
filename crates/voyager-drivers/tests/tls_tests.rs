@@ -1187,4 +1187,95 @@ mod tls_enabled {
         assert!(message.contains("PostgreSQL 17"), "{message}");
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
+
+    #[tokio::test]
+    async fn bolt_tls_local_liveness_evicts_server_closed_socket() {
+        use voyager_drivers::config::{ConnectionConfig, PoolConfig};
+        use voyager_drivers::engine::{AsyncConnection, ConnectionFactory};
+        use voyager_drivers::pool::ConnectionPool;
+
+        let pki = pki();
+        let acceptor = acceptor(&pki, false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let closed_first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_srv = closed_first.clone();
+
+        tokio::spawn(async move {
+            let mut count = 0usize;
+            while let Ok((tcp, _)) = listener.accept().await {
+                count += 1;
+                let acc = acceptor.clone();
+                let closed_flag = closed_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acc.accept(tcp).await else {
+                        return;
+                    };
+                    let mut hs = [0u8; 20];
+                    if tls.read_exact(&mut hs).await.is_err() {
+                        return;
+                    }
+                    let _ = tls.write_all(&[0, 0, 0, 5]).await;
+                    let _ = tls.flush().await;
+                    let _ = read_bolt_message(&mut tls).await;
+                    let _ = tls
+                        .write_all(&[0x00, 0x03, 0xB1, 0x70, 0xA0, 0x00, 0x00])
+                        .await;
+                    let _ = tls.flush().await;
+                    if count == 1 {
+                        // Gracefully shut down TLS (close_notify + TCP FIN) while idle
+                        let _ = tls.shutdown().await;
+                        closed_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        // Keep second connection alive for ping/RESET
+                        while read_bolt_message(&mut tls).await.is_ok() {
+                            let _ = tls
+                                .write_all(&[0x00, 0x03, 0xB1, 0x70, 0xA0, 0x00, 0x00])
+                                .await;
+                            let _ = tls.flush().await;
+                        }
+                    }
+                });
+            }
+        });
+
+        struct TlsBoltFactory(ConnectionConfig);
+        #[async_trait::async_trait]
+        impl ConnectionFactory<BoltConnection> for TlsBoltFactory {
+            async fn create(&self) -> voyager_drivers::Result<BoltConnection> {
+                BoltConnection::connect(&self.0).await
+            }
+        }
+
+        let ca = url_path(&pki.ca_file);
+        let cfg = ConnectionConfig::from_uri(format!("bolt+s://localhost:{port}?tls_ca_file={ca}"));
+        let pool = ConnectionPool::new(
+            PoolConfig::new()
+                .with_min_idle(0)
+                .with_max_size(1)
+                .with_test_on_acquire(false)
+                .with_test_on_idle_after(None),
+            std::sync::Arc::new(TlsBoltFactory(cfg)),
+        );
+
+        {
+            let c1 = pool.acquire().await.expect("first TLS conn");
+            assert!(c1.is_tls());
+        }
+        for _ in 0..50 {
+            if closed_first.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut c2 = pool
+            .acquire()
+            .await
+            .expect("second TLS conn after eviction");
+        c2.ping().await.expect("second TLS conn should be healthy");
+        assert_eq!(pool.metrics().connections_failed_health_check, 1);
+        assert_eq!(pool.metrics().connections_created, 2);
+    }
 }

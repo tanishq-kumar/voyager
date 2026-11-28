@@ -384,7 +384,13 @@ class NativeClient:
     """
 
     def __init__(
-        self, uri: str, min_idle: int = 1, max_size: int = 10, age: bool = False
+        self,
+        uri: str,
+        min_idle: int = 1,
+        max_size: int = 10,
+        age: bool = False,
+        test_on_acquire: bool = False,
+        test_on_idle_after: float | None = 30.0,
     ) -> None: ...
     @property
     def uri(self) -> str: ...

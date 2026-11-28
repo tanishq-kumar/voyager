@@ -27,6 +27,7 @@ use crate::uri::ParsedUri;
 /// Asynchronous physical connection to a PostgreSQL database server or Apache AGE instance.
 pub struct PostgresConnection {
     stream: NetStream,
+    socket_probe: Option<std::net::TcpStream>,
     uri: ParsedUri,
     server_parameters: HashMap<String, String>,
     backend_pid: i32,
@@ -261,15 +262,12 @@ impl PostgresConnection {
         age: bool,
     ) -> Result<Self> {
         let socket_addr = uri.socket_addr();
-        let stream = TcpStream::connect(&socket_addr).await.map_err(|e| {
+        let (stream, socket_probe) = crate::tls::connect_tcp(&socket_addr).await.map_err(|e| {
             NetError::ConnectionFailed(format!(
                 "Failed to connect to PostgreSQL host at {}: {}",
                 socket_addr, e
             ))
         })?;
-
-        // Optimize latency: disable Nagle's algorithm
-        let _ = stream.set_nodelay(true);
 
         let stream = if use_tls && negotiation == SslNegotiation::Direct {
             Self::direct_tls(stream, uri, ssl_mode, tls).await?
@@ -288,6 +286,7 @@ impl PostgresConnection {
 
         let mut conn = Self {
             stream,
+            socket_probe: Some(socket_probe),
             uri: uri.clone(),
             server_parameters: HashMap::new(),
             backend_pid: 0,
@@ -784,6 +783,11 @@ impl AsyncConnection for PostgresConnection {
 
     fn is_valid(&self) -> bool {
         !self.is_broken && self.transaction_status != TransactionStatus::FailedTransaction
+    }
+
+    fn is_locally_alive(&self) -> bool {
+        self.is_valid()
+            && crate::tls::is_stream_locally_alive(&self.stream, self.socket_probe.as_ref())
     }
 
     fn is_in_transaction(&self) -> bool {

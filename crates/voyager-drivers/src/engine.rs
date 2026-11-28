@@ -161,6 +161,14 @@ pub trait AsyncConnection: Send + Sync {
     /// Returns `true` if the underlying network socket or stream is currently healthy and open.
     fn is_valid(&self) -> bool;
 
+    /// Performs a non-blocking local liveness check without sending any network round-trip.
+    ///
+    /// Returns `false` if the connection is marked invalid, the peer has closed the socket,
+    /// the socket has an error, or unexpected unread data is pending on an idle connection.
+    fn is_locally_alive(&self) -> bool {
+        self.is_valid()
+    }
+
     /// Returns the negotiated wire protocol version (for example `"5.4"` for Bolt), if available.
     fn protocol_version(&self) -> Option<String> {
         None
@@ -250,6 +258,10 @@ impl AsyncConnection for Box<dyn AsyncConnection> {
 
     fn is_valid(&self) -> bool {
         (**self).is_valid()
+    }
+
+    fn is_locally_alive(&self) -> bool {
+        (**self).is_locally_alive()
     }
 
     fn protocol_version(&self) -> Option<String> {

@@ -88,8 +88,18 @@ pub struct PoolConfig {
     pub max_lifetime: Option<Duration>,
     /// Interval between background health-check and idle-eviction sweeps. Default is 30 seconds.
     pub health_check_interval: Duration,
-    /// Whether to perform a liveness probe (ping/RESET) on a connection before leasing. Default is true.
+    /// Whether to perform a liveness probe (ping/RESET) on every connection acquisition. Default is false.
     pub test_on_acquire: bool,
+    /// Maximum idle duration before a liveness probe (ping/RESET) is run on acquire.
+    ///
+    /// When `Some(threshold)`, connections idle for longer than `threshold` are pinged before
+    /// reuse; connections reused within `threshold` skip the extra round-trip. Default is 30s.
+    #[serde(default = "default_test_on_idle_after")]
+    pub test_on_idle_after: Option<Duration>,
+}
+
+const fn default_test_on_idle_after() -> Option<Duration> {
+    Some(Duration::from_secs(30))
 }
 
 impl Default for PoolConfig {
@@ -101,7 +111,8 @@ impl Default for PoolConfig {
             idle_timeout: Some(Duration::from_secs(600)),
             max_lifetime: Some(Duration::from_secs(1800)),
             health_check_interval: Duration::from_secs(30),
-            test_on_acquire: true,
+            test_on_acquire: false,
+            test_on_idle_after: default_test_on_idle_after(),
         }
     }
 }
@@ -139,6 +150,18 @@ impl PoolConfig {
     /// Sets the maximum connection lifetime before recycling.
     pub fn with_max_lifetime(mut self, lifetime: Option<Duration>) -> Self {
         self.max_lifetime = lifetime;
+        self
+    }
+
+    /// Sets whether to perform a liveness probe on every connection acquisition.
+    pub fn with_test_on_acquire(mut self, test: bool) -> Self {
+        self.test_on_acquire = test;
+        self
+    }
+
+    /// Sets the idle duration threshold after which a liveness probe is sent on acquire.
+    pub fn with_test_on_idle_after(mut self, threshold: Option<Duration>) -> Self {
+        self.test_on_idle_after = threshold;
         self
     }
 }
@@ -343,5 +366,21 @@ mod tests {
             rendered.contains("database: Some(\"movies\")"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn pool_config_defaults_and_builders() {
+        let cfg = PoolConfig::default();
+        assert!(!cfg.test_on_acquire);
+        assert_eq!(cfg.test_on_idle_after, Some(Duration::from_secs(30)));
+
+        let custom = PoolConfig::new()
+            .with_test_on_acquire(true)
+            .with_test_on_idle_after(Some(Duration::from_secs(5)));
+        assert!(custom.test_on_acquire);
+        assert_eq!(custom.test_on_idle_after, Some(Duration::from_secs(5)));
+
+        let disabled = PoolConfig::new().with_test_on_idle_after(None);
+        assert_eq!(disabled.test_on_idle_after, None);
     }
 }
