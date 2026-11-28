@@ -109,7 +109,7 @@ class FalkorDBBridge:
             graph_name: Name of the graph to use when a FalkorDB client is provided.
                 Ignored when a Graph instance is passed; its own name is used.
         """
-        self.graph_name = graph_name
+        self._graph_name = graph_name
         if hasattr(connection, "select_graph"):
             self.client = connection
             self.graph = connection.select_graph(graph_name)
@@ -117,10 +117,23 @@ class FalkorDBBridge:
             self.graph = connection
             self.client = getattr(connection, "falkordb", None)
             if hasattr(self.graph, "name"):
-                self.graph_name = self.graph.name
+                self._graph_name = self.graph.name
         else:
             self.graph = connection
             self.client = None
+
+    @property
+    def graph_name(self) -> str:
+        """Target graph key name."""
+        return self._graph_name
+
+    @graph_name.setter
+    def graph_name(self, value: str) -> None:
+        """Changes the target graph, selecting it again on a FalkorDB client."""
+        self._graph_name = value
+        client = getattr(self, "client", None)
+        if client is not None and hasattr(client, "select_graph"):
+            self.graph = client.select_graph(value)
 
     def execute(
         self, statement: str, parameters: dict[str, Any] | None = None
@@ -277,6 +290,11 @@ class AsyncFalkorDBBridge:
     def graph_name(self) -> str:
         """Target graph key name."""
         return self.sync_bridge.graph_name
+
+    @graph_name.setter
+    def graph_name(self, value: str) -> None:
+        """Target graph key name, forwarded to the wrapped synchronous bridge."""
+        self.sync_bridge.graph_name = value
 
     async def execute(
         self, statement: str, parameters: dict[str, Any] | None = None

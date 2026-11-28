@@ -31,6 +31,9 @@ impl BoltStubServer {
 
         let server_task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
+                // Without TCP_NODELAY the scripted responses hit Linux delayed
+                // ACK, adding ~41 ms to every loopback test query.
+                let _ = socket.set_nodelay(true);
                 tokio::spawn(async move {
                     let _ = Self::handle_connection(&mut socket).await;
                 });

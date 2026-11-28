@@ -6,6 +6,7 @@
 //! [`voyager_drivers::ParamValue`] for query inputs.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -37,10 +38,14 @@ struct EntityConstructors {
     uuid_cls: Py<PyAny>,
     decimal_cls: Py<PyAny>,
     zoneinfo_cls: Py<PyAny>,
+    zoneinfo_cache: Mutex<HashMap<String, Py<PyAny>>>,
     duration_cls: Py<PyAny>,
     point_cls: Py<PyAny>,
     parse_pg_interval_fn: Py<PyAny>,
 }
+
+/// Upper bound on cached `ZoneInfo` objects for a process.
+const ZONEINFO_CACHE_CAPACITY: usize = 64;
 
 static ENTITY_CONSTRUCTORS: PyOnceLock<EntityConstructors> = PyOnceLock::new();
 
@@ -70,11 +75,41 @@ fn entity_constructors<'py>(py: Python<'py>) -> PyResult<&'py EntityConstructors
             uuid_cls: uuid_mod.getattr("UUID")?.unbind(),
             decimal_cls: dec_mod.getattr("Decimal")?.unbind(),
             zoneinfo_cls: zi_mod.getattr("ZoneInfo")?.unbind(),
+            zoneinfo_cache: Mutex::new(HashMap::new()),
             duration_cls: types_mod.getattr("Duration")?.unbind(),
             point_cls: types_mod.getattr("Point")?.unbind(),
             parse_pg_interval_fn: types_mod.getattr("parse_pg_interval_text")?.unbind(),
         })
     })
+}
+
+/// Returns a cached `ZoneInfo` for `zone_id`, constructing it on first use.
+///
+/// Hydrating a zoned datetime otherwise builds a fresh `ZoneInfo` per cell.
+/// The cache is bounded so a long-lived process cannot accumulate unbounded
+/// zone objects; when it fills it is cleared and rebuilt.
+fn zoneinfo_cached<'py>(
+    py: Python<'py>,
+    ctors: &EntityConstructors,
+    zone_id: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    {
+        let cache = ctors
+            .zoneinfo_cache
+            .lock()
+            .map_err(|_| PyValueError::new_err("ZoneInfo cache lock is poisoned"))?;
+        if let Some(zi) = cache.get(zone_id) {
+            return Ok(zi.bind(py).clone());
+        }
+    }
+    let zi = ctors.zoneinfo_cls.bind(py).call1((zone_id,))?;
+    if let Ok(mut cache) = ctors.zoneinfo_cache.lock() {
+        if cache.len() >= ZONEINFO_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(zone_id.to_string(), zi.clone().unbind());
+    }
+    Ok(zi)
 }
 
 fn is_entity_node_obj(map: &serde_json::Map<String, serde_json::Value>) -> bool {
@@ -540,7 +575,7 @@ fn epoch_nanos_to_py_datetime<'py, S: AsRef<str>>(
             if !(1..=9999).contains(&y) {
                 return Ok(fallback_iso().as_ref().into_pyobject(py)?.into_any());
             }
-            let Ok(zi) = ctors.zoneinfo_cls.bind(py).call1((zone_id,)) else {
+            let Ok(zi) = zoneinfo_cached(py, ctors, zone_id) else {
                 return Ok(fallback_iso().as_ref().into_pyobject(py)?.into_any());
             };
             let utc = ctors.utc_obj.bind(py);
@@ -558,7 +593,7 @@ fn epoch_nanos_to_py_datetime<'py, S: AsRef<str>>(
             if !(1..=9999).contains(&y) {
                 return Ok(fallback_iso().as_ref().into_pyobject(py)?.into_any());
             }
-            let Ok(zi) = ctors.zoneinfo_cls.bind(py).call1((zone_id,)) else {
+            let Ok(zi) = zoneinfo_cached(py, ctors, zone_id) else {
                 return Ok(fallback_iso().as_ref().into_pyobject(py)?.into_any());
             };
             ctors
@@ -795,7 +830,7 @@ fn parse_voyager_typed_utf8<'py>(
             }
             let us = nanos / 1_000;
             if let Some(zone_id) = bracket_zone {
-                let Ok(zi) = ctors.zoneinfo_cls.bind(py).call1((zone_id,)) else {
+                let Ok(zi) = zoneinfo_cached(py, ctors, zone_id) else {
                     return Ok(s.into_pyobject(py)?.into_any());
                 };
                 if let Some(offset) = offset_opt {
@@ -1874,12 +1909,6 @@ fn extract_zone_id(tzinfo: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
 fn py_any_to_param_value(val: &Bound<'_, PyAny>) -> PyResult<voyager_drivers::ParamValue> {
     use voyager_drivers::{ParamTimezone, ParamValue};
 
-    if val.hasattr("__voyager_json__")? {
-        let inner = val.getattr("value")?;
-        let converted = py_any_to_param_value(&inner)?;
-        return Ok(ParamValue::Jsonb(Box::new(converted)));
-    }
-
     if val.is_none() {
         Ok(ParamValue::Json(serde_json::Value::Null))
     } else if let Ok(b) = val.cast::<PyBool>() {
@@ -1898,6 +1927,10 @@ fn py_any_to_param_value(val: &Bound<'_, PyAny>) -> PyResult<voyager_drivers::Pa
         Ok(ParamValue::Json(serde_json::Value::String(
             s.to_string_lossy().into_owned(),
         )))
+    } else if val.hasattr("__voyager_json__")? {
+        let inner = val.getattr("value")?;
+        let converted = py_any_to_param_value(&inner)?;
+        Ok(ParamValue::Jsonb(Box::new(converted)))
     } else if let Ok(b) = val.cast::<PyBytes>() {
         Ok(ParamValue::Bytes(b.as_bytes().to_vec()))
     } else if let Ok(ba) = val.cast::<PyByteArray>() {

@@ -13,9 +13,11 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, Self, TypedDict, TypeVa
 
 from voyager_ogm.bridge import (
     AsyncDatabaseBridge,
+    AsyncDuckDbBridge,
     AsyncMockBridge,
     BulkExecutionResult,
     DatabaseBridge,
+    DuckDbBridge,
     MockBridge,
     _infer_record_columns,
     create_bridge,
@@ -445,10 +447,13 @@ class ExecutionResult(list[dict[str, Any]]):
         batch_size: int = 10_000,
         as_format: str = "dicts",
     ) -> Iterator[Any]:
-        """Streams the execution result in constant-memory chunks of `batch_size` rows.
+        """Slices the already-materialized execution result into chunks of `batch_size` rows.
 
-        Prevents CPython memory explosions and GC stop-the-world pauses when
-        processing high-cardinality result sets (e.g. 100k - 10M rows).
+        The query has already run and its rows are fully materialized when this
+        method is called, so the chunks are views over that result and do not
+        reduce peak memory. Real incremental streaming from the database is
+        tracked separately (#458); until then prefer `execute_to_polars()` or
+        `execute_to_arrow()` for large result sets.
 
         Parameters
         ----------
@@ -755,6 +760,8 @@ class _SessionBase:
 
         if is_native_candidate:
             self._native_client = bridge
+            # A caller-supplied native client keeps a mock bridge so health and
+            # explicit fallback checks still work, matching previous behaviour.
             self._bridge = AsyncMockBridge() if is_async else MockBridge()
         elif (
             self._requested_backend in ("native", "auto")
@@ -784,7 +791,15 @@ class _SessionBase:
                         max_size=pool_size,
                         age=self._wants_apache_age(graph_name),
                     )
-                    self._bridge = create_bridge(bridge, is_async=is_async, graph_name=graph_name)
+                    if self._requested_backend == "native":
+                        # A native-only session has no bridge: bridge-only
+                        # features raise a clear error instead of opening an
+                        # unused connection.
+                        self._bridge = None
+                    else:
+                        self._bridge = create_bridge(
+                            bridge, is_async=is_async, graph_name=graph_name
+                        )
                 except Exception as e:
                     if self._requested_backend == "native":
                         raise RuntimeError(f"Failed to initialize native backend: {e}") from e
@@ -831,8 +846,6 @@ class _SessionBase:
         if resolved_graph is None and self._dialect in ("age", "apache_age", "postgres_age"):
             resolved_graph = "age_graph"
 
-        from voyager_ogm.bridge import AsyncDuckDbBridge, DuckDbBridge
-
         if dialect is None and isinstance(self._bridge, (DuckDbBridge, AsyncDuckDbBridge)):
             self._dialect = "duckpgq"
 
@@ -863,6 +876,21 @@ class _SessionBase:
         if graph_name is None:
             return False
         return dialect not in ("sql_pgq", "duckpgq", "iso_gql")
+
+    def _require_bridge(self, feature: str) -> Any:
+        """Returns the driver bridge or explains why a native-only session has none.
+
+        ``backend="native"`` sessions execute through the native Rust client and do
+        not build a Python driver bridge, so bridge-only features must fail with a
+        clear error instead of an ``AttributeError`` on ``None``.
+        """
+        if self._bridge is None:
+            raise RuntimeError(
+                f"{feature} requires a driver bridge, but this session was created with "
+                'backend="native" and has no bridge. Use backend="auto" or pass a bridge '
+                "to use bridge-only features."
+            )
+        return self._bridge
 
     def _native_execution_result(
         self,
@@ -971,7 +999,7 @@ class _SessionBase:
     @property
     def bridge(self) -> Any:
         """Active database bridge."""
-        return self._bridge
+        return self._require_bridge("session.bridge")
 
     def _get_ping_statement(self) -> str:
         """Determines the appropriate liveness probe query for the session's dialect."""
@@ -1214,7 +1242,9 @@ class _SessionBase:
     ) -> dict[str, Any]:
         """Merges runtime parameters with compiled parameters, warning on key collisions."""
         if not runtime_params:
-            return dict(compiled_params)
+            # The compiled parameter dict is never mutated by execution, so reuse
+            # it instead of copying on every query of a CompiledQuery.
+            return compiled_params
         collisions = set(runtime_params.keys()) & set(compiled_params.keys())
         if collisions:
             collision_keys = sorted(collisions)
@@ -1255,8 +1285,6 @@ class _SessionBase:
                 else self._optimization_level
             )
             target_dialect = self._dialect
-            from voyager_ogm.bridge import AsyncDuckDbBridge, DuckDbBridge
-
             if isinstance(self._bridge, (DuckDbBridge, AsyncDuckDbBridge)) and target_dialect in (
                 "sql_pgq",
                 "pgq",
@@ -1276,7 +1304,8 @@ class _SessionBase:
             stmt = str(query_or_statement)
 
         validate_pagination_parameters(stmt, params)
-        params = {k: serialize_param_value(v) for k, v in params.items()}
+        if params:
+            params = {k: serialize_param_value(v) for k, v in params.items()}
         return stmt, params, q_obj
 
     def _bulk_dialect(self, dialect: str | None) -> str:
@@ -1290,8 +1319,6 @@ class _SessionBase:
         """
         if dialect is not None:
             return dialect
-        from voyager_ogm.bridge import AsyncDuckDbBridge, DuckDbBridge
-
         if isinstance(self._bridge, (DuckDbBridge, AsyncDuckDbBridge)) and (
             self._dialect or ""
         ).lower() in ("duckpgq", "duck_pgq", "sql_pgq", "pgq"):
@@ -1562,7 +1589,7 @@ class Session(_SessionBase):
     @property
     def bridge(self) -> DatabaseBridge:
         """Active database bridge."""
-        return self._bridge
+        return self._require_bridge("session.bridge")
 
     def query(self, target_or_query: Any) -> BoundQuery:
         """Creates a fluent query bound to this session for direct execution and export.
@@ -1642,7 +1669,7 @@ class Session(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
-        raw_records = self._bridge.execute(stmt, params)
+        raw_records = self._require_bridge("Session.execute() fallback").execute(stmt, params)
         return ExecutionResult(
             records=raw_records,
             statement=stmt,
@@ -1696,7 +1723,9 @@ class Session(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
-        return self._bridge.execute_to_polars(stmt, params)
+        return self._require_bridge("Session.execute_to_polars() fallback").execute_to_polars(
+            stmt, params
+        )
 
     def execute_to_arrow(
         self,
@@ -1744,7 +1773,8 @@ class Session(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
-        arrow_execute = getattr(self._bridge, "execute_to_arrow", None)
+        bridge = self._require_bridge("Session.execute_to_arrow() fallback")
+        arrow_execute = getattr(bridge, "execute_to_arrow", None)
         if callable(arrow_execute):
             return arrow_execute(stmt, params)
         res = self.execute(query_or_statement, parameters)
@@ -1855,7 +1885,7 @@ class Session(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
-        return self._bridge.execute_bulk(plan)
+        return self._require_bridge("Session.run_bulk() fallback").execute_bulk(plan)
 
     def ingest_parquet(
         self,
@@ -2372,7 +2402,8 @@ class Session(_SessionBase):
         self.clear()
         if self._native_client is not None:
             self._native_client.close()
-        self._bridge.close()
+        if self._bridge is not None:
+            self._bridge.close()
 
     def __enter__(self) -> Session:
         return self
@@ -2452,7 +2483,7 @@ class AsyncSession(_SessionBase):
     @property
     def bridge(self) -> AsyncDatabaseBridge:
         """Active async database bridge."""
-        return self._bridge
+        return self._require_bridge("session.bridge")
 
     def query(self, target_or_query: Any) -> AsyncBoundQuery:
         """Creates a fluent async query bound to this session for direct execution and export.
@@ -2530,7 +2561,9 @@ class AsyncSession(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
-        raw_records = await self._bridge.execute(stmt, params)
+        raw_records = await self._require_bridge("AsyncSession.execute() fallback").execute(
+            stmt, params
+        )
         return ExecutionResult(
             records=raw_records,
             statement=stmt,
@@ -2584,7 +2617,9 @@ class AsyncSession(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
-        return await self._bridge.execute_to_polars(stmt, params)
+        return await self._require_bridge(
+            "AsyncSession.execute_to_polars() fallback"
+        ).execute_to_polars(stmt, params)
 
     async def execute_to_arrow(
         self,
@@ -2632,7 +2667,8 @@ class AsyncSession(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
-        arrow_execute = getattr(self._bridge, "execute_to_arrow", None)
+        bridge = self._require_bridge("AsyncSession.execute_to_arrow() fallback")
+        arrow_execute = getattr(bridge, "execute_to_arrow", None)
         if callable(arrow_execute):
             return await arrow_execute(stmt, params)
         res = await self.execute(query_or_statement, parameters)
@@ -2749,7 +2785,7 @@ class AsyncSession(_SessionBase):
                     ) from e
                 self._record_native_failure(e)
 
-        return await self._bridge.execute_bulk(plan)
+        return await self._require_bridge("AsyncSession.run_bulk() fallback").execute_bulk(plan)
 
     async def ingest_parquet(
         self,
@@ -3241,7 +3277,8 @@ class AsyncSession(_SessionBase):
         self.clear()
         if self._native_client is not None:
             self._native_client.close()
-        await self._bridge.close()
+        if self._bridge is not None:
+            await self._bridge.close()
 
     async def __aenter__(self) -> AsyncSession:
         return self
