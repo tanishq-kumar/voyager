@@ -10,11 +10,18 @@ commits or rolls back on context exit. The in-memory unit of work lives in
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 
 from voyager_ogm.bridge import BulkExecutionResult
+from voyager_ogm.stream import (
+    DEFAULT_STREAM_FETCH_SIZE,
+    AsyncResultStream,
+    ResultStream,
+    _validate_stream_format,
+)
 from voyager_ogm.unit_of_work import UnitOfWork
 
 if TYPE_CHECKING:
@@ -244,6 +251,67 @@ class Transaction:
         if callable(direct):
             return direct(self, query_or_statement, parameters)
         return self._session.execute_to_arrow(query_or_statement, parameters)
+
+    def stream(
+        self,
+        query_or_statement: Any,
+        parameters: dict[str, Any] | None = None,
+        *,
+        fetch_size: int = DEFAULT_STREAM_FETCH_SIZE,
+        as_format: str = "dicts",
+    ) -> ResultStream:
+        """Opens a pull-based stream on this transaction's connection.
+
+        The stream sees uncommitted writes from earlier statements in the
+        transaction. While it is open, further statements and ``commit()`` fail
+        fast with ``RuntimeError``; close it first.
+
+        Args:
+            query_or_statement: Query, CompiledQuery, or raw statement string.
+            parameters: Query parameters for a raw statement.
+            fetch_size: Maximum rows per batch (default 1,000).
+            as_format: Batch format: ``"dicts"``, ``"arrow"``, or ``"polars"``.
+
+        Returns:
+            A :class:`~voyager_ogm.stream.ResultStream` of batches.
+        """
+        if fetch_size < 1:
+            raise ValueError("fetch_size must be at least 1")
+        _validate_stream_format(as_format)
+        self._ensure_can_execute()
+        stmt, params, _ = self._session._prepare_statement(query_or_statement, parameters)
+        return self._stream_prepared(stmt, params, fetch_size=fetch_size, as_format=as_format)
+
+    def _stream_prepared(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None,
+        *,
+        fetch_size: int,
+        as_format: str,
+    ) -> ResultStream:
+        """Opens a stream for an already-prepared statement and parameters."""
+        self._ensure_can_execute()
+        if self.backend == "native":
+            source = self._driver_tx.stream_sync(statement, parameters, fetch_size)
+        else:
+            stream = getattr(self._driver_tx, "stream", None)
+            if not callable(stream):
+                raise NotImplementedError(
+                    f"{type(self._driver_tx).__name__} does not support streaming; "
+                    "use a native backend, DuckDB, PostgreSQL/AGE, or Neo4j/Memgraph"
+                )
+            source = stream(statement, parameters, fetch_size)
+        stream_obj = ResultStream(
+            source,
+            statement=statement,
+            dialect=self._session.dialect,
+            as_format=as_format,
+            on_release=self._session._end_stream,
+            on_error=(self._session._record_native_failure if self.backend == "native" else None),
+        )
+        self._session._begin_stream()
+        return stream_obj
 
     def _execute_sync(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement through the selected backend transaction."""
@@ -588,6 +656,68 @@ class AsyncTransaction:
         if callable(direct):
             return await direct(self, query_or_statement, parameters)
         return await self._session.execute_to_arrow(query_or_statement, parameters)
+
+    def stream(
+        self,
+        query_or_statement: Any,
+        parameters: dict[str, Any] | None = None,
+        *,
+        fetch_size: int = DEFAULT_STREAM_FETCH_SIZE,
+        as_format: str = "dicts",
+    ) -> AsyncResultStream:
+        """Opens a lazy pull-based stream on this async transaction's connection.
+
+        Args:
+            query_or_statement: Query, CompiledQuery, or raw statement string.
+            parameters: Query parameters for a raw statement.
+            fetch_size: Maximum rows per batch (default 1,000).
+            as_format: Batch format: ``"dicts"``, ``"arrow"``, or ``"polars"``.
+
+        Returns:
+            A lazy :class:`~voyager_ogm.stream.AsyncResultStream` of batches.
+        """
+        if fetch_size < 1:
+            raise ValueError("fetch_size must be at least 1")
+        _validate_stream_format(as_format)
+        self._ensure_can_execute()
+        stmt, params, _ = self._session._prepare_statement(query_or_statement, parameters)
+        return self._stream_prepared(stmt, params, fetch_size=fetch_size, as_format=as_format)
+
+    def _stream_prepared(
+        self,
+        statement: str,
+        parameters: dict[str, Any] | None,
+        *,
+        fetch_size: int,
+        as_format: str,
+    ) -> AsyncResultStream:
+        """Builds a lazy stream for an already-prepared statement and parameters."""
+        self._ensure_can_execute()
+
+        async def opener() -> Any:
+            self._ensure_can_execute()
+            if self.backend == "native":
+                return await self._driver_tx.stream(statement, parameters, fetch_size)
+            stream = getattr(self._driver_tx, "stream", None)
+            if not callable(stream):
+                raise NotImplementedError(
+                    f"{type(self._driver_tx).__name__} does not support streaming; "
+                    "use a native backend, DuckDB, PostgreSQL/AGE, or Neo4j/Memgraph"
+                )
+            result = stream(statement, parameters, fetch_size)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        return AsyncResultStream(
+            opener,
+            statement=statement,
+            dialect=self._session.dialect,
+            as_format=as_format,
+            on_open=self._session._begin_stream,
+            on_release=self._session._end_stream,
+            on_error=(self._session._record_native_failure if self.backend == "native" else None),
+        )
 
     async def _execute(self, statement: str, parameters: dict[str, Any] | None) -> Any:
         """Executes a statement through the selected backend transaction."""

@@ -588,6 +588,33 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
     return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
 
+def _duckdb_arrow_batch_to_canonical(batch: Any, description: Sequence[Any]) -> Any:
+    """Canonicalizes one DuckDB Arrow record batch exactly like ``execute_to_arrow()``.
+
+    It applies the same ``UUID``/``JSON``/``TIMETZ``/``HUGEINT``/``INTERVAL``
+    rules as :func:`_duckdb_arrow_table_to_canonical`, preserving the zero-copy
+    fast path when no column needs canonicalization.
+
+    Args:
+        batch: Raw DuckDB ``pyarrow.RecordBatch`` from ``to_arrow_reader()``.
+        description: DuckDB cursor/relation description with column type objects.
+
+    Returns:
+        A canonical ``pyarrow.RecordBatch``.
+    """
+    import pyarrow as pa
+
+    table = pa.Table.from_batches([batch])
+    canonical = _duckdb_arrow_table_to_canonical(table, description)
+    if canonical is table:
+        return batch
+    if canonical.num_rows == 0:
+        return pa.RecordBatch.from_arrays(
+            [pa.array([], type=field.type) for field in canonical.schema], schema=canonical.schema
+        )
+    return canonical.combine_chunks().to_batches()[0]
+
+
 def _duckdb_python_values_to_arrow(
     name: str, values: list[Any], dtype: Any, *, nullable: bool = True
 ) -> tuple[Any, Any]:

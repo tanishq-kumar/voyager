@@ -135,6 +135,7 @@ from voyager_ogm.session import (
     Session,
     SessionHealth,
 )
+from voyager_ogm.stream import AsyncResultStream, ResultStream
 from voyager_ogm.streaming import (
     QueryResult,
     to_arrow,
@@ -225,6 +226,7 @@ __all__ = [
     "AsyncNeo4jBoltBridge",
     "AsyncPostgresBridge",
     "AsyncRelateBridge",
+    "AsyncResultStream",
     "AsyncSession",
     "AsyncTransaction",
     "BinaryExpr",
@@ -289,6 +291,7 @@ __all__ = [
     "RelationshipFrom",
     "RelationshipTo",
     "Result",
+    "ResultStream",
     "SavepointContext",
     "ScalarsResult",
     "SchemaManager",
