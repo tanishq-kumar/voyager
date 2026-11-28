@@ -35,6 +35,11 @@ def validate_pagination_parameters(statement: str, parameters: Mapping[str, Any]
     """
     if not parameters:
         return
+    # Most OLTP statements bind no pagination at all. A case-insensitive
+    # substring check avoids the regular-expression scan on that hot path.
+    upper = statement.upper()
+    if "LIMIT" not in upper and "SKIP" not in upper and "OFFSET" not in upper:
+        return
     for name in sorted(set(_PAGINATION_PARAMETER_PATTERN.findall(statement))):
         if name not in parameters:
             continue

@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 
 use crate::config::Auth;
@@ -24,7 +25,7 @@ pub struct RedisConnection {
     is_resp3: bool,
     server_info: HashMap<String, RespValue>,
     default_graph: String,
-    graph_schemas: HashMap<String, FalkorGraphSchema>,
+    graph_schemas: HashMap<String, Arc<FalkorGraphSchema>>,
     in_transaction: bool,
     is_valid: bool,
     query_timeout: Option<std::time::Duration>,
@@ -358,7 +359,7 @@ impl RedisConnection {
         &mut self,
         graph: &str,
         version: Option<i64>,
-    ) -> Result<FalkorGraphSchema> {
+    ) -> Result<Arc<FalkorGraphSchema>> {
         let labels = self
             .fetch_schema_string_list(graph, "CALL db.labels()")
             .await?;
@@ -368,13 +369,14 @@ impl RedisConnection {
         let properties = self
             .fetch_schema_string_list(graph, "CALL db.propertyKeys()")
             .await?;
-        let schema = FalkorGraphSchema {
+        let schema = Arc::new(FalkorGraphSchema {
             version,
             labels,
             relationships,
             properties,
-        };
-        self.graph_schemas.insert(graph.to_string(), schema.clone());
+        });
+        self.graph_schemas
+            .insert(graph.to_string(), Arc::clone(&schema));
         Ok(schema)
     }
 
@@ -436,12 +438,14 @@ impl AsyncConnection for RedisConnection {
         let graph = self.default_graph.clone();
         match self.graph_query_compact(&graph, query, params).await {
             Ok(compact_res) => {
-                let cached = self.graph_schemas.get(&graph);
-                let schema = if compact_res.needs_schema_refresh(cached) {
+                // Hold the cached schema by `Arc` so a query never deep-clones
+                // the label/relationship/property lists.
+                let cached = self.graph_schemas.get(&graph).cloned();
+                let schema = if compact_res.needs_schema_refresh(cached.as_deref()) {
                     self.refresh_graph_schema(&graph, compact_res.graph_version)
                         .await?
                 } else {
-                    cached.cloned().unwrap_or_default()
+                    cached.unwrap_or_default()
                 };
                 compact_res.to_query_result(&schema)
             }

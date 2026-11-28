@@ -41,6 +41,8 @@ CARTESIAN_3D: int = 9157
 
 SUPPORTED_SRIDS: frozenset[int] = frozenset({WGS_84_2D, WGS_84_3D, CARTESIAN_2D, CARTESIAN_3D})
 
+_UNSET: Any = object()
+
 # Neo4j and openCypher standard mean Earth radius in meters
 EARTH_RADIUS_METERS: float = 6371008.8
 
@@ -266,13 +268,40 @@ class Point(Expression):
             else "cartesian",
         )
 
+    @property
+    def _native_expr(self) -> Any:
+        """Native `AstExpr` for this point, built on first use.
+
+        Hydrating a `Point` is common while the native expression is only needed
+        when the point is actually embedded in a query, so construction stays
+        cheap and the expression is cached on the instance after first access.
+        The `None` fallback is kept for builds without the Rust extension.
+        """
+        cached = self.__dict__.get("_native_expr", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        expr: Any = None
         if HAS_VOYAGER_RS and AstExpr is not None:
             try:
-                self._native_expr = AstExpr.function(
-                    "point", [AstExpr.literal(self.to_cypher_dict())]
-                )
+                expr = AstExpr.function("point", [AstExpr.literal(self.to_cypher_dict())])
             except Exception:
-                self._native_expr = None
+                expr = None
+        self.__dict__["_native_expr"] = expr
+        return expr
+
+    @_native_expr.setter
+    def _native_expr(self, value: Any) -> None:
+        self.__dict__["_native_expr"] = value
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Returns the picklable state, dropping the lazily rebuilt native expression."""
+        state = dict(self.__dict__)
+        state.pop("_native_expr", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restores pickled state; the native expression is rebuilt on first use."""
+        self.__dict__.update(state)
 
     @property
     def srid(self) -> int:
@@ -693,6 +722,8 @@ def serialize_param_value(val: Any) -> Any:
 
     Maps `Point` objects to a tagged dictionary `{"__voyager_spatial__": ...}`.
     """
+    if val is None or isinstance(val, (str, int, float, bool, bytes)):
+        return val
     if isinstance(val, Point):
         return {"__voyager_spatial__": val.to_dict()}
     if hasattr(val, "to_cypher_dict"):

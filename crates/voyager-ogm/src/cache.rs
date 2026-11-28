@@ -48,6 +48,28 @@ struct LruState {
     evictions: u64,
 }
 
+/// Rewrites `order` down to the live entries, keeping the most recent generation.
+///
+/// `order` records every hit so `put()` can find the least recently used key,
+/// but repeated hits on the same key leave stale generations behind. Compaction
+/// is shared by `get()` and `put()` so a read-only workload cannot grow it
+/// without bound.
+fn compact_order(order: &mut VecDeque<(String, u64)>, map: &HashMap<String, (CompiledQuery, u64)>) {
+    let drained: Vec<_> = order.drain(..).collect();
+    let mut compacted = VecDeque::with_capacity(map.len());
+    let mut seen = HashMap::new();
+    for (k, g) in drained.into_iter().rev() {
+        if let Some((_, current_g)) = map.get(&k)
+            && *current_g == g
+            && !seen.contains_key(&k)
+        {
+            seen.insert(k.clone(), ());
+            compacted.push_front((k, g));
+        }
+    }
+    *order = compacted;
+}
+
 /// Thread-safe Least Recently Used (LRU) query compilation cache.
 #[derive(Debug)]
 pub struct CompiledQueryCache {
@@ -90,6 +112,12 @@ impl CompiledQueryCache {
         if let Some(res) = result {
             state.hits += 1;
             state.order.push_back((key.to_string(), gen_id));
+            // A read-only workload never calls `put()`, so compact here too and
+            // keep `order` bounded by the same multiple of the capacity.
+            if state.order.len() > self.capacity * 4 {
+                let LruState { order, map, .. } = &mut *state;
+                compact_order(order, map);
+            }
             Some(res)
         } else {
             state.misses += 1;
@@ -113,6 +141,10 @@ impl CompiledQueryCache {
 
         if was_existing {
             state.order.push_back((key, gen_id));
+            if state.order.len() > self.capacity * 4 {
+                let LruState { order, map, .. } = &mut *state;
+                compact_order(order, map);
+            }
             return;
         }
 
@@ -136,19 +168,8 @@ impl CompiledQueryCache {
 
         // Periodic maintenance to prevent unbounded VecDeque growth from duplicates
         if state.order.len() > self.capacity * 4 {
-            let drained: Vec<_> = state.order.drain(..).collect();
-            let mut compact_order = VecDeque::with_capacity(state.map.len());
-            let mut seen = HashMap::new();
-            for (k, g) in drained.into_iter().rev() {
-                if let Some((_, current_g)) = state.map.get(&k)
-                    && *current_g == g
-                    && !seen.contains_key(&k)
-                {
-                    seen.insert(k.clone(), ());
-                    compact_order.push_front((k, g));
-                }
-            }
-            state.order = compact_order;
+            let LruState { order, map, .. } = &mut *state;
+            compact_order(order, map);
         }
     }
 
@@ -272,5 +293,27 @@ mod tests {
         assert!(cache.get("k3").is_some());
         assert!(cache.get("k2").is_some());
         assert!(cache.get("k1").is_none()); // k1 was LRU before k2 accesses
+    }
+
+    #[test]
+    fn test_query_cache_get_hits_keep_order_bounded() {
+        let cache = CompiledQueryCache::new(1);
+        let q = CompiledQuery::new("MATCH (n) RETURN n".into(), HashMap::new());
+        cache.put("k1".into(), q.clone());
+
+        for _ in 0..100_000 {
+            assert_eq!(cache.get("k1"), Some(q.clone()));
+        }
+
+        let bound = cache.capacity() * 4;
+        let state = cache.inner.lock().unwrap();
+        assert!(
+            state.order.len() <= bound,
+            "order grew to {} entries with capacity {}",
+            state.order.len(),
+            cache.capacity()
+        );
+        assert_eq!(state.map.len(), 1);
+        assert_eq!(state.hits, 100_000);
     }
 }

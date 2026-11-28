@@ -258,7 +258,10 @@ def create_bridge(
                 if isinstance(sync_inst, DuckDbBridge):
                     return AsyncDuckDbBridge(driver_or_connection)
                 elif isinstance(sync_inst, FalkorDBBridge):
-                    return AsyncFalkorDBBridge(driver_or_connection)
+                    return AsyncFalkorDBBridge(
+                        driver_or_connection,
+                        graph_name=graph_name if graph_name is not None else sync_inst.graph_name,
+                    )
                 elif isinstance(sync_inst, RelateBridge):
                     return AsyncRelateBridge(driver_or_connection)
                 elif isinstance(sync_inst, PostgresBridge):
