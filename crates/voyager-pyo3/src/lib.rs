@@ -3,6 +3,7 @@
 mod values;
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use pyo3::exceptions::{
@@ -11,7 +12,7 @@ use pyo3::exceptions::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
-use values::{py_dict_to_params, record_batch_to_py_dicts};
+use values::{py_dict_to_params, record_batch_to_py_dicts, result_rows_to_py_dicts};
 
 pyo3::create_exception!(
     voyager_ogm._voyager_rs,
@@ -2906,26 +2907,50 @@ impl PyQueryBuilder {
     }
 }
 
+/// In-memory representation backing a [`PyArrowStream`].
+///
+/// A stream is either `Rows` XOR `Arrow`: OLTP `execute()` keeps decoded
+/// [`ResultValue`] rows and never builds a `RecordBatch`, while
+/// `execute_to_arrow()` builds canonical Arrow directly and retains no rows.
+#[derive(Clone)]
+enum StreamBacking {
+    Arrow {
+        batch: arrow_array::RecordBatch,
+        bolt_rows: Option<Arc<Vec<Vec<voyager_drivers::BoltValue>>>>,
+        result_rows: Option<Arc<Vec<Vec<voyager_drivers::ResultValue>>>>,
+        row_offset: usize,
+    },
+    Rows {
+        columns: Arc<[String]>,
+        rows: Arc<Vec<Vec<voyager_drivers::ResultValue>>>,
+        column_hints: Arc<[voyager_drivers::value::arrow::ColumnHint]>,
+        row_offset: usize,
+        row_len: usize,
+        /// Canonical Arrow batch built at most once, only if the caller asks for
+        /// `.to_arrow()` / `.to_polars()` / `__arrow_c_stream__` on a row result.
+        materialized: Arc<OnceLock<arrow_array::RecordBatch>>,
+    },
+}
+
 /// Zero-copy Arrow Stream implementing the Python Arrow PyCapsule Protocol (`__arrow_c_stream__`).
 #[pyclass(name = "ArrowStream", from_py_object)]
 #[derive(Clone)]
 pub struct PyArrowStream {
-    batch: arrow_array::RecordBatch,
+    backing: StreamBacking,
     consumed: Arc<AtomicBool>,
-    bolt_rows: Option<Arc<Vec<Vec<voyager_drivers::BoltValue>>>>,
-    result_rows: Option<Arc<Vec<Vec<voyager_drivers::ResultValue>>>>,
-    row_offset: usize,
 }
 
 impl PyArrowStream {
     /// Creates a new `PyArrowStream` wrapping an Arrow `RecordBatch`.
     pub fn from_batch(batch: arrow_array::RecordBatch) -> Self {
         Self {
-            batch,
+            backing: StreamBacking::Arrow {
+                batch,
+                bolt_rows: None,
+                result_rows: None,
+                row_offset: 0,
+            },
             consumed: Arc::new(AtomicBool::new(false)),
-            bolt_rows: None,
-            result_rows: None,
-            row_offset: 0,
         }
     }
 
@@ -2935,11 +2960,13 @@ impl PyArrowStream {
         bolt_rows: Option<Arc<Vec<Vec<voyager_drivers::BoltValue>>>>,
     ) -> Self {
         Self {
-            batch,
+            backing: StreamBacking::Arrow {
+                batch,
+                bolt_rows,
+                result_rows: None,
+                row_offset: 0,
+            },
             consumed: Arc::new(AtomicBool::new(false)),
-            bolt_rows,
-            result_rows: None,
-            row_offset: 0,
         }
     }
 
@@ -2950,11 +2977,66 @@ impl PyArrowStream {
         result_rows: Option<Arc<Vec<Vec<voyager_drivers::ResultValue>>>>,
     ) -> Self {
         Self {
-            batch,
+            backing: StreamBacking::Arrow {
+                batch,
+                bolt_rows,
+                result_rows,
+                row_offset: 0,
+            },
             consumed: Arc::new(AtomicBool::new(false)),
-            bolt_rows,
-            result_rows,
-            row_offset: 0,
+        }
+    }
+
+    /// Creates a row-backed `PyArrowStream` that builds Arrow only on demand.
+    pub fn from_rows(
+        columns: Vec<String>,
+        rows: Arc<Vec<Vec<voyager_drivers::ResultValue>>>,
+        column_hints: Vec<voyager_drivers::value::arrow::ColumnHint>,
+    ) -> Self {
+        let row_len = rows.len();
+        Self {
+            backing: StreamBacking::Rows {
+                columns: Arc::from(columns),
+                rows,
+                column_hints: Arc::from(column_hints),
+                row_offset: 0,
+                row_len,
+                materialized: Arc::new(OnceLock::new()),
+            },
+            consumed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Returns the canonical Arrow batch, materializing a row-backed stream at most once.
+    ///
+    /// Arrow construction runs with the GIL detached because it is pure Rust work.
+    fn batch_for_export(&self, py: Python<'_>) -> PyResult<arrow_array::RecordBatch> {
+        match &self.backing {
+            StreamBacking::Arrow { batch, .. } => Ok(batch.clone()),
+            StreamBacking::Rows {
+                columns,
+                rows,
+                column_hints,
+                row_offset,
+                row_len,
+                materialized,
+            } => {
+                if let Some(batch) = materialized.get() {
+                    return Ok(batch.clone());
+                }
+                let window = &rows[*row_offset..*row_offset + *row_len];
+                let batch = py
+                    .detach(|| {
+                        voyager_drivers::value::arrow::values_to_record_batch_with_hints(
+                            columns,
+                            window,
+                            column_hints,
+                        )
+                    })
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let _ = materialized.set(batch.clone());
+                Ok(batch)
+            }
         }
     }
 }
@@ -2964,30 +3046,57 @@ impl PyArrowStream {
     /// Number of rows in the batch.
     #[getter]
     fn num_rows(&self) -> usize {
-        self.batch.num_rows()
+        match &self.backing {
+            StreamBacking::Arrow { batch, .. } => batch.num_rows(),
+            StreamBacking::Rows { row_len, .. } => *row_len,
+        }
     }
 
     /// Number of columns in the batch.
     #[getter]
     fn num_columns(&self) -> usize {
-        self.batch.num_columns()
+        match &self.backing {
+            StreamBacking::Arrow { batch, .. } => batch.num_columns(),
+            StreamBacking::Rows { columns, .. } => columns.len(),
+        }
     }
 
-    /// Ordered list of column names from the Arrow batch schema.
+    /// Ordered list of column names from the Arrow batch schema or row buffer.
     #[getter]
     fn columns(&self) -> Vec<String> {
-        self.batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect()
+        match &self.backing {
+            StreamBacking::Arrow { batch, .. } => batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
+            StreamBacking::Rows { columns, .. } => columns.to_vec(),
+        }
     }
 
     /// Returns whether this stream has already been consumed via `__arrow_c_stream__`.
     #[getter]
     fn is_consumed(&self) -> bool {
         self.consumed.load(Ordering::SeqCst)
+    }
+
+    /// Diagnostic hook: `"rows"` or `"arrow"` for the active backing.
+    #[getter]
+    fn _backing(&self) -> &'static str {
+        match &self.backing {
+            StreamBacking::Arrow { .. } => "arrow",
+            StreamBacking::Rows { .. } => "rows",
+        }
+    }
+
+    /// Diagnostic hook: whether a row-backed stream has already materialized Arrow.
+    #[getter]
+    fn _arrow_materialized(&self) -> bool {
+        match &self.backing {
+            StreamBacking::Arrow { .. } => true,
+            StreamBacking::Rows { materialized, .. } => materialized.get().is_some(),
+        }
     }
 
     /// Official Python Arrow PyCapsule Protocol for zero-copy streaming into Polars / PyArrow.
@@ -3003,38 +3112,79 @@ impl PyArrowStream {
                 "ArrowArrayStream has already been consumed: the Apache Arrow C Data Interface specification enforces single-pass stream consumption.",
             ));
         }
-        let ffi_stream = voyager_ogm::arrow::export_batch_to_c_stream(self.batch.clone());
+        let batch = self.batch_for_export(py)?;
+        let ffi_stream = voyager_ogm::arrow::export_batch_to_c_stream(batch);
         pyo3::types::PyCapsule::new_with_value(py, ffi_stream, c"arrow_array_stream")
     }
 
     /// Exports rows as a list of Python dictionaries.
     fn to_dicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        record_batch_to_py_dicts(
-            &self.batch,
-            &[],
-            self.bolt_rows.as_deref().map(Vec::as_slice),
-            self.result_rows.as_deref().map(Vec::as_slice),
-            self.row_offset,
-            py,
-        )
+        match &self.backing {
+            StreamBacking::Arrow {
+                batch,
+                bolt_rows,
+                result_rows,
+                row_offset,
+            } => record_batch_to_py_dicts(
+                batch,
+                &[],
+                bolt_rows.as_deref().map(Vec::as_slice),
+                result_rows.as_deref().map(Vec::as_slice),
+                *row_offset,
+                py,
+            ),
+            StreamBacking::Rows {
+                columns,
+                rows,
+                row_offset,
+                row_len,
+                ..
+            } => result_rows_to_py_dicts(columns, &rows[*row_offset..*row_offset + *row_len], py),
+        }
     }
 
-    /// Slices the record batch into chunked batches of `batch_size` rows each, returning PyArrowStreams.
+    /// Slices the result into chunked PyArrowStreams of `batch_size` rows each.
+    ///
+    /// Row-backed streams only clone `Arc`s and adjust offsets, so chunking an
+    /// OLTP result builds no Arrow batch.
     #[pyo3(signature = (batch_size=10_000))]
     fn iter_batches(&self, batch_size: usize) -> PyResult<Vec<PyArrowStream>> {
         let chunk_size = batch_size.max(1);
-        let num_rows = self.batch.num_rows();
+        let num_rows = self.num_rows();
         let mut chunks = Vec::new();
         let mut offset = 0;
         while offset < num_rows {
             let length = chunk_size.min(num_rows - offset);
-            let sliced = self.batch.slice(offset, length);
+            let backing = match &self.backing {
+                StreamBacking::Arrow {
+                    batch,
+                    bolt_rows,
+                    result_rows,
+                    row_offset,
+                } => StreamBacking::Arrow {
+                    batch: batch.slice(offset, length),
+                    bolt_rows: bolt_rows.clone(),
+                    result_rows: result_rows.clone(),
+                    row_offset: *row_offset + offset,
+                },
+                StreamBacking::Rows {
+                    columns,
+                    rows,
+                    column_hints,
+                    row_offset,
+                    ..
+                } => StreamBacking::Rows {
+                    columns: columns.clone(),
+                    rows: rows.clone(),
+                    column_hints: column_hints.clone(),
+                    row_offset: *row_offset + offset,
+                    row_len: length,
+                    materialized: Arc::new(OnceLock::new()),
+                },
+            };
             chunks.push(PyArrowStream {
-                batch: sliced,
+                backing,
                 consumed: Arc::new(AtomicBool::new(false)),
-                bolt_rows: self.bolt_rows.clone(),
-                result_rows: self.result_rows.clone(),
-                row_offset: self.row_offset + offset,
             });
             offset += length;
         }
@@ -3650,14 +3800,7 @@ impl PyNativeQueryResult {
 
     /// Exports rows as a list of Python dictionaries.
     fn to_dicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        record_batch_to_py_dicts(
-            &self.stream.batch,
-            &self.age_columns,
-            self.stream.bolt_rows.as_deref().map(Vec::as_slice),
-            self.stream.result_rows.as_deref().map(Vec::as_slice),
-            self.stream.row_offset,
-            py,
-        )
+        self.stream.to_dicts(py)
     }
 
     /// Access to result records as a list of Python dictionaries.
@@ -3686,19 +3829,47 @@ fn empty_batch_for_columns(columns: &[String]) -> arrow_array::RecordBatch {
     arrow_array::RecordBatch::new_empty(std::sync::Arc::new(arrow_schema::Schema::new(fields)))
 }
 
+/// Wraps a row-only [`voyager_drivers::QueryResult`] into a lazy PyO3 result.
+///
+/// The returned stream keeps decoded `ResultValue` rows and builds Arrow only
+/// when the caller explicitly exports it, so OLTP `execute()` never constructs
+/// an untransported `RecordBatch`.
 fn query_result_to_py(query_result: voyager_drivers::QueryResult) -> PyResult<PyNativeQueryResult> {
+    if query_result.result_rows.is_none() && !query_result.batches.is_empty() {
+        // A backend without a `Rows` override (for example the in-process mock)
+        // returns Arrow batches from `execute_with_mode`; keep them as-is.
+        return query_result_to_py_arrow(query_result);
+    }
     let columns = query_result.columns.clone();
     let summary = query_result.summary.clone();
     let age_columns = query_result.age_columns.clone();
-    let bolt_rows = query_result.bolt_rows.clone();
-    let result_rows = query_result.result_rows.clone();
+    let rows = query_result.result_rows.unwrap_or_default();
+    let column_hints = query_result.column_hints;
+
+    Ok(PyNativeQueryResult {
+        stream: PyArrowStream::from_rows(columns.clone(), rows, column_hints),
+        columns,
+        summary,
+        age_columns,
+    })
+}
+
+/// Wraps a canonical Arrow [`voyager_drivers::QueryResult`] into a PyO3 result.
+///
+/// Used by `execute_arrow()` paths: no `result_rows`/`bolt_rows` are retained.
+fn query_result_to_py_arrow(
+    query_result: voyager_drivers::QueryResult,
+) -> PyResult<PyNativeQueryResult> {
+    let columns = query_result.columns.clone();
+    let summary = query_result.summary.clone();
+    let age_columns = query_result.age_columns.clone();
     let batch = query_result
         .into_single_batch()
         .map_err(|e| PyValueError::new_err(e.to_string()))?
         .unwrap_or_else(|| empty_batch_for_columns(&columns));
 
     Ok(PyNativeQueryResult {
-        stream: PyArrowStream::from_batch_with_rows(batch, bolt_rows, result_rows),
+        stream: PyArrowStream::from_batch(batch),
         columns,
         summary,
         age_columns,
@@ -3890,6 +4061,9 @@ impl PyNativeClient {
     }
 
     /// Synchronously executes a query releasing the Python GIL during network I/O.
+    ///
+    /// Returns a row-backed result: decoded [`voyager_drivers::ResultValue`] rows
+    /// without building an Apache Arrow `RecordBatch`.
     #[pyo3(signature = (query, params=None))]
     fn execute_sync<'py>(
         &self,
@@ -3902,11 +4076,34 @@ impl PyNativeClient {
         let query_result = py
             .detach(|| {
                 get_tokio_runtime()
-                    .block_on(async move { client.execute(&query, &params_map).await })
+                    .block_on(async move { client.execute_rows(&query, &params_map).await })
             })
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         query_result_to_py(query_result)
+    }
+
+    /// Synchronously executes a query returning canonical Arrow only.
+    ///
+    /// Retains no `result_rows`/`bolt_rows`; used by `execute_to_arrow()` and
+    /// `execute_to_polars()`.
+    #[pyo3(signature = (query, params=None))]
+    fn execute_arrow_sync<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        params: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<PyNativeQueryResult> {
+        let params_map = py_dict_to_params(params)?;
+        let client = self.client.clone();
+        let query_result = py
+            .detach(|| {
+                get_tokio_runtime()
+                    .block_on(async move { client.execute_arrow(&query, &params_map).await })
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        query_result_to_py_arrow(query_result)
     }
 
     /// Asynchronously executes a query returning a Python asyncio Future.
@@ -3921,11 +4118,31 @@ impl PyNativeClient {
         let client = self.client.clone();
         tokio_future_into_py(py, async move {
             let query_result = client
-                .execute(&query, &params_map)
+                .execute_rows(&query, &params_map)
                 .await
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
             query_result_to_py(query_result)
+        })
+    }
+
+    /// Asynchronously executes a query returning canonical Arrow only.
+    #[pyo3(signature = (query, params=None))]
+    fn execute_arrow<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        params: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let params_map = py_dict_to_params(params)?;
+        let client = self.client.clone();
+        tokio_future_into_py(py, async move {
+            let query_result = client
+                .execute_arrow(&query, &params_map)
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+            query_result_to_py_arrow(query_result)
         })
     }
 
@@ -4135,6 +4352,8 @@ impl PyNativeTransaction {
     }
 
     /// Synchronously executes a statement inside the transaction.
+    ///
+    /// Returns a row-backed result without building an untransported Arrow batch.
     #[pyo3(signature = (query, params=None))]
     fn execute_sync(
         &self,
@@ -4147,12 +4366,33 @@ impl PyNativeTransaction {
         let mut tx = self.take()?;
         let (tx, result) = py.detach(|| {
             let result =
-                get_tokio_runtime().block_on(async { tx.execute(&query, &params_map).await });
+                get_tokio_runtime().block_on(async { tx.execute_rows(&query, &params_map).await });
             (tx, result)
         });
         self.sync_state_from_handle(&tx);
         self.put(tx);
         query_result_to_py(result.map_err(|e| PyValueError::new_err(e.to_string()))?)
+    }
+
+    /// Synchronously executes a statement inside the transaction returning Arrow only.
+    #[pyo3(signature = (query, params=None))]
+    fn execute_arrow_sync(
+        &self,
+        py: Python<'_>,
+        query: String,
+        params: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<PyNativeQueryResult> {
+        self.ensure_active()?;
+        let params_map = py_dict_to_params(params)?;
+        let mut tx = self.take()?;
+        let (tx, result) = py.detach(|| {
+            let result =
+                get_tokio_runtime().block_on(async { tx.execute_arrow(&query, &params_map).await });
+            (tx, result)
+        });
+        self.sync_state_from_handle(&tx);
+        self.put(tx);
+        query_result_to_py_arrow(result.map_err(|e| PyValueError::new_err(e.to_string()))?)
     }
 
     /// Asynchronously executes a statement inside the transaction.
@@ -4176,12 +4416,42 @@ impl PyNativeTransaction {
                     return Err(PyRuntimeError::new_err("Transaction is not active"));
                 }
             };
-            let result = tx.execute(&query, &params_map).await;
+            let result = tx.execute_rows(&query, &params_map).await;
             let tx_state = tx.state();
             *inner.lock() = Some(tx);
             state.store(native_transaction_state_code(tx_state), Ordering::Release);
             guard.disarm();
             query_result_to_py(result.map_err(|e| PyValueError::new_err(e.to_string()))?)
+        })
+    }
+
+    /// Asynchronously executes a statement inside the transaction returning Arrow only.
+    #[pyo3(signature = (query, params=None))]
+    fn execute_arrow<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        params: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.ensure_active()?;
+        let params_map = py_dict_to_params(params)?;
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        tokio_future_into_py(py, async move {
+            let mut guard = TxFutureGuard::new(inner.clone(), state.clone());
+            let mut tx = match inner.lock().take() {
+                Some(tx) => tx,
+                None => {
+                    guard.disarm();
+                    return Err(PyRuntimeError::new_err("Transaction is not active"));
+                }
+            };
+            let result = tx.execute_arrow(&query, &params_map).await;
+            let tx_state = tx.state();
+            *inner.lock() = Some(tx);
+            state.store(native_transaction_state_code(tx_state), Ordering::Release);
+            guard.disarm();
+            query_result_to_py_arrow(result.map_err(|e| PyValueError::new_err(e.to_string()))?)
         })
     }
 

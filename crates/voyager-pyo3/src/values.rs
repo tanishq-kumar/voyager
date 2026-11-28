@@ -1733,6 +1733,34 @@ pub(crate) fn record_batch_to_py_dicts<'py>(
     Ok(list)
 }
 
+/// Converts decoded [`ResultValue`] rows directly into Python dictionaries.
+///
+/// This is the row-only counterpart to [`record_batch_to_py_dicts`]: column
+/// names are interned once and every cell is hydrated with
+/// [`result_value_to_py`], so no Apache Arrow `RecordBatch` is built or read.
+pub(crate) fn result_rows_to_py_dicts<'py>(
+    columns: &[String],
+    rows: &[Vec<ResultValue>],
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyList>> {
+    let names: Vec<Bound<'py, PyString>> = columns
+        .iter()
+        .map(|name| PyString::intern(py, name))
+        .collect();
+    let list = PyList::empty(py);
+    for row in rows {
+        let dict = PyDict::new(py);
+        for (col_idx, name) in names.iter().enumerate() {
+            match row.get(col_idx) {
+                Some(value) => dict.set_item(name, result_value_to_py(py, value)?)?,
+                None => dict.set_item(name, py.None())?,
+            }
+        }
+        list.append(dict)?;
+    }
+    Ok(list)
+}
+
 struct ParamPyTypes {
     datetime_cls: Py<PyAny>,
     date_cls: Py<PyAny>,

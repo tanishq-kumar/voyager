@@ -260,7 +260,11 @@ class Transaction:
             if self.backend == "native":
                 from voyager_ogm.session import _stream_to_polars
 
-                result = self._driver_tx.execute_sync(statement, parameters)
+                arrow_execute = getattr(self._driver_tx, "execute_arrow_sync", None)
+                if callable(arrow_execute):
+                    result = arrow_execute(statement, parameters)
+                else:
+                    result = self._driver_tx.execute_sync(statement, parameters)
                 return _stream_to_polars(result.stream)
             return self._driver_tx.execute_to_polars(statement, parameters)
 
@@ -271,7 +275,11 @@ class Transaction:
             if self.backend == "native":
                 from voyager_ogm.session import _stream_to_arrow
 
-                result = self._driver_tx.execute_sync(statement, parameters)
+                arrow_execute = getattr(self._driver_tx, "execute_arrow_sync", None)
+                if callable(arrow_execute):
+                    result = arrow_execute(statement, parameters)
+                else:
+                    result = self._driver_tx.execute_sync(statement, parameters)
                 return _stream_to_arrow(result.stream)
             arrow_execute = getattr(self._driver_tx, "execute_to_arrow", None)
             if callable(arrow_execute):
@@ -599,7 +607,11 @@ class AsyncTransaction:
                 if self.backend == "native":
                     from voyager_ogm.session import _stream_to_polars
 
-                    result = await self._driver_tx.execute(statement, parameters)
+                    arrow_execute = getattr(self._driver_tx, "execute_arrow", None)
+                    if callable(arrow_execute):
+                        result = await arrow_execute(statement, parameters)
+                    else:
+                        result = await self._driver_tx.execute(statement, parameters)
                     return _stream_to_polars(result.stream)
                 return await self._driver_tx.execute_to_polars(statement, parameters)
             except asyncio.CancelledError:
@@ -614,7 +626,11 @@ class AsyncTransaction:
                 if self.backend == "native":
                     from voyager_ogm.session import _stream_to_arrow
 
-                    result = await self._driver_tx.execute(statement, parameters)
+                    arrow_execute = getattr(self._driver_tx, "execute_arrow", None)
+                    if callable(arrow_execute):
+                        result = await arrow_execute(statement, parameters)
+                    else:
+                        result = await self._driver_tx.execute(statement, parameters)
                     return _stream_to_arrow(result.stream)
                 arrow_execute = getattr(self._driver_tx, "execute_to_arrow", None)
                 if callable(arrow_execute):
