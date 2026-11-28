@@ -79,8 +79,13 @@ def _assert_row_and_arrow_backing(session: Any) -> None:
     assert result.stream._backing == "rows"
     assert result.stream._arrow_materialized is False
     assert result.all() == [{"n": 1, "s": "a"}]
-    # Approved decision 5: the row-backed stream stays alive after .all().
+    # The row-backed stream stays alive after .all(), and slicing it into
+    # batches still does not build Arrow.
     assert result.stream._backing == "rows"
+    assert result.stream._arrow_materialized is False
+    chunks = result.stream.iter_batches(1)
+    assert len(chunks) == 1
+    assert all(chunk._arrow_materialized is False for chunk in chunks)
     assert result.stream._arrow_materialized is False
     table = result.to_arrow()
     assert table.to_pylist() == [{"n": 1, "s": "a"}]

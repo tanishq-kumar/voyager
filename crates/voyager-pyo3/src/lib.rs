@@ -7178,45 +7178,4 @@ mod tests {
         };
         assert!(!result.has_age_columns());
     }
-
-    #[test]
-    fn rows_backed_stream_materializes_arrow_lazily_and_matches_arrow_backing() {
-        use voyager_drivers::ResultValue;
-
-        Python::initialize();
-        let columns = vec!["n".to_string(), "s".to_string()];
-        let rows = Arc::new(vec![
-            vec![ResultValue::Int(1), ResultValue::Str("a".into())],
-            vec![ResultValue::Int(2), ResultValue::Null],
-        ]);
-        let stream = PyArrowStream::from_rows(columns.clone(), rows.clone(), Vec::new());
-
-        assert_eq!(stream.num_rows(), 2);
-        assert_eq!(stream.num_columns(), 2);
-        assert_eq!(stream.columns(), columns);
-        assert_eq!(stream._backing(), "rows");
-        assert!(!stream._arrow_materialized());
-
-        let dicts = Python::attach(|py| stream.to_dicts(py).unwrap().to_string());
-        assert!(dicts.contains("'n': 1") && dicts.contains("'s': 'a'"));
-        assert!(
-            !stream._arrow_materialized(),
-            "hydrating Python dicts from rows must not build Arrow"
-        );
-
-        let chunks = stream.iter_batches(1).unwrap();
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks.iter().all(|chunk| !chunk._arrow_materialized()));
-        let second = Python::attach(|py| chunks[1].to_dicts(py).unwrap().to_string());
-        assert!(second.contains("'n': 2") && !second.contains("'n': 1"));
-
-        let expected =
-            voyager_drivers::value::arrow::values_to_record_batch_with_hints(&columns, &rows, &[])
-                .unwrap();
-
-        let batch = Python::attach(|py| stream.batch_for_export(py).unwrap());
-        assert_eq!(batch, expected);
-        assert!(stream._arrow_materialized());
-        assert_eq!(stream.num_rows(), 2);
-    }
 }
