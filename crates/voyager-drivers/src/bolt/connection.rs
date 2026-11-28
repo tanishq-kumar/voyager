@@ -10,9 +10,12 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::debug;
 
+use super::decode_result::{BoltResultDecoder, peek_bolt_message_tag};
 use super::messages::{BoltRequest, BoltResponse};
 use super::packstream::{BoltValue, param_to_bolt_value};
-use super::stream::{encode_chunks, read_message_frame_buffered, write_message_frame};
+use super::stream::{
+    encode_chunks, read_message_frame_borrowed, read_message_frame_buffered, write_message_frame,
+};
 use crate::config::{Auth, ConnectionConfig};
 use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
@@ -43,6 +46,7 @@ pub struct BoltVersion {
 pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = NetStream> {
     stream: S,
     read_buf: BytesMut,
+    frame_buf: Vec<u8>,
     version: BoltVersion,
     /// True when Bolt 4.4 negotiated the `"utc"` patch via `patch_bolt`.
     utc_patched: bool,
@@ -178,6 +182,7 @@ impl BoltConnection<NetStream> {
         let mut conn = Self {
             stream,
             read_buf: BytesMut::with_capacity(65536),
+            frame_buf: Vec::new(),
             version,
             utc_patched: false,
             database: db.map(str::to_string),
@@ -319,6 +324,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         Self {
             stream,
             read_buf: BytesMut::with_capacity(65536),
+            frame_buf: Vec::new(),
             version,
             utc_patched: false,
             database: None,
@@ -883,14 +889,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             }
         };
 
-        // 3. Receive stream of RECORD responses followed by final SUCCESS
-        let mut records = Vec::new();
+        // 3. Receive stream of RECORD responses directly into ResultValue rows, followed by SUCCESS
+        let mut result_rows = Vec::new();
+        let mut decoder = BoltResultDecoder::new();
 
         let summary = loop {
-            let resp = self.receive_response().await?;
+            let frame = read_message_frame_borrowed(
+                &mut self.stream,
+                &mut self.read_buf,
+                &mut self.frame_buf,
+            )
+            .await?;
+
+            if peek_bolt_message_tag(&frame) == Some(0x71) {
+                let row = decoder.decode_record_frame(&frame)?;
+                result_rows.push(row);
+                continue;
+            }
+
+            let mut owned_frame = bytes::Bytes::copy_from_slice(&frame);
+            drop(frame);
+            let resp = BoltResponse::decode(&mut owned_frame)?;
             match resp {
                 BoltResponse::Record { fields } => {
-                    records.push(fields);
+                    result_rows.push(
+                        fields
+                            .into_iter()
+                            .map(crate::value::result::ResultValue::from)
+                            .collect(),
+                    );
                 }
                 BoltResponse::Success { metadata } => {
                     self.is_valid = true;
@@ -917,8 +944,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             }
         };
 
-        // 4. Build Arrow RecordBatch
-        let batch = Self::build_record_batch(&columns, &records)?;
+        // 4. Build Arrow RecordBatch directly from decoded ResultValue rows
+        let batch = crate::value::arrow::values_to_record_batch(&columns, &result_rows)?;
+        let retained_rows =
+            crate::value::arrow::batch_needs_raw_rows(&batch).then_some(result_rows);
         let batches = if batch.num_rows() > 0 || !columns.is_empty() {
             vec![batch]
         } else {
@@ -926,12 +955,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         };
 
         let result = QueryResult::new(columns, batches, summary);
-        if result
-            .batches
-            .iter()
-            .any(super::canonical::batch_needs_bolt_rows)
-        {
-            Ok(result.with_bolt_rows(records))
+        if let Some(result_rows) = retained_rows {
+            Ok(result.with_result_rows(result_rows))
         } else {
             Ok(result)
         }

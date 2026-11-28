@@ -11,9 +11,13 @@ use bytes::{Bytes, BytesMut};
 use proptest::prelude::*;
 use std::collections::HashMap;
 
-use voyager_drivers::bolt::{BoltNode, BoltPath, BoltRelationship, BoltValue, PackStream};
+use voyager_drivers::bolt::{
+    BoltNode, BoltPath, BoltRelationship, BoltResultDecoder, BoltValue, PackStream,
+    decode_bolt_record_frame, decode_result_value_slice,
+};
 use voyager_drivers::error::NetError;
 use voyager_drivers::redis::RespValue;
+use voyager_drivers::value::ResultValue;
 
 // ============================================================================
 // 1. Bolt PackStream Fuzzing & Safety Tests
@@ -31,6 +35,46 @@ proptest! {
             Ok(_) => {}
             Err(NetError::ProtocolError(_)) => {}
             Err(other) => panic!("Unexpected non-protocol error from PackStream::decode: {:?}", other),
+        }
+    }
+
+    /// Property: PackStream direct ResultValue decoder must NEVER panic on arbitrary bytes
+    /// and must agree with ResultValue::from(PackStream::decode) whenever decode succeeds.
+    #[test]
+    fn prop_packstream_result_decoder_never_panics_and_matches(
+        data in proptest::collection::vec(any::<u8>(), 0..2048)
+    ) {
+        let mut bytes = Bytes::copy_from_slice(&data);
+        let old_res = PackStream::decode(&mut bytes);
+        let new_res = decode_result_value_slice(&data);
+
+        match (old_res, new_res) {
+            (Ok(bolt_val), Ok((rv, _))) => {
+                let expected = ResultValue::from(bolt_val);
+                // NaN != NaN under PartialEq, so compare canonical JSON when NaN is present.
+                if expected != rv {
+                    let new_json: serde_json::Value = serde_json::from_str(
+                        &serde_json::to_string(&rv.as_canonical_json()).unwrap(),
+                    )
+                    .unwrap();
+                    let old_json: serde_json::Value = serde_json::from_str(
+                        &serde_json::to_string(&expected.as_canonical_json()).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(new_json, old_json);
+                }
+            }
+            (Err(NetError::ProtocolError(_)), Err(NetError::ProtocolError(_))) => {}
+            (old, new) => panic!(
+                "Decoder mismatch on arbitrary payload {:?}: old={old:?}, new={new:?}",
+                data
+            ),
+        }
+
+        // Also ensure decode_bolt_record_frame never panics on arbitrary bytes.
+        match decode_bolt_record_frame(&data) {
+            Ok(_) | Err(NetError::ProtocolError(_)) => {}
+            Err(other) => panic!("Unexpected non-protocol error from decode_bolt_record_frame: {other:?}"),
         }
     }
 
@@ -188,6 +232,39 @@ fn test_packstream_recursion_depth_limit() {
         "Expected recursion depth error, got: {}",
         err_msg
     );
+
+    // Direct ResultValue decoder enforces the same depth limit and truncation safety.
+    let mut deep = vec![0x91; 70];
+    deep.push(0x01);
+    let direct_err = decode_result_value_slice(&deep).unwrap_err().to_string();
+    assert!(
+        direct_err.contains("maximum nesting depth"),
+        "Expected recursion depth error from direct decoder, got: {}",
+        direct_err
+    );
+
+    // Truncation invariance on a RECORD frame containing a Node.
+    let mut rec_buf = BytesMut::new();
+    let rec = BoltValue::Structure {
+        tag: 0x71,
+        fields: vec![BoltValue::List(vec![BoltValue::Node(BoltNode {
+            id: 7,
+            labels: vec!["Person".to_string()],
+            properties: HashMap::from([("name".to_string(), BoltValue::String("Bob".to_string()))]),
+            element_id: Some("4:a:7".to_string()),
+        })])],
+    };
+    PackStream::encode(&rec, &mut rec_buf);
+    let encoded = rec_buf.freeze();
+    let mut decoder = BoltResultDecoder::new();
+    for prefix_len in 0..encoded.len() {
+        let res = decoder.decode_record_frame(&encoded[..prefix_len]);
+        assert!(
+            matches!(res, Err(NetError::ProtocolError(_))),
+            "Expected ProtocolError on truncated RECORD prefix {prefix_len}/{}",
+            encoded.len()
+        );
+    }
 }
 
 // ============================================================================

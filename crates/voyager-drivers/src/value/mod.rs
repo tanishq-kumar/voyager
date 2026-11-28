@@ -16,8 +16,8 @@ pub use arrow::{
 };
 pub use param::{ParamTimezone, ParamValue};
 pub use result::{
-    ResultDateTime, ResultNode, ResultPath, ResultRelationship, ResultStructure, ResultTimezone,
-    ResultUnboundRelationship, ResultValue,
+    ResultDateTime, ResultMap, ResultNode, ResultPath, ResultRelationship, ResultStructure,
+    ResultTimezone, ResultTypedText, ResultUnboundRelationship, ResultValue,
 };
 
 /// Arrow field metadata key carrying the canonical Voyager value type.

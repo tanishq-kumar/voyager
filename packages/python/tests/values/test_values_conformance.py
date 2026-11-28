@@ -19,6 +19,17 @@ from typing import Any
 
 import pytest
 from hypothesis import HealthCheck, given, seed, settings
+from voyager_ogm._voyager_rs import (
+    ARROW_EXTENSION_NAME,
+    ARROW_UUID_EXTENSION,
+    META_ENCODING_JSON,
+    META_TYPE_DATETIME_TZ,
+    META_TYPE_JSON,
+    META_TYPE_TIME_TZ,
+    META_TYPE_UUID,
+    VOYAGER_META_ENCODING,
+    VOYAGER_META_TYPE,
+)
 
 from .engines import BaseValueAdapter, EngineUnavailableError, open_adapter
 from .equality import compare_value_and_type
@@ -131,17 +142,60 @@ def _finalize_conformance_run() -> Iterator[None]:
         pytest.fail("Stale known-difference entries no longer reproduce:\n" + "\n".join(stale_msgs))
 
 
+ARROW_META_TREE_PREFIX = " |meta-tree| "
+
+
+def _split_arrow_type_desc(type_desc: str) -> tuple[str, dict[str, Any] | None]:
+    """Splits an ``_extract_arrow_cell`` description into its text and metadata tree."""
+    if ARROW_META_TREE_PREFIX not in type_desc:
+        return type_desc, None
+    base, tree_json = type_desc.split(ARROW_META_TREE_PREFIX, 1)
+    try:
+        tree = json.loads(tree_json)
+    except json.JSONDecodeError:
+        return type_desc, None
+    return base, tree if isinstance(tree, dict) else None
+
+
 def _parse_arrow_meta(type_desc: str) -> dict[str, str]:
     """Extracts ``key=value`` pairs from ``_extract_arrow_cell`` type descriptions."""
-    if "[" not in type_desc or not type_desc.endswith("]"):
+    base, _ = _split_arrow_type_desc(type_desc)
+    if "[" not in base or not base.endswith("]"):
         return {}
-    inner = type_desc.rsplit("[", 1)[1][:-1]
+    inner = base.rsplit("[", 1)[1][:-1]
     meta: dict[str, str] = {}
     for part in inner.split(", "):
         if "=" in part:
             k, v = part.split("=", 1)
             meta[k.strip()] = v.strip()
     return meta
+
+
+def _union_child_for_raw(tree: dict[str, Any], raw: Any) -> dict[str, Any] | None:
+    """Returns the union member whose Arrow type matches the materialized Python scalar."""
+    for child in tree.get("children", []):
+        arrow_type = str(child.get("type", ""))
+        if isinstance(raw, bytes) and arrow_type.startswith(
+            ("fixed_size_binary", "binary", "large_binary")
+        ):
+            return child
+        if isinstance(raw, str) and arrow_type.startswith(("string", "large_string")):
+            return child
+        if isinstance(raw, bool) and arrow_type.startswith("bool"):
+            return child
+        if (
+            isinstance(raw, int)
+            and not isinstance(raw, bool)
+            and arrow_type.startswith(("int", "uint"))
+        ):
+            return child
+        if isinstance(raw, float) and arrow_type.startswith(("double", "float")):
+            return child
+        if isinstance(raw, list) and arrow_type.startswith("list"):
+            return child
+        if isinstance(raw, dict) and arrow_type.startswith(("struct", "map")):
+            return child
+    return None
 
 
 def _decode_columnar_value(
@@ -151,6 +205,7 @@ def _decode_columnar_value(
     value_kind: str,
     *,
     is_polars: bool = False,
+    tree: dict[str, Any] | None = None,
 ) -> Any:
     """Decodes documented Arrow/Polars transport shapes back to comparable Python objects."""
     from voyager_ogm import Duration, Point
@@ -158,9 +213,12 @@ def _decode_columnar_value(
 
     if raw is None:
         return None
-    meta = _parse_arrow_meta(type_desc)
+    if tree is None:
+        _, tree = _split_arrow_type_desc(type_desc)
+    meta = tree.get("metadata", {}) if tree is not None else _parse_arrow_meta(type_desc)
     v_enc = meta.get("voyager.encoding")
     v_type = meta.get("voyager.type")
+    children = tree.get("children", []) if tree is not None else []
 
     if v_enc == "json" or (
         is_polars
@@ -194,6 +252,82 @@ def _decode_columnar_value(
         )
     ):
         return Point.from_dict(raw)
+    if tree is not None:
+        kind = tree.get("kind")
+        if (
+            kind in ("list", "fixed_size_list")
+            and children
+            and isinstance(raw, (list, tuple))
+            and isinstance(reference, (list, tuple))
+        ):
+            decoded = [
+                _decode_columnar_value(
+                    r_item,
+                    ref_item if idx < len(reference) else None,
+                    type_desc,
+                    value_kind,
+                    is_polars=is_polars,
+                    tree=children[0],
+                )
+                for idx, (r_item, ref_item) in enumerate(zip(raw, reference, strict=False))
+            ]
+            return tuple(decoded) if kind == "fixed_size_list" else decoded
+        if (
+            kind == "map"
+            and len(children) >= 2
+            and isinstance(raw, list)
+            and isinstance(reference, dict)
+        ):
+            key_tree, value_tree = children[0], children[1]
+            decoded_map: dict[Any, Any] = {}
+            for entry in raw:
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    raw_key, raw_value = entry
+                elif isinstance(entry, dict) and "key" in entry and "value" in entry:
+                    raw_key, raw_value = entry["key"], entry["value"]
+                else:
+                    return raw
+                decoded_key = _decode_columnar_value(
+                    raw_key,
+                    next(iter(reference), None),
+                    type_desc,
+                    value_kind,
+                    is_polars=is_polars,
+                    tree=key_tree,
+                )
+                decoded_map[decoded_key] = _decode_columnar_value(
+                    raw_value,
+                    reference.get(decoded_key, reference.get(raw_key)),
+                    type_desc,
+                    value_kind,
+                    is_polars=is_polars,
+                    tree=value_tree,
+                )
+            return decoded_map
+        if kind == "struct" and children and isinstance(raw, dict) and isinstance(reference, dict):
+            child_by_name = {child.get("name"): child for child in children}
+            return {
+                key: _decode_columnar_value(
+                    value,
+                    reference.get(key),
+                    type_desc,
+                    value_kind,
+                    is_polars=is_polars,
+                    tree=child_by_name.get(key),
+                )
+                for key, value in raw.items()
+            }
+        if kind == "union":
+            union_child = _union_child_for_raw(tree, raw)
+            if union_child is not None:
+                return _decode_columnar_value(
+                    raw,
+                    reference,
+                    type_desc,
+                    value_kind,
+                    is_polars=is_polars,
+                    tree=union_child,
+                )
     if isinstance(raw, list) and isinstance(reference, list):
         if is_polars and value_kind == "list" and reference and isinstance(reference[0], uuid.UUID):
             return [uuid.UUID(bytes=x) if isinstance(x, bytes) and len(x) == 16 else x for x in raw]
@@ -207,6 +341,13 @@ def _decode_columnar_value(
             )
             for idx, (r_item, ref_item) in enumerate(zip(raw, reference, strict=False))
         ]
+    if v_type == "uuid" and isinstance(raw, bytes) and len(raw) == 16:
+        return uuid.UUID(bytes=raw)
+    if v_type == "uuid" and isinstance(raw, str):
+        try:
+            return uuid.UUID(raw)
+        except ValueError:
+            return raw
     if v_type == "date" and isinstance(raw, str):
         return _hydrate_date(raw)
     if v_type == "time_tz" and isinstance(raw, str):
@@ -693,3 +834,191 @@ def test_duckdb_nested_uuid_and_json_containers(engine: str) -> None:
             )
 
     _check()
+
+
+def _arrow_field_metadata(field: Any) -> dict[str, str]:
+    """Returns a decoded copy of an Arrow field's metadata mapping."""
+    return {
+        key.decode("utf-8", "replace"): value.decode("utf-8", "replace")
+        for key, value in (field.metadata or {}).items()
+    }
+
+
+def _assert_field_metadata(
+    field: Any,
+    context: str,
+    expected: dict[str, str],
+) -> None:
+    """Asserts that ``field`` carries every expected Voyager metadata annotation."""
+    actual = _arrow_field_metadata(field)
+    for key, value in expected.items():
+        if key == ARROW_EXTENSION_NAME and actual.get(key) is None:
+            # PyArrow promotes a registered extension to an ExtensionType and can
+            # consume the raw ARROW:extension:name metadata while importing the
+            # C stream; the extension type carries the same annotation.
+            if getattr(field.type, "extension_name", None) == value:
+                continue
+        assert actual.get(key) == value, (
+            f"{context}: expected {key}={value!r}, got {actual.get(key)!r} "
+            f"(metadata={actual}, type={field.type})"
+        )
+
+
+def _union_member(union_type: Any, name: str) -> Any:
+    """Returns the named member field of a PyArrow union type."""
+    for index in range(union_type.num_fields):
+        child = union_type.field(index)
+        if child.name == name:
+            return child
+    raise AssertionError(f"union member {name!r} not found in {union_type}")
+
+
+@pytest.mark.parametrize(
+    "engine", [pytest.param("neo4j"), pytest.param("memgraph"), pytest.param("pg19")]
+)
+def test_recursive_arrow_list_item_metadata(engine: str) -> None:
+    """Nested list columns carry Voyager metadata on their item field."""
+    import pyarrow as pa
+
+    adapter = _get_adapter(engine)
+    plus_two = datetime.timezone(datetime.timedelta(hours=2))
+    time_value = datetime.time(9, 30, 15, 123456, tzinfo=plus_two)
+    datetime_value = datetime.datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=plus_two)
+    uuid_value = uuid.UUID("12345678-1234-5678-1234-567812345678")
+
+    if engine in ("neo4j", "memgraph"):
+        cases = [
+            (
+                "datetime_offset",
+                "RETURN [$v] AS v",
+                {"v": datetime_value},
+                {VOYAGER_META_TYPE: META_TYPE_DATETIME_TZ},
+            )
+        ]
+        if engine == "neo4j":
+            cases.append(
+                (
+                    "time_offset",
+                    "RETURN [$v] AS v",
+                    {"v": time_value},
+                    {VOYAGER_META_TYPE: META_TYPE_TIME_TZ},
+                )
+            )
+    else:
+        cases = [
+            (
+                "uuid",
+                "SELECT ARRAY[$v::uuid] AS v",
+                {"v": uuid_value},
+                {
+                    VOYAGER_META_TYPE: META_TYPE_UUID,
+                    ARROW_EXTENSION_NAME: ARROW_UUID_EXTENSION,
+                },
+            ),
+            (
+                "time_offset",
+                "SELECT ARRAY[$v::timetz] AS v",
+                {"v": time_value},
+                {VOYAGER_META_TYPE: META_TYPE_TIME_TZ},
+            ),
+        ]
+
+    for value_kind, sql, params, expected in cases:
+        field = adapter.native.execute_to_arrow(sql, params).schema.field("v")
+        assert (
+            pa.types.is_list(field.type)
+            or pa.types.is_large_list(field.type)
+            or pa.types.is_fixed_size_list(field.type)
+        ), f"{engine}/{value_kind}: expected an Arrow list, got {field.type}"
+        _assert_field_metadata(
+            field.type.value_field,
+            f"{engine}/{value_kind} list item",
+            expected,
+        )
+
+
+def test_duckdb_recursive_arrow_child_metadata() -> None:
+    """DuckDB Arrow columns carry metadata on list items, map values, struct children, and union members."""
+    import pyarrow as pa
+
+    adapter = _get_adapter("duckdb")
+    bridge = adapter.bridge
+    uuid_value = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    json_value = {"a": [1, True, None], "nested": {"k": "v"}}
+    time_value = datetime.time(
+        9,
+        30,
+        15,
+        123456,
+        tzinfo=datetime.timezone(datetime.timedelta(hours=2)),
+    )
+
+    def field(sql: str, params: dict[str, Any]) -> Any:
+        return bridge.execute_to_arrow(sql, params).schema.field("v")
+
+    uuid_meta = {
+        VOYAGER_META_TYPE: META_TYPE_UUID,
+        ARROW_EXTENSION_NAME: ARROW_UUID_EXTENSION,
+    }
+    json_meta = {
+        VOYAGER_META_ENCODING: META_ENCODING_JSON,
+        VOYAGER_META_TYPE: META_TYPE_JSON,
+    }
+
+    struct_uuid = field("SELECT {'v': $v::UUID} AS v", {"v": uuid_value})
+    assert pa.types.is_struct(struct_uuid.type)
+    _assert_field_metadata(struct_uuid.type.field("v"), "duckdb struct child uuid", uuid_meta)
+
+    array_uuid = field("SELECT [$v::UUID, NULL]::UUID[2] AS v", {"v": uuid_value})
+    assert pa.types.is_fixed_size_list(array_uuid.type)
+    _assert_field_metadata(array_uuid.type.value_field, "duckdb array item uuid", uuid_meta)
+
+    map_uuid = field("SELECT MAP {'k': $v::UUID} AS v", {"v": uuid_value})
+    assert pa.types.is_map(map_uuid.type)
+    _assert_field_metadata(map_uuid.type.item_field, "duckdb map value uuid", uuid_meta)
+
+    union_uuid = field(
+        "SELECT union_value(u := $v::UUID)::UNION(u UUID, j JSON) AS v",
+        {"v": uuid_value},
+    )
+    assert pa.types.is_union(union_uuid.type)
+    _assert_field_metadata(
+        _union_member(union_uuid.type, "u"),
+        "duckdb union member uuid",
+        uuid_meta,
+    )
+
+    struct_json = field("SELECT {'v': $v::JSON} AS v", {"v": json_value})
+    assert pa.types.is_struct(struct_json.type)
+    _assert_field_metadata(
+        struct_json.type.field("v"),
+        "duckdb struct child json",
+        json_meta,
+    )
+
+    array_json = field("SELECT [$v::JSON, NULL]::JSON[2] AS v", {"v": json_value})
+    assert pa.types.is_fixed_size_list(array_json.type)
+    _assert_field_metadata(array_json.type.value_field, "duckdb array item json", json_meta)
+
+    map_json = field("SELECT MAP {'k': $v::JSON} AS v", {"v": json_value})
+    assert pa.types.is_map(map_json.type)
+    _assert_field_metadata(map_json.type.item_field, "duckdb map value json", json_meta)
+
+    union_json = field(
+        "SELECT union_value(j := $v::JSON)::UNION(u UUID, j JSON) AS v",
+        {"v": json_value},
+    )
+    assert pa.types.is_union(union_json.type)
+    _assert_field_metadata(
+        _union_member(union_json.type, "j"),
+        "duckdb union member json",
+        json_meta,
+    )
+
+    array_time = field("SELECT [$v::TIMETZ, NULL]::TIMETZ[2] AS v", {"v": time_value})
+    assert pa.types.is_fixed_size_list(array_time.type)
+    _assert_field_metadata(
+        array_time.type.value_field,
+        "duckdb array item time_tz",
+        {VOYAGER_META_TYPE: META_TYPE_TIME_TZ},
+    )

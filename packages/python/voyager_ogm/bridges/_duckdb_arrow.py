@@ -540,27 +540,29 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
     """
     import pyarrow as pa
 
-    arrays = []
-    fields = []
+    changed = False
+    arrays: list[Any] = []
+    fields: list[Any] = []
     for idx, field in enumerate(arrow_table.schema):
         dtype: Any = (
             description[idx][1] if idx < len(description) and len(description[idx]) > 1 else ""
         )
-        description_type = str(dtype).upper()
         tid = _duckdb_type_id(dtype) if dtype else ""
-        column = arrow_table.column(idx)
-        metadata = dict(field.metadata) if field.metadata else {}
         if tid == "hugeint":
-            array = column
+            metadata = dict(field.metadata) if field.metadata else {}
+            array = arrow_table.column(idx)
             metadata[_VOYAGER_META_TYPE] = b"hugeint"
         elif is_month_day_nano_interval(field.type):
-            array = mdn_column_to_arrow(column)
+            metadata = dict(field.metadata) if field.metadata else {}
+            array = mdn_column_to_arrow(arrow_table.column(idx))
             if pa.types.is_struct(array.type):
                 metadata[_VOYAGER_META_TYPE] = b"duration"
         elif _duckdb_type_has(
             dtype, _DUCKDB_ARROW_CANONICAL_TYPE_IDS
         ) or has_month_day_nano_interval(field.type):
-            array = _duckdb_canonicalize_arrow_column(column, dtype)
+            metadata = dict(field.metadata) if field.metadata else {}
+            description_type = str(dtype).upper()
+            array = _duckdb_canonicalize_arrow_column(arrow_table.column(idx), dtype)
             if tid in ("uuid", "json", "time with time zone"):
                 metadata = _duckdb_arrow_field_metadata(dtype, array.type, metadata) or {}
             elif description_type.startswith("UUID["):
@@ -568,13 +570,21 @@ def _duckdb_arrow_table_to_canonical(arrow_table: Any, description: Sequence[Any
             elif description_type.startswith("TIME WITH TIME ZONE"):
                 metadata[_VOYAGER_META_TYPE] = b"time_tz"
         else:
-            arrays.append(column)
-            fields.append(field)
+            if changed:
+                arrays.append(arrow_table.column(idx))
+                fields.append(field)
             continue
+        if not changed:
+            changed = True
+            for prev in range(idx):
+                arrays.append(arrow_table.column(prev))
+                fields.append(arrow_table.schema.field(prev))
         fields.append(
             pa.field(field.name, array.type, nullable=field.nullable, metadata=metadata or None)
         )
         arrays.append(array)
+    if not changed:
+        return arrow_table
     return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
 
