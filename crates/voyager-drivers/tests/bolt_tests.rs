@@ -1637,3 +1637,507 @@ async fn test_bolt_execute_rows_and_execute_arrow_equivalence_and_buffer_reuse()
 
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_bolt_stream_full_pull_count_and_chunk_fidelity() {
+    use voyager_drivers::bolt::BoltStubServer;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(&stub.uri(), Some(PoolConfig::default())).unwrap();
+
+    let mut stream = client
+        .stream(
+            "MATCH (n) RETURN n.name, n.age /* ROWS 10000 */",
+            &HashMap::new(),
+            StreamOptions::new(1_000),
+        )
+        .await
+        .unwrap();
+    assert!(stream.is_server_streaming());
+    assert_eq!(stream.columns(), &["name".to_string(), "age".to_string()]);
+    assert_eq!(client.pool().active_count(), 1);
+
+    let mut total_rows = 0usize;
+    let mut chunk_count = 0usize;
+    while let Some(chunk) = stream.next_chunk().await.unwrap() {
+        chunk_count += 1;
+        assert_eq!(chunk.num_rows(), 1_000);
+        let batch = chunk.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 1_000);
+        total_rows += chunk.num_rows();
+    }
+
+    assert_eq!(chunk_count, 10);
+    assert_eq!(total_rows, 10_000);
+    assert!(stream.is_closed());
+    assert_eq!(stub.pull_count(), 10);
+    assert_eq!(stub.discard_count(), 0);
+    assert_eq!(stub.connection_count(), 1);
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 1);
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_bolt_stream_early_close_sends_discard_and_reuses_connection() {
+    use voyager_drivers::bolt::BoltStubServer;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(
+        &stub.uri(),
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+
+    let mut stream = client
+        .stream(
+            "STREAM ROWS 10000",
+            &HashMap::new(),
+            StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+    let first = stream.next_chunk().await.unwrap().expect("chunk 1");
+    assert_eq!(first.num_rows(), 100);
+    assert_eq!(stub.pull_count(), 1);
+    assert_eq!(stub.discard_count(), 0);
+
+    stream.close().await.unwrap();
+    // Idempotent second close
+    stream.close().await.unwrap();
+    assert!(stream.is_closed());
+    assert_eq!(stub.pull_count(), 1);
+    assert_eq!(stub.discard_count(), 1);
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 1);
+
+    // Subsequent query reuses the exact same connection
+    let follow_up = client
+        .execute_rows("RETURN 1", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(follow_up.row_count(), 2);
+    assert_eq!(stub.connection_count(), 1);
+    assert_eq!(stub.reset_count(), 0);
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_bolt_stream_close_before_chunk1_drains_and_discards() {
+    use voyager_drivers::bolt::BoltStubServer;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(
+        &stub.uri(),
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+
+    // Case 1: more rows remain after pipelined chunk 1 -> drains chunk 1 then sends DISCARD
+    let mut stream = client
+        .stream("STREAM ROWS 500", &HashMap::new(), StreamOptions::new(100))
+        .await
+        .unwrap();
+    stream.close().await.unwrap();
+    assert_eq!(stub.pull_count(), 1);
+    assert_eq!(stub.discard_count(), 1);
+    assert_eq!(stub.connection_count(), 1);
+    assert_eq!(client.pool().idle_count(), 1);
+
+    // Case 2: all rows fit in pipelined chunk 1 -> drains chunk 1, sees has_more=false, no DISCARD
+    let mut small_stream = client
+        .stream("RETURN 1", &HashMap::new(), StreamOptions::new(100))
+        .await
+        .unwrap();
+    small_stream.close().await.unwrap();
+    assert_eq!(stub.pull_count(), 2);
+    assert_eq!(stub.discard_count(), 1);
+    assert_eq!(stub.connection_count(), 1);
+
+    let follow_up = client
+        .execute_rows("RETURN 2", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(follow_up.row_count(), 2);
+    assert_eq!(stub.connection_count(), 1);
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_bolt_stream_abrupt_drop_marks_broken_without_blocking_and_replaces() {
+    use voyager_drivers::bolt::BoltStubServer;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(
+        &stub.uri(),
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+
+    {
+        let mut stream = client
+            .stream("STREAM ROWS 500", &HashMap::new(), StreamOptions::new(100))
+            .await
+            .unwrap();
+        let chunk1 = stream.next_chunk().await.unwrap().expect("chunk 1");
+        assert_eq!(chunk1.num_rows(), 100);
+        // Drop `stream` abruptly without calling close()
+    }
+
+    assert_eq!(stub.discard_count(), 0);
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 0);
+    assert_eq!(client.pool().total_count(), 0);
+
+    // Next query opens a fresh replacement connection and succeeds
+    let res = client
+        .execute_rows("RETURN 1", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(res.row_count(), 2);
+    assert_eq!(stub.connection_count(), 2);
+    assert_eq!(client.pool().total_count(), 1);
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_bolt_stream_mid_stream_failure_sends_deferred_reset_and_recovers() {
+    use voyager_drivers::bolt::BoltStubServer;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, NetError, StreamOptions};
+
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(
+        &stub.uri(),
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+
+    let mut stream = client
+        .stream(
+            "STREAM ROWS 500 FAIL_MID_STREAM 150",
+            &HashMap::new(),
+            StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+
+    let chunk1 = stream.next_chunk().await.unwrap().expect("chunk 1");
+    assert_eq!(chunk1.num_rows(), 100);
+
+    let err = stream
+        .next_chunk()
+        .await
+        .expect_err("chunk 2 must return mid-stream FAILURE");
+    assert!(
+        matches!(err, NetError::ProtocolError(ref m) if m.contains("/ by zero")),
+        "unexpected error: {err:?}"
+    );
+    assert!(stream.is_closed());
+    // Connection returns to pool with pending_reset=true; prepare_for_reuse consumes it
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 1);
+
+    let res = client
+        .execute_rows("RETURN 42", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(res.row_count(), 2);
+    assert_eq!(stub.reset_count(), 1);
+    assert_eq!(stub.connection_count(), 1);
+    assert_eq!(client.pool().metrics().connections_failed_health_check, 0);
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_bolt_stream_explicit_tx_qid_fail_fast_and_drop_guards() {
+    use voyager_drivers::bolt::BoltStubServer;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, NativeTransactionState, NetError, StreamOptions};
+
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(
+        &stub.uri(),
+        Some(PoolConfig::new().with_min_idle(0).with_max_size(1)),
+    )
+    .unwrap();
+
+    // 1. Low-level cursor API tests fail-fast guard on concurrent tx statements + qid on PULL & DISCARD
+    let mut tx = client.begin_transaction().await.unwrap();
+    let mut cursor = tx
+        .open_stream_cursor("STREAM ROWS 500", &HashMap::new(), &StreamOptions::new(100))
+        .await
+        .unwrap();
+    assert!(tx.has_open_stream());
+
+    let err_exec = tx.execute("RETURN 1", &HashMap::new()).await.unwrap_err();
+    assert!(matches!(err_exec, NetError::TransactionError(ref m) if m.contains("active stream")));
+    let err_rows = tx
+        .execute_rows("RETURN 1", &HashMap::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err_rows, NetError::TransactionError(ref m) if m.contains("active stream")));
+    let err_commit = tx.commit().await.unwrap_err();
+    assert!(matches!(err_commit, NetError::TransactionError(ref m) if m.contains("active stream")));
+    let err_second_stream = tx
+        .open_stream_cursor("RETURN 1", &HashMap::new(), &StreamOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_second_stream, NetError::TransactionError(ref m) if m.contains("active stream"))
+    );
+
+    // Pull chunk 1 and chunk 2 (verifies qid=0 is sent on subsequent PULL), then close (verifies qid=0 on DISCARD)
+    let c1 = tx.next_stream_chunk(&mut cursor).await.unwrap().unwrap();
+    let c2 = tx.next_stream_chunk(&mut cursor).await.unwrap().unwrap();
+    assert_eq!(c1.num_rows(), 100);
+    assert_eq!(c2.num_rows(), 100);
+    tx.close_stream_cursor(&mut cursor).await.unwrap();
+    assert!(!tx.has_open_stream());
+
+    // Follow-up query + commit succeed on the same transaction
+    let after = tx.execute_rows("RETURN 1", &HashMap::new()).await.unwrap();
+    assert_eq!(after.row_count(), 2);
+    tx.commit().await.unwrap();
+    assert_eq!(stub.begin_count(), 1);
+    assert_eq!(stub.commit_count(), 1);
+    assert_eq!(stub.discard_count(), 1);
+    assert_eq!(stub.connection_count(), 1);
+
+    // 2. Ergonomic TransactionStream abrupt Drop marks tx failed and rollback cleans up without hanging
+    let mut tx2 = client.begin_transaction().await.unwrap();
+    {
+        let mut st = tx2
+            .stream("STREAM ROWS 500", &HashMap::new(), StreamOptions::new(100))
+            .await
+            .unwrap();
+        let _ = st.next_chunk().await.unwrap().unwrap();
+        // Drop `st` without close()
+    }
+    assert!(!tx2.has_open_stream());
+    assert_eq!(tx2.state(), NativeTransactionState::Failed);
+    let err_after_abort = tx2.commit().await.unwrap_err();
+    assert!(matches!(err_after_abort, NetError::TransactionError(_)));
+    tx2.rollback().await.unwrap();
+    assert_eq!(tx2.state(), NativeTransactionState::RolledBack);
+
+    // Next query opens replacement connection and succeeds
+    let recovered = client
+        .execute_rows("RETURN 1", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(recovered.row_count(), 2);
+    assert_eq!(stub.connection_count(), 2);
+
+    // 3. Explicit rollback while an open stream cursor is active discards broken connection cleanly
+    let mut tx3 = client.begin_transaction().await.unwrap();
+    let _open_cursor = tx3
+        .open_stream_cursor("STREAM ROWS 500", &HashMap::new(), &StreamOptions::new(100))
+        .await
+        .unwrap();
+    tx3.rollback().await.unwrap();
+    assert_eq!(tx3.state(), NativeTransactionState::RolledBack);
+    assert!(!tx3.has_open_stream());
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_bolt_v3_fallback_and_memgraph_discard_quirk_and_timeout_cancel() {
+    use bytes::BytesMut;
+    use tokio::io::AsyncWriteExt;
+    use voyager_drivers::bolt::messages::BoltResponse;
+    use voyager_drivers::bolt::packstream::{BoltValue, PackStream};
+    use voyager_drivers::bolt::stream::{encode_chunks, read_message_frame, write_message_frame};
+    use voyager_drivers::bolt::{BoltConnection, BoltVersion};
+    use voyager_drivers::engine::AsyncConnection;
+    use voyager_drivers::{NetError, StreamOptions};
+
+    fn frame_resp(resp: &BoltResponse) -> Vec<u8> {
+        let val = match resp {
+            BoltResponse::Success { metadata } => BoltValue::Structure {
+                tag: 0x70,
+                fields: vec![BoltValue::Map(metadata.clone())],
+            },
+            BoltResponse::Record { fields } => BoltValue::Structure {
+                tag: 0x71,
+                fields: vec![BoltValue::List(fields.clone())],
+            },
+            _ => unreachable!(),
+        };
+        let mut payload = BytesMut::new();
+        PackStream::encode(&val, &mut payload);
+        let mut chunks = BytesMut::new();
+        encode_chunks(&payload, &mut chunks);
+        chunks.to_vec()
+    }
+
+    // 1. Bolt v3.0 falls back to Buffered stream
+    let (v3_client, mut v3_server) = tokio::io::duplex(65536);
+    let v3_srv = tokio::spawn(async move {
+        let _ = read_message_frame(&mut v3_server).await.unwrap();
+        let _ = read_message_frame(&mut v3_server).await.unwrap();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&frame_resp(&BoltResponse::Success {
+            metadata: HashMap::from([(
+                "fields".to_string(),
+                BoltValue::List(vec![BoltValue::String("n".to_string())]),
+            )]),
+        }));
+        for i in 0..3 {
+            wire.extend_from_slice(&frame_resp(&BoltResponse::Record {
+                fields: vec![BoltValue::Integer(i)],
+            }));
+        }
+        wire.extend_from_slice(&frame_resp(&BoltResponse::Success {
+            metadata: HashMap::new(),
+        }));
+        write_message_frame(&mut v3_server, &wire).await.unwrap();
+        let _ = v3_server.flush().await;
+    });
+
+    let mut conn_v3 = BoltConnection::from_stream(v3_client, BoltVersion { major: 3, minor: 0 });
+    let mut v3_cursor = conn_v3
+        .open_stream("RETURN 1", &HashMap::new(), &StreamOptions::new(2))
+        .await
+        .unwrap();
+    assert!(!v3_cursor.is_server_streaming());
+    assert!(v3_cursor.is_wire_clean());
+    let b1 = conn_v3
+        .next_stream_chunk(&mut v3_cursor)
+        .await
+        .unwrap()
+        .unwrap();
+    let b2 = conn_v3
+        .next_stream_chunk(&mut v3_cursor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(b1.num_rows(), 2);
+    assert_eq!(b2.num_rows(), 1);
+    assert!(
+        conn_v3
+            .next_stream_chunk(&mut v3_cursor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    conn_v3.close_stream(&mut v3_cursor).await.unwrap();
+    v3_srv.await.unwrap();
+
+    // 2. Memgraph quirks: RUN lacks t_first, DISCARD SUCCESS carries "has_more": false
+    let (mg_client, mut mg_server) = tokio::io::duplex(65536);
+    let mg_srv = tokio::spawn(async move {
+        let _run = read_message_frame(&mut mg_server).await.unwrap();
+        let _pull1 = read_message_frame(&mut mg_server).await.unwrap();
+        let mut wire = Vec::new();
+        // RUN SUCCESS without t_first
+        wire.extend_from_slice(&frame_resp(&BoltResponse::Success {
+            metadata: HashMap::from([(
+                "fields".to_string(),
+                BoltValue::List(vec![BoltValue::String("n".to_string())]),
+            )]),
+        }));
+        wire.extend_from_slice(&frame_resp(&BoltResponse::Record {
+            fields: vec![BoltValue::Integer(1)],
+        }));
+        wire.extend_from_slice(&frame_resp(&BoltResponse::Success {
+            metadata: HashMap::from([("has_more".to_string(), BoltValue::Boolean(true))]),
+        }));
+        write_message_frame(&mut mg_server, &wire).await.unwrap();
+        let _ = mg_server.flush().await;
+
+        let mut discard_frame = read_message_frame(&mut mg_server).await.unwrap();
+        let discard_msg = PackStream::decode(&mut discard_frame).unwrap();
+        assert!(matches!(
+            discard_msg,
+            BoltValue::Structure { tag: 0x2F, .. }
+        ));
+        let disc_wire = frame_resp(&BoltResponse::Success {
+            metadata: HashMap::from([("has_more".to_string(), BoltValue::Boolean(false))]),
+        });
+        write_message_frame(&mut mg_server, &disc_wire)
+            .await
+            .unwrap();
+        let _ = mg_server.flush().await;
+    });
+
+    let mut conn_mg = BoltConnection::from_stream(mg_client, BoltVersion { major: 5, minor: 2 });
+    let mut mg_cursor = conn_mg
+        .open_stream("RETURN 1", &HashMap::new(), &StreamOptions::new(1))
+        .await
+        .unwrap();
+    assert!(mg_cursor.is_server_streaming());
+    assert_eq!(mg_cursor.summary().execution_time_ms, 0);
+    let mg_c1 = conn_mg
+        .next_stream_chunk(&mut mg_cursor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mg_c1.num_rows(), 1);
+    conn_mg.close_stream(&mut mg_cursor).await.unwrap();
+    assert!(mg_cursor.is_wire_clean());
+    assert!(conn_mg.is_valid());
+    mg_srv.await.unwrap();
+
+    // 3. Mid-flight tokio::time::timeout cancellation marks connection dirty/unusable
+    let (to_client, mut to_server) = tokio::io::duplex(65536);
+    let to_srv = tokio::spawn(async move {
+        let _run = read_message_frame(&mut to_server).await.unwrap();
+        let _pull1 = read_message_frame(&mut to_server).await.unwrap();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&frame_resp(&BoltResponse::Success {
+            metadata: HashMap::from([(
+                "fields".to_string(),
+                BoltValue::List(vec![BoltValue::String("n".to_string())]),
+            )]),
+        }));
+        wire.extend_from_slice(&frame_resp(&BoltResponse::Record {
+            fields: vec![BoltValue::Integer(1)],
+        }));
+        wire.extend_from_slice(&frame_resp(&BoltResponse::Success {
+            metadata: HashMap::from([("has_more".to_string(), BoltValue::Boolean(true))]),
+        }));
+        write_message_frame(&mut to_server, &wire).await.unwrap();
+        let _ = to_server.flush().await;
+
+        let _pull2 = read_message_frame(&mut to_server).await.unwrap();
+        // Stall intentionally on chunk 2 so caller timeout fires mid-await
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    });
+
+    let mut conn_to = BoltConnection::from_stream(to_client, BoltVersion { major: 5, minor: 4 });
+    let mut to_cursor = conn_to
+        .open_stream("RETURN 1", &HashMap::new(), &StreamOptions::new(1))
+        .await
+        .unwrap();
+    let _c1 = conn_to
+        .next_stream_chunk(&mut to_cursor)
+        .await
+        .unwrap()
+        .unwrap();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        conn_to.next_stream_chunk(&mut to_cursor),
+    )
+    .await;
+    assert!(cancelled.is_err(), "chunk 2 should time out");
+    let close_after_cancel = conn_to.close_stream(&mut to_cursor).await;
+    assert!(matches!(close_after_cancel, Err(NetError::Closed(_))));
+    assert!(!conn_to.is_valid());
+    assert!(!to_cursor.is_wire_clean());
+    to_srv.abort();
+}

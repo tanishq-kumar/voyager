@@ -26,6 +26,7 @@ pub mod postgres;
 mod redact;
 #[cfg(feature = "redis")]
 pub mod redis;
+pub mod stream;
 pub mod tls;
 pub mod uri;
 pub mod value;
@@ -34,7 +35,7 @@ pub mod value;
 #[cfg(feature = "testkit")]
 pub use bolt::BoltStubServer;
 #[cfg(feature = "bolt")]
-pub use bolt::{BoltConnection, BoltRequest, BoltResponse, BoltVersion};
+pub use bolt::{BoltConnection, BoltRequest, BoltResponse, BoltStreamCursor, BoltVersion};
 pub use bolt::{
     BoltNode, BoltPath, BoltRelationship, BoltUnboundRelationship, BoltValue, PackStream,
     bolt_node_to_canonical_json, bolt_path_to_canonical_json, bolt_relationship_to_canonical_json,
@@ -69,6 +70,10 @@ pub use postgres::{
 pub use redis::{
     FalkorNode, FalkorQueryResult, FalkorRelationship, FalkorStatistics, RedisConnection,
     RedisTransaction, RespCodec, RespValue,
+};
+pub use stream::{
+    BufferedStreamCursor, DEFAULT_STREAM_FETCH_SIZE, ResultChunk, ResultStream, StreamCursor,
+    StreamOptions, TransactionStream,
 };
 pub use tls::{NetStream, SslMode, SslNegotiation, TLS_AVAILABLE, TlsOptions, TlsVerification};
 pub use uri::{DatabaseProtocol, ParsedUri};

@@ -1218,57 +1218,100 @@ fn skip_packstream_value(cursor: &mut SliceCursor<'_>, depth: usize) -> Result<(
     }
 }
 
-/// Decodes the projected column names from a Bolt `RUN` `SUCCESS` (`0x70`) frame without
-/// materializing an intermediate metadata `HashMap` or `BoltValue` tree.
+/// Metadata decoded from a Bolt `RUN` `SUCCESS` (`0x70`) frame without intermediate maps.
+#[cfg(feature = "bolt")]
+#[derive(Debug, Default)]
+pub(crate) struct RunSuccessMeta {
+    pub(crate) columns: Vec<String>,
+    pub(crate) qid: Option<i64>,
+    pub(crate) t_first: Option<u64>,
+}
+
+/// Metadata decoded from a Bolt `PULL` or `DISCARD` `SUCCESS` (`0x70`) frame without intermediate maps.
+#[cfg(feature = "bolt")]
+#[derive(Debug, Default)]
+pub(crate) struct PullSuccessMeta {
+    pub(crate) summary: crate::engine::QuerySummary,
+    pub(crate) has_more: bool,
+    pub(crate) has_t_last: bool,
+    pub(crate) bookmark: Option<String>,
+}
+
+/// Decodes projected columns, `qid`, and `t_first` from a Bolt `RUN` `SUCCESS` (`0x70`) frame
+/// without materializing an intermediate metadata `HashMap` or `BoltValue` tree.
 ///
 /// Returns `Ok(None)` when the frame tag is not `0x70` (for example `0x7F FAILURE`).
 #[cfg(feature = "bolt")]
-pub(crate) fn decode_run_success_columns(frame: &[u8]) -> Result<Option<Vec<String>>> {
+pub(crate) fn decode_run_success_metadata(frame: &[u8]) -> Result<Option<RunSuccessMeta>> {
     let Some((mut cursor, map_size)) = open_success_metadata_map(frame)? else {
         return Ok(None);
     };
-    let mut columns = Vec::new();
+    let mut meta = RunSuccessMeta::default();
     for _ in 0..map_size {
         let Some(key) = try_read_str(&mut cursor, 2)? else {
             return Err(NetError::ProtocolError(
                 "Map key must be a String".to_string(),
             ));
         };
-        if key == "fields" {
-            if let Some(len) = try_read_list_header(&mut cursor, 2)? {
-                let mut cols = Vec::with_capacity(len.min(1024));
-                for _ in 0..len {
-                    if let Some(col) = try_read_str(&mut cursor, 3)? {
-                        cols.push(col.to_string());
-                    } else {
-                        skip_packstream_value(&mut cursor, 3)?;
+        match key {
+            "fields" => {
+                if let Some(len) = try_read_list_header(&mut cursor, 2)? {
+                    let mut cols = Vec::with_capacity(len.min(1024));
+                    for _ in 0..len {
+                        if let Some(col) = try_read_str(&mut cursor, 3)? {
+                            cols.push(col.to_string());
+                        } else {
+                            skip_packstream_value(&mut cursor, 3)?;
+                        }
                     }
+                    meta.columns = cols;
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
                 }
-                columns = cols;
-            } else {
-                skip_packstream_value(&mut cursor, 2)?;
             }
-        } else {
-            skip_packstream_value(&mut cursor, 2)?;
+            "qid" => {
+                if let Some(n) = try_read_i64(&mut cursor, 2)? {
+                    meta.qid = Some(n);
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
+                }
+            }
+            "t_first" => {
+                if let Some(n) = try_read_i64(&mut cursor, 2)? {
+                    meta.t_first = Some(n.max(0) as u64);
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
+                }
+            }
+            _ => skip_packstream_value(&mut cursor, 2)?,
         }
     }
-    Ok(Some(columns))
+    Ok(Some(meta))
 }
 
-/// Decodes [`crate::engine::QuerySummary`] metrics from a Bolt `PULL` `SUCCESS` (`0x70`) frame
-/// without allocating a metadata `HashMap`, nested `stats` `HashMap`, or `BoltValue` enum.
+/// Decodes the projected column names from a Bolt `RUN` `SUCCESS` (`0x70`) frame without
+/// materializing an intermediate metadata `HashMap` or `BoltValue` tree.
 ///
 /// Returns `Ok(None)` when the frame tag is not `0x70` (for example `0x7F FAILURE`).
 #[cfg(feature = "bolt")]
-pub(crate) fn decode_pull_success_summary(
-    frame: &[u8],
-) -> Result<Option<crate::engine::QuerySummary>> {
+pub(crate) fn decode_run_success_columns(frame: &[u8]) -> Result<Option<Vec<String>>> {
+    Ok(decode_run_success_metadata(frame)?.map(|m| m.columns))
+}
+
+/// Decodes [`crate::engine::QuerySummary`], `has_more`, and `bookmark` from a Bolt `PULL` or
+/// `DISCARD` `SUCCESS` (`0x70`) frame without allocating a metadata `HashMap` or `BoltValue`.
+///
+/// Returns `Ok(None)` when the frame tag is not `0x70` (for example `0x7F FAILURE`).
+#[cfg(feature = "bolt")]
+pub(crate) fn decode_pull_success_metadata(frame: &[u8]) -> Result<Option<PullSuccessMeta>> {
     let Some((mut cursor, map_size)) = open_success_metadata_map(frame)? else {
         return Ok(None);
     };
     let mut summary = crate::engine::QuerySummary::empty();
     let mut t_last: Option<u64> = None;
     let mut t_first: Option<u64> = None;
+    let mut has_more = false;
+    let mut bookmark: Option<String> = None;
 
     for _ in 0..map_size {
         let Some(key) = try_read_str(&mut cursor, 2)? else {
@@ -1286,7 +1329,7 @@ pub(crate) fn decode_pull_success_summary(
                             ));
                         };
                         if let Some(n) = try_read_i64(&mut cursor, 3)? {
-                            let val = n as u64;
+                            let val = n.max(0) as u64;
                             match stat_key {
                                 "nodes-created" => summary.nodes_created = val,
                                 "nodes-deleted" => summary.nodes_deleted = val,
@@ -1309,14 +1352,41 @@ pub(crate) fn decode_pull_success_summary(
             }
             "t_last" => {
                 if let Some(n) = try_read_i64(&mut cursor, 2)? {
-                    t_last = Some(n as u64);
+                    t_last = Some(n.max(0) as u64);
                 } else {
                     skip_packstream_value(&mut cursor, 2)?;
                 }
             }
             "t_first" => {
                 if let Some(n) = try_read_i64(&mut cursor, 2)? {
-                    t_first = Some(n as u64);
+                    t_first = Some(n.max(0) as u64);
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
+                }
+            }
+            "has_more" => {
+                if let Some(b) = try_read_bool(&mut cursor, 2)? {
+                    has_more = b;
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
+                }
+            }
+            "bookmark" => {
+                if let Some(bm) = try_read_str(&mut cursor, 2)? {
+                    bookmark = Some(bm.to_string());
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
+                }
+            }
+            "bookmarks" => {
+                if let Some(len) = try_read_list_header(&mut cursor, 2)? {
+                    for _ in 0..len {
+                        if let Some(bm) = try_read_str(&mut cursor, 3)? {
+                            bookmark = Some(bm.to_string());
+                        } else {
+                            skip_packstream_value(&mut cursor, 3)?;
+                        }
+                    }
                 } else {
                     skip_packstream_value(&mut cursor, 2)?;
                 }
@@ -1325,10 +1395,27 @@ pub(crate) fn decode_pull_success_summary(
         }
     }
 
+    let has_t_last = t_last.is_some();
     if let Some(time) = t_last.or(t_first) {
         summary.execution_time_ms = time;
     }
-    Ok(Some(summary))
+    Ok(Some(PullSuccessMeta {
+        summary,
+        has_more,
+        has_t_last,
+        bookmark,
+    }))
+}
+
+/// Decodes [`crate::engine::QuerySummary`] metrics from a Bolt `PULL` `SUCCESS` (`0x70`) frame
+/// without allocating a metadata `HashMap`, nested `stats` `HashMap`, or `BoltValue` enum.
+///
+/// Returns `Ok(None)` when the frame tag is not `0x70` (for example `0x7F FAILURE`).
+#[cfg(feature = "bolt")]
+pub(crate) fn decode_pull_success_summary(
+    frame: &[u8],
+) -> Result<Option<crate::engine::QuerySummary>> {
+    Ok(decode_pull_success_metadata(frame)?.map(|m| m.summary))
 }
 
 /// Lightweight zero-copy cursor over a PackStream byte slice.
@@ -1499,6 +1586,28 @@ fn try_read_str<'a>(cursor: &mut SliceCursor<'a>, depth: usize) -> Result<Option
         _ => return Ok(None),
     };
     Ok(Some(read_utf8_str(cursor, len)?))
+}
+
+#[inline]
+#[cfg(feature = "bolt")]
+fn try_read_bool(cursor: &mut SliceCursor<'_>, depth: usize) -> Result<Option<bool>> {
+    check_depth(depth)?;
+    let Some(marker) = cursor.peek_u8() else {
+        return Err(NetError::ProtocolError(
+            "Unexpected EOF while decoding PackStream value".to_string(),
+        ));
+    };
+    match marker {
+        0xC2 => {
+            cursor.pos += 1;
+            Ok(Some(false))
+        }
+        0xC3 => {
+            cursor.pos += 1;
+            Ok(Some(true))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[inline]
@@ -2115,5 +2224,51 @@ mod tests {
             decode_run_success_columns(bad_run),
             Err(NetError::ProtocolError(_))
         ));
+
+        // RUN metadata with qid + t_first and PULL metadata with has_more + bookmark
+        let run_stream_meta = HashMap::from([
+            (
+                "fields".to_string(),
+                BoltValue::List(vec![BoltValue::String("x".to_string())]),
+            ),
+            ("qid".to_string(), BoltValue::Integer(7)),
+            ("t_first".to_string(), BoltValue::Integer(12)),
+        ]);
+        let mut run_stream_buf = BytesMut::new();
+        PackStream::encode(
+            &BoltValue::Structure {
+                tag: 0x70,
+                fields: vec![BoltValue::Map(run_stream_meta)],
+            },
+            &mut run_stream_buf,
+        );
+        let decoded_run = decode_run_success_metadata(&run_stream_buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded_run.columns, vec!["x".to_string()]);
+        assert_eq!(decoded_run.qid, Some(7));
+        assert_eq!(decoded_run.t_first, Some(12));
+
+        let pull_more_meta = HashMap::from([
+            ("has_more".to_string(), BoltValue::Boolean(true)),
+            (
+                "bookmark".to_string(),
+                BoltValue::String("bm:2".to_string()),
+            ),
+        ]);
+        let mut pull_more_buf = BytesMut::new();
+        PackStream::encode(
+            &BoltValue::Structure {
+                tag: 0x70,
+                fields: vec![BoltValue::Map(pull_more_meta)],
+            },
+            &mut pull_more_buf,
+        );
+        let decoded_pull = decode_pull_success_metadata(&pull_more_buf)
+            .unwrap()
+            .unwrap();
+        assert!(decoded_pull.has_more);
+        assert!(!decoded_pull.has_t_last);
+        assert_eq!(decoded_pull.bookmark.as_deref(), Some("bm:2"));
     }
 }

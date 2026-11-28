@@ -534,3 +534,238 @@ async fn test_live_neo4j_execute_rows_and_arrow_equivalence() {
         .await;
     client.close().await;
 }
+
+#[tokio::test]
+async fn test_live_neo4j_stream_lifecycle_early_close_tx_qid_and_timeout_cancel() {
+    if !is_neo4j_online().await {
+        eprintln!("[SKIP] Live Neo4j instance is not reachable on 127.0.0.1:7687");
+        return;
+    }
+
+    use std::time::Duration;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::{NativeClient, NetError, ResultValue, StreamOptions};
+
+    let uri = format!("bolt://{NEO4J_USER}:{NEO4J_PASS}@127.0.0.1:7687");
+    let client = NativeClient::new(
+        &uri,
+        Some(
+            PoolConfig::new()
+                .with_min_idle(0)
+                .with_max_size(1)
+                .with_acquire_timeout(Duration::from_secs(5)),
+        ),
+    )
+    .unwrap();
+
+    // 1. Full multi-chunk stream (2,500 rows, fetch_size=1000) -> 3 chunks, eager lease release
+    let mut full_stream = client
+        .stream(
+            "UNWIND range(1, 2500) AS i RETURN i",
+            &HashMap::new(),
+            StreamOptions::new(1_000),
+        )
+        .await
+        .unwrap();
+    assert!(full_stream.is_server_streaming());
+    assert_eq!(full_stream.columns(), &["i".to_string()]);
+    assert_eq!(client.pool().active_count(), 1);
+
+    let mut chunk_sizes = Vec::new();
+    let mut last_val = 0i64;
+    while let Some(chunk) = full_stream.next_chunk().await.unwrap() {
+        chunk_sizes.push(chunk.num_rows());
+        if let Some(row) = chunk.rows.last()
+            && let ResultValue::Int(v) = row[0]
+        {
+            last_val = v;
+        }
+        assert!(chunk.to_record_batch().is_ok());
+    }
+    assert_eq!(chunk_sizes, vec![1_000, 1_000, 500]);
+    assert_eq!(last_val, 2_500);
+    assert!(full_stream.is_closed());
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 1);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 2. Early close after chunk 1 reuses the exact same pooled connection
+    let mut early_stream = client
+        .stream(
+            "UNWIND range(1, 10000) AS i RETURN i",
+            &HashMap::new(),
+            StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+    let c1 = early_stream.next_chunk().await.unwrap().expect("chunk 1");
+    assert_eq!(c1.num_rows(), 100);
+    early_stream.close().await.unwrap();
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 1);
+    let after_early = client
+        .execute_rows("RETURN 42 AS n", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(after_early.row_count(), 1);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 3. Close before chunk 1 drains & discards cleanly, reusing the same connection
+    let mut unread_stream = client
+        .stream(
+            "UNWIND range(1, 500) AS i RETURN i",
+            &HashMap::new(),
+            StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+    unread_stream.close().await.unwrap();
+    let after_unread = client
+        .execute_rows("RETURN 43 AS n", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(after_unread.row_count(), 1);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 4. Explicit transaction stream: qid propagation, fail-fast guard, close, follow-up & commit
+    let mut tx = client.begin_transaction().await.unwrap();
+    let mut cursor = tx
+        .open_stream_cursor(
+            "UNWIND range(1, 500) AS i RETURN i",
+            &HashMap::new(),
+            &StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+    let err_concurrent = tx
+        .execute_rows("RETURN 1 AS x", &HashMap::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_concurrent, NetError::TransactionError(ref m) if m.contains("active stream"))
+    );
+    let tx_c1 = tx.next_stream_chunk(&mut cursor).await.unwrap().unwrap();
+    let tx_c2 = tx.next_stream_chunk(&mut cursor).await.unwrap().unwrap();
+    assert_eq!(tx_c1.num_rows(), 100);
+    assert_eq!(tx_c2.num_rows(), 100);
+    tx.close_stream_cursor(&mut cursor).await.unwrap();
+    let tx_after = tx
+        .execute_rows("RETURN 99 AS x", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(tx_after.row_count(), 1);
+    tx.commit().await.unwrap();
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 5. Mid-stream FAILURE recovers via deferred RESET on the same pooled connection
+    let mut err_stream = client
+        .stream(
+            "UNWIND [1, 2, 0] AS x RETURN 10 / x AS q",
+            &HashMap::new(),
+            StreamOptions::new(1),
+        )
+        .await
+        .unwrap();
+    let ok1 = err_stream.next_chunk().await.unwrap().unwrap();
+    let ok2 = err_stream.next_chunk().await.unwrap().unwrap();
+    assert_eq!(ok1.num_rows(), 1);
+    assert_eq!(ok2.num_rows(), 1);
+    let mid_err = err_stream.next_chunk().await.unwrap_err();
+    assert!(matches!(mid_err, NetError::ProtocolError(_)));
+    let after_err = client
+        .execute_rows("RETURN 7 AS ok", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(after_err.row_count(), 1);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+    assert_eq!(client.pool().metrics().connections_failed_health_check, 0);
+
+    // 6. Mid-flight tokio::time::timeout cancellation replaces broken connection transparently
+    let mut slow_stream = client
+        .stream(
+            "UNWIND range(1, 100) AS a UNWIND range(1, 200000) AS b WITH a, b WHERE (a + b) % 200000 = 0 RETURN a, b",
+            &HashMap::new(),
+            StreamOptions::new(1),
+        )
+        .await
+        .unwrap();
+    let _first_slow = slow_stream.next_chunk().await.unwrap().expect("chunk 1");
+    let cancel_res =
+        tokio::time::timeout(Duration::from_micros(100), slow_stream.next_chunk()).await;
+    assert!(
+        cancel_res.is_err(),
+        "expected mid-flight timeout cancellation on chunk 2"
+    );
+    drop(slow_stream);
+    assert_eq!(client.pool().total_count(), 0);
+    let recovered = client
+        .execute_rows("RETURN 1 AS ok", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(recovered.row_count(), 1);
+    assert_eq!(client.pool().metrics().connections_created, 2);
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_live_neo4j_stream_ttfb_1k_vs_100k() {
+    if !is_neo4j_online().await {
+        eprintln!("[SKIP] Live Neo4j instance is not reachable on 127.0.0.1:7687");
+        return;
+    }
+
+    use std::time::Instant;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    let uri = format!("bolt://{NEO4J_USER}:{NEO4J_PASS}@127.0.0.1:7687");
+    let client = NativeClient::new(&uri, None).unwrap();
+    // Warm up pool connection so handshake isn't billed to TTFB
+    client.ping().await.unwrap();
+
+    let t0_1k = Instant::now();
+    let mut s_1k = client
+        .stream(
+            "UNWIND range(1, 1000) AS i RETURN i",
+            &HashMap::new(),
+            StreamOptions::new(1_000),
+        )
+        .await
+        .unwrap();
+    let first_1k = s_1k.next_chunk().await.unwrap().unwrap();
+    let ttfb_1k = t0_1k.elapsed();
+    assert_eq!(first_1k.num_rows(), 1_000);
+    while s_1k.next_chunk().await.unwrap().is_some() {}
+
+    let t0_100k = Instant::now();
+    let mut s_100k = client
+        .stream(
+            "UNWIND range(1, 100000) AS i RETURN i",
+            &HashMap::new(),
+            StreamOptions::new(1_000),
+        )
+        .await
+        .unwrap();
+    let first_100k = s_100k.next_chunk().await.unwrap().unwrap();
+    let ttfb_100k = t0_100k.elapsed();
+    assert_eq!(first_100k.num_rows(), 1_000);
+    let mut total_100k = first_100k.num_rows();
+    while let Some(c) = s_100k.next_chunk().await.unwrap() {
+        total_100k += c.num_rows();
+    }
+    let ttlb_100k = t0_100k.elapsed();
+    assert_eq!(total_100k, 100_000);
+
+    eprintln!(
+        "[neo4j stream] ttfb_1k={:?}, ttfb_100k={:?}, ttlb_100k={:?}",
+        ttfb_1k, ttfb_100k, ttlb_100k
+    );
+    assert!(
+        ttfb_100k.as_secs_f64() < ttlb_100k.as_secs_f64() * 0.25,
+        "100k TTFB {:?} was not well below TTLB {:?}",
+        ttfb_100k,
+        ttlb_100k
+    );
+
+    client.close().await;
+}

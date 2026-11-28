@@ -893,3 +893,106 @@ async fn test_pool_slipped_through_dead_connection_returns_error_and_discards() 
     client.close().await;
     server_task.abort();
 }
+
+#[tokio::test]
+async fn test_pool_exhaustion_with_active_bolt_stream_and_buffered_immediate_release() {
+    use voyager_drivers::mock::MockConnectionFactory;
+    use voyager_drivers::pool::ConnectionPool;
+    use voyager_drivers::{
+        BoltStubServer, NativeClient, NetError, QueryResult, QuerySummary, ResultStream,
+        ResultValue, StreamCursor, StreamOptions,
+    };
+
+    // 1. Server-streaming Bolt stream with max_size=1 holds the single permit until closed
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(
+        &stub.uri(),
+        Some(
+            PoolConfig::new()
+                .with_min_idle(0)
+                .with_max_size(1)
+                .with_acquire_timeout(Duration::from_millis(100)),
+        ),
+    )
+    .unwrap();
+
+    let mut stream = client
+        .stream("STREAM ROWS 500", &HashMap::new(), StreamOptions::new(100))
+        .await
+        .unwrap();
+    let chunk1 = stream.next_chunk().await.unwrap().expect("chunk 1");
+    assert_eq!(chunk1.num_rows(), 100);
+    assert_eq!(client.pool().active_count(), 1);
+    assert_eq!(client.pool().idle_count(), 0);
+
+    let err_exec = client
+        .execute_rows("RETURN 1", &HashMap::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err_exec, NetError::PoolExhausted(_)));
+
+    let err_stream = client
+        .stream("RETURN 1", &HashMap::new(), StreamOptions::default())
+        .await
+        .err()
+        .expect("second stream must fail with PoolExhausted");
+    assert!(matches!(err_stream, NetError::PoolExhausted(_)));
+
+    stream.close().await.unwrap();
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 1);
+
+    let ok_res = client
+        .execute_rows("RETURN 1", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(ok_res.row_count(), 2);
+    assert_eq!(stub.connection_count(), 1);
+    client.close().await;
+
+    // 2. Buffered cursor releases its pooled connection immediately on open_stream
+    let factory = Arc::new(MockConnectionFactory::new());
+    let pool = ConnectionPool::new(
+        PoolConfig::new()
+            .with_min_idle(0)
+            .with_max_size(1)
+            .with_acquire_timeout(Duration::from_millis(100)),
+        factory,
+    );
+    let mut conn = pool.acquire().await.unwrap();
+    conn.push_canned_result(Ok(QueryResult::from_rows(
+        vec!["x".to_string()],
+        vec![
+            vec![ResultValue::Int(1)],
+            vec![ResultValue::Int(2)],
+            vec![ResultValue::Int(3)],
+        ],
+        Vec::new(),
+        QuerySummary::empty(),
+    )));
+    let cursor = conn
+        .open_stream("RETURN 1", &HashMap::new(), &StreamOptions::new(2))
+        .await
+        .unwrap();
+    assert!(!cursor.is_server_streaming());
+    drop(conn);
+    assert_eq!(pool.active_count(), 0);
+    assert_eq!(pool.idle_count(), 1);
+
+    // Concurrent acquire succeeds immediately while buffered cursor hasn't been drained yet
+    let other_conn = pool.acquire().await.unwrap();
+    assert_eq!(pool.active_count(), 1);
+    drop(other_conn);
+
+    // And draining ResultStream<MockConnection> with None connection still yields all chunks
+    let StreamCursor::Buffered(buf_cursor) = cursor else {
+        panic!("expected Buffered cursor");
+    };
+    let mut buf_stream: ResultStream<voyager_drivers::mock::MockConnection> =
+        ResultStream::from_buffered(buf_cursor);
+    let c1 = buf_stream.next_chunk().await.unwrap().unwrap();
+    let c2 = buf_stream.next_chunk().await.unwrap().unwrap();
+    assert_eq!(c1.num_rows(), 2);
+    assert_eq!(c2.num_rows(), 1);
+    assert!(buf_stream.next_chunk().await.unwrap().is_none());
+}
