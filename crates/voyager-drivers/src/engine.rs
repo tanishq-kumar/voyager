@@ -11,7 +11,21 @@ use std::sync::Arc;
 use crate::bolt::BoltValue;
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
+use crate::value::arrow::{ColumnHint, values_to_record_batch_with_hints};
 use crate::value::result::ResultValue;
+
+/// Selects the primary in-memory representation produced by query execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResultMode {
+    /// Build Apache Arrow `RecordBatch`es directly without retaining `result_rows`
+    /// or `bolt_rows`. Used by `execute_arrow()` / `execute_to_polars()`.
+    #[default]
+    Arrow,
+    /// Retain decoded [`ResultValue`] rows without constructing an Apache Arrow
+    /// `RecordBatch`. Arrow can still be materialized lazily via
+    /// [`QueryResult::to_record_batch`]. Used by OLTP `execute_rows()`.
+    Rows,
+}
 
 /// Execution summary metrics and mutation counters returned after query execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +91,9 @@ pub struct QueryResult {
     /// Optional pre-converted [`ResultValue`] rows retained alongside Arrow batches
     /// so Bolt/FalkorDB results avoid a second `BoltValue` -> `ResultValue` copy in PyO3.
     pub result_rows: Option<Arc<Vec<Vec<ResultValue>>>>,
+    /// Per-column Arrow conversion hints preserved alongside `result_rows`
+    /// so lazy Arrow materialization matches `ResultMode::Arrow` identically.
+    pub column_hints: Vec<ColumnHint>,
 }
 
 impl QueryResult {
@@ -89,6 +106,27 @@ impl QueryResult {
             age_columns: Vec::new(),
             bolt_rows: None,
             result_rows: None,
+            column_hints: Vec::new(),
+        }
+    }
+
+    /// Creates a row-backed `QueryResult` without constructing an Apache Arrow [`RecordBatch`].
+    ///
+    /// Arrow can be materialized lazily later via [`Self::to_record_batch`].
+    pub fn from_rows(
+        columns: Vec<String>,
+        rows: Vec<Vec<ResultValue>>,
+        column_hints: Vec<ColumnHint>,
+        summary: QuerySummary,
+    ) -> Self {
+        Self {
+            columns,
+            batches: Vec::new(),
+            summary,
+            age_columns: Vec::new(),
+            bolt_rows: None,
+            result_rows: Some(Arc::new(rows)),
+            column_hints,
         }
     }
 
@@ -113,12 +151,21 @@ impl QueryResult {
             age_columns: Vec::new(),
             bolt_rows: None,
             result_rows: None,
+            column_hints: Vec::new(),
         }
     }
 
-    /// Returns total row count across all record batches in the result.
+    /// Returns total row count across batches or retained row buffers in the result.
     pub fn row_count(&self) -> usize {
-        self.batches.iter().map(|b| b.num_rows()).sum()
+        if !self.batches.is_empty() {
+            self.batches.iter().map(|b| b.num_rows()).sum()
+        } else if let Some(ref rows) = self.result_rows {
+            rows.len()
+        } else if let Some(ref rows) = self.bolt_rows {
+            rows.len()
+        } else {
+            0
+        }
     }
 
     /// Returns `true` if there are no rows in the result.
@@ -126,19 +173,60 @@ impl QueryResult {
         self.row_count() == 0
     }
 
+    /// Returns or lazily materializes a single canonical Arrow [`RecordBatch`].
+    ///
+    /// Preserves `column_hints` (PostgreSQL OID/typmod, mixed-depth array, and
+    /// Apache AGE rules) so lazy materialization from a [`ResultMode::Rows`] result
+    /// matches [`ResultMode::Arrow`] identically.
+    pub fn to_record_batch(&self) -> Result<Option<RecordBatch>> {
+        if !self.batches.is_empty() {
+            if self.batches.len() == 1 {
+                return Ok(Some(self.batches[0].clone()));
+            }
+            #[cfg(feature = "arrow")]
+            {
+                let schema = self.batches[0].schema();
+                let concatenated =
+                    concat_batches(&schema, &self.batches).map_err(NetError::ArrowError)?;
+                return Ok(Some(concatenated));
+            }
+            #[cfg(not(feature = "arrow"))]
+            {
+                return Err(NetError::ProtocolError(
+                    "Concatenating multiple RecordBatches requires the `arrow` feature".to_string(),
+                ));
+            }
+        }
+        if let Some(ref rows) = self.result_rows {
+            if self.columns.is_empty() && rows.is_empty() {
+                return Ok(None);
+            }
+            let batch = values_to_record_batch_with_hints(&self.columns, rows, &self.column_hints)?;
+            return Ok(Some(batch));
+        }
+        if !self.columns.is_empty() {
+            let batch = values_to_record_batch_with_hints(&self.columns, &[], &self.column_hints)?;
+            return Ok(Some(batch));
+        }
+        Ok(None)
+    }
+
     /// Consolidates multiple Arrow record batches into a single `RecordBatch`.
     #[cfg(feature = "arrow")]
     pub fn into_single_batch(self) -> Result<Option<RecordBatch>> {
-        if self.batches.is_empty() {
-            return Ok(None);
+        if !self.batches.is_empty() {
+            if self.batches.len() == 1 {
+                return Ok(Some(self.batches.into_iter().next().unwrap()));
+            }
+            let schema = self.batches[0].schema();
+            let concatenated =
+                concat_batches(&schema, &self.batches).map_err(NetError::ArrowError)?;
+            return Ok(Some(concatenated));
         }
-        if self.batches.len() == 1 {
-            return Ok(Some(self.batches.into_iter().next().unwrap()));
+        if self.result_rows.is_some() || !self.columns.is_empty() {
+            return self.to_record_batch();
         }
-
-        let schema = self.batches[0].schema();
-        let concatenated = concat_batches(&schema, &self.batches).map_err(NetError::ArrowError)?;
-        Ok(Some(concatenated))
+        Ok(None)
     }
 }
 
@@ -151,6 +239,18 @@ pub trait AsyncConnection: Send + Sync {
         query: &str,
         params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult>;
+
+    /// Executes a parameterized query string with an explicit [`ResultMode`].
+    ///
+    /// Backends that do not override this fall back to [`Self::execute`].
+    async fn execute_with_mode(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        _mode: ResultMode,
+    ) -> Result<QueryResult> {
+        self.execute(query, params).await
+    }
 
     /// Sends a lightweight liveness probe / ping to verify socket connectivity.
     async fn ping(&mut self) -> Result<()>;
@@ -256,6 +356,15 @@ impl AsyncConnection for Box<dyn AsyncConnection> {
         params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
         (**self).execute(query, params).await
+    }
+
+    async fn execute_with_mode(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        mode: ResultMode,
+    ) -> Result<QueryResult> {
+        (**self).execute_with_mode(query, params, mode).await
     }
 
     async fn ping(&mut self) -> Result<()> {
@@ -397,4 +506,90 @@ pub trait AsyncEngine: Send + Sync {
 
     /// Returns the engine's health status and connection pool statistics.
     async fn ping(&self) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::arrow::EmptyColumnKind;
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+
+    #[test]
+    fn result_mode_default_is_arrow() {
+        assert_eq!(ResultMode::default(), ResultMode::Arrow);
+    }
+
+    #[test]
+    fn query_result_from_rows_tracks_row_count_and_materializes_lazily() {
+        let res = QueryResult::from_rows(
+            vec!["id".to_string(), "name".to_string()],
+            vec![
+                vec![ResultValue::Int(1), ResultValue::Str("a".into())],
+                vec![ResultValue::Int(2), ResultValue::Str("b".into())],
+            ],
+            vec![
+                ColumnHint::PgEmptyTyped(EmptyColumnKind::Int),
+                ColumnHint::PgEmptyTyped(EmptyColumnKind::Str),
+            ],
+            QuerySummary::empty(),
+        );
+        assert!(res.batches.is_empty());
+        assert_eq!(res.row_count(), 2);
+        assert!(!res.is_empty());
+
+        let batch = res.to_record_batch().unwrap().expect("lazy batch");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(1),
+            2
+        );
+        assert_eq!(batch.column(1).as_string::<i32>().value(0), "a");
+
+        #[cfg(feature = "arrow")]
+        {
+            let via_into = res.into_single_batch().unwrap().expect("into_single_batch");
+            assert_eq!(via_into, batch);
+        }
+    }
+
+    #[test]
+    fn query_result_from_rows_preserves_zero_row_typed_pg_schema() {
+        let typmod_10_2 = ((10 << 16) | 2) + 4;
+        let res = QueryResult::from_rows(
+            vec!["id".to_string(), "price".to_string(), "tags".to_string()],
+            Vec::new(),
+            vec![
+                ColumnHint::PgEmptyTyped(EmptyColumnKind::Uuid),
+                ColumnHint::PgDecimal {
+                    typmod: Some(typmod_10_2),
+                },
+                ColumnHint::PgArray {
+                    depth: 1,
+                    elem_hint: Box::new(ColumnHint::PgEmptyTyped(EmptyColumnKind::Int)),
+                },
+            ],
+            QuerySummary::empty(),
+        );
+        assert_eq!(res.row_count(), 0);
+        assert!(res.is_empty());
+        let batch = res.to_record_batch().unwrap().expect("typed empty batch");
+        assert_eq!(batch.num_rows(), 0);
+        let schema = batch.schema();
+        assert_eq!(schema.field(0).data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal128(38, 2));
+        assert!(matches!(schema.field(2).data_type(), DataType::List(_)));
+    }
+
+    #[test]
+    fn query_result_from_rows_empty_columns_returns_none_batch() {
+        let res = QueryResult::from_rows(Vec::new(), Vec::new(), Vec::new(), QuerySummary::empty());
+        assert_eq!(res.row_count(), 0);
+        assert!(res.to_record_batch().unwrap().is_none());
+        #[cfg(feature = "arrow")]
+        assert!(res.into_single_batch().unwrap().is_none());
+    }
 }

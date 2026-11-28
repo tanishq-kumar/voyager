@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
+use crate::engine::{AsyncConnection, QueryResult, QuerySummary, ResultMode};
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
 use crate::pool::PooledConnection;
@@ -136,6 +136,47 @@ impl<C: AsyncConnection + 'static> NativeTransaction<C> {
                 Err(err)
             }
         }
+    }
+
+    async fn execute_with_mode(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        mode: ResultMode,
+    ) -> Result<QueryResult> {
+        let conn = self.active_conn()?;
+        match conn.execute_with_mode(query, params, mode).await {
+            Ok(res) => {
+                self.accumulate(&res.summary);
+                Ok(res)
+            }
+            Err(err) => {
+                self.state = NativeTransactionState::Failed;
+                Err(err)
+            }
+        }
+    }
+
+    /// Executes a parameterized statement inside the transaction, retaining decoded
+    /// [`ResultValue`](crate::ResultValue) rows without building an Apache Arrow `RecordBatch`.
+    pub async fn execute_rows(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+    ) -> Result<QueryResult> {
+        self.execute_with_mode(query, params, ResultMode::Rows)
+            .await
+    }
+
+    /// Executes a parameterized statement inside the transaction, building an Apache Arrow
+    /// `RecordBatch` directly without retaining `result_rows` or `bolt_rows`.
+    pub async fn execute_arrow(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+    ) -> Result<QueryResult> {
+        self.execute_with_mode(query, params, ResultMode::Arrow)
+            .await
     }
 
     /// Commits the transaction and returns its accumulated mutation summary.

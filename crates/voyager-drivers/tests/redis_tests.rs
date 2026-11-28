@@ -985,3 +985,159 @@ fn test_falkordb_compact_temporal_errors_tag15_timestamp_and_bolt_rows() {
     .unwrap();
     assert!(mixed_res.result_rows.is_some());
 }
+
+#[test]
+fn test_falkordb_result_mode_rows_and_arrow_equivalence() {
+    use voyager_drivers::ResultMode;
+    use voyager_drivers::redis::graph::{
+        FalkorCompactResult, FalkorGraphSchema, decode_compact_cell,
+    };
+    use voyager_drivers::redis::resp::RespValue;
+    use voyager_drivers::value::result::ResultValue;
+
+    let schema = FalkorGraphSchema {
+        version: Some(1),
+        labels: vec!["Person".to_string()],
+        relationships: vec!["KNOWS".to_string()],
+        properties: vec!["name".to_string(), "since".to_string()],
+    };
+
+    let node1 = RespValue::Array(Some(vec![
+        RespValue::Integer(8),
+        RespValue::Array(Some(vec![
+            RespValue::Integer(1),
+            RespValue::Array(Some(vec![RespValue::Integer(0)])),
+            RespValue::Array(Some(vec![RespValue::Array(Some(vec![
+                RespValue::Integer(0),
+                RespValue::Integer(2),
+                RespValue::BulkString(Some(b"Alice".to_vec())),
+            ]))])),
+        ])),
+    ]));
+    let node2 = RespValue::Array(Some(vec![
+        RespValue::Integer(8),
+        RespValue::Array(Some(vec![
+            RespValue::Integer(2),
+            RespValue::Array(Some(vec![RespValue::Integer(0)])),
+            RespValue::Array(Some(vec![RespValue::Array(Some(vec![
+                RespValue::Integer(0),
+                RespValue::Integer(2),
+                RespValue::BulkString(Some(b"Bob".to_vec())),
+            ]))])),
+        ])),
+    ]));
+    let edge = RespValue::Array(Some(vec![
+        RespValue::Integer(7),
+        RespValue::Array(Some(vec![
+            RespValue::Integer(10),
+            RespValue::Integer(0),
+            RespValue::Integer(1),
+            RespValue::Integer(2),
+            RespValue::Array(Some(vec![RespValue::Array(Some(vec![
+                RespValue::Integer(1),
+                RespValue::Integer(3),
+                RespValue::Integer(2024),
+            ]))])),
+        ])),
+    ]));
+    let path = RespValue::Array(Some(vec![
+        RespValue::Integer(9),
+        RespValue::Array(Some(vec![
+            RespValue::Array(Some(vec![
+                RespValue::Integer(6),
+                RespValue::Array(Some(vec![node1.clone(), node2])),
+            ])),
+            RespValue::Array(Some(vec![
+                RespValue::Integer(6),
+                RespValue::Array(Some(vec![edge.clone()])),
+            ])),
+        ])),
+    ]));
+    let map = RespValue::Array(Some(vec![
+        RespValue::Integer(10),
+        RespValue::Array(Some(vec![
+            RespValue::BulkString(Some(b"k".to_vec())),
+            RespValue::Array(Some(vec![RespValue::Integer(3), RespValue::Integer(99)])),
+        ])),
+    ]));
+    let point = RespValue::Array(Some(vec![
+        RespValue::Integer(11),
+        RespValue::Array(Some(vec![RespValue::Double(52.5), RespValue::Double(13.4)])),
+    ]));
+    let vecf32 = RespValue::Array(Some(vec![
+        RespValue::Integer(12),
+        RespValue::Array(Some(vec![RespValue::Double(1.0), RespValue::Double(2.5)])),
+    ]));
+    let dt = RespValue::Array(Some(vec![
+        RespValue::Integer(13),
+        RespValue::Integer(1_700_000_000),
+    ]));
+    let date = RespValue::Array(Some(vec![
+        RespValue::Integer(14),
+        RespValue::Integer(19_723 * 86_400),
+    ]));
+    let time = RespValue::Array(Some(vec![
+        RespValue::Integer(15),
+        RespValue::Integer(3_661),
+    ]));
+    let dur = RespValue::Array(Some(vec![
+        RespValue::Integer(16),
+        RespValue::Integer(90_061),
+    ]));
+
+    let row = vec![
+        RespValue::Array(Some(vec![RespValue::Integer(0), RespValue::Null])),
+        RespValue::Array(Some(vec![RespValue::Integer(4), RespValue::Boolean(true)])),
+        node1,
+        edge,
+        path,
+        map,
+        point,
+        vecf32,
+        dt,
+        date,
+        time,
+        dur,
+    ];
+    let expected_rv: Vec<ResultValue> = row
+        .iter()
+        .map(|cell| ResultValue::from(&decode_compact_cell(cell, &schema).unwrap()))
+        .collect();
+
+    let compact = FalkorCompactResult {
+        columns: vec![
+            "nul", "b", "n", "r", "p", "m", "pt", "vf", "dt", "d", "t", "dur",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        rows: vec![row],
+        statistics: Default::default(),
+        graph_version: Some(1),
+    };
+
+    let leg = compact.to_query_result(&schema).unwrap();
+    let rows_res = compact
+        .to_query_result_with_mode(&schema, ResultMode::Rows)
+        .unwrap();
+    let arrow_res = compact
+        .to_query_result_with_mode(&schema, ResultMode::Arrow)
+        .unwrap();
+
+    assert!(rows_res.batches.is_empty());
+    assert!(rows_res.bolt_rows.is_none());
+    assert_eq!(rows_res.row_count(), 1);
+    assert_eq!(rows_res.result_rows.as_deref(), Some(&vec![expected_rv]));
+
+    assert!(arrow_res.result_rows.is_none());
+    assert!(arrow_res.bolt_rows.is_none());
+
+    assert_eq!(
+        rows_res.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arrow_res.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+}

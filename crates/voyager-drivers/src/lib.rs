@@ -48,7 +48,7 @@ pub use client::{ConnectOptions, NativeClient, connect_any, connect_any_with_opt
 pub use config::{Auth, ConnectionConfig, PoolConfig, TlsMode};
 pub use engine::{
     AsyncConnection, AsyncEngine, AsyncTransaction, ConnectionFactory, FnConnectionFactory,
-    QueryResult, QuerySummary,
+    QueryResult, QuerySummary, ResultMode,
 };
 pub use error::{NetError, Result};
 pub use introspect::{GraphSchema, IntrospectOptions, introspect};

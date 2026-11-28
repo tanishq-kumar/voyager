@@ -9,14 +9,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tracing::debug;
 
-use super::decode_result::{BoltResultDecoder, peek_bolt_message_tag};
-use super::messages::{BoltRequest, BoltResponse};
-use super::packstream::{BoltValue, param_to_bolt_value};
+use super::decode_result::{
+    BoltResultDecoder, decode_pull_success_summary, decode_run_success_columns,
+    peek_bolt_message_tag,
+};
+use super::messages::{BoltRequest, BoltResponse, encode_pull_all_message, encode_run_message};
+use super::packstream::BoltValue;
 use super::stream::{
     encode_chunks, read_message_frame_borrowed, read_message_frame_buffered, write_message_frame,
 };
 use crate::config::{Auth, ConnectionConfig};
-use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
+use crate::engine::{AsyncConnection, QueryResult, QuerySummary, ResultMode};
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
 use crate::tls::{NetStream, TlsVerification};
@@ -41,6 +44,16 @@ pub struct BoltVersion {
     pub minor: u8,
 }
 
+const MAX_RETAINED_WRITE_BUF_CAPACITY: usize = 64 * 1024;
+
+#[inline]
+fn clear_reusable_buf(buf: &mut BytesMut, default_cap: usize) {
+    buf.clear();
+    if buf.capacity() > MAX_RETAINED_WRITE_BUF_CAPACITY {
+        *buf = BytesMut::with_capacity(default_cap);
+    }
+}
+
 /// Physical asynchronous Bolt connection managing socket I/O, PackStream framing, and state.
 pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = NetStream> {
     stream: S,
@@ -48,6 +61,9 @@ pub struct BoltConnection<S: AsyncRead + AsyncWrite + Unpin + Send + Sync = NetS
     local_alive_check: fn(&S, Option<&std::net::TcpStream>) -> bool,
     read_buf: BytesMut,
     frame_buf: Vec<u8>,
+    write_buf: BytesMut,
+    msg_buf: BytesMut,
+    decoder: BoltResultDecoder,
     version: BoltVersion,
     /// True when Bolt 4.4 negotiated the `"utc"` patch via `patch_bolt`.
     utc_patched: bool,
@@ -185,6 +201,9 @@ impl BoltConnection<NetStream> {
             local_alive_check: crate::tls::is_stream_locally_alive,
             read_buf: BytesMut::with_capacity(65536),
             frame_buf: Vec::new(),
+            write_buf: BytesMut::with_capacity(1024),
+            msg_buf: BytesMut::with_capacity(512),
+            decoder: BoltResultDecoder::new(),
             version,
             utc_patched: false,
             database: db.map(str::to_string),
@@ -330,6 +349,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             local_alive_check: |_, _| true,
             read_buf: BytesMut::with_capacity(65536),
             frame_buf: Vec::new(),
+            write_buf: BytesMut::with_capacity(1024),
+            msg_buf: BytesMut::with_capacity(512),
+            decoder: BoltResultDecoder::new(),
             version,
             utc_patched: false,
             database: None,
@@ -358,18 +380,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         self.database.as_deref()
     }
 
-    /// Returns the database to send in auto-commit `RUN` metadata.
-    ///
-    /// Bolt names the database per transaction; a `RUN` inside an explicit
-    /// transaction must rely on the database named by `BEGIN` instead.
-    fn auto_commit_database(&self) -> Option<&str> {
-        if self.version.major >= 4 && !self.in_transaction {
-            self.database.as_deref()
-        } else {
-            None
-        }
-    }
-
     /// Returns the server agent string if reported by the database server.
     pub fn server_agent(&self) -> Option<&str> {
         self.server_agent.as_deref()
@@ -387,13 +397,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
 
     /// Sends an encoded `BoltRequest` message frame over the stream.
     pub async fn send_request(&mut self, request: &BoltRequest) -> Result<()> {
-        let mut payload = BytesMut::new();
-        request.encode(&mut payload);
+        clear_reusable_buf(&mut self.msg_buf, 512);
+        clear_reusable_buf(&mut self.write_buf, 1024);
+        request.encode(&mut self.msg_buf);
+        encode_chunks(&self.msg_buf, &mut self.write_buf);
 
-        let mut chunk_buf = BytesMut::new();
-        encode_chunks(&payload, &mut chunk_buf);
-
-        write_message_frame(&mut self.stream, &chunk_buf).await
+        write_message_frame(&mut self.stream, &self.write_buf).await
     }
 
     /// Receives and decodes a single `BoltResponse` message from the stream.
@@ -809,11 +818,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         }
     }
 
-    /// Inner execution routine for `AsyncConnection::execute` with pre-allocated buffers.
+    /// Inner execution routine for `AsyncConnection::execute` / `execute_with_mode` with reused buffers.
     async fn execute_inner(
         &mut self,
         query: &str,
         params: &HashMap<String, ParamValue>,
+        mode: Option<ResultMode>,
     ) -> Result<QueryResult> {
         if !self.is_valid {
             return Err(NetError::Closed(
@@ -827,84 +837,89 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
         } else {
             self.version.major
         };
-        let mut bolt_params = HashMap::with_capacity(params.len());
-        for (k, v) in params {
-            bolt_params.insert(k.clone(), param_to_bolt_value(v, temporal_major)?);
-        }
-
-        let mut extra = HashMap::new();
-        if let Some(db) = self.auto_commit_database() {
-            extra.insert("db".to_string(), BoltValue::String(db.to_string()));
-        }
-        if let Some(to) = self.query_timeout {
-            extra.insert(
-                "tx_timeout".to_string(),
-                BoltValue::Integer(to.as_millis() as i64),
-            );
-        }
-
-        // 1. Pipeline RUN + PULL in a single pre-allocated write buffer
-        let run_req = BoltRequest::Run {
-            query: query.to_string(),
-            params: bolt_params,
-            extra,
+        let db = if self.version.major >= 4 && !self.in_transaction {
+            self.database.as_deref()
+        } else {
+            None
         };
-        let pull_req = BoltRequest::pull_all();
+        let tx_timeout_ms = self.query_timeout.map(|to| to.as_millis() as i64);
 
-        let mut write_buf = BytesMut::with_capacity(1024);
-        let mut run_payload = BytesMut::with_capacity(512);
-        run_req.encode(&mut run_payload);
-        encode_chunks(&run_payload, &mut write_buf);
+        // 1. Pipeline RUN + PULL in reused buffers (zero intermediate HashMap/BoltValue/String allocs)
+        clear_reusable_buf(&mut self.write_buf, 1024);
+        clear_reusable_buf(&mut self.msg_buf, 512);
+        encode_run_message(
+            query,
+            params,
+            temporal_major,
+            db,
+            tx_timeout_ms,
+            &mut self.msg_buf,
+        )?;
+        encode_chunks(&self.msg_buf, &mut self.write_buf);
 
-        let mut pull_payload = BytesMut::with_capacity(64);
-        pull_req.encode(&mut pull_payload);
-        encode_chunks(&pull_payload, &mut write_buf);
+        self.msg_buf.clear();
+        encode_pull_all_message(&mut self.msg_buf);
+        encode_chunks(&self.msg_buf, &mut self.write_buf);
 
         // Send pipelined requests with sticky invalidation until terminal response
         self.is_valid = false;
-        write_message_frame(&mut self.stream, &write_buf).await?;
+        write_message_frame(&mut self.stream, &self.write_buf).await?;
         // If the previous query failed, its RESET is already in flight; consume the
         // acknowledgement now that this request is on the wire, adding no round trip.
         self.consume_pending_reset().await?;
 
         // 2. Receive RUN response (Expect SUCCESS with column fields)
-        let run_resp = self.receive_response().await?;
-        let columns: Vec<String> = match run_resp {
-            BoltResponse::Success { ref metadata } => metadata
-                .get("fields")
-                .and_then(|v| v.as_list())
-                .map(|l| {
-                    l.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect::<Vec<String>>()
-                })
-                .unwrap_or_default(),
-            BoltResponse::Failure { metadata } => {
-                let code = metadata
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("QueryError");
-                let msg = metadata
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Query failed");
-                // Consume in-flight IGNORED response from pipelined PULL
-                self.receive_response().await?;
-                // Write RESET now; its acknowledgement is consumed by the next request.
-                self.send_deferred_reset().await?;
-                return Err(NetError::ProtocolError(format!("{}: {}", code, msg)));
-            }
-            other => {
-                return Err(NetError::ProtocolError(format!(
-                    "Unexpected RUN response: {:?}",
-                    other
-                )));
+        let columns: Vec<String> = {
+            let run_frame = read_message_frame_borrowed(
+                &mut self.stream,
+                &mut self.read_buf,
+                &mut self.frame_buf,
+            )
+            .await?;
+            if let Some(cols) = decode_run_success_columns(&run_frame)? {
+                cols
+            } else {
+                let mut owned_frame = bytes::Bytes::copy_from_slice(&run_frame);
+                drop(run_frame);
+                let run_resp = BoltResponse::decode(&mut owned_frame)?;
+                match run_resp {
+                    BoltResponse::Success { ref metadata } => metadata
+                        .get("fields")
+                        .and_then(|v| v.as_list())
+                        .map(|l| {
+                            l.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default(),
+                    BoltResponse::Failure { metadata } => {
+                        let code = metadata
+                            .get("code")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("QueryError");
+                        let msg = metadata
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Query failed");
+                        // Consume in-flight IGNORED response from pipelined PULL
+                        self.receive_response().await?;
+                        // Write RESET now; its acknowledgement is consumed by the next request.
+                        self.send_deferred_reset().await?;
+                        return Err(NetError::ProtocolError(format!("{}: {}", code, msg)));
+                    }
+                    other => {
+                        return Err(NetError::ProtocolError(format!(
+                            "Unexpected RUN response: {:?}",
+                            other
+                        )));
+                    }
+                }
             }
         };
 
         // 3. Receive stream of RECORD responses directly into ResultValue rows, followed by SUCCESS
         let mut result_rows = Vec::new();
-        let mut decoder = BoltResultDecoder::new();
+        self.decoder.clear();
 
         let summary = loop {
             let frame = read_message_frame_borrowed(
@@ -915,9 +930,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             .await?;
 
             if peek_bolt_message_tag(&frame) == Some(0x71) {
-                let row = decoder.decode_record_frame(&frame)?;
+                let row = self.decoder.decode_record_frame(&frame)?;
                 result_rows.push(row);
                 continue;
+            }
+
+            if let Some(summary) = decode_pull_success_summary(&frame)? {
+                self.is_valid = true;
+                break summary;
             }
 
             let mut owned_frame = bytes::Bytes::copy_from_slice(&frame);
@@ -957,21 +977,62 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> BoltConnection<S> {
             }
         };
 
-        // 4. Build Arrow RecordBatch directly from decoded ResultValue rows
-        let batch = crate::value::arrow::values_to_record_batch(&columns, &result_rows)?;
-        let retained_rows =
-            crate::value::arrow::batch_needs_raw_rows(&batch).then_some(result_rows);
-        let batches = if batch.num_rows() > 0 || !columns.is_empty() {
-            vec![batch]
-        } else {
-            Vec::new()
-        };
+        // 4. Produce ResultMode::Rows, ResultMode::Arrow, or legacy execute() output
+        match mode {
+            Some(ResultMode::Rows) => Ok(QueryResult::from_rows(
+                columns,
+                result_rows,
+                Vec::new(),
+                summary,
+            )),
+            Some(ResultMode::Arrow) => {
+                let batch = crate::value::arrow::values_to_record_batch(&columns, &result_rows)?;
+                let batches = if batch.num_rows() > 0 || !columns.is_empty() {
+                    vec![batch]
+                } else {
+                    Vec::new()
+                };
+                Ok(QueryResult::new(columns, batches, summary))
+            }
+            None => {
+                let batch = crate::value::arrow::values_to_record_batch(&columns, &result_rows)?;
+                let retained_rows =
+                    crate::value::arrow::batch_needs_raw_rows(&batch).then_some(result_rows);
+                let batches = if batch.num_rows() > 0 || !columns.is_empty() {
+                    vec![batch]
+                } else {
+                    Vec::new()
+                };
 
-        let result = QueryResult::new(columns, batches, summary);
-        if let Some(result_rows) = retained_rows {
-            Ok(result.with_result_rows(result_rows))
+                let result = QueryResult::new(columns, batches, summary);
+                if let Some(result_rows) = retained_rows {
+                    Ok(result.with_result_rows(result_rows))
+                } else {
+                    Ok(result)
+                }
+            }
+        }
+    }
+
+    async fn execute_with_timeout(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        mode: Option<ResultMode>,
+    ) -> Result<QueryResult> {
+        if let Some(to) = self.query_timeout {
+            match timeout(to, self.execute_inner(query, params, mode)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    self.is_valid = false;
+                    Err(NetError::Timeout(format!(
+                        "Query execution timed out after {:?}",
+                        to
+                    )))
+                }
+            }
         } else {
-            Ok(result)
+            self.execute_inner(query, params, mode).await
         }
     }
     /// Writes `RESET` after a failure without waiting for its `SUCCESS`.
@@ -1063,20 +1124,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
         query: &str,
         params: &HashMap<String, ParamValue>,
     ) -> Result<QueryResult> {
-        if let Some(to) = self.query_timeout {
-            match timeout(to, self.execute_inner(query, params)).await {
-                Ok(res) => res,
-                Err(_) => {
-                    self.is_valid = false;
-                    Err(NetError::Timeout(format!(
-                        "Query execution timed out after {:?}",
-                        to
-                    )))
-                }
-            }
-        } else {
-            self.execute_inner(query, params).await
-        }
+        self.execute_with_timeout(query, params, None).await
+    }
+
+    async fn execute_with_mode(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        mode: ResultMode,
+    ) -> Result<QueryResult> {
+        self.execute_with_timeout(query, params, Some(mode)).await
     }
 
     async fn ping(&mut self) -> Result<()> {

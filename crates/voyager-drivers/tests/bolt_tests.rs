@@ -1384,3 +1384,256 @@ fn test_legacy_0x66_wire_bytes_and_negative_durations() {
         &DataType::Duration(TimeUnit::Microsecond)
     );
 }
+
+#[tokio::test]
+async fn test_bolt_execute_rows_and_execute_arrow_equivalence_and_buffer_reuse() {
+    use bytes::BytesMut;
+    use tokio::io::AsyncWriteExt;
+    use voyager_drivers::bolt::messages::BoltResponse;
+    use voyager_drivers::bolt::packstream::{
+        BoltDateTimeZoneId, BoltDuration, BoltNode, BoltPath, BoltPoint2D, BoltRelationship,
+        BoltUnboundRelationship, BoltValue, PackStream,
+    };
+    use voyager_drivers::bolt::stream::{encode_chunks, read_message_frame, write_message_frame};
+    use voyager_drivers::bolt::{BoltConnection, BoltStubServer, BoltVersion};
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::engine::{AsyncConnection, ResultMode};
+    use voyager_drivers::value::result::ResultValue;
+    use voyager_drivers::{NativeClient, ParamTimezone, ParamValue};
+
+    // 1. NativeClient & NativeTransaction against BoltStubServer
+    let stub = BoltStubServer::start().await.unwrap();
+    let client = NativeClient::new(&stub.uri(), Some(PoolConfig::default())).unwrap();
+
+    let legacy = client.execute("RETURN 1", &HashMap::new()).await.unwrap();
+    let rows_res = client
+        .execute_rows("RETURN 1", &HashMap::new())
+        .await
+        .unwrap();
+    let arrow_res = client
+        .execute_arrow("RETURN 1", &HashMap::new())
+        .await
+        .unwrap();
+
+    assert!(rows_res.batches.is_empty());
+    assert!(rows_res.result_rows.is_some());
+    assert!(rows_res.bolt_rows.is_none());
+    assert_eq!(rows_res.row_count(), legacy.row_count());
+
+    assert_eq!(arrow_res.batches.len(), 1);
+    assert!(arrow_res.result_rows.is_none());
+    assert!(arrow_res.bolt_rows.is_none());
+
+    let legacy_batch = legacy.to_record_batch().unwrap().unwrap();
+    let rows_batch = rows_res.to_record_batch().unwrap().unwrap();
+    let arrow_batch = arrow_res.to_record_batch().unwrap().unwrap();
+    assert_eq!(rows_batch, legacy_batch);
+    assert_eq!(arrow_batch, legacy_batch);
+
+    // Transaction execute_rows & execute_arrow
+    let mut tx = client.begin_transaction().await.unwrap();
+    let tx_rows = tx.execute_rows("RETURN 1", &HashMap::new()).await.unwrap();
+    let tx_arrow = tx.execute_arrow("RETURN 1", &HashMap::new()).await.unwrap();
+    assert!(tx_rows.batches.is_empty());
+    assert_eq!(tx_rows.to_record_batch().unwrap().unwrap(), legacy_batch);
+    assert!(tx_arrow.result_rows.is_none());
+    assert_eq!(tx_arrow.to_record_batch().unwrap().unwrap(), legacy_batch);
+    tx.commit().await.unwrap();
+    client.close().await;
+
+    // 2. Duplex rich-entity + temporal + spatial + 0-row + parameterized buffer-reuse equivalence
+    fn send_msg(resp: &BoltResponse) -> Vec<u8> {
+        let val = match resp {
+            BoltResponse::Success { metadata } => BoltValue::Structure {
+                tag: 0x70,
+                fields: vec![BoltValue::Map(metadata.clone())],
+            },
+            BoltResponse::Record { fields } => BoltValue::Structure {
+                tag: 0x71,
+                fields: vec![BoltValue::List(fields.clone())],
+            },
+            _ => unreachable!(),
+        };
+        let mut payload = BytesMut::new();
+        PackStream::encode(&val, &mut payload);
+        let mut chunks = BytesMut::new();
+        encode_chunks(&payload, &mut chunks);
+        chunks.to_vec()
+    }
+
+    let node1 = BoltNode {
+        id: 1,
+        labels: vec!["Person".to_string()],
+        properties: HashMap::from([("name".to_string(), BoltValue::String("Alice".to_string()))]),
+        element_id: Some("4:a:1".to_string()),
+    };
+    let node2 = BoltNode {
+        id: 2,
+        labels: vec!["Person".to_string()],
+        properties: HashMap::from([("name".to_string(), BoltValue::String("Bob".to_string()))]),
+        element_id: Some("4:a:2".to_string()),
+    };
+    let rel = BoltRelationship {
+        id: 10,
+        start_node_id: 1,
+        end_node_id: 2,
+        rel_type: "KNOWS".to_string(),
+        properties: HashMap::from([("since".to_string(), BoltValue::Integer(2024))]),
+        element_id: Some("5:a:10".to_string()),
+        start_element_id: Some("4:a:1".to_string()),
+        end_element_id: Some("4:a:2".to_string()),
+    };
+    let path = BoltPath {
+        nodes: vec![node1.clone(), node2],
+        relationships: vec![BoltUnboundRelationship {
+            id: 10,
+            rel_type: "KNOWS".to_string(),
+            properties: HashMap::from([("since".to_string(), BoltValue::Integer(2024))]),
+            element_id: Some("5:a:10".to_string()),
+        }],
+        sequence: vec![1, 1],
+    };
+    let rich_row = vec![
+        BoltValue::Integer(7),
+        BoltValue::Node(node1),
+        BoltValue::Relationship(rel),
+        BoltValue::Path(path),
+        BoltValue::Point2D(BoltPoint2D {
+            srid: srid::WGS_84_2D,
+            x: 13.4,
+            y: 52.5,
+        }),
+        BoltValue::DateTimeZoneId(BoltDateTimeZoneId {
+            seconds: 1_700_000_000,
+            nanoseconds: 123_000,
+            zone_id: "Europe/Berlin".to_string(),
+            is_local: false,
+        }),
+        BoltValue::Duration(BoltDuration::new(1, 2, 3, 4_000)),
+        BoltValue::Map(HashMap::from([(
+            "k".to_string(),
+            BoltValue::List(vec![
+                BoltValue::Integer(1),
+                BoltValue::String("x".to_string()),
+            ]),
+        )])),
+    ];
+
+    let (client_stream, mut server_stream) = tokio::io::duplex(65536);
+    let expected_rich_row = rich_row.clone();
+    let server_task = tokio::spawn(async move {
+        // Serve 6 queries: (legacy, Rows, Arrow) for rich query + (legacy, Rows, Arrow) for 0-row query
+        for idx in 0..6 {
+            let mut run_frame = read_message_frame(&mut server_stream).await.unwrap();
+            let run_val = PackStream::decode(&mut run_frame).unwrap();
+            // Verify direct RUN parameter encoding round-trips cleanly
+            let BoltValue::Structure { tag: 0x10, fields } = run_val else {
+                panic!("expected RUN");
+            };
+            assert!(matches!(fields[1], BoltValue::Map(_)));
+            let mut pull_frame = read_message_frame(&mut server_stream).await.unwrap();
+            let pull_val = PackStream::decode(&mut pull_frame).unwrap();
+            assert!(matches!(pull_val, BoltValue::Structure { tag: 0x3F, .. }));
+
+            let mut wire = Vec::new();
+            let cols = if idx < 3 {
+                vec!["id", "n", "r", "p", "pt", "dt", "dur", "m"]
+            } else {
+                vec!["empty_col"]
+            };
+            let run_meta = HashMap::from([(
+                "fields".to_string(),
+                BoltValue::List(
+                    cols.into_iter()
+                        .map(|s| BoltValue::String(s.to_string()))
+                        .collect(),
+                ),
+            )]);
+            wire.extend_from_slice(&send_msg(&BoltResponse::Success { metadata: run_meta }));
+            if idx < 3 {
+                wire.extend_from_slice(&send_msg(&BoltResponse::Record {
+                    fields: expected_rich_row.clone(),
+                }));
+            }
+            wire.extend_from_slice(&send_msg(&BoltResponse::Success {
+                metadata: HashMap::new(),
+            }));
+            write_message_frame(&mut server_stream, &wire)
+                .await
+                .unwrap();
+            let _ = server_stream.flush().await;
+        }
+    });
+
+    let mut conn = BoltConnection::from_stream(client_stream, BoltVersion { major: 5, minor: 4 });
+    let mut params = HashMap::new();
+    params.insert("p_int".to_string(), ParamValue::Json(serde_json::json!(42)));
+    params.insert(
+        "p_dt".to_string(),
+        ParamValue::DateTime {
+            utc_seconds: 1_700_000_000,
+            nanosecond: 500,
+            tz: ParamTimezone::ZoneId {
+                id: "UTC".to_string(),
+                offset_seconds: 0,
+            },
+        },
+    );
+    params.insert(
+        "p_list".to_string(),
+        ParamValue::List(vec![
+            ParamValue::Float(1.5),
+            ParamValue::Uuid("abc".to_string()),
+        ]),
+    );
+
+    let leg_rich = conn.execute("RETURN ...", &params).await.unwrap();
+    let row_rich = conn
+        .execute_with_mode("RETURN ...", &params, ResultMode::Rows)
+        .await
+        .unwrap();
+    let arr_rich = conn
+        .execute_with_mode("RETURN ...", &params, ResultMode::Arrow)
+        .await
+        .unwrap();
+
+    assert!(row_rich.batches.is_empty());
+    assert!(arr_rich.result_rows.is_none());
+    assert!(arr_rich.bolt_rows.is_none());
+    assert_eq!(row_rich.row_count(), 1);
+    assert_eq!(
+        row_rich.to_record_batch().unwrap().unwrap(),
+        leg_rich.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr_rich.to_record_batch().unwrap().unwrap(),
+        leg_rich.to_record_batch().unwrap().unwrap()
+    );
+    let expected_rv: Vec<Vec<ResultValue>> = vec![rich_row.iter().map(ResultValue::from).collect()];
+    assert_eq!(row_rich.result_rows.as_deref(), Some(&expected_rv));
+
+    // 0-row queries reusing the same BoltConnection buffers and decoder
+    let leg_empty = conn
+        .execute("RETURN ... LIMIT 0", &HashMap::new())
+        .await
+        .unwrap();
+    let row_empty = conn
+        .execute_with_mode("RETURN ... LIMIT 0", &HashMap::new(), ResultMode::Rows)
+        .await
+        .unwrap();
+    let arr_empty = conn
+        .execute_with_mode("RETURN ... LIMIT 0", &HashMap::new(), ResultMode::Arrow)
+        .await
+        .unwrap();
+    assert_eq!(row_empty.row_count(), 0);
+    assert_eq!(
+        row_empty.to_record_batch().unwrap().unwrap(),
+        leg_empty.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr_empty.to_record_batch().unwrap().unwrap(),
+        leg_empty.to_record_batch().unwrap().unwrap()
+    );
+
+    server_task.await.unwrap();
+}

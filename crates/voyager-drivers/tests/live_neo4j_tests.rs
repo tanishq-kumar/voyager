@@ -465,3 +465,72 @@ async fn test_live_neo4j_simultaneous_explain_and_profile_connections() {
         .await
         .expect("Failed to close setup connection");
 }
+
+#[tokio::test]
+async fn test_live_neo4j_execute_rows_and_arrow_equivalence() {
+    if !is_neo4j_online().await {
+        eprintln!("[SKIP] Live Neo4j instance is not reachable on 127.0.0.1:7687");
+        return;
+    }
+
+    use voyager_drivers::NativeClient;
+    let uri = format!("bolt://{NEO4J_USER}:{NEO4J_PASS}@127.0.0.1:7687");
+    let client = NativeClient::new(&uri, None).unwrap();
+
+    let _ = client
+        .execute("MATCH (n:ZzStage1Neo4j) DETACH DELETE n", &HashMap::new())
+        .await;
+    client
+        .execute(
+            "CREATE (a:ZzStage1Neo4j {name: 'Alice', age: 30})-[:ZZ_KNOWS {since: 2024}]->(b:ZzStage1Neo4j {name: 'Bob', age: 25})",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let q_rich = "MATCH p=(a:ZzStage1Neo4j)-[r:ZZ_KNOWS]->(b:ZzStage1Neo4j) \
+                  RETURN a.name AS name, a.age AS age, a, r, p, \
+                  {k: [1, 'x']} AS m, point({latitude: 52.5, longitude: 13.4}) AS pt, \
+                  datetime('2024-01-02T03:04:05+02:00') AS dt";
+    let leg = client.execute(q_rich, &HashMap::new()).await.unwrap();
+    let rows = client.execute_rows(q_rich, &HashMap::new()).await.unwrap();
+    let arr = client.execute_arrow(q_rich, &HashMap::new()).await.unwrap();
+
+    assert!(rows.batches.is_empty());
+    assert!(rows.result_rows.is_some());
+    assert!(rows.bolt_rows.is_none());
+    assert_eq!(rows.row_count(), 1);
+    assert!(arr.result_rows.is_none());
+    assert!(arr.bolt_rows.is_none());
+    assert_eq!(
+        rows.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(rows.result_rows, leg.result_rows);
+
+    // 0-row check + tx check
+    let mut tx = client.begin_transaction().await.unwrap();
+    let q_empty = "MATCH (n:ZzStage1Neo4jMissing) RETURN n.name AS name";
+    let tx_leg = tx.execute(q_empty, &HashMap::new()).await.unwrap();
+    let tx_rows = tx.execute_rows(q_empty, &HashMap::new()).await.unwrap();
+    let tx_arr = tx.execute_arrow(q_empty, &HashMap::new()).await.unwrap();
+    assert_eq!(tx_rows.row_count(), 0);
+    assert_eq!(
+        tx_rows.to_record_batch().unwrap().unwrap(),
+        tx_leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        tx_arr.to_record_batch().unwrap().unwrap(),
+        tx_leg.to_record_batch().unwrap().unwrap()
+    );
+    tx.commit().await.unwrap();
+
+    let _ = client
+        .execute("MATCH (n:ZzStage1Neo4j) DETACH DELETE n", &HashMap::new())
+        .await;
+    client.close().await;
+}

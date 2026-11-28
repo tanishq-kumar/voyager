@@ -59,7 +59,7 @@ impl PathScratch {
 /// colliding keys from a hostile server cannot degrade lookups, and scratch vectors
 /// for path binding.
 pub struct BoltResultDecoder {
-    interner: HashSet<Arc<str>, RandomState>,
+    interner: Option<HashSet<Arc<str>, RandomState>>,
     map_hasher: RandomState,
     path_scratch: PathScratch,
 }
@@ -71,24 +71,42 @@ impl Default for BoltResultDecoder {
 }
 
 impl BoltResultDecoder {
-    /// Creates a new per-result decoder with an empty interner and scratch buffers.
+    /// Creates a new per-result decoder with a lazily allocated interner and empty scratch buffers.
     pub fn new() -> Self {
         let map_hasher = RandomState::new();
         Self {
-            interner: HashSet::with_capacity_and_hasher(32, RandomState::new()),
+            interner: None,
             map_hasher,
             path_scratch: PathScratch::default(),
         }
     }
 
+    /// Clears per-query interner entries and path scratch buffers for reuse across queries.
+    ///
+    /// Drops oversized interner tables (`capacity > 512`) so an unusually wide schema
+    /// query does not pin memory on subsequent small queries.
+    pub fn clear(&mut self) {
+        if let Some(interner) = self.interner.as_mut() {
+            if interner.capacity() > 512 {
+                self.interner = None;
+            } else {
+                interner.clear();
+            }
+        }
+        self.path_scratch.clear();
+    }
+
     #[inline]
     fn intern(&mut self, s: &str) -> Arc<str> {
-        if let Some(existing) = self.interner.get(s) {
+        let interner = self
+            .interner
+            .get_or_insert_with(|| HashSet::with_capacity_and_hasher(32, RandomState::new()));
+        if let Some(existing) = interner.get(s) {
             return Arc::clone(existing);
         }
         let arc: Arc<str> = Arc::from(s);
-        if self.interner.len() < MAX_INTERNED_STRINGS {
-            self.interner.insert(Arc::clone(&arc));
+        if interner.len() < MAX_INTERNED_STRINGS {
+            interner.insert(Arc::clone(&arc));
         }
         arc
     }
@@ -1046,6 +1064,273 @@ pub fn decode_bolt_record_frame(frame: &[u8]) -> Result<Vec<ResultValue>> {
     decoder.decode_record_frame(frame)
 }
 
+#[cfg(feature = "bolt")]
+fn open_success_metadata_map<'a>(frame: &'a [u8]) -> Result<Option<(SliceCursor<'a>, usize)>> {
+    if peek_bolt_message_tag(frame) != Some(0x70) {
+        return Ok(None);
+    }
+    let mut cursor = SliceCursor::new(frame);
+    let Some((num_fields, 0x70)) = try_read_struct_header(&mut cursor, 0)? else {
+        return Ok(None);
+    };
+    if num_fields != 1 {
+        return Err(NetError::ProtocolError(format!(
+            "SUCCESS message must have 1 field, got {}",
+            num_fields
+        )));
+    }
+    let Some(map_size) = try_read_map_header(&mut cursor, 1)? else {
+        return Err(NetError::ProtocolError(
+            "Expected metadata map in SUCCESS message".to_string(),
+        ));
+    };
+    Ok(Some((cursor, map_size)))
+}
+
+#[cfg(feature = "bolt")]
+fn skip_packstream_value(cursor: &mut SliceCursor<'_>, depth: usize) -> Result<()> {
+    check_depth(depth)?;
+    let marker = cursor.read_u8("Unexpected EOF while skipping PackStream value")?;
+    match marker {
+        0x00..=0x7F | 0xF0..=0xFF | 0xC0 | 0xC2 | 0xC3 => Ok(()),
+        0xC1 => {
+            cursor.read_exact_slice(8, "Incomplete Float64")?;
+            Ok(())
+        }
+        0xC8 => {
+            cursor.read_exact_slice(1, "Incomplete Int8")?;
+            Ok(())
+        }
+        0xC9 => {
+            cursor.read_exact_slice(2, "Incomplete Int16")?;
+            Ok(())
+        }
+        0xCA => {
+            cursor.read_exact_slice(4, "Incomplete Int32")?;
+            Ok(())
+        }
+        0xCB => {
+            cursor.read_exact_slice(8, "Incomplete Int64")?;
+            Ok(())
+        }
+        0x80..=0x8F => {
+            let _ = read_utf8_str(cursor, (marker & 0x0F) as usize)?;
+            Ok(())
+        }
+        0xD0 => {
+            let len = cursor.read_u8("Incomplete String8 length")? as usize;
+            let _ = read_utf8_str(cursor, len)?;
+            Ok(())
+        }
+        0xD1 => {
+            let len = cursor.read_u16("Incomplete String16 length")? as usize;
+            let _ = read_utf8_str(cursor, len)?;
+            Ok(())
+        }
+        0xD2 => {
+            let len = cursor.read_u32("Incomplete String32 length")? as usize;
+            let _ = read_utf8_str(cursor, len)?;
+            Ok(())
+        }
+        0xCC => {
+            let len = cursor.read_u8("Incomplete Bytes8 length")? as usize;
+            cursor.read_exact_slice(len, "Incomplete Bytes payload")?;
+            Ok(())
+        }
+        0xCD => {
+            let len = cursor.read_u16("Incomplete Bytes16 length")? as usize;
+            cursor.read_exact_slice(len, "Incomplete Bytes payload")?;
+            Ok(())
+        }
+        0xCE => {
+            let len = cursor.read_u32("Incomplete Bytes32 length")? as usize;
+            cursor.read_exact_slice(len, "Incomplete Bytes payload")?;
+            Ok(())
+        }
+        0x90..=0x9F | 0xD4..=0xD6 => {
+            let len = match marker {
+                0x90..=0x9F => (marker & 0x0F) as usize,
+                0xD4 => cursor.read_u8("Incomplete List8 length")? as usize,
+                0xD5 => cursor.read_u16("Incomplete List16 length")? as usize,
+                _ => cursor.read_u32("Incomplete List32 length")? as usize,
+            };
+            if len > cursor.remaining() {
+                return Err(NetError::ProtocolError(format!(
+                    "List length {} exceeds available buffer bytes {}",
+                    len,
+                    cursor.remaining()
+                )));
+            }
+            for _ in 0..len {
+                skip_packstream_value(cursor, depth + 1)?;
+            }
+            Ok(())
+        }
+        0xA0..=0xAF | 0xD8..=0xDA => {
+            let size = match marker {
+                0xA0..=0xAF => (marker & 0x0F) as usize,
+                0xD8 => cursor.read_u8("Incomplete Map8 length")? as usize,
+                0xD9 => cursor.read_u16("Incomplete Map16 length")? as usize,
+                _ => cursor.read_u32("Incomplete Map32 length")? as usize,
+            };
+            let min_required = size.saturating_mul(2);
+            if min_required > cursor.remaining() {
+                return Err(NetError::ProtocolError(format!(
+                    "Map size {} requires at least {} bytes, which exceeds available buffer bytes {}",
+                    size,
+                    min_required,
+                    cursor.remaining()
+                )));
+            }
+            for _ in 0..size {
+                if try_read_str(cursor, depth + 1)?.is_none() {
+                    return Err(NetError::ProtocolError(
+                        "Map key must be a String".to_string(),
+                    ));
+                }
+                skip_packstream_value(cursor, depth + 1)?;
+            }
+            Ok(())
+        }
+        0xB0..=0xBF | 0xDC | 0xDD => {
+            let num_fields = match marker {
+                0xB0..=0xBF => (marker & 0x0F) as usize,
+                0xDC => cursor.read_u8("Incomplete Struct8 length")? as usize,
+                _ => cursor.read_u16("Incomplete Struct16 length")? as usize,
+            };
+            let _tag = cursor.read_u8("Unexpected EOF reading structure signature tag")?;
+            if num_fields > cursor.remaining() {
+                return Err(NetError::ProtocolError(format!(
+                    "Structure field count {} exceeds available buffer bytes {}",
+                    num_fields,
+                    cursor.remaining()
+                )));
+            }
+            for _ in 0..num_fields {
+                skip_packstream_value(cursor, depth + 1)?;
+            }
+            Ok(())
+        }
+        unknown => Err(NetError::ProtocolError(format!(
+            "Unknown PackStream marker byte 0x{:02X}",
+            unknown
+        ))),
+    }
+}
+
+/// Decodes the projected column names from a Bolt `RUN` `SUCCESS` (`0x70`) frame without
+/// materializing an intermediate metadata `HashMap` or `BoltValue` tree.
+///
+/// Returns `Ok(None)` when the frame tag is not `0x70` (for example `0x7F FAILURE`).
+#[cfg(feature = "bolt")]
+pub(crate) fn decode_run_success_columns(frame: &[u8]) -> Result<Option<Vec<String>>> {
+    let Some((mut cursor, map_size)) = open_success_metadata_map(frame)? else {
+        return Ok(None);
+    };
+    let mut columns = Vec::new();
+    for _ in 0..map_size {
+        let Some(key) = try_read_str(&mut cursor, 2)? else {
+            return Err(NetError::ProtocolError(
+                "Map key must be a String".to_string(),
+            ));
+        };
+        if key == "fields" {
+            if let Some(len) = try_read_list_header(&mut cursor, 2)? {
+                let mut cols = Vec::with_capacity(len.min(1024));
+                for _ in 0..len {
+                    if let Some(col) = try_read_str(&mut cursor, 3)? {
+                        cols.push(col.to_string());
+                    } else {
+                        skip_packstream_value(&mut cursor, 3)?;
+                    }
+                }
+                columns = cols;
+            } else {
+                skip_packstream_value(&mut cursor, 2)?;
+            }
+        } else {
+            skip_packstream_value(&mut cursor, 2)?;
+        }
+    }
+    Ok(Some(columns))
+}
+
+/// Decodes [`crate::engine::QuerySummary`] metrics from a Bolt `PULL` `SUCCESS` (`0x70`) frame
+/// without allocating a metadata `HashMap`, nested `stats` `HashMap`, or `BoltValue` enum.
+///
+/// Returns `Ok(None)` when the frame tag is not `0x70` (for example `0x7F FAILURE`).
+#[cfg(feature = "bolt")]
+pub(crate) fn decode_pull_success_summary(
+    frame: &[u8],
+) -> Result<Option<crate::engine::QuerySummary>> {
+    let Some((mut cursor, map_size)) = open_success_metadata_map(frame)? else {
+        return Ok(None);
+    };
+    let mut summary = crate::engine::QuerySummary::empty();
+    let mut t_last: Option<u64> = None;
+    let mut t_first: Option<u64> = None;
+
+    for _ in 0..map_size {
+        let Some(key) = try_read_str(&mut cursor, 2)? else {
+            return Err(NetError::ProtocolError(
+                "Map key must be a String".to_string(),
+            ));
+        };
+        match key {
+            "stats" => {
+                if let Some(stats_len) = try_read_map_header(&mut cursor, 2)? {
+                    for _ in 0..stats_len {
+                        let Some(stat_key) = try_read_str(&mut cursor, 3)? else {
+                            return Err(NetError::ProtocolError(
+                                "Map key must be a String".to_string(),
+                            ));
+                        };
+                        if let Some(n) = try_read_i64(&mut cursor, 3)? {
+                            let val = n as u64;
+                            match stat_key {
+                                "nodes-created" => summary.nodes_created = val,
+                                "nodes-deleted" => summary.nodes_deleted = val,
+                                "relationships-created" => summary.relationships_created = val,
+                                "relationships-deleted" => summary.relationships_deleted = val,
+                                "properties-set" => summary.properties_set = val,
+                                "labels-added" => summary.labels_added = val,
+                                "labels-removed" => summary.labels_removed = val,
+                                "indexes-added" => summary.indexes_added = val,
+                                "constraints-added" => summary.constraints_added = val,
+                                _ => {}
+                            }
+                        } else {
+                            skip_packstream_value(&mut cursor, 3)?;
+                        }
+                    }
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
+                }
+            }
+            "t_last" => {
+                if let Some(n) = try_read_i64(&mut cursor, 2)? {
+                    t_last = Some(n as u64);
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
+                }
+            }
+            "t_first" => {
+                if let Some(n) = try_read_i64(&mut cursor, 2)? {
+                    t_first = Some(n as u64);
+                } else {
+                    skip_packstream_value(&mut cursor, 2)?;
+                }
+            }
+            _ => skip_packstream_value(&mut cursor, 2)?,
+        }
+    }
+
+    if let Some(time) = t_last.or(t_first) {
+        summary.execution_time_ms = time;
+    }
+    Ok(Some(summary))
+}
+
 /// Lightweight zero-copy cursor over a PackStream byte slice.
 struct SliceCursor<'a> {
     data: &'a [u8],
@@ -1652,7 +1937,49 @@ mod tests {
             assert_eq!(new_row, old_row);
         }
         // Interner holds only the 4 distinct keys/labels/zones: "Person", "name", "age", "UTC"
-        assert_eq!(decoder.interner.len(), 4);
+        assert_eq!(decoder.interner.as_ref().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn lazy_interner_stays_unallocated_for_scalar_rows_and_clears_cleanly() {
+        let mut decoder = BoltResultDecoder::new();
+        assert!(decoder.interner.is_none());
+
+        let scalar_rec = BoltValue::Structure {
+            tag: 0x71,
+            fields: vec![BoltValue::List(vec![
+                BoltValue::Integer(42),
+                BoltValue::String("hello".to_string()),
+                BoltValue::Boolean(true),
+                BoltValue::Float(1.5),
+            ])],
+        };
+        let mut buf = BytesMut::new();
+        PackStream::encode(&scalar_rec, &mut buf);
+        let frame = buf.freeze();
+
+        let row = decoder.decode_record_frame(&frame).unwrap();
+        assert_eq!(row.len(), 4);
+        assert!(
+            decoder.interner.is_none(),
+            "scalar-only rows must not allocate the interner HashSet"
+        );
+
+        // Now decode a map: interner is allocated lazily
+        let mut map = HashMap::new();
+        map.insert("k".to_string(), BoltValue::Integer(1));
+        let map_rec = BoltValue::Structure {
+            tag: 0x71,
+            fields: vec![BoltValue::List(vec![BoltValue::Map(map)])],
+        };
+        let mut buf2 = BytesMut::new();
+        PackStream::encode(&map_rec, &mut buf2);
+        let frame2 = buf2.freeze();
+        let _ = decoder.decode_record_frame(&frame2).unwrap();
+        assert_eq!(decoder.interner.as_ref().unwrap().len(), 1);
+
+        decoder.clear();
+        assert_eq!(decoder.interner.as_ref().unwrap().len(), 0);
     }
 
     #[test]
@@ -1669,7 +1996,7 @@ mod tests {
         let (rv, consumed) = decoder.decode_value_slice(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert!(matches!(rv, ResultValue::Map(m) if m.len() == MAX_INTERNED_STRINGS + 100));
-        assert!(decoder.interner.len() <= MAX_INTERNED_STRINGS);
+        assert!(decoder.interner.as_ref().unwrap().len() <= MAX_INTERNED_STRINGS);
     }
 
     #[test]
@@ -1699,6 +2026,93 @@ mod tests {
         let bad_zone: &[u8] = &[0xB3, 0x69, 0x01, 0x02, 0x82, 0xFF, 0xFE];
         assert!(matches!(
             decode_result_value_slice(bad_zone),
+            Err(NetError::ProtocolError(_))
+        ));
+    }
+
+    #[cfg(feature = "bolt")]
+    #[test]
+    fn success_slice_decoders_match_bolt_response_decode() {
+        let mut fields_meta = HashMap::new();
+        fields_meta.insert(
+            "fields".to_string(),
+            BoltValue::List(vec![
+                BoltValue::String("a".to_string()),
+                BoltValue::Integer(99), // skipped just like filter_map(as_str)
+                BoltValue::String("b".to_string()),
+            ]),
+        );
+        fields_meta.insert("t_first".to_string(), BoltValue::Integer(4));
+        fields_meta.insert(
+            "extra_nested".to_string(),
+            BoltValue::Map(HashMap::from([(
+                "k".to_string(),
+                BoltValue::List(vec![BoltValue::Float(1.5), BoltValue::Bytes(vec![1, 2])]),
+            )])),
+        );
+        let run_success = BoltValue::Structure {
+            tag: 0x70,
+            fields: vec![BoltValue::Map(fields_meta)],
+        };
+        let mut run_buf = BytesMut::new();
+        PackStream::encode(&run_success, &mut run_buf);
+        let cols = decode_run_success_columns(&run_buf).unwrap().unwrap();
+        assert_eq!(cols, vec!["a".to_string(), "b".to_string()]);
+
+        let stats = HashMap::from([
+            ("nodes-created".to_string(), BoltValue::Integer(3)),
+            ("nodes-deleted".to_string(), BoltValue::Integer(1)),
+            ("relationships-created".to_string(), BoltValue::Integer(2)),
+            ("relationships-deleted".to_string(), BoltValue::Integer(4)),
+            ("properties-set".to_string(), BoltValue::Integer(5)),
+            ("labels-added".to_string(), BoltValue::Integer(6)),
+            ("labels-removed".to_string(), BoltValue::Integer(7)),
+            ("indexes-added".to_string(), BoltValue::Integer(8)),
+            ("constraints-added".to_string(), BoltValue::Integer(9)),
+            ("other-stat".to_string(), BoltValue::Integer(100)),
+        ]);
+        let pull_meta = HashMap::from([
+            ("stats".to_string(), BoltValue::Map(stats)),
+            ("t_first".to_string(), BoltValue::Integer(11)),
+            ("t_last".to_string(), BoltValue::Integer(42)),
+            (
+                "bookmark".to_string(),
+                BoltValue::String("bm:1".to_string()),
+            ),
+            ("has_more".to_string(), BoltValue::Boolean(false)),
+        ]);
+        let pull_success = BoltValue::Structure {
+            tag: 0x70,
+            fields: vec![BoltValue::Map(pull_meta)],
+        };
+        let mut pull_buf = BytesMut::new();
+        PackStream::encode(&pull_success, &mut pull_buf);
+        let summary = decode_pull_success_summary(&pull_buf).unwrap().unwrap();
+        assert_eq!(summary.nodes_created, 3);
+        assert_eq!(summary.nodes_deleted, 1);
+        assert_eq!(summary.relationships_created, 2);
+        assert_eq!(summary.relationships_deleted, 4);
+        assert_eq!(summary.properties_set, 5);
+        assert_eq!(summary.labels_added, 6);
+        assert_eq!(summary.labels_removed, 7);
+        assert_eq!(summary.indexes_added, 8);
+        assert_eq!(summary.constraints_added, 9);
+        assert_eq!(summary.execution_time_ms, 42);
+
+        // Non-SUCCESS tag (0x7F FAILURE) returns Ok(None) for fallback handling
+        let failure = BoltValue::Structure {
+            tag: 0x7F,
+            fields: vec![BoltValue::Map(HashMap::new())],
+        };
+        let mut fail_buf = BytesMut::new();
+        PackStream::encode(&failure, &mut fail_buf);
+        assert!(decode_run_success_columns(&fail_buf).unwrap().is_none());
+        assert!(decode_pull_success_summary(&fail_buf).unwrap().is_none());
+
+        // Malformed UTF-8 in skipped metadata string is rejected
+        let bad_run: &[u8] = &[0xB1, 0x70, 0xA1, 0x81, b'x', 0x82, 0xFF, 0xFE];
+        assert!(matches!(
+            decode_run_success_columns(bad_run),
             Err(NetError::ProtocolError(_))
         ));
     }

@@ -398,3 +398,54 @@ async fn test_live_falkordb_fluent_builder_with_clause_and_pagination() {
     let _ = conn.graph_delete(graph_name).await;
     conn.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_live_falkordb_execute_rows_and_arrow_equivalence() {
+    if !is_falkordb_online().await {
+        eprintln!("[SKIP] Live FalkorDB container is not reachable on 127.0.0.1:6379");
+        return;
+    }
+
+    use voyager_drivers::NativeClient;
+    let graph_name = "zz_stage1_462_falkor";
+    let uri = format!("{BASE_FALKORDB_ADDR}?graph={graph_name}");
+    let parsed = ParsedUri::parse(&uri).unwrap();
+    let mut setup_conn = RedisConnection::connect(&parsed).await.unwrap();
+    let _ = setup_conn.graph_delete(graph_name).await;
+    setup_conn.close().await.unwrap();
+
+    let client = NativeClient::new(&uri, None).unwrap();
+    client
+        .execute(
+            "CREATE (a:Person {name: 'Alice', age: 30})-[:KNOWS {since: 2024}]->(b:Person {name: 'Bob', age: 25})",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let q_rich = "MATCH p=(a:Person)-[r:KNOWS]->(b:Person) \
+                  RETURN a.name AS name, a.age AS age, a, r, p, {k: [1, 'x']} AS m";
+    let leg = client.execute(q_rich, &HashMap::new()).await.unwrap();
+    let rows = client.execute_rows(q_rich, &HashMap::new()).await.unwrap();
+    let arr = client.execute_arrow(q_rich, &HashMap::new()).await.unwrap();
+
+    assert!(rows.batches.is_empty());
+    assert!(rows.bolt_rows.is_none());
+    assert!(arr.result_rows.is_none());
+    assert!(arr.bolt_rows.is_none());
+    assert_eq!(rows.row_count(), 1);
+    assert_eq!(
+        rows.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(rows.result_rows, leg.result_rows);
+
+    let mut teardown = RedisConnection::connect(&parsed).await.unwrap();
+    let _ = teardown.graph_delete(graph_name).await;
+    teardown.close().await.unwrap();
+    client.close().await;
+}

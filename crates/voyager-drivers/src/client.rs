@@ -7,7 +7,7 @@ use crate::bolt::BoltConnection;
 #[cfg(feature = "bolt")]
 use crate::config::ConnectionConfig;
 use crate::config::PoolConfig;
-use crate::engine::{AsyncConnection, QueryResult};
+use crate::engine::{AsyncConnection, QueryResult, ResultMode};
 use crate::error::{NetError, Result};
 use crate::native_transaction::NativeTransaction;
 use crate::params::ParamValue;
@@ -172,6 +172,30 @@ impl NativeClient {
     ) -> Result<QueryResult> {
         let mut conn = self.pool.acquire().await?;
         conn.execute(query, params).await
+    }
+
+    /// Executes a parameterized query retaining decoded [`ResultValue`](crate::ResultValue) rows
+    /// without building an Apache Arrow `RecordBatch`.
+    pub async fn execute_rows(
+        &self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+    ) -> Result<QueryResult> {
+        let mut conn = self.pool.acquire().await?;
+        conn.execute_with_mode(query, params, ResultMode::Rows)
+            .await
+    }
+
+    /// Executes a parameterized query building an Apache Arrow `RecordBatch` directly
+    /// without retaining `result_rows` or `bolt_rows`.
+    pub async fn execute_arrow(
+        &self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+    ) -> Result<QueryResult> {
+        let mut conn = self.pool.acquire().await?;
+        conn.execute_with_mode(query, params, ResultMode::Arrow)
+            .await
     }
 
     /// Leases one pooled connection and begins an explicit transaction on it.
