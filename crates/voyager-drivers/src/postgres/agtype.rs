@@ -1,28 +1,22 @@
 //! Apache AGE `agtype` parser, graph entity structures, and Apache Arrow RecordBatch deserialization.
 
-use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, DurationMicrosecondBuilder,
-    DurationNanosecondBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder,
-    LargeBinaryBuilder, StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
-};
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch};
-use arrow_buffer::{NullBuffer, OffsetBuffer};
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_array::RecordBatch;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use crate::bolt::canonical::{
-    append_duration_struct, duration_struct_fields, make_duration_struct_builder,
-};
 use crate::bolt::packstream::{
     BoltDate, BoltDateTime, BoltDuration, BoltLocalDateTime, BoltLocalTime, BoltTime, ymd_to_days,
 };
 use crate::bolt::{BoltNode, BoltPath, BoltRelationship, BoltValue};
 use crate::error::{NetError, Result};
+use crate::value::arrow::{ColumnHint, EmptyColumnKind, values_to_record_batch_with_hints};
+use crate::value::result::{
+    ResultDateTime, ResultNode, ResultPath, ResultRelationship, ResultTimezone, ResultTypedText,
+    ResultValue,
+};
 use crate::value::{
-    ARROW_EXTENSION_NAME, ARROW_UUID_EXTENSION, VOYAGER_META_ENCODING, VOYAGER_META_KIND,
-    VOYAGER_META_TYPE,
+    DurationParts, META_TYPE_DATE, META_TYPE_DATETIME_TZ, META_TYPE_DECIMAL, META_TYPE_DURATION,
+    META_TYPE_LOCAL_DATETIME, META_TYPE_TIME, META_TYPE_TIME_TZ, META_TYPE_UUID,
 };
 
 /// Apache AGE Graph Vertex entity (`::vertex`).
@@ -1152,124 +1146,6 @@ fn parse_bool_element(value: &str, column: &str) -> Result<bool> {
     }
 }
 
-fn field_with_meta(name: &str, data_type: DataType, key: &str, value: &str) -> Field {
-    let mut meta = HashMap::new();
-    meta.insert(key.to_string(), value.to_string());
-    Field::new(name, data_type, true).with_metadata(meta)
-}
-
-fn build_utf8_with_meta(
-    name: &str,
-    cells: &[Option<&str>],
-    meta: &[(&str, &str)],
-) -> (Field, ArrayRef) {
-    let mut builder = StringBuilder::with_capacity(cells.len(), cells.len() * 16);
-    for cell in cells {
-        match cell {
-            Some(v) => builder.append_value(v),
-            None => builder.append_null(),
-        }
-    }
-    let mut field = Field::new(name, DataType::Utf8, true);
-    if !meta.is_empty() {
-        let mut map = HashMap::with_capacity(meta.len());
-        for (k, v) in meta {
-            map.insert((*k).to_string(), (*v).to_string());
-        }
-        field = field.with_metadata(map);
-    }
-    (field, Arc::new(builder.finish()))
-}
-
-fn pg_numeric_typmod_scale(typmod: i32) -> Option<i16> {
-    if typmod >= 4 {
-        Some(((typmod - 4) & 0xFFFF) as i16)
-    } else {
-        None
-    }
-}
-
-fn try_parse_decimal128_column(
-    cells: &[Option<&str>],
-    typmod: Option<i32>,
-) -> Option<(u8, Vec<Option<i128>>)> {
-    const MAX_DECIMAL128: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999_i128;
-
-    let mut max_scale: usize = 0;
-    if let Some(tm) = typmod
-        && let Some(decl_scale) = pg_numeric_typmod_scale(tm)
-    {
-        if !(0..=38).contains(&decl_scale) {
-            return None;
-        }
-        max_scale = decl_scale as usize;
-    }
-
-    let mut parsed_parts: Vec<Option<(bool, &str, &str)>> = Vec::with_capacity(cells.len());
-
-    for cell in cells {
-        let Some(raw) = cell else {
-            parsed_parts.push(None);
-            continue;
-        };
-        let s = raw.trim();
-        let (neg, unsigned) = if let Some(rest) = s.strip_prefix('-') {
-            (true, rest)
-        } else if let Some(rest) = s.strip_prefix('+') {
-            (false, rest)
-        } else {
-            (false, s)
-        };
-        if unsigned.is_empty() || unsigned.contains(['e', 'E']) {
-            return None;
-        }
-        let (int_part, frac_part) = match unsigned.split_once('.') {
-            Some((i, f)) => {
-                if f.contains('.') {
-                    return None;
-                }
-                (i, f)
-            }
-            None => (unsigned, ""),
-        };
-        if (int_part.is_empty() && frac_part.is_empty())
-            || !int_part.bytes().all(|b| b.is_ascii_digit())
-            || !frac_part.bytes().all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-        if frac_part.len() > 38 {
-            return None;
-        }
-        max_scale = max_scale.max(frac_part.len());
-        parsed_parts.push(Some((neg, int_part.trim_start_matches('0'), frac_part)));
-    }
-
-    let mut values = Vec::with_capacity(cells.len());
-    for item in parsed_parts {
-        let Some((neg, int_part, frac_part)) = item else {
-            values.push(None);
-            continue;
-        };
-        if int_part.len() + max_scale > 38 {
-            return None;
-        }
-        let mut mag: i128 = 0;
-        for b in int_part.bytes().chain(frac_part.bytes()) {
-            mag = mag.checked_mul(10)?.checked_add((b - b'0') as i128)?;
-        }
-        for _ in 0..(max_scale - frac_part.len()) {
-            mag = mag.checked_mul(10)?;
-        }
-        if mag > MAX_DECIMAL128 {
-            return None;
-        }
-        let signed = if neg && mag != 0 { -mag } else { mag };
-        values.push(Some(signed));
-    }
-    Some((max_scale as u8, values))
-}
-
 fn parse_pg_uuid(raw: &str) -> Option<[u8; 16]> {
     let mut hex_bytes = [0u8; 32];
     let mut idx = 0usize;
@@ -1778,417 +1654,220 @@ fn parse_pg_interval(raw: &str) -> Option<BoltDuration> {
     })
 }
 
-fn pg_duration_micros(dur: &BoltDuration) -> Option<i64> {
-    if dur.months != 0 || dur.days != 0 || dur.nanoseconds % 1_000 != 0 {
-        return None;
+fn json_to_result_value(val: &serde_json::Value) -> ResultValue {
+    match val {
+        serde_json::Value::Null => ResultValue::Null,
+        serde_json::Value::Bool(b) => ResultValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                ResultValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                ResultValue::Float(f)
+            } else {
+                ResultValue::Str(n.to_string().into_boxed_str())
+            }
+        }
+        serde_json::Value::String(s) => ResultValue::Str(s.clone().into_boxed_str()),
+        serde_json::Value::Array(arr) => ResultValue::List(
+            arr.iter()
+                .map(json_to_result_value)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        serde_json::Value::Object(obj) => ResultValue::Map(Box::new(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), json_to_result_value(v)))
+                .collect(),
+        )),
     }
-    dur.seconds
-        .checked_mul(1_000_000)?
-        .checked_add(dur.nanoseconds / 1_000)
 }
 
-fn pg_duration_nanos(dur: &BoltDuration) -> Option<i64> {
-    if dur.months != 0 || dur.days != 0 {
-        return None;
+fn age_vertex_to_result_node(v: AgeVertex) -> ResultNode {
+    let labels = if v.label.is_empty() {
+        Vec::new()
+    } else {
+        vec![v.label]
+    };
+    let properties = v
+        .properties
+        .into_iter()
+        .map(|(k, val)| (k, json_to_result_value(&val)))
+        .collect();
+    ResultNode {
+        id: v.id,
+        labels,
+        properties,
+        element_id: None,
     }
-    dur.seconds
-        .checked_mul(1_000_000_000)?
-        .checked_add(dur.nanoseconds)
 }
 
-fn build_pg_typed_values(
-    field_name: &str,
-    oid: i32,
-    typmod: Option<i32>,
-    cells: &[Option<&str>],
-) -> Result<Option<(Field, ArrayRef)>> {
-    let n = cells.len();
+fn age_edge_to_result_rel(e: AgeEdge) -> ResultRelationship {
+    let properties = e
+        .properties
+        .into_iter()
+        .map(|(k, val)| (k, json_to_result_value(&val)))
+        .collect();
+    ResultRelationship {
+        id: e.id,
+        start_node_id: e.start_id,
+        end_node_id: e.end_id,
+        rel_type: e.label,
+        properties,
+        element_id: None,
+        start_element_id: None,
+        end_element_id: None,
+    }
+}
+
+impl From<AgeValue> for ResultValue {
+    fn from(val: AgeValue) -> Self {
+        match val {
+            AgeValue::Null => Self::Null,
+            AgeValue::Boolean(b) => Self::Bool(b),
+            AgeValue::Integer(i) => Self::Int(i),
+            AgeValue::Float(f) => Self::Float(f),
+            AgeValue::String(s) => Self::Str(s.into_boxed_str()),
+            AgeValue::Vertex(v) => Self::Node(Box::new(age_vertex_to_result_node(v))),
+            AgeValue::Edge(e) => Self::Relationship(Box::new(age_edge_to_result_rel(e))),
+            AgeValue::Path(p) => Self::Path(Box::new(ResultPath {
+                nodes: p
+                    .vertices
+                    .into_iter()
+                    .map(age_vertex_to_result_node)
+                    .collect(),
+                relationships: p.edges.into_iter().map(age_edge_to_result_rel).collect(),
+            })),
+            AgeValue::List(items) => Self::List(
+                items
+                    .into_iter()
+                    .map(Self::from)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            AgeValue::Map(map) => Self::Map(Box::new(
+                map.into_iter().map(|(k, v)| (k, Self::from(v))).collect(),
+            )),
+        }
+    }
+}
+
+fn pg_oid_column_hint(oid: i32, typmod: Option<i32>) -> Option<ColumnHint> {
     match oid {
-        16 => {
-            let mut builder = BooleanBuilder::with_capacity(n);
-            for cell in cells {
-                match cell {
-                    Some(v) => builder.append_value(parse_bool_element(v, field_name)?),
-                    None => builder.append_null(),
-                }
-            }
-            Ok(Some((
-                Field::new(field_name, DataType::Boolean, true),
-                Arc::new(builder.finish()),
-            )))
-        }
-        20 | 21 | 23 => {
-            let mut builder = Int64Builder::with_capacity(n);
-            for cell in cells {
-                match cell {
-                    Some(v) => builder.append_value(parse_int_element(v, field_name)?),
-                    None => builder.append_null(),
-                }
-            }
-            Ok(Some((
-                Field::new(field_name, DataType::Int64, true),
-                Arc::new(builder.finish()),
-            )))
-        }
-        700 | 701 => {
-            let mut builder = Float64Builder::with_capacity(n);
-            for cell in cells {
-                match cell {
-                    Some(v) => builder.append_value(parse_float_element(v, field_name)?),
-                    None => builder.append_null(),
-                }
-            }
-            Ok(Some((
-                Field::new(field_name, DataType::Float64, true),
-                Arc::new(builder.finish()),
-            )))
-        }
-        1700 => {
-            if let Some((scale, values)) = try_parse_decimal128_column(cells, typmod) {
-                let mut builder = Decimal128Builder::with_capacity(n);
-                for val in values {
-                    match val {
-                        Some(v) => builder.append_value(v),
-                        None => builder.append_null(),
-                    }
-                }
-                let arr = builder
-                    .finish()
-                    .with_precision_and_scale(38, scale as i8)
-                    .map_err(NetError::ArrowError)?;
-                Ok(Some((
-                    Field::new(field_name, DataType::Decimal128(38, scale as i8), true),
-                    Arc::new(arr),
-                )))
-            } else {
-                Ok(Some(build_utf8_with_meta(
-                    field_name,
-                    cells,
-                    &[(VOYAGER_META_TYPE, "decimal")],
-                )))
-            }
-        }
-        2950 => {
-            let mut parsed = Vec::with_capacity(n);
-            let mut all_ok = true;
-            for cell in cells {
-                match cell {
-                    Some(v) => match parse_pg_uuid(v) {
-                        Some(bytes) => parsed.push(Some(bytes)),
-                        None => {
-                            all_ok = false;
-                            break;
-                        }
-                    },
-                    None => parsed.push(None),
-                }
-            }
-            if all_ok {
-                let mut builder = FixedSizeBinaryBuilder::with_capacity(n, 16);
-                for cell in parsed {
-                    match cell {
-                        Some(bytes) => builder.append_value(bytes).map_err(NetError::ArrowError)?,
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    field_with_meta(
-                        field_name,
-                        DataType::FixedSizeBinary(16),
-                        ARROW_EXTENSION_NAME,
-                        ARROW_UUID_EXTENSION,
-                    ),
-                    Arc::new(builder.finish()),
-                )))
-            } else {
-                Ok(Some(build_utf8_with_meta(
-                    field_name,
-                    cells,
-                    &[(VOYAGER_META_TYPE, "uuid")],
-                )))
-            }
-        }
+        16 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Bool)),
+        20 | 21 | 23 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Int)),
+        700 | 701 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Float)),
+        1700 => Some(ColumnHint::PgDecimal { typmod }),
+        2950 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Uuid)),
+        17 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Bytes)),
+        1082 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Date)),
+        1083 => Some(ColumnHint::PgLocalTimeUs),
+        1266 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::TimeTz)),
+        1114 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::TimestampUs)),
+        1184 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::TimestampTzUtc)),
+        1186 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::DurationUs)),
+        114 | 3802 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Json)),
+        19 | 25 | 869 | 1042 | 1043 => Some(ColumnHint::PgEmptyTyped(EmptyColumnKind::Str)),
+        _ => None,
+    }
+}
+
+fn decode_pg_scalar_cell(raw: &str, oid: i32, field_name: &str) -> Result<Option<ResultValue>> {
+    match oid {
+        16 => Ok(Some(ResultValue::Bool(parse_bool_element(
+            raw, field_name,
+        )?))),
+        20 | 21 | 23 => Ok(Some(ResultValue::Int(parse_int_element(raw, field_name)?))),
+        700 | 701 => Ok(Some(ResultValue::Float(parse_float_element(
+            raw, field_name,
+        )?))),
+        1700 => Ok(Some(ResultValue::Decimal(raw.into()))),
+        2950 => match parse_pg_uuid(raw) {
+            Some(bytes) => Ok(Some(ResultValue::Uuid(bytes))),
+            None => Ok(Some(ResultValue::TypedText(Box::new(ResultTypedText {
+                meta_type: META_TYPE_UUID,
+                text: raw.into(),
+            })))),
+        },
         17 => {
-            let mut decoded: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
-            let mut total_len = 0usize;
-            for cell in cells {
-                match cell {
-                    Some(raw) => {
-                        let bytes = decode_pg_bytea(raw).ok_or_else(|| {
-                            NetError::ProtocolError(format!(
-                                "Invalid bytea value in column {field_name:?}"
-                            ))
-                        })?;
-                        total_len += bytes.len();
-                        decoded.push(Some(bytes));
-                    }
-                    None => decoded.push(None),
-                }
-            }
-            if total_len <= i32::MAX as usize {
-                let mut builder = BinaryBuilder::with_capacity(n, total_len);
-                for cell in decoded {
-                    match cell {
-                        Some(bytes) => builder.append_value(&bytes),
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    Field::new(field_name, DataType::Binary, true),
-                    Arc::new(builder.finish()),
-                )))
-            } else {
-                let mut builder = LargeBinaryBuilder::with_capacity(n, total_len);
-                for cell in decoded {
-                    match cell {
-                        Some(bytes) => builder.append_value(&bytes),
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    Field::new(field_name, DataType::LargeBinary, true),
-                    Arc::new(builder.finish()),
-                )))
-            }
+            let bytes = decode_pg_bytea(raw).ok_or_else(|| {
+                NetError::ProtocolError(format!("Invalid bytea value in column {field_name:?}"))
+            })?;
+            Ok(Some(ResultValue::Bytes(bytes.into_boxed_slice())))
         }
-        1082 => {
-            let mut parsed = Vec::with_capacity(n);
-            let mut all_ok = true;
-            for cell in cells {
-                match cell {
-                    Some(v) => match parse_pg_date_days(v) {
-                        Some(days) => parsed.push(Some(days)),
-                        None => {
-                            all_ok = false;
-                            break;
-                        }
-                    },
-                    None => parsed.push(None),
-                }
-            }
-            if all_ok {
-                let mut builder = Date32Builder::with_capacity(n);
-                for cell in parsed {
-                    match cell {
-                        Some(days) => builder.append_value(days),
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    Field::new(field_name, DataType::Date32, true),
-                    Arc::new(builder.finish()),
-                )))
-            } else {
-                Ok(Some(build_utf8_with_meta(
-                    field_name,
-                    cells,
-                    &[(VOYAGER_META_TYPE, "date")],
-                )))
-            }
-        }
-        1083 => {
-            let mut parsed = Vec::with_capacity(n);
-            let mut all_ok = true;
-            for cell in cells {
-                match cell {
-                    Some(v) => match parse_pg_time_micros(v) {
-                        Some(us) => parsed.push(Some(us)),
-                        None => {
-                            all_ok = false;
-                            break;
-                        }
-                    },
-                    None => parsed.push(None),
-                }
-            }
-            if all_ok {
-                let mut builder = Time64MicrosecondBuilder::with_capacity(n);
-                for cell in parsed {
-                    match cell {
-                        Some(us) => builder.append_value(us),
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    Field::new(field_name, DataType::Time64(TimeUnit::Microsecond), true),
-                    Arc::new(builder.finish()),
-                )))
-            } else {
-                Ok(Some(build_utf8_with_meta(
-                    field_name,
-                    cells,
-                    &[(VOYAGER_META_TYPE, "time")],
-                )))
-            }
-        }
-        1266 => Ok(Some(build_utf8_with_meta(
-            field_name,
-            cells,
-            &[(VOYAGER_META_TYPE, "time_tz")],
-        ))),
-        1114 => {
-            let mut parsed = Vec::with_capacity(n);
-            let mut all_ok = true;
-            for cell in cells {
-                match cell {
-                    Some(v) => match parse_pg_timestamp_micros(v) {
-                        Some(us) => parsed.push(Some(us)),
-                        None => {
-                            all_ok = false;
-                            break;
-                        }
-                    },
-                    None => parsed.push(None),
-                }
-            }
-            if all_ok {
-                let mut builder = TimestampMicrosecondBuilder::with_capacity(n);
-                for cell in parsed {
-                    match cell {
-                        Some(us) => builder.append_value(us),
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    Field::new(
-                        field_name,
-                        DataType::Timestamp(TimeUnit::Microsecond, None),
-                        true,
-                    ),
-                    Arc::new(builder.finish()),
-                )))
-            } else {
-                Ok(Some(build_utf8_with_meta(
-                    field_name,
-                    cells,
-                    &[(VOYAGER_META_TYPE, "local_datetime")],
-                )))
-            }
-        }
-        1184 => {
-            let mut parsed = Vec::with_capacity(n);
-            let mut all_utc = true;
-            for cell in cells {
-                match cell {
-                    Some(v) => match parse_pg_timestamptz_micros(v) {
-                        Some((us, 0)) => parsed.push(Some(us)),
-                        _ => {
-                            all_utc = false;
-                            break;
-                        }
-                    },
-                    None => parsed.push(None),
-                }
-            }
-            if all_utc {
-                let mut builder =
-                    TimestampMicrosecondBuilder::with_capacity(n).with_timezone("UTC".to_string());
-                for cell in parsed {
-                    match cell {
-                        Some(us) => builder.append_value(us),
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    Field::new(
-                        field_name,
-                        DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
-                        true,
-                    ),
-                    Arc::new(builder.finish()),
-                )))
-            } else {
-                Ok(Some(build_utf8_with_meta(
-                    field_name,
-                    cells,
-                    &[(VOYAGER_META_TYPE, "datetime_tz")],
-                )))
-            }
-        }
-        1186 => {
-            let mut parsed = Vec::with_capacity(n);
-            let mut all_ok = true;
-            for cell in cells {
-                match cell {
-                    Some(v) => match parse_pg_interval(v) {
-                        Some(dur) => parsed.push(Some(dur)),
-                        None => {
-                            all_ok = false;
-                            break;
-                        }
-                    },
-                    None => parsed.push(None),
-                }
-            }
-            if !all_ok {
-                return Ok(Some(build_utf8_with_meta(
-                    field_name,
-                    cells,
-                    &[(VOYAGER_META_TYPE, "duration")],
-                )));
-            }
-            if parsed
-                .iter()
-                .all(|d| d.as_ref().is_none_or(|v| pg_duration_micros(v).is_some()))
-            {
-                let mut builder = DurationMicrosecondBuilder::with_capacity(n);
-                for cell in &parsed {
-                    match cell.as_ref().and_then(pg_duration_micros) {
-                        Some(us) => builder.append_value(us),
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    Field::new(field_name, DataType::Duration(TimeUnit::Microsecond), true),
-                    Arc::new(builder.finish()),
-                )))
-            } else if parsed
-                .iter()
-                .all(|d| d.as_ref().is_none_or(|v| pg_duration_nanos(v).is_some()))
-            {
-                let mut builder = DurationNanosecondBuilder::with_capacity(n);
-                for cell in &parsed {
-                    match cell.as_ref().and_then(pg_duration_nanos) {
-                        Some(ns) => builder.append_value(ns),
-                        None => builder.append_null(),
-                    }
-                }
-                Ok(Some((
-                    Field::new(field_name, DataType::Duration(TimeUnit::Nanosecond), true),
-                    Arc::new(builder.finish()),
-                )))
-            } else {
-                let mut builder = make_duration_struct_builder(n);
-                for cell in &parsed {
-                    append_duration_struct(&mut builder, cell.as_ref());
-                }
-                Ok(Some((
-                    field_with_meta(
-                        field_name,
-                        DataType::Struct(duration_struct_fields()),
-                        VOYAGER_META_TYPE,
-                        "duration",
-                    ),
-                    Arc::new(builder.finish()),
-                )))
-            }
-        }
-        114 | 3802 => Ok(Some(build_utf8_with_meta(
-            field_name,
-            cells,
-            &[(VOYAGER_META_ENCODING, "json"), (VOYAGER_META_TYPE, "json")],
-        ))),
-        19 | 25 | 869 | 1042 | 1043 => Ok(Some(build_utf8_with_meta(field_name, cells, &[]))),
+        1082 => match parse_pg_date_days(raw) {
+            Some(days) => Ok(Some(ResultValue::Date(days as i64))),
+            None => Ok(Some(ResultValue::TypedText(Box::new(ResultTypedText {
+                meta_type: META_TYPE_DATE,
+                text: raw.into(),
+            })))),
+        },
+        1083 => match parse_pg_time_micros(raw) {
+            Some(us) => Ok(Some(ResultValue::LocalTime(us * 1_000))),
+            None => Ok(Some(ResultValue::TypedText(Box::new(ResultTypedText {
+                meta_type: META_TYPE_TIME,
+                text: raw.into(),
+            })))),
+        },
+        1266 => Ok(Some(ResultValue::TypedText(Box::new(ResultTypedText {
+            meta_type: META_TYPE_TIME_TZ,
+            text: raw.into(),
+        })))),
+        1114 => match parse_pg_timestamp_micros(raw) {
+            Some(us) => Ok(Some(ResultValue::LocalDateTime {
+                seconds: us.div_euclid(1_000_000),
+                nanoseconds: (us.rem_euclid(1_000_000) * 1_000) as u32,
+            })),
+            None => Ok(Some(ResultValue::TypedText(Box::new(ResultTypedText {
+                meta_type: META_TYPE_LOCAL_DATETIME,
+                text: raw.into(),
+            })))),
+        },
+        1184 => match parse_pg_timestamptz_micros(raw) {
+            Some((us, 0)) => Ok(Some(ResultValue::DateTime(Box::new(ResultDateTime {
+                seconds: us.div_euclid(1_000_000),
+                nanoseconds: us.rem_euclid(1_000_000) * 1_000,
+                tz: ResultTimezone::Offset(0),
+            })))),
+            _ => Ok(Some(ResultValue::TypedText(Box::new(ResultTypedText {
+                meta_type: META_TYPE_DATETIME_TZ,
+                text: raw.into(),
+            })))),
+        },
+        1186 => match parse_pg_interval(raw) {
+            Some(dur) => Ok(Some(ResultValue::Duration(Box::new(DurationParts {
+                months: dur.months,
+                days: dur.days,
+                seconds: dur.seconds,
+                nanoseconds: dur.nanoseconds,
+            })))),
+            None => Ok(Some(ResultValue::TypedText(Box::new(ResultTypedText {
+                meta_type: META_TYPE_DURATION,
+                text: raw.into(),
+            })))),
+        },
+        114 | 3802 => Ok(Some(ResultValue::Json(raw.into()))),
+        19 | 25 | 869 | 1042 | 1043 => Ok(Some(ResultValue::Str(raw.into()))),
         _ => Ok(None),
     }
 }
 
-/// Outcome of decoding a PostgreSQL array column.
-enum ArrayColumnBatch {
-    /// Every non-empty row has the same depth, so the column is a typed Arrow list.
-    Typed(Field, ArrayRef),
-    /// Non-empty rows disagree on depth; the column falls back to JSON text.
-    MixedDepth,
+fn pg_array_value_to_result(
+    value: &PgArrayValue,
+    elem_oid: i32,
+    field_name: &str,
+) -> Result<ResultValue> {
+    match value {
+        PgArrayValue::Element(None) => Ok(ResultValue::Null),
+        PgArrayValue::Element(Some(raw)) => Ok(decode_pg_scalar_cell(raw, elem_oid, field_name)?
+            .unwrap_or_else(|| ResultValue::Str(raw.as_str().into()))),
+        PgArrayValue::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(pg_array_value_to_result(item, elem_oid, field_name)?);
+            }
+            Ok(ResultValue::List(out.into_boxed_slice()))
+        }
+    }
 }
 
 fn json_number_from_f64(value: f64) -> serde_json::Value {
@@ -2234,48 +1913,6 @@ fn pg_array_to_json(value: &PgArrayValue, elem_oid: i32) -> serde_json::Value {
                 .collect(),
         ),
     }
-}
-
-/// Builds the documented JSON-text fallback for a mixed-depth array column.
-fn mixed_depth_array_column(
-    name: &str,
-    elem_oid: i32,
-    rows: &[Vec<Option<String>>],
-    col_idx: usize,
-) -> Result<(Field, ArrayRef)> {
-    let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
-    for row in rows {
-        match row.get(col_idx).and_then(|value| value.as_deref()) {
-            Some(raw) => {
-                let parsed = parse_pg_array_literal(raw)?;
-                let text = serde_json::to_string(&pg_array_to_json(&parsed, elem_oid)).map_err(
-                    |error| {
-                        NetError::ProtocolError(format!(
-                            "Failed to encode PostgreSQL array column {name:?} as JSON: {error}"
-                        ))
-                    },
-                )?;
-                builder.append_value(&text);
-            }
-            None => builder.append_null(),
-        }
-    }
-    let mut metadata = HashMap::new();
-    metadata.insert(VOYAGER_META_ENCODING.to_string(), "json".to_string());
-    // Keep the declared element type so `execute()` can hand `numeric` elements
-    // back as Decimal and `uuid` elements as uuid.UUID instead of untyped JSON
-    // strings/numbers. The Arrow/Polars exports still expose JSON text.
-    match elem_oid {
-        1700 => {
-            metadata.insert(VOYAGER_META_TYPE.to_string(), "decimal".to_string());
-        }
-        2950 => {
-            metadata.insert(VOYAGER_META_TYPE.to_string(), "uuid".to_string());
-        }
-        _ => {}
-    }
-    let field = Field::new(name, DataType::Utf8, true).with_metadata(metadata);
-    Ok((field, Arc::new(builder.finish())))
 }
 
 fn micros_to_seconds_nanos(micros: i64) -> (i64, i64) {
@@ -2357,148 +1994,6 @@ fn pg_array_to_bolt_value(raw: &str, elem_oid: i32) -> Result<BoltValue> {
     pg_array_value_to_bolt(&parsed, elem_oid)
 }
 
-fn array_column_batch(
-    name: &str,
-    elem_oid: i32,
-    typmod: Option<i32>,
-    rows: &[Vec<Option<String>>],
-    col_idx: usize,
-) -> Result<ArrayColumnBatch> {
-    let mut parsed: Vec<Option<PgArrayValue>> = Vec::with_capacity(rows.len());
-    let mut depth: Option<usize> = None;
-    for row in rows {
-        match row.get(col_idx).and_then(|value| value.as_deref()) {
-            Some(raw) => {
-                let value = parse_pg_array_literal(raw)?;
-                // An empty literal (`{}`) carries no dimensionality: PostgreSQL
-                // serializes an empty array of any rank this way. Treat it as
-                // compatible with the dimensions other rows reveal.
-                let empty = matches!(&value, PgArrayValue::Array(items) if items.is_empty());
-                if !empty {
-                    let cell_depth = pg_array_depth(&value)?;
-                    match depth {
-                        Some(existing) if existing != cell_depth => {
-                            return Ok(ArrayColumnBatch::MixedDepth);
-                        }
-                        None => depth = Some(cell_depth),
-                        _ => {}
-                    }
-                }
-                parsed.push(Some(value));
-            }
-            None => parsed.push(None),
-        }
-    }
-
-    // An all-NULL or all-empty column has no observable dimensionality; keep
-    // the 1-D shape the previous decoder used so the Arrow type stays stable.
-    let depth = depth.unwrap_or(1);
-
-    // `level_lengths[level]` holds the child count of every node at that level.
-    // Level 0 has one entry per database row (including SQL NULLs); deeper
-    // levels are always array nodes because PostgreSQL arrays are rectangular.
-    let mut level_lengths: Vec<Vec<Option<usize>>> = Vec::with_capacity(depth);
-    let mut level_zero = Vec::with_capacity(parsed.len());
-    let mut nodes: Vec<&PgArrayValue> = Vec::new();
-    for cell in &parsed {
-        match cell {
-            Some(value) => {
-                let items = value
-                    .children()
-                    .expect("a parsed array literal is always an array");
-                level_zero.push(Some(items.len()));
-                nodes.extend(items.iter());
-            }
-            None => level_zero.push(None),
-        }
-    }
-    level_lengths.push(level_zero);
-
-    for _ in 1..depth {
-        let mut lengths = Vec::with_capacity(nodes.len());
-        let mut next = Vec::new();
-        for node in std::mem::take(&mut nodes) {
-            let items = node.children().ok_or_else(|| {
-                NetError::ProtocolError(
-                    "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
-                )
-            })?;
-            lengths.push(Some(items.len()));
-            next.extend(items.iter());
-        }
-        level_lengths.push(lengths);
-        nodes = next;
-    }
-
-    let mut flat_cells: Vec<Option<&str>> = Vec::with_capacity(nodes.len());
-    for node in &nodes {
-        match node {
-            PgArrayValue::Element(value) => flat_cells.push(value.as_deref()),
-            PgArrayValue::Array(_) => {
-                return Err(NetError::ProtocolError(
-                    "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
-                ));
-            }
-        }
-    }
-
-    let (item_field, leaf_array) =
-        match build_pg_typed_values("item", elem_oid, typmod, &flat_cells)? {
-            Some(pair) => pair,
-            None => build_utf8_with_meta("item", &flat_cells, &[]),
-        };
-
-    let mut child_field = item_field;
-    let mut child_array = leaf_array;
-    for level in (0..depth).rev() {
-        let lengths = &level_lengths[level];
-        let mut offsets: Vec<i32> = Vec::with_capacity(lengths.len() + 1);
-        let mut validity = Vec::with_capacity(lengths.len());
-        let mut has_null = false;
-        let mut offset = 0i32;
-        offsets.push(0);
-        for length in lengths {
-            match length {
-                Some(length) => {
-                    offset = offset.checked_add(*length as i32).ok_or_else(|| {
-                        NetError::ProtocolError(
-                            "PostgreSQL array column is too large to decode".to_string(),
-                        )
-                    })?;
-                    validity.push(true);
-                }
-                None => {
-                    has_null = true;
-                    validity.push(false);
-                }
-            }
-            offsets.push(offset);
-        }
-        if offset as usize != child_array.len() {
-            return Err(NetError::ProtocolError(
-                "Ragged PostgreSQL array literal: dimensions are inconsistent".to_string(),
-            ));
-        }
-
-        let field = if level == 0 {
-            Field::new(name, DataType::List(Arc::new(child_field.clone())), true)
-        } else {
-            Field::new("item", DataType::List(Arc::new(child_field.clone())), true)
-        };
-        let nulls = has_null.then(|| NullBuffer::from(validity));
-        let list = ListArray::new(
-            Arc::new(child_field),
-            OffsetBuffer::new(offsets.into()),
-            child_array,
-            nulls,
-        );
-        child_array = Arc::new(list);
-        child_field = field;
-    }
-
-    Ok(ArrayColumnBatch::Typed(child_field, child_array))
-}
-
 /// Dynamically transforms tabular row values into an Apache Arrow [`RecordBatch`].
 pub fn rows_to_record_batch(
     column_names: &[String],
@@ -2561,12 +2056,9 @@ pub fn rows_to_record_batch_with_column_metadata(
 /// Like [`rows_to_record_batch_with_column_metadata`], optionally returning raw
 /// Bolt rows for columns that fell back to JSON.
 ///
-/// A PostgreSQL array column cannot mix depths in one Arrow `List` type. When
-/// non-empty rows disagree on depth the column is serialized as JSON text tagged
-/// `voyager.encoding=json` (the same representation the native backends use for
-/// mixed values). `collect_bolt_rows` additionally decodes each such cell into a
-/// [`BoltValue`] row so `execute()` can return per-row shapes with element types
-/// intact instead of JSON text.
+/// Decodes every column into [`ResultValue`] and delegates Arrow [`RecordBatch`]
+/// construction to the single unified [`crate::value::arrow::values_to_record_batch_with_hints`]
+/// builder.
 pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
     column_names: &[String],
     rows: &[Vec<Option<String>>],
@@ -2576,199 +2068,113 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
     collect_bolt_rows: bool,
 ) -> Result<(RecordBatch, Option<Vec<Vec<BoltValue>>>)> {
     if column_names.is_empty() {
-        return Ok((RecordBatch::new_empty(Arc::new(Schema::empty())), None));
+        return Ok((values_to_record_batch_with_hints(&[], &[], &[])?, None));
     }
 
     let num_rows = rows.len();
     let num_cols = column_names.len();
 
-    let mut fields = Vec::with_capacity(num_cols);
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+    let mut result_rows: Vec<Vec<ResultValue>> = (0..num_rows)
+        .map(|_| vec![ResultValue::Null; num_cols])
+        .collect();
+    let mut hints: Vec<ColumnHint> = Vec::with_capacity(num_cols);
     let mut fallback_columns: Vec<(usize, i32)> = Vec::new();
 
     for (col_idx, name) in column_names.iter().enumerate() {
         if age_columns.get(col_idx).copied().unwrap_or(false) {
-            let mut parsed_cells: Vec<Option<AgeValue>> = Vec::with_capacity(num_rows);
-            let mut int_count = 0usize;
-            let mut float_count = 0usize;
-            let mut bool_count = 0usize;
-            let mut string_count = 0usize;
-            let mut node_count = 0usize;
-            let mut edge_count = 0usize;
-            let mut path_count = 0usize;
-            let mut has_structured = false;
-            let mut non_null_count = 0usize;
-
-            for row in rows {
-                match row.get(col_idx).and_then(|v| v.as_deref()) {
-                    Some(raw) => {
-                        let parsed = parse_agtype(raw)?;
-                        match &parsed {
-                            AgeValue::Null => {
-                                parsed_cells.push(None);
-                            }
-                            AgeValue::Integer(_) => {
-                                int_count += 1;
-                                non_null_count += 1;
-                                parsed_cells.push(Some(parsed));
-                            }
-                            AgeValue::Float(_) => {
-                                float_count += 1;
-                                non_null_count += 1;
-                                parsed_cells.push(Some(parsed));
-                            }
-                            AgeValue::Boolean(_) => {
-                                bool_count += 1;
-                                non_null_count += 1;
-                                parsed_cells.push(Some(parsed));
-                            }
-                            AgeValue::Vertex(_) => {
-                                node_count += 1;
-                                has_structured = true;
-                                non_null_count += 1;
-                                parsed_cells.push(Some(parsed));
-                            }
-                            AgeValue::Edge(_) => {
-                                edge_count += 1;
-                                has_structured = true;
-                                non_null_count += 1;
-                                parsed_cells.push(Some(parsed));
-                            }
-                            AgeValue::Path(_) => {
-                                path_count += 1;
-                                has_structured = true;
-                                non_null_count += 1;
-                                parsed_cells.push(Some(parsed));
-                            }
-                            AgeValue::List(_) | AgeValue::Map(_) => {
-                                has_structured = true;
-                                non_null_count += 1;
-                                parsed_cells.push(Some(parsed));
-                            }
-                            AgeValue::String(_) => {
-                                string_count += 1;
-                                non_null_count += 1;
-                                parsed_cells.push(Some(parsed));
-                            }
-                        }
-                    }
-                    None => parsed_cells.push(None),
+            for (row_idx, row) in rows.iter().enumerate() {
+                if let Some(raw) = row.get(col_idx).and_then(|v| v.as_deref()) {
+                    let parsed = parse_agtype(raw)?;
+                    result_rows[row_idx][col_idx] = ResultValue::from(parsed);
                 }
             }
-
-            if non_null_count > 0 && int_count == non_null_count {
-                let mut builder = Int64Builder::with_capacity(num_rows);
-                for cell in &parsed_cells {
-                    match cell {
-                        Some(AgeValue::Integer(i)) => builder.append_value(*i),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(name, DataType::Int64, true));
-                columns.push(Arc::new(builder.finish()));
-            } else if non_null_count > 0 && float_count == non_null_count {
-                let mut builder = Float64Builder::with_capacity(num_rows);
-                for cell in &parsed_cells {
-                    match cell {
-                        Some(AgeValue::Float(f)) => builder.append_value(*f),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(name, DataType::Float64, true));
-                columns.push(Arc::new(builder.finish()));
-            } else if non_null_count > 0
-                && (int_count + float_count) == non_null_count
-                && int_count > 0
-                && float_count > 0
-            {
-                let mut builder = Float64Builder::with_capacity(num_rows);
-                for cell in &parsed_cells {
-                    match cell {
-                        Some(AgeValue::Float(f)) => builder.append_value(*f),
-                        Some(AgeValue::Integer(i)) => builder.append_value(*i as f64),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(name, DataType::Float64, true));
-                columns.push(Arc::new(builder.finish()));
-            } else if non_null_count > 0 && bool_count == non_null_count {
-                let mut builder = BooleanBuilder::with_capacity(num_rows);
-                for cell in &parsed_cells {
-                    match cell {
-                        Some(AgeValue::Boolean(b)) => builder.append_value(*b),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(name, DataType::Boolean, true));
-                columns.push(Arc::new(builder.finish()));
-            } else if has_structured || (non_null_count > 0 && string_count != non_null_count) {
-                let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 64);
-                for cell in &parsed_cells {
-                    match cell {
-                        Some(val) => {
-                            let json_str = serde_json::to_string(&age_value_to_arrow_json(val))
-                                .unwrap_or_else(|_| "null".to_string());
-                            builder.append_value(&json_str);
-                        }
-                        None => builder.append_null(),
-                    }
-                }
-                let mut metadata = HashMap::new();
-                metadata.insert(VOYAGER_META_ENCODING.to_string(), "json".to_string());
-                if non_null_count > 0 && node_count == non_null_count {
-                    metadata.insert(VOYAGER_META_KIND.to_string(), "node".to_string());
-                } else if non_null_count > 0 && edge_count == non_null_count {
-                    metadata.insert(VOYAGER_META_KIND.to_string(), "relationship".to_string());
-                } else if non_null_count > 0 && path_count == non_null_count {
-                    metadata.insert(VOYAGER_META_KIND.to_string(), "path".to_string());
-                }
-                fields.push(Field::new(name, DataType::Utf8, true).with_metadata(metadata));
-                columns.push(Arc::new(builder.finish()));
-            } else {
-                let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
-                for cell in &parsed_cells {
-                    match cell {
-                        Some(AgeValue::String(s)) => builder.append_value(s),
-                        _ => builder.append_null(),
-                    }
-                }
-                fields.push(Field::new(name, DataType::Utf8, true));
-                columns.push(Arc::new(builder.finish()));
-            }
+            hints.push(ColumnHint::Age);
             continue;
         }
 
         if let Some(&oid) = column_types.get(col_idx) {
             let typmod = column_type_modifiers.get(col_idx).copied();
             if let Some(elem_oid) = pg_array_element_oid(oid) {
-                match array_column_batch(name, elem_oid, typmod, rows, col_idx)? {
-                    ArrayColumnBatch::Typed(field, array) => {
-                        fields.push(field);
-                        columns.push(array);
+                let mut parsed_cells: Vec<Option<PgArrayValue>> = Vec::with_capacity(num_rows);
+                let mut depth: Option<usize> = None;
+                let mut mixed_depth = false;
+
+                for row in rows {
+                    match row.get(col_idx).and_then(|value| value.as_deref()) {
+                        Some(raw) => {
+                            let value = parse_pg_array_literal(raw)?;
+                            let empty =
+                                matches!(&value, PgArrayValue::Array(items) if items.is_empty());
+                            if !empty {
+                                let cell_depth = pg_array_depth(&value)?;
+                                match depth {
+                                    Some(existing) if existing != cell_depth => {
+                                        mixed_depth = true;
+                                    }
+                                    None => depth = Some(cell_depth),
+                                    _ => {}
+                                }
+                            }
+                            parsed_cells.push(Some(value));
+                        }
+                        None => parsed_cells.push(None),
                     }
-                    ArrayColumnBatch::MixedDepth => {
-                        let (field, array) =
-                            mixed_depth_array_column(name, elem_oid, rows, col_idx)?;
-                        fields.push(field);
-                        columns.push(array);
-                        if collect_bolt_rows {
-                            fallback_columns.push((col_idx, elem_oid));
+                }
+
+                if mixed_depth {
+                    for (row_idx, cell) in parsed_cells.into_iter().enumerate() {
+                        if let Some(parsed) = cell {
+                            let text = serde_json::to_string(&pg_array_to_json(&parsed, elem_oid))
+                                .map_err(|error| {
+                                    NetError::ProtocolError(format!(
+                                        "Failed to encode PostgreSQL array column {name:?} as JSON: {error}"
+                                    ))
+                                })?;
+                            result_rows[row_idx][col_idx] =
+                                ResultValue::Json(text.into_boxed_str());
                         }
                     }
+                    let meta_type = match elem_oid {
+                        1700 => Some(META_TYPE_DECIMAL),
+                        2950 => Some(META_TYPE_UUID),
+                        _ => None,
+                    };
+                    hints.push(ColumnHint::JsonColumn { meta_type });
+                    if collect_bolt_rows {
+                        fallback_columns.push((col_idx, elem_oid));
+                    }
+                } else {
+                    let depth = depth.unwrap_or(1);
+                    for (row_idx, cell) in parsed_cells.into_iter().enumerate() {
+                        if let Some(parsed) = cell {
+                            result_rows[row_idx][col_idx] =
+                                pg_array_value_to_result(&parsed, elem_oid, name)?;
+                        }
+                    }
+                    let elem_hint = pg_oid_column_hint(elem_oid, typmod)
+                        .unwrap_or(ColumnHint::PgEmptyTyped(EmptyColumnKind::Str));
+                    hints.push(ColumnHint::PgArray {
+                        depth,
+                        elem_hint: Box::new(elem_hint),
+                    });
                 }
                 continue;
             }
-            let cells: Vec<Option<&str>> = rows
-                .iter()
-                .map(|row| row.get(col_idx).and_then(|v| v.as_deref()))
-                .collect();
-            if let Some((field, array)) = build_pg_typed_values(name, oid, typmod, &cells)? {
-                fields.push(field);
-                columns.push(array);
+
+            if let Some(hint) = pg_oid_column_hint(oid, typmod) {
+                for (row_idx, row) in rows.iter().enumerate() {
+                    if let Some(raw) = row.get(col_idx).and_then(|v| v.as_deref())
+                        && let Some(val) = decode_pg_scalar_cell(raw, oid, name)?
+                    {
+                        result_rows[row_idx][col_idx] = val;
+                    }
+                }
+                hints.push(hint);
                 continue;
             }
         }
 
+        // Untyped fallback: infer Int64 / Float64 / Boolean / Utf8 dynamically.
         let mut has_non_null = false;
         let mut can_be_int = true;
         let mut can_be_float = true;
@@ -2796,80 +2202,29 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
             }
         }
 
-        let data_type = if !has_non_null {
-            DataType::Utf8
-        } else if can_be_int {
-            DataType::Int64
-        } else if can_be_float {
-            DataType::Float64
-        } else if can_be_bool {
-            DataType::Boolean
-        } else {
-            DataType::Utf8
-        };
-
-        fields.push(Field::new(name, data_type.clone(), true));
-
-        match data_type {
-            DataType::Int64 => {
-                let mut builder = Int64Builder::with_capacity(num_rows);
-                for row in rows {
-                    match row.get(col_idx).and_then(|v| v.as_deref()) {
-                        Some(val) => {
-                            let cleaned = clean_agtype_string(val);
-                            if let Ok(i) = cleaned.parse::<i64>() {
-                                builder.append_value(i);
-                            } else {
-                                builder.append_null();
-                            }
-                        }
-                        None => builder.append_null(),
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            DataType::Float64 => {
-                let mut builder = Float64Builder::with_capacity(num_rows);
-                for row in rows {
-                    match row.get(col_idx).and_then(|v| v.as_deref()) {
-                        Some(val) => {
-                            let cleaned = clean_agtype_string(val);
-                            if let Ok(f) = cleaned.parse::<f64>() {
-                                builder.append_value(f);
-                            } else {
-                                builder.append_null();
-                            }
-                        }
-                        None => builder.append_null(),
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            DataType::Boolean => {
-                let mut builder = BooleanBuilder::with_capacity(num_rows);
-                for row in rows {
-                    match row.get(col_idx).and_then(|v| v.as_deref()) {
-                        Some(val) => {
-                            let cleaned = clean_agtype_string(val);
-                            let b = cleaned == "t" || cleaned == "true";
-                            builder.append_value(b);
-                        }
-                        None => builder.append_null(),
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            _ => {
-                let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
-                for row in rows {
-                    match row.get(col_idx).and_then(|v| v.as_deref()) {
-                        Some(val) => builder.append_value(val),
-                        None => builder.append_null(),
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
+        for (row_idx, row) in rows.iter().enumerate() {
+            if let Some(val) = row.get(col_idx).and_then(|v| v.as_deref()) {
+                result_rows[row_idx][col_idx] = if !has_non_null {
+                    ResultValue::Null
+                } else if can_be_int {
+                    clean_agtype_string(val)
+                        .parse::<i64>()
+                        .map(ResultValue::Int)
+                        .unwrap_or(ResultValue::Null)
+                } else if can_be_float {
+                    clean_agtype_string(val)
+                        .parse::<f64>()
+                        .map(ResultValue::Float)
+                        .unwrap_or(ResultValue::Null)
+                } else if can_be_bool {
+                    let cleaned = clean_agtype_string(val);
+                    ResultValue::Bool(cleaned == "t" || cleaned == "true")
+                } else {
+                    ResultValue::Str(val.into())
+                };
             }
         }
+        hints.push(ColumnHint::Auto);
     }
 
     let bolt_rows = if collect_bolt_rows && !fallback_columns.is_empty() {
@@ -2888,16 +2243,20 @@ pub fn rows_to_record_batch_with_column_metadata_and_bolt_rows(
         None
     };
 
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema, columns).map_err(NetError::ArrowError)?;
+    let batch = values_to_record_batch_with_hints(column_names, &result_rows, &hints)?;
     Ok((batch, bolt_rows))
 }
 
 #[cfg(test)]
 mod pg_array_tests {
     use super::*;
+    use crate::value::{
+        ARROW_EXTENSION_NAME, ARROW_UUID_EXTENSION, VOYAGER_META_ENCODING, VOYAGER_META_TYPE,
+    };
     use arrow_array::Array;
     use arrow_array::cast::AsArray;
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
 
     fn batch_for(oid: i32, rows: &[Option<&str>]) -> RecordBatch {
         let columns = vec!["value".to_string()];
@@ -3499,6 +2858,41 @@ mod pg_array_tests {
         assert_eq!(
             parse_pg_interval("-3"),
             Some(BoltDuration::new(0, -3, 0, 0))
+        );
+    }
+
+    #[test]
+    fn timetz_and_uuid_arrays_propagate_recursive_child_metadata() {
+        let ttz = batch_for(1270, &[Some("{14:30:15+02,NULL}")]);
+        let DataType::List(item) = ttz.schema().field(0).data_type().clone() else {
+            panic!("expected List for timetz[]");
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(
+            item.metadata().get(VOYAGER_META_TYPE).map(String::as_str),
+            Some(crate::value::META_TYPE_TIME_TZ)
+        );
+
+        let uuids = batch_for(
+            2951,
+            &[Some("{{12345678-1234-5678-1234-567812345678,NULL}}")],
+        );
+        let DataType::List(outer) = uuids.schema().field(0).data_type().clone() else {
+            panic!("expected outer List for uuid[][]");
+        };
+        let DataType::List(leaf) = outer.data_type().clone() else {
+            panic!("expected inner List for uuid[][]");
+        };
+        assert_eq!(leaf.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(
+            leaf.metadata()
+                .get(ARROW_EXTENSION_NAME)
+                .map(String::as_str),
+            Some(ARROW_UUID_EXTENSION)
+        );
+        assert_eq!(
+            leaf.metadata().get(VOYAGER_META_TYPE).map(String::as_str),
+            Some(crate::value::META_TYPE_UUID)
         );
     }
 

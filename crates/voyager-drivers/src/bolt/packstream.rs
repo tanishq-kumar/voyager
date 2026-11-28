@@ -106,82 +106,8 @@ pub struct BoltPoint3D {
     pub z: f64,
 }
 
-/// Gregorian civil calendar conversion: days since 1970-01-01 to (year, month, day).
-/// Howard Hinnant's civil day algorithm: O(1) arithmetic, zero allocations.
-pub fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    let z = days.saturating_add(719468);
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
-}
-
-/// Gregorian civil calendar conversion: (year, month, day) to days since 1970-01-01.
-pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 {
-        year as i64 - 1
-    } else {
-        year as i64
-    };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
-    let m = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe as i64 - 719468
-}
-
-/// Converts nanoseconds since midnight into (hours, minutes, seconds, sub-second nanoseconds).
-pub fn nanos_to_hmsn(nanos: i64) -> (u32, u32, u32, u32) {
-    let total_secs = (nanos / 1_000_000_000).rem_euclid(86400);
-    let sub_nanos = (nanos.rem_euclid(1_000_000_000)) as u32;
-    let hour = (total_secs / 3600) as u32;
-    let minute = ((total_secs % 3600) / 60) as u32;
-    let second = (total_secs % 60) as u32;
-    (hour, minute, second, sub_nanos)
-}
-
-/// Formats UTC offset in seconds to ISO-8601 offset string (e.g. "+02:00", "-05:00", "+00:00").
-pub fn format_tz_offset(offset_seconds: i64) -> String {
-    let sign = if offset_seconds >= 0 { '+' } else { '-' };
-    let abs_secs = offset_seconds.unsigned_abs();
-    let hours = abs_secs / 3600;
-    let minutes = (abs_secs % 3600) / 60;
-    let seconds = abs_secs % 60;
-    if seconds == 0 {
-        format!("{}{:02}:{:02}", sign, hours, minutes)
-    } else {
-        format!("{}{:02}:{:02}:{:02}", sign, hours, minutes, seconds)
-    }
-}
-
-pub(crate) fn format_time_string(
-    h: u32,
-    m: u32,
-    s: u32,
-    nanos: u32,
-    offset: Option<&str>,
-) -> String {
-    let base = if nanos == 0 {
-        format!("{:02}:{:02}:{:02}", h, m, s)
-    } else if nanos.is_multiple_of(1_000_000) {
-        format!("{:02}:{:02}:{:02}.{:03}", h, m, s, nanos / 1_000_000)
-    } else if nanos.is_multiple_of(1_000) {
-        format!("{:02}:{:02}:{:02}.{:06}", h, m, s, nanos / 1_000)
-    } else {
-        format!("{:02}:{:02}:{:02}.{:09}", h, m, s, nanos)
-    };
-    match offset {
-        Some(off) => format!("{}{}", base, off),
-        None => base,
-    }
-}
+pub(crate) use crate::value::format_time_string;
+pub use crate::value::{days_to_ymd, format_tz_offset, nanos_to_hmsn, ymd_to_days};
 
 /// Represents a calendar Date decoded from a Bolt PackStream structure (`tag = 0x44`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -5,11 +5,8 @@
 //! relationships, paths) into unified [`BoltNode`], [`BoltRelationship`], and columnar
 //! Apache Arrow [`RecordBatch`] structures.
 
-use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::RecordBatch;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::bolt::{
     BoltDate, BoltDuration, BoltLocalDateTime, BoltLocalTime, BoltNode, BoltPath, BoltPoint2D,
@@ -18,6 +15,8 @@ use crate::bolt::{
 use crate::engine::{QueryResult, QuerySummary};
 use crate::error::{NetError, Result};
 use crate::redis::resp::RespValue;
+use crate::value::arrow::values_to_record_batch;
+use crate::value::result::ResultValue;
 
 /// Parsed execution statistics from FalkorDB query execution.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -413,31 +412,27 @@ impl FalkorQueryResult {
         }
     }
 
-    /// Converts tabular result rows into an Apache Arrow [`RecordBatch`].
+    /// Converts tabular result rows into an Apache Arrow [`RecordBatch`] via the
+    /// unified [`crate::value::arrow::values_to_record_batch`] builder.
     pub fn to_arrow_record_batch(&self) -> Result<RecordBatch> {
         let num_cols = self.columns.len();
         let num_rows = self.rows.len();
 
         if num_cols == 0 || num_rows == 0 {
-            // Build an empty RecordBatch with matching schema
-            let fields: Vec<Field> = self
-                .columns
-                .iter()
-                .map(|name| Field::new(name, DataType::Utf8, true))
-                .collect();
-            let schema = Arc::new(Schema::new(fields));
-            let columns: Vec<ArrayRef> = self
-                .columns
-                .iter()
-                .map(|_| Arc::new(StringBuilder::new().finish()) as ArrayRef)
-                .collect();
-            return RecordBatch::try_new(schema, columns).map_err(NetError::ArrowError);
+            return values_to_record_batch(&self.columns, &[]);
         }
 
-        // Dynamic type inference per column
-        let mut inferred_types = vec![DataType::Utf8; num_cols];
+        #[derive(Clone, Copy)]
+        enum InferredScalar {
+            Int,
+            Float,
+            Bool,
+            Str,
+        }
 
-        for (col_idx, inferred_type) in inferred_types.iter_mut().enumerate() {
+        let mut inferred = vec![InferredScalar::Str; num_cols];
+
+        for (col_idx, inferred_col) in inferred.iter_mut().enumerate() {
             let mut has_non_null = false;
             let mut can_be_int = true;
             let mut can_be_float = true;
@@ -490,7 +485,6 @@ impl FalkorQueryResult {
                             }
                         }
                         _ => {
-                            // Nested structures, nodes, edges promote to Utf8 / JSON
                             can_be_int = false;
                             can_be_float = false;
                             can_be_bool = false;
@@ -499,94 +493,49 @@ impl FalkorQueryResult {
                 }
             }
 
-            if !has_non_null {
-                *inferred_type = DataType::Utf8;
+            *inferred_col = if !has_non_null {
+                InferredScalar::Str
             } else if can_be_int {
-                *inferred_type = DataType::Int64;
+                InferredScalar::Int
             } else if can_be_float {
-                *inferred_type = DataType::Float64;
+                InferredScalar::Float
             } else if can_be_bool {
-                *inferred_type = DataType::Boolean;
+                InferredScalar::Bool
             } else {
-                *inferred_type = DataType::Utf8;
-            }
+                InferredScalar::Str
+            };
         }
 
-        // Build Arrow columnar arrays
-        let mut fields = Vec::with_capacity(num_cols);
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_cols);
-
-        for (col_idx, name) in self.columns.iter().enumerate() {
-            let data_type = &inferred_types[col_idx];
-            fields.push(Field::new(name, data_type.clone(), true));
-
-            match data_type {
-                DataType::Int64 => {
-                    let mut builder = Int64Builder::with_capacity(num_rows);
-                    for row in &self.rows {
-                        match row.get(col_idx) {
-                            Some(cell) if !cell.is_null() => {
-                                if let Some(i) = cell.as_i64() {
-                                    builder.append_value(i);
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            _ => builder.append_null(),
+        let mut result_rows: Vec<Vec<ResultValue>> = Vec::with_capacity(num_rows);
+        for row in &self.rows {
+            let mut vals = Vec::with_capacity(num_cols);
+            for (col_idx, kind) in inferred.iter().enumerate() {
+                let val = match row.get(col_idx) {
+                    Some(cell) if !cell.is_null() => match kind {
+                        InferredScalar::Int => cell
+                            .as_i64()
+                            .map(ResultValue::Int)
+                            .unwrap_or(ResultValue::Null),
+                        InferredScalar::Float => cell
+                            .as_f64()
+                            .map(ResultValue::Float)
+                            .unwrap_or(ResultValue::Null),
+                        InferredScalar::Bool => cell
+                            .as_bool()
+                            .map(ResultValue::Bool)
+                            .unwrap_or(ResultValue::Null),
+                        InferredScalar::Str => {
+                            ResultValue::Str(cell.to_string_lossy().into_boxed_str())
                         }
-                    }
-                    columns.push(Arc::new(builder.finish()));
-                }
-                DataType::Float64 => {
-                    let mut builder = Float64Builder::with_capacity(num_rows);
-                    for row in &self.rows {
-                        match row.get(col_idx) {
-                            Some(cell) if !cell.is_null() => {
-                                if let Some(f) = cell.as_f64() {
-                                    builder.append_value(f);
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            _ => builder.append_null(),
-                        }
-                    }
-                    columns.push(Arc::new(builder.finish()));
-                }
-                DataType::Boolean => {
-                    let mut builder = BooleanBuilder::with_capacity(num_rows);
-                    for row in &self.rows {
-                        match row.get(col_idx) {
-                            Some(cell) if !cell.is_null() => {
-                                if let Some(b) = cell.as_bool() {
-                                    builder.append_value(b);
-                                } else {
-                                    builder.append_null();
-                                }
-                            }
-                            _ => builder.append_null(),
-                        }
-                    }
-                    columns.push(Arc::new(builder.finish()));
-                }
-                _ => {
-                    // String / JSON fallback
-                    let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
-                    for row in &self.rows {
-                        match row.get(col_idx) {
-                            Some(cell) if !cell.is_null() => {
-                                builder.append_value(cell.to_string_lossy());
-                            }
-                            _ => builder.append_null(),
-                        }
-                    }
-                    columns.push(Arc::new(builder.finish()));
-                }
+                    },
+                    _ => ResultValue::Null,
+                };
+                vals.push(val);
             }
+            result_rows.push(vals);
         }
 
-        let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, columns).map_err(NetError::ArrowError)
+        values_to_record_batch(&self.columns, &result_rows)
     }
 
     /// Alias for [`to_arrow_record_batch`].
