@@ -158,6 +158,16 @@ pub trait AsyncConnection: Send + Sync {
     /// Resets the connection state, aborting any active open transactions or buffer states.
     async fn reset(&mut self) -> Result<()>;
 
+    /// Consumes any deferred protocol acknowledgement (for example a Bolt `RESET`
+    /// written after a failed query) so the connection is safe to lease again.
+    ///
+    /// The default implementation has nothing to do. A backend that leaves an
+    /// acknowledgement unread must override this and report a failure if the peer
+    /// rejected it or the socket failed.
+    async fn prepare_for_reuse(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Returns `true` if the underlying network socket or stream is currently healthy and open.
     fn is_valid(&self) -> bool;
 
@@ -254,6 +264,10 @@ impl AsyncConnection for Box<dyn AsyncConnection> {
 
     async fn reset(&mut self) -> Result<()> {
         (**self).reset().await
+    }
+
+    async fn prepare_for_reuse(&mut self) -> Result<()> {
+        (**self).prepare_for_reuse().await
     }
 
     fn is_valid(&self) -> bool {

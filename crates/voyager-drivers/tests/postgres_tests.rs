@@ -601,7 +601,18 @@ fn test_age_value_to_canonical_json_shapes() {
 #[test]
 fn test_connect_options_default_is_not_age() {
     assert!(!ConnectOptions::default().age);
-    assert!(ConnectOptions { age: true }.age);
+    assert!(
+        ConnectOptions::default()
+            .prepared_statement_cache_size
+            .is_none()
+    );
+    assert!(
+        ConnectOptions {
+            age: true,
+            ..Default::default()
+        }
+        .age
+    );
 }
 
 #[test]

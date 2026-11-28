@@ -55,6 +55,93 @@ _DUCKPGQ_STATEMENT_PATTERN = re.compile(r"\bGRAPH_TABLE\b|\bPROPERTY\s+GRAPH\b",
 #: Cypher bulk plans that DuckDB cannot parse; ingest them as relational rows instead.
 _CYPHER_BULK_STATEMENT_PATTERN = re.compile(r"^\s*UNWIND\b", re.IGNORECASE)
 
+#: Statement shapes whose DuckDB relation API is required rather than the eager DB-API path.
+#: ``DML ... RETURNING`` must run through ``con.sql()`` so the returned rows get the same
+#: TIMETZ/INTERVAL projection as reads; multi-statement input and DuckPGQ own the relation
+#: API too. Statements that name a projected type use the relation path so a ``TIMETZ``
+#: column can be cast to ISO text without losing the offset next to a calendar ``INTERVAL``.
+_RELATION_STATEMENT_PATTERN = re.compile(
+    r"\b(GRAPH_TABLE|PROPERTY\s+GRAPH|INTERVAL|TIMETZ|UNION|JSON)\b", re.IGNORECASE
+)
+_DML_STATEMENT_PATTERN = re.compile(r"^\s*(INSERT|UPDATE|DELETE|MERGE)\b", re.IGNORECASE)
+_DML_ANYWHERE_PATTERN = re.compile(r"\b(INSERT|UPDATE|DELETE|MERGE)\b", re.IGNORECASE)
+_RETURNING_PATTERN = re.compile(r"\bRETURNING\b", re.IGNORECASE)
+_READ_STATEMENT_PATTERN = re.compile(
+    r"^\s*(SELECT|WITH|VALUES|SHOW|DESCRIBE|SUMMARIZE|PRAGMA|EXPLAIN)\b", re.IGNORECASE
+)
+
+
+def _has_multiple_statements(statement: str) -> bool:
+    """Returns whether ``statement`` holds more than one SQL statement.
+
+    Semicolons inside quoted strings, quoted identifiers, and dollar-quoted bodies
+    are ignored. Being conservative here only routes a statement to the relation
+    path, so a missed edge cannot double-execute anything.
+    """
+    quote: str | None = None
+    index = 0
+    length = len(statement)
+    seen_terminator = False
+    while index < length:
+        char = statement[index]
+        if quote is not None:
+            if char == quote:
+                if index + 1 < length and statement[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            elif char == "\\" and quote == "'" and index + 1 < length:
+                index += 2
+                continue
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == ";":
+            if seen_terminator:
+                return True
+            seen_terminator = True
+        elif not char.isspace() and seen_terminator:
+            return True
+        index += 1
+    return False
+
+
+def _statement_needs_relation(statement: str) -> bool:
+    """Returns whether ``statement`` must use ``con.sql()`` instead of ``con.execute()``."""
+    if _has_multiple_statements(statement):
+        return True
+    if _RELATION_STATEMENT_PATTERN.search(statement):
+        return True
+    if _DML_STATEMENT_PATTERN.match(statement) and _RETURNING_PATTERN.search(statement):
+        return True
+    if _DML_ANYWHERE_PATTERN.search(statement) and _RETURNING_PATTERN.search(statement):
+        return True
+    return not _READ_STATEMENT_PATTERN.match(statement) and not _DML_STATEMENT_PATTERN.match(
+        statement
+    )
+
+
+_VOLATILE_READ_PATTERN = re.compile(
+    r"\b(nextval|currval|lastval|random|gen_random_uuid|uuid)\s*\(", re.IGNORECASE
+)
+
+
+def _is_replayable_read(statement: str) -> bool:
+    """Returns whether a read is free of row/sequence side effects.
+
+    Only used for the rare read whose result contains both ``TIMETZ`` and
+    ``INTERVAL`` (and whose SQL did not name either type): re-reading it once
+    through ``con.sql()`` keeps the TIMETZ offset *and* calendar INTERVAL months,
+    which a single DB-API cursor cannot expose together. DML is never replayed.
+    """
+    return (
+        bool(_READ_STATEMENT_PATTERN.match(statement))
+        and not _DML_ANYWHERE_PATTERN.search(statement)
+        and not _RETURNING_PATTERN.search(statement)
+        and not _VOLATILE_READ_PATTERN.search(statement)
+    )
+
 
 def _duckpgq_error_message(cause: BaseException) -> str:
     """Builds the actionable error shown when DuckPGQ cannot be loaded."""
@@ -374,6 +461,11 @@ class DuckDbBridge:
             return None, ()
         return relation, _duckdb_relation_description(relation)
 
+    def _execute_dbapi(self, stmt: str, params: dict[str, Any]) -> Any:
+        """Runs ``stmt`` exactly once through the eager DB-API ``execute()`` path."""
+        _duckdb_complete_pending(self.con)
+        return self.con.execute(stmt, params)
+
     def _relation_arrow_table(self, relation: Any, description: Sequence[Any]) -> Any | None:
         """Materializes ``relation`` as Arrow once, projecting any ``TIMETZ`` values to text."""
         projection = _duckdb_timetz_projection(description)
@@ -406,30 +498,47 @@ class DuckDbBridge:
         self._ensure_duckpgq_for_statement(statement)
         stmt, params = self._format_pgq_statement(statement, parameters or {})
         params = _adapt_duckdb_parameters(stmt, params)
-        sql_res = self._execute_sql_relation(stmt, params)
-        if sql_res is not None:
-            relation, description = sql_res
-            if relation is None or not description:
-                return BridgeResult([], columns=())
-            if _duckdb_description_has_interval(description) or _duckdb_description_has_union_json(
-                description
-            ):
-                arrow_table = self._relation_arrow_table(relation, description)
-                if arrow_table is not None:
-                    return _records_from_duckdb_arrow(description, arrow_table)
-            return _records_from_duckdb_rows(description, relation.fetchall())
+        if _statement_needs_relation(stmt):
+            sql_res = self._execute_sql_relation(stmt, params)
+            if sql_res is not None:
+                relation, description = sql_res
+                if relation is None or not description:
+                    return BridgeResult([], columns=())
+                if _duckdb_description_has_interval(
+                    description
+                ) or _duckdb_description_has_union_json(description):
+                    arrow_table = self._relation_arrow_table(relation, description)
+                    if arrow_table is not None:
+                        return _records_from_duckdb_arrow(description, arrow_table)
+                return _records_from_duckdb_rows(description, relation.fetchall())
 
-        rel = self.con.execute(stmt, params)
+        # Eager DB-API fast path for simple reads and non-RETURNING DML. The
+        # statement is executed exactly once: results are decoded from this
+        # cursor, never re-run through ``con.sql()``.
+        rel = self._execute_dbapi(stmt, params)
         if not rel.description:
             return BridgeResult([], columns=())
-        if (
-            _duckdb_description_has_interval(rel.description)
-            or _duckdb_description_has_union_json(rel.description)
-        ) and not _duckdb_description_has_timetz(rel.description):
+        description = tuple(rel.description)
+        has_interval = _duckdb_description_has_interval(
+            description
+        ) or _duckdb_description_has_union_json(description)
+        has_timetz = _duckdb_description_has_timetz(description)
+        if has_interval and not has_timetz:
             arrow_table = self._arrow_table(rel)
             if arrow_table is not None:
-                return _records_from_duckdb_arrow(rel.description, arrow_table)
-        return _records_from_duckdb_rows(rel.description, rel.fetchall())
+                return _records_from_duckdb_arrow(description, arrow_table)
+        if has_interval and has_timetz and _is_replayable_read(stmt):
+            # The DB-API cursor folds calendar months into 30-day timedeltas and
+            # Arrow drops TIMETZ offsets, so only the projecting relation can keep
+            # both. This is a side-effect-free read; no DML is ever replayed.
+            sql_res = self._execute_sql_relation(stmt, params)
+            if sql_res is not None:
+                relation, relation_description = sql_res
+                if relation is not None and relation_description:
+                    arrow_table = self._relation_arrow_table(relation, relation_description)
+                    if arrow_table is not None:
+                        return _records_from_duckdb_arrow(relation_description, arrow_table)
+        return _records_from_duckdb_rows(description, rel.fetchall())
 
     def execute_to_arrow(self, statement: str, parameters: dict[str, Any] | None = None) -> Any:
         """Executes a query and returns an Arrow table with Voyager's export types.

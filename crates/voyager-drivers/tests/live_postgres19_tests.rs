@@ -4,10 +4,27 @@ use std::collections::HashMap;
 use voyager_drivers::postgres::{PostgresConnection, PostgresTransaction};
 use voyager_drivers::{AsyncConnection, ParsedUri};
 
-const PG19_URI: &str = "postgresql://postgres:voyagerpass123@127.0.0.1:5456/postgres";
+const PG19_USER: &str = "postgres";
+const PG19_PASSWORD: &str = "voyagerpass123";
+const PG19_DATABASE: &str = "postgres";
+
+fn pg19_host() -> String {
+    std::env::var("VOYAGER_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+fn pg19_uri() -> String {
+    format!(
+        "postgresql://{PG19_USER}:{PG19_PASSWORD}@{}:5456/{PG19_DATABASE}",
+        pg19_host()
+    )
+}
 
 async fn get_pg19_connection() -> Option<PostgresConnection> {
-    let parsed = match ParsedUri::parse(PG19_URI) {
+    connect_pg19(&pg19_uri()).await
+}
+
+async fn connect_pg19(uri: &str) -> Option<PostgresConnection> {
+    let parsed = match ParsedUri::parse(uri) {
         Ok(p) => p,
         Err(_) => return None,
     };
@@ -22,6 +39,14 @@ async fn get_pg19_connection() -> Option<PostgresConnection> {
             None
         }
     }
+}
+
+async fn get_pg19_connection_with_cache(size: usize) -> Option<PostgresConnection> {
+    connect_pg19(&format!(
+        "{}?prepared_statement_cache_size={size}",
+        pg19_uri()
+    ))
+    .await
 }
 
 #[tokio::test]
@@ -345,4 +370,247 @@ async fn test_live_postgres19_sql_pgq_graph_table_and_arrow() {
     let _ = conn
         .execute_simple("DROP TABLE IF EXISTS net_pgq_person;")
         .await;
+}
+
+fn int_param(value: i64) -> HashMap<String, voyager_drivers::ParamValue> {
+    let mut params = HashMap::new();
+    params.insert(
+        "v".to_string(),
+        voyager_drivers::ParamValue::from(serde_json::json!(value)),
+    );
+    params
+}
+
+#[tokio::test]
+async fn test_live_postgres19_prepared_statement_cache_evicts_and_reuses() {
+    let Some(mut conn) = get_pg19_connection_with_cache(2).await else {
+        return;
+    };
+
+    // Three distinct SQL texts exceed the capacity of two. Every statement must
+    // still return the right rows after the oldest entry is evicted and closed.
+    for offset in 0..3 {
+        let query = format!("SELECT $v::bigint + {offset} AS value");
+        let result = conn.execute(&query, &int_param(41)).await.unwrap();
+        let batch = result.batches.first().expect("one batch");
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("bigint column");
+        assert_eq!(column.value(0), 41 + offset);
+        assert!(conn.prepared_statement_cache_len() <= 2);
+    }
+
+    let again = conn
+        .execute("SELECT $v::bigint + 0 AS value", &int_param(7))
+        .await
+        .unwrap();
+    let column = again
+        .batches
+        .first()
+        .expect("one batch")
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .expect("bigint column");
+    assert_eq!(column.value(0), 7);
+    assert!(conn.prepared_statement_cache_len() <= 2);
+}
+
+#[tokio::test]
+async fn test_live_postgres19_prepared_statement_cache_disabled() {
+    let Some(mut conn) = get_pg19_connection_with_cache(0).await else {
+        return;
+    };
+
+    for _ in 0..2 {
+        let result = conn
+            .execute("SELECT $v::bigint AS value", &int_param(5))
+            .await
+            .unwrap();
+        let column = result
+            .batches
+            .first()
+            .expect("one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("bigint column");
+        assert_eq!(column.value(0), 5);
+        assert_eq!(conn.prepared_statement_cache_len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn test_live_postgres19_prepared_statement_cache_recovers_after_schema_change() {
+    let Some(mut conn) = get_pg19_connection().await else {
+        return;
+    };
+
+    let _ = conn
+        .execute_simple("DROP TABLE IF EXISTS zz_pg461_cache_schema;")
+        .await;
+    conn.execute_simple("CREATE TABLE zz_pg461_cache_schema (id INT);")
+        .await
+        .unwrap();
+    conn.execute_simple("INSERT INTO zz_pg461_cache_schema VALUES (1), (2);")
+        .await
+        .unwrap();
+
+    let query = "SELECT * FROM zz_pg461_cache_schema WHERE id >= $v";
+    let first = conn.execute(query, &int_param(1)).await.unwrap();
+    assert_eq!(first.columns, vec!["id"]);
+    assert_eq!(first.row_count(), 2);
+    assert_eq!(conn.prepared_statement_cache_len(), 1);
+
+    // A named statement's result type changes when a column is added. PostgreSQL
+    // answers 0A000 ("cached plan must not change result type"); the connection
+    // must drop the cached entry and re-parse once instead of surfacing the error.
+    conn.execute_simple("ALTER TABLE zz_pg461_cache_schema ADD COLUMN label TEXT;")
+        .await
+        .unwrap();
+    conn.execute_simple("UPDATE zz_pg461_cache_schema SET label = 'row-' || id;")
+        .await
+        .unwrap();
+
+    let second = conn.execute(query, &int_param(1)).await.unwrap();
+    assert_eq!(second.columns, vec!["id", "label"]);
+    assert_eq!(second.row_count(), 2);
+    assert_eq!(conn.prepared_statement_cache_len(), 1);
+
+    let _ = conn
+        .execute_simple("DROP TABLE IF EXISTS zz_pg461_cache_schema;")
+        .await;
+}
+
+#[tokio::test]
+async fn test_live_postgres19_prepared_statement_cache_does_not_retry_inside_transaction() {
+    let Some(mut conn) = get_pg19_connection().await else {
+        return;
+    };
+
+    let _ = conn
+        .execute_simple("DROP TABLE IF EXISTS zz_pg461_cache_tx;")
+        .await;
+    conn.execute_simple("CREATE TABLE zz_pg461_cache_tx (id INT);")
+        .await
+        .unwrap();
+    conn.execute_simple("INSERT INTO zz_pg461_cache_tx VALUES (1), (2);")
+        .await
+        .unwrap();
+
+    let query = "SELECT * FROM zz_pg461_cache_tx WHERE id >= $v";
+    let first = conn.execute(query, &int_param(1)).await.unwrap();
+    assert_eq!(first.columns, vec!["id"]);
+    assert_eq!(first.row_count(), 2);
+    assert_eq!(conn.prepared_statement_cache_len(), 1);
+
+    conn.begin_transaction().await.unwrap();
+    // Change the result type from a second connection so the ALTER survives the
+    // rollback below. The transaction has not read the table yet, so it holds no
+    // lock that would block the ALTER.
+    let Some(mut other) = get_pg19_connection().await else {
+        return;
+    };
+    other
+        .execute_simple("ALTER TABLE zz_pg461_cache_tx ADD COLUMN label TEXT;")
+        .await
+        .unwrap();
+    other
+        .execute_simple("UPDATE zz_pg461_cache_tx SET label = 'row-' || id;")
+        .await
+        .unwrap();
+    let _ = other.close().await;
+
+    // The first 0A000 already aborts the transaction, so a second Parse would fail
+    // with 25P02: the original error must be returned and the stale name forgotten.
+    let error = conn
+        .execute(query, &int_param(1))
+        .await
+        .expect_err("cached plan result-type change should fail inside the transaction");
+    let message = error.to_string();
+    assert!(
+        message.contains("0A000") || message.contains("cached plan must not change result type"),
+        "expected the original 0A000 error, got: {message}"
+    );
+    assert_eq!(conn.prepared_statement_cache_len(), 0);
+    assert!(conn.can_rollback());
+    conn.rollback_transaction().await.unwrap();
+
+    // The entry was dropped, so after ROLLBACK the same statement re-parses and works.
+    let after = conn.execute(query, &int_param(1)).await.unwrap();
+    assert_eq!(after.columns, vec!["id", "label"]);
+    assert_eq!(after.row_count(), 2);
+    assert_eq!(conn.prepared_statement_cache_len(), 1);
+
+    let _ = conn
+        .execute_simple("DROP TABLE IF EXISTS zz_pg461_cache_tx;")
+        .await;
+}
+
+#[tokio::test]
+async fn test_live_postgres19_prepared_statement_cache_unknown_inside_transaction() {
+    let Some(mut conn) = get_pg19_connection().await else {
+        return;
+    };
+
+    let query = "SELECT $v::bigint + 200 AS value";
+    let first = conn.execute(query, &int_param(1)).await.unwrap();
+    assert_eq!(first.row_count(), 1);
+    assert_eq!(conn.prepared_statement_cache_len(), 1);
+
+    conn.begin_transaction().await.unwrap();
+    conn.execute_simple("DEALLOCATE ALL;").await.unwrap();
+    let error = conn
+        .execute(query, &int_param(2))
+        .await
+        .expect_err("the server forgot the named statement");
+    let message = error.to_string();
+    assert!(
+        message.contains("26000") || message.to_lowercase().contains("does not exist"),
+        "expected the original 26000 error, got: {message}"
+    );
+    assert_eq!(conn.prepared_statement_cache_len(), 0);
+    assert!(conn.can_rollback());
+    conn.rollback_transaction().await.unwrap();
+
+    let after = conn.execute(query, &int_param(3)).await.unwrap();
+    let column = after
+        .batches
+        .first()
+        .expect("one batch")
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .expect("bigint column");
+    assert_eq!(column.value(0), 203);
+    assert_eq!(conn.prepared_statement_cache_len(), 1);
+}
+
+#[tokio::test]
+async fn test_live_postgres19_prepared_statement_cache_recovers_after_deallocate() {
+    let Some(mut conn) = get_pg19_connection().await else {
+        return;
+    };
+
+    let query = "SELECT $v::bigint + 100 AS value";
+    let first = conn.execute(query, &int_param(1)).await.unwrap();
+    assert_eq!(first.row_count(), 1);
+    assert_eq!(conn.prepared_statement_cache_len(), 1);
+
+    // The server forgets the named statement; the client sees SQLSTATE 26000 and
+    // must re-parse instead of failing the query.
+    conn.execute_simple("DEALLOCATE ALL;").await.unwrap();
+    let second = conn.execute(query, &int_param(2)).await.unwrap();
+    let column = second
+        .batches
+        .first()
+        .expect("one batch")
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .expect("bigint column");
+    assert_eq!(column.value(0), 102);
+    assert_eq!(conn.prepared_statement_cache_len(), 1);
 }

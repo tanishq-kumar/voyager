@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use arrow_array::{Array, Int64Array, StringArray};
+use voyager_drivers::NativeClient;
 use voyager_drivers::bolt::BoltConnection;
-use voyager_drivers::config::ConnectionConfig;
+use voyager_drivers::config::{ConnectionConfig, PoolConfig};
 use voyager_drivers::engine::{AsyncConnection, QueryResult};
 
 const NEO4J_USER: &str = "neo4j";
@@ -201,4 +202,124 @@ async fn test_live_memgraph_keeps_working_without_a_database() {
         .expect("Memgraph query failed");
     assert_eq!(result.row_count(), 1);
     let _ = conn.close().await;
+}
+
+async fn assert_error_then_next_query_succeeds(mut conn: BoltConnection, engine: &str) {
+    // A failed query writes a deferred RESET. The very next query must pipeline
+    // behind it and succeed on the same connection, repeatedly.
+    for round in 0..3 {
+        let error = conn
+            .execute("RETURN 1 +", &HashMap::new())
+            .await
+            .expect_err("syntax error should fail");
+        assert!(
+            !error.to_string().is_empty(),
+            "{engine} round {round}: empty error"
+        );
+        assert!(conn.is_valid(), "{engine} round {round}: marked invalid");
+
+        let result = conn
+            .execute("RETURN 42 AS n", &HashMap::new())
+            .await
+            .unwrap_or_else(|error| panic!("{engine} round {round}: recovery failed: {error}"));
+        assert_eq!(
+            int_at(&result, 0, 0),
+            Some(42),
+            "{engine} round {round}: wrong value"
+        );
+    }
+    let _ = conn.close().await;
+}
+
+#[tokio::test]
+async fn test_live_neo4j_error_then_next_query_recovers_on_same_connection() {
+    let host = test_host();
+    let Some(conn) = connect_neo4j(&host, None).await else {
+        eprintln!("[SKIP] Neo4j is not reachable on {host}:7687");
+        return;
+    };
+    assert_error_then_next_query_succeeds(conn, "Neo4j").await;
+}
+
+#[tokio::test]
+async fn test_live_memgraph_error_then_next_query_recovers_on_same_connection() {
+    let host = test_host();
+    let config = ConnectionConfig::from_uri(format!("bolt://{host}:7688"));
+    let Ok(conn) = BoltConnection::connect(&config).await else {
+        eprintln!("[SKIP] Memgraph is not reachable on {host}:7688");
+        return;
+    };
+    assert_error_then_next_query_succeeds(conn, "Memgraph").await;
+}
+
+async fn assert_pool_error_then_next_query_succeeds(client: &NativeClient, engine: &str) {
+    // The failed query leaves a deferred RESET reply unread on the pooled socket.
+    // The pool must consume it before re-leasing the connection, not evict it.
+    let error = client
+        .execute("RETURN 1 +", &HashMap::new())
+        .await
+        .expect_err("syntax error should fail");
+    assert!(
+        !error.to_string().is_empty(),
+        "{engine}: empty error from failed query"
+    );
+
+    let result = client
+        .execute("RETURN 42 AS n", &HashMap::new())
+        .await
+        .unwrap_or_else(|error| panic!("{engine}: pooled recovery failed: {error}"));
+    assert_eq!(int_at(&result, 0, 0), Some(42), "{engine}: wrong value");
+
+    assert_eq!(
+        client.pool().total_count(),
+        1,
+        "{engine}: a failed query must not add a pooled connection"
+    );
+    let metrics = client.pool().metrics();
+    assert_eq!(
+        metrics.connections_created, 1,
+        "{engine}: a failed query must not open a new connection"
+    );
+    assert_eq!(
+        metrics.connections_failed_health_check, 0,
+        "{engine}: the deferred RESET reply must not look like a broken connection"
+    );
+    client.close().await;
+}
+
+fn pool_config() -> PoolConfig {
+    PoolConfig::new()
+        .with_min_idle(0)
+        .with_max_size(1)
+        .with_test_on_idle_after(Some(Duration::from_secs(30)))
+}
+
+#[tokio::test]
+async fn test_live_neo4j_pool_error_then_next_query_recovers() {
+    let host = test_host();
+    let uri = format!("bolt://{NEO4J_USER}:{NEO4J_PASS}@{host}:7687");
+    let Ok(client) = NativeClient::new(&uri, Some(pool_config())) else {
+        eprintln!("[SKIP] Neo4j is not reachable on {host}:7687");
+        return;
+    };
+    if client.ping().await.is_err() {
+        eprintln!("[SKIP] Neo4j is not reachable on {host}:7687");
+        return;
+    }
+    assert_pool_error_then_next_query_succeeds(&client, "Neo4j").await;
+}
+
+#[tokio::test]
+async fn test_live_memgraph_pool_error_then_next_query_recovers() {
+    let host = test_host();
+    let uri = format!("bolt://{host}:7688");
+    let Ok(client) = NativeClient::new(&uri, Some(pool_config())) else {
+        eprintln!("[SKIP] Memgraph is not reachable on {host}:7688");
+        return;
+    };
+    if client.ping().await.is_err() {
+        eprintln!("[SKIP] Memgraph is not reachable on {host}:7688");
+        return;
+    }
+    assert_pool_error_then_next_query_succeeds(&client, "Memgraph").await;
 }

@@ -737,9 +737,19 @@ async fn test_sec2_bolt_cancellation_and_failed_reset_poison_connection() {
         .execute("BAD QUERY", &HashMap::new())
         .await
         .unwrap_err();
+    // The RESET is written but not awaited, so the failure is detected on the
+    // next request instead of costing a synchronous round trip here.
+    assert!(
+        conn2.is_valid(),
+        "deferred RESET is acknowledged lazily (err={err:?})"
+    );
+    assert!(
+        conn2.reset().await.is_err(),
+        "the unanswered RESET must surface on the next request"
+    );
     assert!(
         !conn2.is_valid(),
-        "failed RESET must keep is_valid == false (err={err:?})"
+        "a connection whose RESET never succeeded must not stay valid"
     );
 }
 

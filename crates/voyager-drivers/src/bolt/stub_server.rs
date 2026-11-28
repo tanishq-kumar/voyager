@@ -21,6 +21,8 @@ pub struct BoltStubServer {
     server_task: JoinHandle<()>,
     reset_count: Arc<AtomicUsize>,
     run_count: Arc<AtomicUsize>,
+    connection_count: Arc<AtomicUsize>,
+    hello_count: Arc<AtomicUsize>,
 }
 
 impl BoltStubServer {
@@ -35,18 +37,24 @@ impl BoltStubServer {
 
         let reset_count = Arc::new(AtomicUsize::new(0));
         let run_count = Arc::new(AtomicUsize::new(0));
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let hello_count = Arc::new(AtomicUsize::new(0));
         let reset_clone = reset_count.clone();
         let run_clone = run_count.clone();
+        let connection_clone = connection_count.clone();
+        let hello_clone = hello_count.clone();
 
         let server_task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
+                connection_clone.fetch_add(1, Ordering::SeqCst);
                 // Without TCP_NODELAY the scripted responses hit Linux delayed
                 // ACK, adding ~41 ms to every loopback test query.
                 let _ = socket.set_nodelay(true);
                 let resets = reset_clone.clone();
                 let runs = run_clone.clone();
+                let hellos = hello_clone.clone();
                 tokio::spawn(async move {
-                    let _ = Self::handle_connection(&mut socket, resets, runs).await;
+                    let _ = Self::handle_connection(&mut socket, resets, runs, hellos).await;
                 });
             }
         });
@@ -56,6 +64,8 @@ impl BoltStubServer {
             server_task,
             reset_count,
             run_count,
+            connection_count,
+            hello_count,
         })
     }
 
@@ -67,6 +77,16 @@ impl BoltStubServer {
     /// Returns the total number of Bolt `RUN` messages received by this stub server.
     pub fn run_count(&self) -> usize {
         self.run_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the total number of TCP connections accepted by this stub server.
+    pub fn connection_count(&self) -> usize {
+        self.connection_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns the total number of Bolt `HELLO` messages received by this stub server.
+    pub fn hello_count(&self) -> usize {
+        self.hello_count.load(Ordering::SeqCst)
     }
 
     /// Returns the socket address `127.0.0.1:port` of the running stub server.
@@ -83,6 +103,7 @@ impl BoltStubServer {
         socket: &mut TcpStream,
         reset_count: Arc<AtomicUsize>,
         run_count: Arc<AtomicUsize>,
+        hello_count: Arc<AtomicUsize>,
     ) -> Result<()> {
         // 1. Read 20-byte Handshake
         let mut handshake = [0u8; 20];
@@ -110,6 +131,7 @@ impl BoltStubServer {
         // 2. Read HELLO
         let mut frame = read_message_frame(socket).await?;
         let _hello_val = PackStream::decode(&mut frame)?;
+        hello_count.fetch_add(1, Ordering::SeqCst);
 
         // Reply SUCCESS to HELLO
         let mut hello_meta = HashMap::new();
