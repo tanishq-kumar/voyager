@@ -945,7 +945,7 @@ impl PackStream {
 
     // --- Encoders ---
 
-    fn encode_integer(val: i64, buf: &mut BytesMut) {
+    pub(crate) fn encode_integer(val: i64, buf: &mut BytesMut) {
         if (-16..=127).contains(&val) {
             buf.put_u8((val as i8) as u8);
         } else if (i8::MIN as i64..=i8::MAX as i64).contains(&val) {
@@ -963,7 +963,7 @@ impl PackStream {
         }
     }
 
-    fn encode_bytes(bytes: &[u8], buf: &mut BytesMut) {
+    pub(crate) fn encode_bytes(bytes: &[u8], buf: &mut BytesMut) {
         let len = bytes.len();
         if len <= u8::MAX as usize {
             buf.put_u8(0xCC);
@@ -978,7 +978,7 @@ impl PackStream {
         buf.put_slice(bytes);
     }
 
-    fn encode_string(s: &str, buf: &mut BytesMut) {
+    pub(crate) fn encode_string(s: &str, buf: &mut BytesMut) {
         let len = s.len();
         if len <= 15 {
             buf.put_u8(0x80 | (len as u8));
@@ -995,8 +995,7 @@ impl PackStream {
         buf.put_slice(s.as_bytes());
     }
 
-    fn encode_list(list: &[BoltValue], buf: &mut BytesMut) {
-        let len = list.len();
+    pub(crate) fn encode_list_header(len: usize, buf: &mut BytesMut) {
         if len <= 15 {
             buf.put_u8(0x90 | (len as u8));
         } else if len <= u8::MAX as usize {
@@ -1009,13 +1008,16 @@ impl PackStream {
             buf.put_u8(0xD6);
             buf.put_u32(len as u32);
         }
+    }
+
+    fn encode_list(list: &[BoltValue], buf: &mut BytesMut) {
+        Self::encode_list_header(list.len(), buf);
         for item in list {
             Self::encode(item, buf);
         }
     }
 
-    fn encode_map(map: &HashMap<String, BoltValue>, buf: &mut BytesMut) {
-        let len = map.len();
+    pub(crate) fn encode_map_header(len: usize, buf: &mut BytesMut) {
         if len <= 15 {
             buf.put_u8(0xA0 | (len as u8));
         } else if len <= u8::MAX as usize {
@@ -1028,14 +1030,17 @@ impl PackStream {
             buf.put_u8(0xDA);
             buf.put_u32(len as u32);
         }
+    }
+
+    pub(crate) fn encode_map(map: &HashMap<String, BoltValue>, buf: &mut BytesMut) {
+        Self::encode_map_header(map.len(), buf);
         for (k, v) in map {
             Self::encode_string(k, buf);
             Self::encode(v, buf);
         }
     }
 
-    fn encode_structure(tag: u8, fields: &[BoltValue], buf: &mut BytesMut) {
-        let len = fields.len();
+    pub(crate) fn encode_struct_header(tag: u8, len: usize, buf: &mut BytesMut) {
         if len <= 15 {
             buf.put_u8(0xB0 | (len as u8));
         } else if len <= u8::MAX as usize {
@@ -1046,9 +1051,225 @@ impl PackStream {
             buf.put_u16(len as u16);
         }
         buf.put_u8(tag);
+    }
+
+    fn encode_structure(tag: u8, fields: &[BoltValue], buf: &mut BytesMut) {
+        Self::encode_struct_header(tag, fields.len(), buf);
         for field in fields {
             Self::encode(field, buf);
         }
+    }
+
+    #[cfg(feature = "bolt")]
+    pub(crate) fn encode_json_value(json: &serde_json::Value, buf: &mut BytesMut) {
+        match json {
+            serde_json::Value::Null => buf.put_u8(0xC0),
+            serde_json::Value::Bool(false) => buf.put_u8(0xC2),
+            serde_json::Value::Bool(true) => buf.put_u8(0xC3),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Self::encode_integer(i, buf);
+                } else if let Some(f) = n.as_f64() {
+                    buf.put_u8(0xC1);
+                    buf.put_f64(f);
+                } else {
+                    buf.put_u8(0xC0);
+                }
+            }
+            serde_json::Value::String(s) => Self::encode_string(s, buf),
+            serde_json::Value::Array(arr) => {
+                Self::encode_list_header(arr.len(), buf);
+                for item in arr {
+                    Self::encode_json_value(item, buf);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                Self::encode_map_header(obj.len(), buf);
+                for (k, v) in obj {
+                    Self::encode_string(k, buf);
+                    Self::encode_json_value(v, buf);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "bolt")]
+    pub(crate) fn encode_param_value(
+        param: &ParamValue,
+        bolt_major: u8,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        match param {
+            ParamValue::Json(v) => {
+                Self::encode_json_value(v, buf);
+                Ok(())
+            }
+            ParamValue::Jsonb(inner) => Self::encode_param_value(inner, bolt_major, buf),
+            ParamValue::Float(f) => {
+                buf.put_u8(0xC1);
+                buf.put_f64(*f);
+                Ok(())
+            }
+            ParamValue::Bytes(b) => {
+                Self::encode_bytes(b, buf);
+                Ok(())
+            }
+            ParamValue::Date { year, month, day } => {
+                let date = BoltDate::from_ymd(*year, *month as u32, *day as u32)?;
+                Self::encode_struct_header(0x44, 1, buf);
+                Self::encode_integer(date.days, buf);
+                Ok(())
+            }
+            ParamValue::Time {
+                hour,
+                minute,
+                second,
+                nanosecond,
+                tz_offset_seconds,
+            } => {
+                let nanos = ((*hour as i64) * 3_600 + (*minute as i64) * 60 + (*second as i64))
+                    * 1_000_000_000
+                    + (*nanosecond as i64);
+                match tz_offset_seconds {
+                    Some(off) => {
+                        Self::encode_struct_header(0x54, 2, buf);
+                        Self::encode_integer(nanos, buf);
+                        Self::encode_integer(*off as i64, buf);
+                    }
+                    None => {
+                        Self::encode_struct_header(0x74, 1, buf);
+                        Self::encode_integer(nanos, buf);
+                    }
+                }
+                Ok(())
+            }
+            ParamValue::LocalDateTime {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                nanosecond,
+            } => {
+                let date = BoltDate::from_ymd(*year, *month as u32, *day as u32)?;
+                let seconds = date.days * 86_400
+                    + (*hour as i64) * 3_600
+                    + (*minute as i64) * 60
+                    + (*second as i64);
+                Self::encode_struct_header(0x64, 2, buf);
+                Self::encode_integer(seconds, buf);
+                Self::encode_integer(*nanosecond as i64, buf);
+                Ok(())
+            }
+            ParamValue::DateTime {
+                utc_seconds,
+                nanosecond,
+                tz,
+            } => {
+                if bolt_major >= 5 {
+                    match tz {
+                        ParamTimezone::OffsetSeconds(off) => {
+                            Self::encode_struct_header(0x49, 3, buf);
+                            Self::encode_integer(*utc_seconds, buf);
+                            Self::encode_integer(*nanosecond as i64, buf);
+                            Self::encode_integer(*off as i64, buf);
+                        }
+                        ParamTimezone::ZoneId { id, .. } => {
+                            Self::encode_struct_header(0x69, 3, buf);
+                            Self::encode_integer(*utc_seconds, buf);
+                            Self::encode_integer(*nanosecond as i64, buf);
+                            Self::encode_string(id, buf);
+                        }
+                    }
+                } else {
+                    match tz {
+                        ParamTimezone::OffsetSeconds(off) => {
+                            let local_secs = utc_seconds.saturating_add(*off as i64);
+                            Self::encode_struct_header(0x46, 3, buf);
+                            Self::encode_integer(local_secs, buf);
+                            Self::encode_integer(*nanosecond as i64, buf);
+                            Self::encode_integer(*off as i64, buf);
+                        }
+                        ParamTimezone::ZoneId { id, offset_seconds } => {
+                            let local_secs = utc_seconds.saturating_add(*offset_seconds as i64);
+                            Self::encode_struct_header(0x66, 3, buf);
+                            Self::encode_integer(local_secs, buf);
+                            Self::encode_integer(*nanosecond as i64, buf);
+                            Self::encode_string(id, buf);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ParamValue::Duration {
+                months,
+                days,
+                seconds,
+                nanoseconds,
+            } => {
+                Self::encode_struct_header(0x45, 4, buf);
+                Self::encode_integer(*months, buf);
+                Self::encode_integer(*days, buf);
+                Self::encode_integer(*seconds, buf);
+                Self::encode_integer(*nanoseconds, buf);
+                Ok(())
+            }
+            ParamValue::Uuid(s) => {
+                Self::encode_string(s, buf);
+                Ok(())
+            }
+            ParamValue::Decimal(s) => {
+                let f = parse_decimal_f64(s).ok_or_else(|| {
+                    NetError::ProtocolError(format!("Invalid decimal parameter value: {s:?}"))
+                })?;
+                buf.put_u8(0xC1);
+                buf.put_f64(f);
+                Ok(())
+            }
+            ParamValue::Point2D { srid, x, y } => {
+                Self::encode_struct_header(0x58, 3, buf);
+                Self::encode_integer(*srid, buf);
+                buf.put_u8(0xC1);
+                buf.put_f64(*x);
+                buf.put_u8(0xC1);
+                buf.put_f64(*y);
+                Ok(())
+            }
+            ParamValue::Point3D { srid, x, y, z } => {
+                Self::encode_struct_header(0x59, 4, buf);
+                Self::encode_integer(*srid, buf);
+                buf.put_u8(0xC1);
+                buf.put_f64(*x);
+                buf.put_u8(0xC1);
+                buf.put_f64(*y);
+                buf.put_u8(0xC1);
+                buf.put_f64(*z);
+                Ok(())
+            }
+            ParamValue::List(items) => {
+                Self::encode_list_header(items.len(), buf);
+                for item in items {
+                    Self::encode_param_value(item, bolt_major, buf)?;
+                }
+                Ok(())
+            }
+            ParamValue::Map(map) => Self::encode_param_map(map, bolt_major, buf),
+        }
+    }
+
+    #[cfg(feature = "bolt")]
+    pub(crate) fn encode_param_map(
+        map: &HashMap<String, ParamValue>,
+        bolt_major: u8,
+        buf: &mut BytesMut,
+    ) -> Result<()> {
+        Self::encode_map_header(map.len(), buf);
+        for (k, v) in map {
+            Self::encode_string(k, buf);
+            Self::encode_param_value(v, bolt_major, buf)?;
+        }
+        Ok(())
     }
 
     fn encode_node(node: &BoltNode, buf: &mut BytesMut) {

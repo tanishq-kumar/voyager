@@ -7,16 +7,19 @@
 
 use arrow_array::RecordBatch;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::bolt::{
     BoltDate, BoltDuration, BoltLocalDateTime, BoltLocalTime, BoltNode, BoltPath, BoltPoint2D,
     BoltRelationship, BoltUnboundRelationship, BoltValue,
 };
-use crate::engine::{QueryResult, QuerySummary};
+use crate::engine::{QueryResult, QuerySummary, ResultMode};
 use crate::error::{NetError, Result};
 use crate::redis::resp::RespValue;
+use crate::value::DurationParts;
+use crate::value::Point2D;
 use crate::value::arrow::values_to_record_batch;
-use crate::value::result::ResultValue;
+use crate::value::result::{ResultMap, ResultNode, ResultPath, ResultRelationship, ResultValue};
 
 /// Parsed execution statistics from FalkorDB query execution.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -715,6 +718,24 @@ impl FalkorCompactResult {
 
     /// Converts compact rows into [`ResultValue`]s once and builds an Arrow [`QueryResult`].
     pub fn to_query_result(&self, schema: &FalkorGraphSchema) -> Result<QueryResult> {
+        self.to_query_result_internal(schema, None)
+    }
+
+    /// Converts compact rows directly into [`ResultValue`]s according to `mode`
+    /// (`Rows` skips Arrow construction; `Arrow` skips retaining `result_rows`).
+    pub fn to_query_result_with_mode(
+        &self,
+        schema: &FalkorGraphSchema,
+        mode: ResultMode,
+    ) -> Result<QueryResult> {
+        self.to_query_result_internal(schema, Some(mode))
+    }
+
+    fn to_query_result_internal(
+        &self,
+        schema: &FalkorGraphSchema,
+        mode: Option<ResultMode>,
+    ) -> Result<QueryResult> {
         let summary = self.statistics.to_query_summary();
         if self.columns.is_empty() {
             return Ok(QueryResult::empty(summary));
@@ -724,20 +745,32 @@ impl FalkorCompactResult {
         for row in &self.rows {
             let mut result_row = Vec::with_capacity(row.len());
             for cell in row {
-                result_row.push(crate::value::result::ResultValue::from(
-                    decode_compact_cell(cell, schema)?,
-                ));
+                result_row.push(decode_compact_cell_to_result(cell, schema)?);
             }
             result_rows.push(result_row);
         }
 
-        let batch = crate::value::arrow::values_to_record_batch(&self.columns, &result_rows)?;
-        let needs_raw = crate::value::arrow::batch_needs_raw_rows(&batch);
-        let result = QueryResult::new(self.columns.clone(), vec![batch], summary);
-        if needs_raw {
-            Ok(result.with_result_rows(result_rows))
-        } else {
-            Ok(result)
+        match mode {
+            Some(ResultMode::Rows) => Ok(QueryResult::from_rows(
+                self.columns.clone(),
+                result_rows,
+                Vec::new(),
+                summary,
+            )),
+            Some(ResultMode::Arrow) => {
+                let batch = values_to_record_batch(&self.columns, &result_rows)?;
+                Ok(QueryResult::new(self.columns.clone(), vec![batch], summary))
+            }
+            None => {
+                let batch = values_to_record_batch(&self.columns, &result_rows)?;
+                let needs_raw = crate::value::arrow::batch_needs_raw_rows(&batch);
+                let result = QueryResult::new(self.columns.clone(), vec![batch], summary);
+                if needs_raw {
+                    Ok(result.with_result_rows(result_rows))
+                } else {
+                    Ok(result)
+                }
+            }
         }
     }
 }
@@ -1102,4 +1135,344 @@ pub fn decode_compact_cell(cell: &RespValue, schema: &FalkorGraphSchema) -> Resu
         }
         _ => Ok(resp_to_bolt_value(val)),
     }
+}
+
+fn resp_to_result_value(val: &RespValue) -> ResultValue {
+    match val {
+        RespValue::Null | RespValue::BulkString(None) | RespValue::Array(None) => ResultValue::Null,
+        RespValue::Boolean(b) => ResultValue::Bool(*b),
+        RespValue::Integer(i) => ResultValue::Int(*i),
+        RespValue::Double(f) => ResultValue::Float(*f),
+        RespValue::SimpleString(s) | RespValue::BigNumber(s) => {
+            ResultValue::Str(s.clone().into_boxed_str())
+        }
+        RespValue::BulkString(Some(b)) => {
+            ResultValue::Str(String::from_utf8_lossy(b).into_owned().into_boxed_str())
+        }
+        RespValue::Array(Some(arr)) | RespValue::Set(arr) | RespValue::Push(arr) => {
+            ResultValue::List(
+                arr.iter()
+                    .map(resp_to_result_value)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        }
+        RespValue::Map(pairs) => {
+            let mut entries: Vec<(Arc<str>, ResultValue)> = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                let key: Arc<str> = Arc::from(k.to_string_lossy());
+                let val = resp_to_result_value(v);
+                if let Some((_, existing)) = entries
+                    .iter_mut()
+                    .find(|(ek, _)| ek.as_ref() == key.as_ref())
+                {
+                    *existing = val;
+                } else {
+                    entries.push((key, val));
+                }
+            }
+            ResultValue::Map(ResultMap::from_entries(entries))
+        }
+        other => ResultValue::Str(other.to_string_lossy().into_boxed_str()),
+    }
+}
+
+fn decode_compact_properties_to_result(
+    props_val: &RespValue,
+    schema: &FalkorGraphSchema,
+) -> Result<ResultMap> {
+    let Some(items) = props_val.as_array() else {
+        return Ok(ResultMap::new());
+    };
+    let mut entries: Vec<(Arc<str>, ResultValue)> = Vec::with_capacity(items.len());
+    for prop in items {
+        if let Some(parts) = prop.as_array()
+            && parts.len() >= 3
+        {
+            let prop_idx = parts[0].as_i64().unwrap_or(-1);
+            let key: Arc<str> = usize::try_from(prop_idx)
+                .ok()
+                .and_then(|idx| schema.properties.get(idx))
+                .map(|s| Arc::from(s.as_str()))
+                .unwrap_or_else(|| Arc::from(format!("prop_{}", prop_idx)));
+            let val = if let Some(scalar_type) = parts[1].as_i64() {
+                decode_compact_typed_value_to_result(scalar_type, &parts[2], schema)?
+            } else {
+                resp_to_result_value(&parts[2])
+            };
+            if let Some((_, existing)) = entries
+                .iter_mut()
+                .find(|(ek, _)| ek.as_ref() == key.as_ref())
+            {
+                *existing = val;
+            } else {
+                entries.push((key, val));
+            }
+        }
+    }
+    Ok(ResultMap::from_entries(entries))
+}
+
+fn decode_compact_node_to_result(
+    val: &RespValue,
+    schema: &FalkorGraphSchema,
+) -> Result<ResultNode> {
+    let fields = val.as_array().ok_or_else(|| {
+        NetError::ProtocolError(format!(
+            "Expected compact FalkorDB node array, got {:?}",
+            val
+        ))
+    })?;
+    if fields.len() < 3 {
+        return Err(NetError::ProtocolError(format!(
+            "Compact FalkorDB node array too short: {:?}",
+            fields
+        )));
+    }
+    let id = fields[0].as_i64().unwrap_or(0);
+    let mut labels = Vec::new();
+    if let Some(lbl_ids) = fields[1].as_array() {
+        labels.reserve(lbl_ids.len());
+        for lbl_id_val in lbl_ids {
+            if let Some(lbl_id) = lbl_id_val.as_i64()
+                && let Ok(idx) = usize::try_from(lbl_id)
+                && let Some(name) = schema.labels.get(idx)
+            {
+                labels.push(Arc::from(name.as_str()));
+            }
+        }
+    }
+    let properties = decode_compact_properties_to_result(&fields[2], schema)?;
+    Ok(ResultNode {
+        id,
+        labels,
+        properties,
+        element_id: None,
+    })
+}
+
+fn decode_compact_edge_to_result(
+    val: &RespValue,
+    schema: &FalkorGraphSchema,
+) -> Result<ResultRelationship> {
+    let fields = val.as_array().ok_or_else(|| {
+        NetError::ProtocolError(format!(
+            "Expected compact FalkorDB edge array, got {:?}",
+            val
+        ))
+    })?;
+    if fields.len() < 5 {
+        return Err(NetError::ProtocolError(format!(
+            "Compact FalkorDB edge array too short: {:?}",
+            fields
+        )));
+    }
+    let id = fields[0].as_i64().unwrap_or(0);
+    let rel_idx = fields[1].as_i64().unwrap_or(-1);
+    let rel_type: Arc<str> = usize::try_from(rel_idx)
+        .ok()
+        .and_then(|idx| schema.relationships.get(idx))
+        .map(|s| Arc::from(s.as_str()))
+        .unwrap_or_else(|| Arc::from(""));
+    let start_node_id = fields[2].as_i64().unwrap_or(0);
+    let end_node_id = fields[3].as_i64().unwrap_or(0);
+    let properties = decode_compact_properties_to_result(&fields[4], schema)?;
+    Ok(ResultRelationship {
+        id,
+        start_node_id,
+        end_node_id,
+        rel_type,
+        properties,
+        element_id: None,
+        start_element_id: None,
+        end_element_id: None,
+    })
+}
+
+fn decode_compact_typed_value_to_result(
+    scalar_type: i64,
+    val: &RespValue,
+    schema: &FalkorGraphSchema,
+) -> Result<ResultValue> {
+    match scalar_type {
+        0 | 1 => Ok(ResultValue::Null),
+        2 => Ok(ResultValue::Str(val.to_string_lossy().into_boxed_str())),
+        3 => Ok(ResultValue::Int(val.as_i64().unwrap_or(0))),
+        4 => Ok(ResultValue::Bool(val.as_bool().unwrap_or(false))),
+        5 => Ok(ResultValue::Float(val.as_f64().unwrap_or(0.0))),
+        6 => {
+            let mut out = Vec::new();
+            if let Some(items) = val.as_array() {
+                out.reserve(items.len());
+                for item in items {
+                    out.push(decode_compact_cell_to_result(item, schema)?);
+                }
+            }
+            Ok(ResultValue::List(out.into_boxed_slice()))
+        }
+        7 => Ok(ResultValue::Relationship(Box::new(
+            decode_compact_edge_to_result(val, schema)?,
+        ))),
+        8 => Ok(ResultValue::Node(Box::new(decode_compact_node_to_result(
+            val, schema,
+        )?))),
+        9 => {
+            let parts = val.as_array().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected compact FalkorDB path array, got {:?}",
+                    val
+                ))
+            })?;
+            if parts.len() < 2 {
+                return Err(NetError::ProtocolError(
+                    "Compact FalkorDB path array missing nodes or edges".to_string(),
+                ));
+            }
+            let raw_nodes = match decode_compact_cell_to_result(&parts[0], schema)? {
+                ResultValue::List(items) => items,
+                _ => Box::from([]),
+            };
+            let raw_edges = match decode_compact_cell_to_result(&parts[1], schema)? {
+                ResultValue::List(items) => items,
+                _ => Box::from([]),
+            };
+            let mut nodes = Vec::with_capacity(raw_nodes.len());
+            for n in raw_nodes {
+                if let ResultValue::Node(node) = n {
+                    nodes.push(*node);
+                }
+            }
+            let mut relationships = Vec::with_capacity(raw_edges.len());
+            for (idx, edge_val) in raw_edges.into_iter().enumerate() {
+                if let ResultValue::Relationship(mut rel) = edge_val {
+                    if let (Some(prev), Some(next)) = (nodes.get(idx), nodes.get(idx + 1)) {
+                        let forward = rel.start_node_id == prev.id && rel.end_node_id == next.id;
+                        if forward {
+                            rel.start_node_id = prev.id;
+                            rel.end_node_id = next.id;
+                        } else {
+                            rel.start_node_id = next.id;
+                            rel.end_node_id = prev.id;
+                        }
+                    }
+                    relationships.push(*rel);
+                }
+            }
+            Ok(ResultValue::Path(Box::new(ResultPath {
+                nodes,
+                relationships,
+            })))
+        }
+        10 => {
+            let mut entries: Vec<(Arc<str>, ResultValue)> = Vec::new();
+            if let Some(items) = val.as_array() {
+                entries.reserve(items.len() / 2);
+                let mut i = 0;
+                while i + 1 < items.len() {
+                    let key: Arc<str> = Arc::from(items[i].to_string_lossy());
+                    let v = decode_compact_cell_to_result(&items[i + 1], schema)?;
+                    if let Some((_, existing)) = entries
+                        .iter_mut()
+                        .find(|(ek, _)| ek.as_ref() == key.as_ref())
+                    {
+                        *existing = v;
+                    } else {
+                        entries.push((key, v));
+                    }
+                    i += 2;
+                }
+            }
+            Ok(ResultValue::Map(ResultMap::from_entries(entries)))
+        }
+        11 => {
+            if let Some(coords) = val.as_array()
+                && coords.len() >= 2
+            {
+                let lat = coords[0].as_f64().unwrap_or(0.0);
+                let lon = coords[1].as_f64().unwrap_or(0.0);
+                Ok(ResultValue::Point2D(Box::new(Point2D {
+                    srid: 4326,
+                    x: lon,
+                    y: lat,
+                })))
+            } else {
+                Ok(resp_to_result_value(val))
+            }
+        }
+        12 => {
+            let mut floats = Vec::new();
+            if let Some(items) = val.as_array() {
+                floats.reserve(items.len());
+                for item in items {
+                    if let Some(f) = item.as_f64() {
+                        floats.push(ResultValue::Float(f));
+                    }
+                }
+            }
+            Ok(ResultValue::List(floats.into_boxed_slice()))
+        }
+        13 => {
+            let secs = val.as_i64().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected integer payload for FalkorDB DATETIME cell (tag 13), got {val:?}"
+                ))
+            })?;
+            Ok(ResultValue::LocalDateTime {
+                seconds: secs,
+                nanoseconds: 0,
+            })
+        }
+        14 => {
+            let secs = val.as_i64().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected integer payload for FalkorDB DATE cell (tag 14), got {val:?}"
+                ))
+            })?;
+            Ok(ResultValue::Date(secs.div_euclid(86_400)))
+        }
+        15 => {
+            let raw_secs = val.as_i64().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected integer payload for FalkorDB TIME cell (tag 15), got {val:?}"
+                ))
+            })?;
+            Ok(ResultValue::LocalTime(
+                raw_secs.rem_euclid(86_400).saturating_mul(1_000_000_000),
+            ))
+        }
+        16 => {
+            let total_secs = val.as_i64().ok_or_else(|| {
+                NetError::ProtocolError(format!(
+                    "Expected integer payload for FalkorDB DURATION cell (tag 16), got {val:?}"
+                ))
+            })?;
+            let days = total_secs.div_euclid(86_400);
+            let secs = total_secs.rem_euclid(86_400);
+            Ok(ResultValue::Duration(Box::new(DurationParts {
+                months: 0,
+                days,
+                seconds: secs,
+                nanoseconds: 0,
+            })))
+        }
+        _ => Ok(resp_to_result_value(val)),
+    }
+}
+
+/// Decodes one compact FalkorDB `[scalar_type, value]` cell directly into [`ResultValue`],
+/// avoiding the intermediate [`BoltValue`] enum allocation.
+pub(crate) fn decode_compact_cell_to_result(
+    cell: &RespValue,
+    schema: &FalkorGraphSchema,
+) -> Result<ResultValue> {
+    let Some(pair) = cell.as_array() else {
+        return Ok(resp_to_result_value(cell));
+    };
+    if pair.len() < 2 {
+        return Ok(resp_to_result_value(cell));
+    }
+    let Some(scalar_type) = pair[0].as_i64() else {
+        return Ok(resp_to_result_value(cell));
+    };
+    decode_compact_typed_value_to_result(scalar_type, &pair[1], schema)
 }

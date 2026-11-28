@@ -10,10 +10,12 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::config::Auth;
-use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
+use crate::engine::{AsyncConnection, QueryResult, QuerySummary, ResultMode};
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
-use crate::postgres::agtype::rows_to_record_batch_with_column_metadata_and_bolt_rows;
+use crate::postgres::agtype::{
+    PgRowDecoder, rows_to_record_batch_with_column_metadata_and_bolt_rows,
+};
 use crate::postgres::auth::{ScramClient, compute_md5_password};
 use crate::postgres::codec::{
     DEFAULT_READ_BUFFER_CAPACITY, read_backend_message, write_frontend_message,
@@ -633,6 +635,7 @@ impl PostgresConnection {
         let result = self
             .execute_simple_inner(
                 "SELECT oid FROM pg_catalog.pg_type                  WHERE typname = 'agtype' AND typnamespace = 'ag_catalog'::regnamespace;",
+                None,
             )
             .await?;
         let Some(batch) = result.batches.first() else {
@@ -661,8 +664,16 @@ impl PostgresConnection {
 
     /// Executes a simple query string via PostgreSQL Simple Query Protocol (`'Q'`).
     pub async fn execute_simple(&mut self, query: &str) -> Result<QueryResult> {
+        self.execute_simple_with_timeout(query, None).await
+    }
+
+    async fn execute_simple_with_timeout(
+        &mut self,
+        query: &str,
+        mode: Option<ResultMode>,
+    ) -> Result<QueryResult> {
         if let Some(to) = self.query_timeout {
-            match tokio::time::timeout(to, self.execute_simple_inner(query)).await {
+            match tokio::time::timeout(to, self.execute_simple_inner(query, mode)).await {
                 Ok(res) => res,
                 Err(_) => {
                     self.transaction_status = TransactionStatus::FailedTransaction;
@@ -673,7 +684,7 @@ impl PostgresConnection {
                 }
             }
         } else {
-            self.execute_simple_inner(query).await
+            self.execute_simple_inner(query, mode).await
         }
     }
 
@@ -740,7 +751,11 @@ impl PostgresConnection {
         }
     }
 
-    async fn execute_simple_inner(&mut self, query: &str) -> Result<QueryResult> {
+    async fn execute_simple_inner(
+        &mut self,
+        query: &str,
+        mode: Option<ResultMode>,
+    ) -> Result<QueryResult> {
         if self.is_broken {
             return Err(NetError::Closed(
                 "PostgreSQL connection is closed or broken".to_string(),
@@ -752,34 +767,75 @@ impl PostgresConnection {
         write_frontend_message(&mut self.stream, &FrontendMessage::Query(query.to_string()))
             .await?;
 
-        let mut columns = Vec::new();
-        let mut field_types: Vec<i32> = Vec::new();
-        let mut field_type_modifiers: Vec<i32> = Vec::new();
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         let mut summary = QuerySummary::empty();
         let mut query_error = None;
+        let mut decode_error: Option<NetError> = None;
+
+        enum SimpleCollector {
+            Legacy {
+                columns: Vec<String>,
+                field_types: Vec<i32>,
+                field_type_modifiers: Vec<i32>,
+                rows: Vec<Vec<Option<String>>>,
+            },
+            Direct(PgRowDecoder),
+        }
+
+        let mut collector = match mode {
+            Some(m) => SimpleCollector::Direct(PgRowDecoder::new(m)),
+            None => SimpleCollector::Legacy {
+                columns: Vec::new(),
+                field_types: Vec::new(),
+                field_type_modifiers: Vec::new(),
+                rows: Vec::new(),
+            },
+        };
 
         loop {
             let msg = read_backend_message(&mut self.stream, &mut self.read_buf).await?;
             match msg {
-                BackendMessage::RowDescription(fields) => {
-                    field_types = fields.iter().map(|f| f.type_oid).collect();
-                    field_type_modifiers = fields.iter().map(|f| f.type_modifier).collect();
-                    columns = fields.into_iter().map(|f| f.name).collect();
-                }
-                BackendMessage::DataRow(vals) => {
-                    let mut row = Vec::with_capacity(vals.len());
-                    for val in vals {
-                        match val {
-                            Some(bytes) => {
-                                let s = String::from_utf8_lossy(&bytes).into_owned();
-                                row.push(Some(s));
+                BackendMessage::RowDescription(fields) => match &mut collector {
+                    SimpleCollector::Legacy {
+                        columns,
+                        field_types,
+                        field_type_modifiers,
+                        ..
+                    } => {
+                        *field_types = fields.iter().map(|f| f.type_oid).collect();
+                        *field_type_modifiers = fields.iter().map(|f| f.type_modifier).collect();
+                        *columns = fields.into_iter().map(|f| f.name).collect();
+                    }
+                    SimpleCollector::Direct(decoder) => {
+                        let field_types: Vec<i32> = fields.iter().map(|f| f.type_oid).collect();
+                        let field_type_modifiers: Vec<i32> =
+                            fields.iter().map(|f| f.type_modifier).collect();
+                        let columns: Vec<String> = fields.into_iter().map(|f| f.name).collect();
+                        let age_cols = self.age_columns(&field_types);
+                        decoder.set_schema(columns, &field_types, &field_type_modifiers, &age_cols);
+                    }
+                },
+                BackendMessage::DataRow(vals) => match &mut collector {
+                    SimpleCollector::Legacy { rows, .. } => {
+                        let mut row = Vec::with_capacity(vals.len());
+                        for val in vals {
+                            match val {
+                                Some(bytes) => {
+                                    let s = String::from_utf8_lossy(&bytes).into_owned();
+                                    row.push(Some(s));
+                                }
+                                None => row.push(None),
                             }
-                            None => row.push(None),
+                        }
+                        rows.push(row);
+                    }
+                    SimpleCollector::Direct(decoder) => {
+                        if decode_error.is_none()
+                            && let Err(err) = decoder.push_row(vals)
+                        {
+                            decode_error = Some(err);
                         }
                     }
-                    rows.push(row);
-                }
+                },
                 BackendMessage::CommandComplete(tag) => {
                     self.last_command_tag = Some(tag.clone());
                     parse_command_tag(&tag, &mut summary);
@@ -790,7 +846,9 @@ impl PostgresConnection {
                     break;
                 }
                 BackendMessage::ErrorResponse(diag) => {
-                    query_error = Some(NetError::ProtocolError(diag.format_error()));
+                    if query_error.is_none() {
+                        query_error = Some(NetError::ProtocolError(diag.format_error()));
+                    }
                 }
                 BackendMessage::EmptyQueryResponse => {}
                 BackendMessage::NoticeResponse(_) => {}
@@ -806,29 +864,42 @@ impl PostgresConnection {
         if let Some(err) = query_error {
             return Err(err);
         }
+        if let Some(err) = decode_error {
+            return Err(err);
+        }
 
         summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
-        let age_cols = self.age_columns(&field_types);
-        let (batch, bolt_rows) = rows_to_record_batch_with_column_metadata_and_bolt_rows(
-            &columns,
-            &rows,
-            &age_cols,
-            &field_types,
-            &field_type_modifiers,
-            true,
-        )?;
-        let batches = if batch.num_rows() > 0 || !columns.is_empty() {
-            vec![batch]
-        } else {
-            Vec::new()
-        };
+        match collector {
+            SimpleCollector::Legacy {
+                columns,
+                field_types,
+                field_type_modifiers,
+                rows,
+            } => {
+                let age_cols = self.age_columns(&field_types);
+                let (batch, bolt_rows) = rows_to_record_batch_with_column_metadata_and_bolt_rows(
+                    &columns,
+                    &rows,
+                    &age_cols,
+                    &field_types,
+                    &field_type_modifiers,
+                    true,
+                )?;
+                let batches = if batch.num_rows() > 0 || !columns.is_empty() {
+                    vec![batch]
+                } else {
+                    Vec::new()
+                };
 
-        let mut result = QueryResult::new(columns, batches, summary);
-        if let Some(rows) = bolt_rows {
-            result = result.with_bolt_rows(rows);
+                let mut result = QueryResult::new(columns, batches, summary);
+                if let Some(rows) = bolt_rows {
+                    result = result.with_bolt_rows(rows);
+                }
+                Ok(result)
+            }
+            SimpleCollector::Direct(decoder) => decoder.finish(summary),
         }
-        Ok(result)
     }
 
     /// Executes a parameterized statement via the PostgreSQL extended query protocol.
@@ -844,6 +915,7 @@ impl PostgresConnection {
     async fn execute_extended_inner(
         &mut self,
         prepared: &PreparedPostgresStatement,
+        mode: Option<ResultMode>,
     ) -> Result<QueryResult> {
         if self.is_broken {
             return Err(NetError::Closed(
@@ -908,7 +980,9 @@ impl PostgresConnection {
             messages.push(FrontendMessage::Sync);
             write_frontend_messages(&mut self.stream, &messages).await?;
 
-            let response = read_extended_response(&mut self.stream, &mut self.read_buf).await?;
+            let response =
+                read_extended_response(&mut self.stream, &mut self.read_buf, mode, self.agtype_oid)
+                    .await?;
             self.transaction_status = response.transaction_status;
             self.is_broken = false;
             for (name, value) in response.parameter_status {
@@ -940,40 +1014,55 @@ impl PostgresConnection {
                 }
                 return Err(err);
             }
+            if let Some(err) = response.decode_error {
+                return Err(err);
+            }
 
             let mut summary = response.summary;
             summary.execution_time_ms = start_time.elapsed().as_millis() as u64;
 
-            let age_cols = self.age_columns(&response.field_types);
-            let (batch, bolt_rows) = rows_to_record_batch_with_column_metadata_and_bolt_rows(
-                &response.columns,
-                &response.rows,
-                &age_cols,
-                &response.field_types,
-                &response.field_type_modifiers,
-                true,
-            )?;
-            let batches = if batch.num_rows() > 0 || !response.columns.is_empty() {
-                vec![batch]
-            } else {
-                Vec::new()
-            };
+            match response.payload {
+                ExtendedPayload::Legacy {
+                    columns,
+                    field_types,
+                    field_type_modifiers,
+                    rows,
+                } => {
+                    let age_cols = self.age_columns(&field_types);
+                    let (batch, bolt_rows) =
+                        rows_to_record_batch_with_column_metadata_and_bolt_rows(
+                            &columns,
+                            &rows,
+                            &age_cols,
+                            &field_types,
+                            &field_type_modifiers,
+                            true,
+                        )?;
+                    let batches = if batch.num_rows() > 0 || !columns.is_empty() {
+                        vec![batch]
+                    } else {
+                        Vec::new()
+                    };
 
-            let mut result = QueryResult::new(response.columns, batches, summary);
-            if let Some(rows) = bolt_rows {
-                result = result.with_bolt_rows(rows);
+                    let mut result = QueryResult::new(columns, batches, summary);
+                    if let Some(rows) = bolt_rows {
+                        result = result.with_bolt_rows(rows);
+                    }
+                    return Ok(result);
+                }
+                ExtendedPayload::Direct(decoder) => return decoder.finish(summary),
             }
-            return Ok(result);
         }
     }
 
     /// Executes a prepared statement with the configured query timeout.
-    async fn execute_extended(
+    async fn execute_extended_with_timeout(
         &mut self,
         prepared: &PreparedPostgresStatement,
+        mode: Option<ResultMode>,
     ) -> Result<QueryResult> {
         if let Some(to) = self.query_timeout {
-            match tokio::time::timeout(to, self.execute_extended_inner(prepared)).await {
+            match tokio::time::timeout(to, self.execute_extended_inner(prepared, mode)).await {
                 Ok(res) => res,
                 Err(_) => {
                     self.transaction_status = TransactionStatus::FailedTransaction;
@@ -984,7 +1073,7 @@ impl PostgresConnection {
                 }
             }
         } else {
-            self.execute_extended_inner(prepared).await
+            self.execute_extended_inner(prepared, mode).await
         }
     }
 
@@ -1042,9 +1131,27 @@ impl AsyncConnection for PostgresConnection {
     ) -> Result<QueryResult> {
         let prepared = prepare_postgres_statement(query, params)?;
         if !prepared.is_parameterized() {
-            return self.execute_simple(&prepared.statement).await;
+            return self
+                .execute_simple_with_timeout(&prepared.statement, None)
+                .await;
         }
-        self.execute_extended(&prepared).await
+        self.execute_extended_with_timeout(&prepared, None).await
+    }
+
+    async fn execute_with_mode(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        mode: ResultMode,
+    ) -> Result<QueryResult> {
+        let prepared = prepare_postgres_statement(query, params)?;
+        if !prepared.is_parameterized() {
+            return self
+                .execute_simple_with_timeout(&prepared.statement, Some(mode))
+                .await;
+        }
+        self.execute_extended_with_timeout(&prepared, Some(mode))
+            .await
     }
 
     async fn ping(&mut self) -> Result<()> {
@@ -1173,15 +1280,23 @@ pub(crate) fn validate_savepoint_name(name: &str) -> Result<()> {
     }
 }
 
+enum ExtendedPayload {
+    Legacy {
+        columns: Vec<String>,
+        field_types: Vec<i32>,
+        field_type_modifiers: Vec<i32>,
+        rows: Vec<Vec<Option<String>>>,
+    },
+    Direct(PgRowDecoder),
+}
+
 /// Fully drained response to an extended-query cycle.
 struct ExtendedResponse {
-    columns: Vec<String>,
-    field_types: Vec<i32>,
-    field_type_modifiers: Vec<i32>,
-    rows: Vec<Vec<Option<String>>>,
+    payload: ExtendedPayload,
     summary: QuerySummary,
     command_tag: Option<String>,
     error: Option<NetError>,
+    decode_error: Option<NetError>,
     /// SQLSTATE of the first `ErrorResponse`, used to invalidate prepared statements.
     error_code: Option<String>,
     transaction_status: TransactionStatus,
@@ -1192,18 +1307,27 @@ struct ExtendedResponse {
 async fn read_extended_response<R>(
     reader: &mut R,
     read_buf: &mut BytesMut,
+    mode: Option<ResultMode>,
+    agtype_oid: Option<i32>,
 ) -> Result<ExtendedResponse>
 where
     R: AsyncRead + Unpin,
 {
+    let payload = match mode {
+        Some(m) => ExtendedPayload::Direct(PgRowDecoder::new(m)),
+        None => ExtendedPayload::Legacy {
+            columns: Vec::new(),
+            field_types: Vec::new(),
+            field_type_modifiers: Vec::new(),
+            rows: Vec::new(),
+        },
+    };
     let mut response = ExtendedResponse {
-        columns: Vec::new(),
-        field_types: Vec::new(),
-        field_type_modifiers: Vec::new(),
-        rows: Vec::new(),
+        payload,
         summary: QuerySummary::empty(),
         command_tag: None,
         error: None,
+        decode_error: None,
         error_code: None,
         transaction_status: TransactionStatus::Idle,
         parameter_status: Vec::new(),
@@ -1217,24 +1341,51 @@ where
             | BackendMessage::CloseComplete
             | BackendMessage::NoData
             | BackendMessage::EmptyQueryResponse => {}
-            BackendMessage::RowDescription(fields) => {
-                response.field_types = fields.iter().map(|f| f.type_oid).collect();
-                response.field_type_modifiers = fields.iter().map(|f| f.type_modifier).collect();
-                response.columns = fields.into_iter().map(|f| f.name).collect();
-            }
-            BackendMessage::DataRow(vals) => {
-                let mut row = Vec::with_capacity(vals.len());
-                for val in vals {
-                    match val {
-                        Some(bytes) => {
-                            let s = String::from_utf8_lossy(&bytes).into_owned();
-                            row.push(Some(s));
+            BackendMessage::RowDescription(fields) => match &mut response.payload {
+                ExtendedPayload::Legacy {
+                    columns,
+                    field_types,
+                    field_type_modifiers,
+                    ..
+                } => {
+                    *field_types = fields.iter().map(|f| f.type_oid).collect();
+                    *field_type_modifiers = fields.iter().map(|f| f.type_modifier).collect();
+                    *columns = fields.into_iter().map(|f| f.name).collect();
+                }
+                ExtendedPayload::Direct(decoder) => {
+                    let field_types: Vec<i32> = fields.iter().map(|f| f.type_oid).collect();
+                    let field_type_modifiers: Vec<i32> =
+                        fields.iter().map(|f| f.type_modifier).collect();
+                    let columns: Vec<String> = fields.into_iter().map(|f| f.name).collect();
+                    let age_cols: Vec<bool> = match agtype_oid {
+                        Some(oid) => field_types.iter().map(|oid_i| *oid_i == oid).collect(),
+                        None => Vec::new(),
+                    };
+                    decoder.set_schema(columns, &field_types, &field_type_modifiers, &age_cols);
+                }
+            },
+            BackendMessage::DataRow(vals) => match &mut response.payload {
+                ExtendedPayload::Legacy { rows, .. } => {
+                    let mut row = Vec::with_capacity(vals.len());
+                    for val in vals {
+                        match val {
+                            Some(bytes) => {
+                                let s = String::from_utf8_lossy(&bytes).into_owned();
+                                row.push(Some(s));
+                            }
+                            None => row.push(None),
                         }
-                        None => row.push(None),
+                    }
+                    rows.push(row);
+                }
+                ExtendedPayload::Direct(decoder) => {
+                    if response.decode_error.is_none()
+                        && let Err(err) = decoder.push_row(vals)
+                    {
+                        response.decode_error = Some(err);
                     }
                 }
-                response.rows.push(row);
-            }
+            },
             BackendMessage::CommandComplete(tag) => {
                 parse_command_tag(&tag, &mut response.summary);
                 response.command_tag = Some(tag);
@@ -1338,7 +1489,7 @@ mod tests {
         first_cycle.extend_from_slice(&ready_frame(b'E')); // failed transaction
         server.write_all(&first_cycle).await.unwrap();
 
-        let first = read_extended_response(&mut client, &mut read_buf)
+        let first = read_extended_response(&mut client, &mut read_buf, None, None)
             .await
             .unwrap();
         assert!(first.error.is_some());
@@ -1355,7 +1506,10 @@ mod tests {
             first.transaction_status,
             TransactionStatus::FailedTransaction
         );
-        assert!(first.columns.is_empty());
+        match &first.payload {
+            ExtendedPayload::Legacy { columns, .. } => assert!(columns.is_empty()),
+            ExtendedPayload::Direct(_) => panic!("expected legacy payload"),
+        }
 
         let mut second_cycle = Vec::new();
         // RowDescription with one text column "n"
@@ -1379,13 +1533,18 @@ mod tests {
         second_cycle.extend_from_slice(&ready_frame(b'I'));
         server.write_all(&second_cycle).await.unwrap();
 
-        let second = read_extended_response(&mut client, &mut read_buf)
+        let second = read_extended_response(&mut client, &mut read_buf, None, None)
             .await
             .unwrap();
         assert!(second.error.is_none());
         assert_eq!(second.transaction_status, TransactionStatus::Idle);
-        assert_eq!(second.columns, vec!["n".to_string()]);
-        assert_eq!(second.rows, vec![vec![Some("one".to_string())]]);
+        match &second.payload {
+            ExtendedPayload::Legacy { columns, rows, .. } => {
+                assert_eq!(columns, &vec!["n".to_string()]);
+                assert_eq!(rows, &vec![vec![Some("one".to_string())]]);
+            }
+            ExtendedPayload::Direct(_) => panic!("expected legacy payload"),
+        }
         assert_eq!(second.command_tag.as_deref(), Some("SELECT 1"));
     }
 

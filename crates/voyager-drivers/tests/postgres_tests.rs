@@ -813,3 +813,490 @@ fn test_wire_multidimensional_array_columns_decode_to_nested_arrow_lists() {
     assert!(values.is_null(1));
     assert_eq!(values.value(2), "beta,gamma");
 }
+
+#[tokio::test]
+async fn test_pg_execute_rows_and_arrow_equivalence_mixed_arrays_zero_rows_and_age() {
+    use bytes::BufMut;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use voyager_drivers::engine::{AsyncConnection, ResultMode};
+    use voyager_drivers::postgres::PostgresConnection;
+    use voyager_drivers::value::result::ResultValue;
+    use voyager_drivers::{ParamValue, ParsedUri};
+
+    fn pg_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(msg_type);
+        out.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn rd_payload(fields: &[(&str, i32, i32)]) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.put_i16(fields.len() as i16);
+        for (name, oid, typmod) in fields {
+            payload.put_slice(name.as_bytes());
+            payload.put_u8(0);
+            payload.put_i32(0);
+            payload.put_i16(0);
+            payload.put_i32(*oid);
+            payload.put_i16(-1);
+            payload.put_i32(*typmod);
+            payload.put_i16(0);
+        }
+        payload.to_vec()
+    }
+
+    fn dr_bytes(values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.put_i16(values.len() as i16);
+        for val in values {
+            match val {
+                Some(b) => {
+                    payload.put_i32(b.len() as i32);
+                    payload.put_slice(b);
+                }
+                None => payload.put_i32(-1),
+            }
+        }
+        payload.to_vec()
+    }
+
+    async fn make_pg_with_age(
+        script: Vec<Vec<u8>>,
+    ) -> (PostgresConnection, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut server_stream, _) = listener.accept().await.unwrap();
+            let _ = server_stream.set_nodelay(true);
+            // Startup
+            let mut startup = [0u8; 512];
+            let _ = server_stream.read(&mut startup).await.unwrap();
+            let mut auth_ok = BytesMut::new();
+            auth_ok.put_i32(0);
+            let mut hello = pg_frame(b'R', &auth_ok);
+            hello.extend_from_slice(&pg_frame(b'K', &[0; 8]));
+            hello.extend_from_slice(&pg_frame(b'S', b"TimeZone\0UTC\0"));
+            hello.extend_from_slice(&pg_frame(b'Z', b"I"));
+            server_stream.write_all(&hello).await.unwrap();
+            server_stream.flush().await.unwrap();
+
+            // AGE setup: 1) LOAD 'age'; SET search_path ...; 2) resolve_agtype_oid
+            for idx in 0..2 {
+                let mut buf = [0u8; 1024];
+                let _ = server_stream.read(&mut buf).await.unwrap();
+                let mut resp = Vec::new();
+                if idx == 1 {
+                    resp.extend_from_slice(&pg_frame(b'T', &rd_payload(&[("oid", 26, -1)])));
+                    resp.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"16400")])));
+                    resp.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+                } else {
+                    resp.extend_from_slice(&pg_frame(b'C', b"OK\0"));
+                }
+                resp.extend_from_slice(&pg_frame(b'Z', b"I"));
+                server_stream.write_all(&resp).await.unwrap();
+                server_stream.flush().await.unwrap();
+            }
+
+            for reply in script {
+                let mut buf = [0u8; 4096];
+                let n = server_stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                server_stream.write_all(&reply).await.unwrap();
+                server_stream.flush().await.unwrap();
+            }
+        });
+
+        let uri = ParsedUri::parse(&format!(
+            "age://postgres@{addr}/voyager_graph?sslmode=disable"
+        ))
+        .unwrap();
+        let conn = PostgresConnection::connect_with_age(&uri, true)
+            .await
+            .unwrap();
+        (conn, handle)
+    }
+
+    // Build 3 query responses (repeated 3x for execute, execute_with_mode(Rows), execute_with_mode(Arrow)):
+    // 1. Simple query with typed scalars, fixed-depth arrays, mixed-depth arrays (int[], numeric[], uuid[]), AGE agtype, and untyped
+    let typmod_10_2 = ((10 << 16) | 2) + 4;
+    let schema_1 = rd_payload(&[
+        ("b", 16, -1),
+        ("i", 20, -1),
+        ("f", 701, -1),
+        ("num", 1700, typmod_10_2),
+        ("uid", 2950, -1),
+        ("bin", 17, -1),
+        ("d", 1082, -1),
+        ("t", 1083, -1),
+        ("ttz", 1266, -1),
+        ("ts", 1114, -1),
+        ("tstz", 1184, -1),
+        ("iv", 1186, -1),
+        ("js", 3802, -1),
+        ("arr2d", 1016, -1),
+        ("mix_i", 1007, -1),
+        ("mix_n", 1231, -1),
+        ("mix_u", 2951, -1),
+        ("age_v", 16400, -1),
+        ("unk", 999999, -1),
+    ]);
+    let r1 = dr_bytes(&[
+        Some(b"t"),
+        Some(b"42"),
+        Some(b"3.5"),
+        Some(b"12.30"),
+        Some(b"12345678-1234-5678-1234-567812345678"),
+        Some(br"\x01fe"),
+        Some(b"2024-01-02"),
+        Some(b"14:30:15"),
+        Some(b"14:30:15+02"),
+        Some(b"2024-01-02 03:04:05"),
+        Some(b"2024-01-02 03:04:05+00"),
+        Some(b"1 year 2 mons 3 days 04:05:06"),
+        Some(br#"{"a":1}"#),
+        Some(b"{{1,2},{3,NULL}}"),
+        Some(b"{1,2}"),
+        Some(b"{1.5,2}"),
+        Some(b"{12345678-1234-5678-1234-567812345678}"),
+        Some(br#"{"id": 1, "label": "Person", "properties": {"name": "Alice"}}::vertex"#),
+        Some(b"77"),
+    ]);
+    let r2 = dr_bytes(&[
+        Some(b"f"),
+        None,
+        Some(b"1.25"),
+        Some(b"0.50"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(b"{{4,5},{6,7}}"),
+        Some(b"{{3,NULL},{5,6}}"),
+        Some(b"{{3.25},{4}}"),
+        Some(b"{{87654321-4321-8765-4321-876543218765}}"),
+        Some(b"10"),
+        None,
+    ]);
+    let mut simple_reply = Vec::new();
+    simple_reply.extend_from_slice(&pg_frame(b'T', &schema_1));
+    simple_reply.extend_from_slice(&pg_frame(b'D', &r1));
+    simple_reply.extend_from_slice(&pg_frame(b'D', &r2));
+    simple_reply.extend_from_slice(&pg_frame(b'C', b"SELECT 2\0"));
+    simple_reply.extend_from_slice(&pg_frame(b'Z', b"I"));
+
+    // 2. 0-row typed PG table
+    let schema_zero = rd_payload(&[
+        ("uid", 2950, -1),
+        ("num", 1700, typmod_10_2),
+        ("ttz", 1266, -1),
+        ("arr", 1007, -1),
+    ]);
+    let mut zero_reply = Vec::new();
+    zero_reply.extend_from_slice(&pg_frame(b'T', &schema_zero));
+    zero_reply.extend_from_slice(&pg_frame(b'C', b"SELECT 0\0"));
+    zero_reply.extend_from_slice(&pg_frame(b'Z', b"I"));
+
+    // 3. Extended parameterized query
+    let mut ext_reply = Vec::new();
+    ext_reply.extend_from_slice(&pg_frame(b'1', &[]));
+    ext_reply.extend_from_slice(&pg_frame(b'2', &[]));
+    ext_reply.extend_from_slice(&pg_frame(
+        b'T',
+        &rd_payload(&[("x", 20, -1), ("mix", 1007, -1)]),
+    ));
+    ext_reply.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"99"), Some(b"{1,2}")])));
+    ext_reply.extend_from_slice(&pg_frame(b'D', &dr_bytes(&[Some(b"100"), Some(b"{{3}}")])));
+    ext_reply.extend_from_slice(&pg_frame(b'C', b"SELECT 2\0"));
+    ext_reply.extend_from_slice(&pg_frame(b'Z', b"I"));
+
+    let script = vec![
+        simple_reply.clone(),
+        simple_reply.clone(),
+        simple_reply,
+        zero_reply.clone(),
+        zero_reply.clone(),
+        zero_reply,
+        ext_reply.clone(),
+        ext_reply.clone(),
+        ext_reply,
+    ];
+
+    let (mut conn, handle) = make_pg_with_age(script).await;
+
+    // 1. Simple rich + mixed arrays + AGE + untyped
+    let leg = conn.execute("SELECT ...", &HashMap::new()).await.unwrap();
+    let rows = conn
+        .execute_with_mode("SELECT ...", &HashMap::new(), ResultMode::Rows)
+        .await
+        .unwrap();
+    let arr = conn
+        .execute_with_mode("SELECT ...", &HashMap::new(), ResultMode::Arrow)
+        .await
+        .unwrap();
+
+    assert!(rows.batches.is_empty());
+    assert!(rows.bolt_rows.is_none());
+    assert!(arr.result_rows.is_none());
+    assert!(arr.bolt_rows.is_none());
+    assert_eq!(rows.row_count(), 2);
+
+    let leg_b = leg.to_record_batch().unwrap().unwrap();
+    let row_b = rows.to_record_batch().unwrap().unwrap();
+    let arr_b = arr.to_record_batch().unwrap().unwrap();
+    assert_eq!(row_b, leg_b);
+    assert_eq!(arr_b, leg_b);
+
+    // Mixed-depth PG arrays in result_rows hold lossless ResultValue::List with Decimal / Uuid leaves
+    let rrows = rows.result_rows.as_ref().unwrap();
+    assert_eq!(
+        rrows[0][15],
+        ResultValue::List(
+            vec![
+                ResultValue::Decimal("1.5".into()),
+                ResultValue::Decimal("2".into())
+            ]
+            .into_boxed_slice()
+        )
+    );
+    assert!(
+        matches!(rrows[0][16], ResultValue::List(ref items) if matches!(items[0], ResultValue::Uuid(_)))
+    );
+    assert_eq!(rrows[0][18], ResultValue::Int(77));
+
+    // 2. 0-row typed PG table
+    let leg0 = conn.execute("SELECT 0", &HashMap::new()).await.unwrap();
+    let row0 = conn
+        .execute_with_mode("SELECT 0", &HashMap::new(), ResultMode::Rows)
+        .await
+        .unwrap();
+    let arr0 = conn
+        .execute_with_mode("SELECT 0", &HashMap::new(), ResultMode::Arrow)
+        .await
+        .unwrap();
+    assert_eq!(row0.row_count(), 0);
+    assert_eq!(
+        row0.to_record_batch().unwrap().unwrap(),
+        leg0.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr0.to_record_batch().unwrap().unwrap(),
+        leg0.to_record_batch().unwrap().unwrap()
+    );
+
+    // 3. Extended parameterized query
+    let params = HashMap::from([("p".to_string(), ParamValue::Json(serde_json::json!(1)))]);
+    let leg_e = conn.execute("SELECT $p", &params).await.unwrap();
+    let row_e = conn
+        .execute_with_mode("SELECT $p", &params, ResultMode::Rows)
+        .await
+        .unwrap();
+    let arr_e = conn
+        .execute_with_mode("SELECT $p", &params, ResultMode::Arrow)
+        .await
+        .unwrap();
+    assert_eq!(
+        row_e.to_record_batch().unwrap().unwrap(),
+        leg_e.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr_e.to_record_batch().unwrap().unwrap(),
+        leg_e.to_record_batch().unwrap().unwrap()
+    );
+    // Extended bolt_rows converted to ResultValue matches execute_rows mixed-depth array
+    let leg_bolt_rows = leg_e.bolt_rows.as_ref().unwrap();
+    assert_eq!(
+        row_e.result_rows.as_ref().unwrap()[0][1],
+        ResultValue::from(&leg_bolt_rows[0][1])
+    );
+
+    drop(conn);
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_pg_row_decoder_security_limits_depth_ragged_invalid_and_utf8() {
+    use bytes::BufMut;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use voyager_drivers::ParsedUri;
+    use voyager_drivers::engine::{AsyncConnection, ResultMode};
+    use voyager_drivers::postgres::PostgresConnection;
+
+    fn pg_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + payload.len());
+        out.push(msg_type);
+        out.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn rd_one(oid: i32) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.put_i16(1);
+        payload.put_slice(b"v\0");
+        payload.put_i32(0);
+        payload.put_i16(0);
+        payload.put_i32(oid);
+        payload.put_i16(-1);
+        payload.put_i32(-1);
+        payload.put_i16(0);
+        pg_frame(b'T', &payload)
+    }
+
+    fn dr_one(bytes: &[u8]) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        payload.put_i16(1);
+        payload.put_i32(bytes.len() as i32);
+        payload.put_slice(bytes);
+        pg_frame(b'D', &payload)
+    }
+
+    let deep_pg_arr = format!("{}1{}", "{".repeat(70), "}".repeat(70));
+    let deep_age_arr = format!("{}1{}", "[".repeat(70), "]".repeat(70));
+
+    let mut cases: Vec<(Vec<u8>, &str)> = vec![
+        (
+            [
+                rd_one(1007),
+                dr_one(deep_pg_arr.as_bytes()),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat(),
+            "depth 65 PG array",
+        ),
+        (
+            [
+                rd_one(16400),
+                dr_one(deep_age_arr.as_bytes()),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat(),
+            "depth 65 AGE agtype",
+        ),
+        (
+            [
+                rd_one(1007),
+                dr_one(b"{{1,2},{3}}"),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat(),
+            "ragged PG array",
+        ),
+        (
+            [
+                rd_one(23),
+                dr_one(b"not_an_int"),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat(),
+            "invalid integer scalar",
+        ),
+        (
+            [
+                rd_one(16),
+                dr_one(b"maybe"),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat(),
+            "invalid bool scalar",
+        ),
+        (
+            [
+                rd_one(23),
+                dr_one(&[0xFF, 0xFE]),
+                pg_frame(b'C', b"SELECT 1\0"),
+                pg_frame(b'Z', b"I"),
+            ]
+            .concat(),
+            "invalid UTF-8 in typed int",
+        ),
+    ];
+    // Add invalid UTF-8 in text column (must succeed with lossy replacement, never panic)
+    let valid_text_lossy = [
+        rd_one(25),
+        dr_one(&[0x61, 0xFF, 0x62]),
+        pg_frame(b'C', b"SELECT 1\0"),
+        pg_frame(b'Z', b"I"),
+    ]
+    .concat();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let replies: Vec<Vec<u8>> = cases
+        .drain(..)
+        .map(|(r, _)| r)
+        .chain(std::iter::once(valid_text_lossy))
+        .collect();
+    let server = tokio::spawn(async move {
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let _ = server_stream.set_nodelay(true);
+        let mut startup = [0u8; 512];
+        let _ = server_stream.read(&mut startup).await.unwrap();
+        let mut auth_ok = BytesMut::new();
+        auth_ok.put_i32(0);
+        let mut hello = pg_frame(b'R', &auth_ok);
+        hello.extend_from_slice(&pg_frame(b'K', &[0; 8]));
+        hello.extend_from_slice(&pg_frame(b'Z', b"I"));
+        server_stream.write_all(&hello).await.unwrap();
+        server_stream.flush().await.unwrap();
+
+        for idx in 0..2 {
+            let mut buf = [0u8; 1024];
+            let _ = server_stream.read(&mut buf).await.unwrap();
+            let mut resp = Vec::new();
+            if idx == 1 {
+                resp.extend_from_slice(&rd_one(26));
+                resp.extend_from_slice(&dr_one(b"16400"));
+                resp.extend_from_slice(&pg_frame(b'C', b"SELECT 1\0"));
+            } else {
+                resp.extend_from_slice(&pg_frame(b'C', b"OK\0"));
+            }
+            resp.extend_from_slice(&pg_frame(b'Z', b"I"));
+            server_stream.write_all(&resp).await.unwrap();
+            server_stream.flush().await.unwrap();
+        }
+        for reply in replies {
+            let mut buf = [0u8; 1024];
+            let _ = server_stream.read(&mut buf).await.unwrap();
+            server_stream.write_all(&reply).await.unwrap();
+            server_stream.flush().await.unwrap();
+        }
+    });
+
+    let uri = ParsedUri::parse(&format!(
+        "age://postgres@{addr}/voyager_graph?sslmode=disable"
+    ))
+    .unwrap();
+    let mut conn = PostgresConnection::connect_with_age(&uri, true)
+        .await
+        .unwrap();
+
+    for i in 0..6 {
+        let err = conn
+            .execute_with_mode("SELECT v", &HashMap::new(), ResultMode::Rows)
+            .await
+            .expect_err(&format!("case {i} must return ProtocolError"));
+        assert!(matches!(err, voyager_drivers::NetError::ProtocolError(_)));
+    }
+    let ok = conn
+        .execute_with_mode("SELECT v", &HashMap::new(), ResultMode::Rows)
+        .await
+        .expect("lossy UTF-8 in text column succeeds safely");
+    assert_eq!(ok.row_count(), 1);
+
+    drop(conn);
+    server.await.unwrap();
+}

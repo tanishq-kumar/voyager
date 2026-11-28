@@ -7,6 +7,7 @@ use std::fmt;
 use super::packstream::{BoltValue, PackStream};
 use crate::config::Auth;
 use crate::error::{NetError, Result};
+use crate::params::ParamValue;
 use crate::redact::is_sensitive_key;
 
 /// Bolt protocol request messages sent from client to database server.
@@ -314,114 +315,86 @@ impl BoltRequest {
     pub fn encode(&self, buf: &mut BytesMut) {
         match self {
             Self::Hello { extra } => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x01,
-                        fields: vec![BoltValue::Map(extra.clone())],
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x01, 1, buf);
+                PackStream::encode_map(extra, buf);
             }
             Self::Logon { auth } => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x6A,
-                        fields: vec![BoltValue::Map(auth.clone())],
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x6A, 1, buf);
+                PackStream::encode_map(auth, buf);
             }
             Self::Logoff => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x6B,
-                        fields: Vec::new(),
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x6B, 0, buf);
             }
             Self::Run {
                 query,
                 params,
                 extra,
             } => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x10,
-                        fields: vec![
-                            BoltValue::String(query.clone()),
-                            BoltValue::Map(params.clone()),
-                            BoltValue::Map(extra.clone()),
-                        ],
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x10, 3, buf);
+                PackStream::encode_string(query, buf);
+                PackStream::encode_map(params, buf);
+                PackStream::encode_map(extra, buf);
             }
             Self::Pull { extra } => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x3F,
-                        fields: vec![BoltValue::Map(extra.clone())],
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x3F, 1, buf);
+                PackStream::encode_map(extra, buf);
             }
             Self::Discard { extra } => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x2F,
-                        fields: vec![BoltValue::Map(extra.clone())],
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x2F, 1, buf);
+                PackStream::encode_map(extra, buf);
             }
             Self::Begin { extra } => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x11,
-                        fields: vec![BoltValue::Map(extra.clone())],
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x11, 1, buf);
+                PackStream::encode_map(extra, buf);
             }
             Self::Commit => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x12,
-                        fields: Vec::new(),
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x12, 0, buf);
             }
             Self::Rollback => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x13,
-                        fields: Vec::new(),
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x13, 0, buf);
             }
             Self::Reset => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x0F,
-                        fields: Vec::new(),
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x0F, 0, buf);
             }
             Self::Goodbye => {
-                PackStream::encode(
-                    &BoltValue::Structure {
-                        tag: 0x02,
-                        fields: Vec::new(),
-                    },
-                    buf,
-                );
+                PackStream::encode_struct_header(0x02, 0, buf);
             }
         }
     }
+}
+
+/// Encodes a Bolt `RUN` message directly from borrowed inputs into `buf` without
+/// allocating intermediate `String`, `HashMap`, or `BoltValue` copies.
+pub(crate) fn encode_run_message(
+    query: &str,
+    params: &HashMap<String, ParamValue>,
+    temporal_major: u8,
+    db: Option<&str>,
+    tx_timeout_ms: Option<i64>,
+    buf: &mut BytesMut,
+) -> Result<()> {
+    PackStream::encode_struct_header(0x10, 3, buf);
+    PackStream::encode_string(query, buf);
+    PackStream::encode_param_map(params, temporal_major, buf)?;
+    let extra_len = usize::from(db.is_some()) + usize::from(tx_timeout_ms.is_some());
+    PackStream::encode_map_header(extra_len, buf);
+    if let Some(db_name) = db {
+        PackStream::encode_string("db", buf);
+        PackStream::encode_string(db_name, buf);
+    }
+    if let Some(ms) = tx_timeout_ms {
+        PackStream::encode_string("tx_timeout", buf);
+        PackStream::encode_integer(ms, buf);
+    }
+    Ok(())
+}
+
+/// Encodes a Bolt `PULL {"n": -1}` message directly into `buf` without allocating.
+#[inline]
+pub(crate) fn encode_pull_all_message(buf: &mut BytesMut) {
+    use bytes::BufMut;
+    // TinyStruct(1) tag=0x3F, TinyMap(1), TinyString("n"), TinyInt(-1)
+    buf.put_slice(&[0xB1, 0x3F, 0xA1, 0x81, b'n', 0xFF]);
 }
 
 /// Bolt protocol response messages returned by the database server.

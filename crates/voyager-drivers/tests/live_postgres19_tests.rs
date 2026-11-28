@@ -614,3 +614,102 @@ async fn test_live_postgres19_prepared_statement_cache_recovers_after_deallocate
     assert_eq!(column.value(0), 102);
     assert_eq!(conn.prepared_statement_cache_len(), 1);
 }
+
+#[tokio::test]
+async fn test_live_postgres19_execute_rows_and_arrow_equivalence() {
+    use voyager_drivers::NativeClient;
+    use voyager_drivers::value::result::ResultValue;
+
+    if get_pg19_connection().await.is_none() {
+        return;
+    }
+
+    let client = NativeClient::new(&pg19_uri(), None).unwrap();
+    let _ = client
+        .execute("DROP TABLE IF EXISTS zz_stage1_462_pg;", &HashMap::new())
+        .await;
+    client
+        .execute(
+            "CREATE TABLE zz_stage1_462_pg (\
+             id int, b bool, f double precision, num numeric(10, 2), \
+             uid uuid, d date, t time, ts timestamp, iv interval, \
+             js jsonb, arr int[], mix_i int[], mix_n numeric[], mix_u uuid[])",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    // 1. 0-row typed PG table equivalence
+    let q_zero = "SELECT id, b, f, num, uid, d, t, ts, iv, js, arr FROM zz_stage1_462_pg";
+    let leg0 = client.execute(q_zero, &HashMap::new()).await.unwrap();
+    let row0 = client.execute_rows(q_zero, &HashMap::new()).await.unwrap();
+    let arr0 = client.execute_arrow(q_zero, &HashMap::new()).await.unwrap();
+    assert_eq!(row0.row_count(), 0);
+    assert!(row0.batches.is_empty());
+    assert!(arr0.result_rows.is_none());
+    assert_eq!(
+        row0.to_record_batch().unwrap().unwrap(),
+        leg0.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr0.to_record_batch().unwrap().unwrap(),
+        leg0.to_record_batch().unwrap().unwrap()
+    );
+
+    // 2. Populated rows including mixed-depth arrays
+    client
+        .execute(
+            "INSERT INTO zz_stage1_462_pg VALUES \
+             (1, true, 3.5, 12.30, '12345678-1234-5678-1234-567812345678', '2024-01-02', '14:30:15', '2024-01-02 03:04:05', '1 day 02:00:00', '{\"a\":1}', '{{1,2},{3,NULL}}', '{1,2}', '{1.5,2}', '{12345678-1234-5678-1234-567812345678}'), \
+             (2, false, 1.25, 0.50, NULL, NULL, NULL, NULL, NULL, NULL, '{{4,5},{6,7}}', '{{3,NULL},{5,6}}', '{{3.25},{4}}', '{{87654321-4321-8765-4321-876543218765}}')",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let q_all = "SELECT id, b, f, num, uid, d, t, ts, iv, js, arr, mix_i, mix_n, mix_u FROM zz_stage1_462_pg ORDER BY id";
+    let leg = client.execute(q_all, &HashMap::new()).await.unwrap();
+    let rows = client.execute_rows(q_all, &HashMap::new()).await.unwrap();
+    let arr = client.execute_arrow(q_all, &HashMap::new()).await.unwrap();
+
+    assert!(rows.batches.is_empty());
+    assert!(rows.bolt_rows.is_none());
+    assert!(arr.result_rows.is_none());
+    assert!(arr.bolt_rows.is_none());
+    assert_eq!(rows.row_count(), 2);
+    assert_eq!(
+        rows.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+
+    // Parameterized query inside a transaction
+    let mut tx = client.begin_transaction().await.unwrap();
+    let params = int_param(1);
+    let q_param = "SELECT id, mix_i, mix_n FROM zz_stage1_462_pg WHERE id >= $v ORDER BY id";
+    let tx_leg = tx.execute(q_param, &params).await.unwrap();
+    let tx_rows = tx.execute_rows(q_param, &params).await.unwrap();
+    let tx_arr = tx.execute_arrow(q_param, &params).await.unwrap();
+    assert_eq!(
+        tx_rows.to_record_batch().unwrap().unwrap(),
+        tx_leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        tx_arr.to_record_batch().unwrap().unwrap(),
+        tx_leg.to_record_batch().unwrap().unwrap()
+    );
+    let leg_bolt = tx_leg.bolt_rows.as_ref().unwrap();
+    assert_eq!(
+        tx_rows.result_rows.as_ref().unwrap()[0][1],
+        ResultValue::from(&leg_bolt[0][1])
+    );
+    tx.commit().await.unwrap();
+
+    let _ = client
+        .execute("DROP TABLE IF EXISTS zz_stage1_462_pg;", &HashMap::new())
+        .await;
+    client.close().await;
+}

@@ -93,6 +93,14 @@ pub enum ColumnHint {
         /// `META_TYPE_DECIMAL`, or `META_TYPE_UUID`).
         meta_type: Option<&'static str>,
     },
+    /// PostgreSQL mixed-depth array column: retained as lossless nested
+    /// [`ResultValue::List`](crate::value::result::ResultValue::List) in row mode,
+    /// and serialized to `Utf8` with `voyager.encoding=json` (plus optional `voyager.type`)
+    /// when Arrow is materialized.
+    PgMixedArray {
+        /// Optional `voyager.type` metadata value (`META_TYPE_DECIMAL` or `META_TYPE_UUID`).
+        meta_type: Option<&'static str>,
+    },
 }
 
 /// Returns `true` when `batch` contains any JSON-encoded column that relies on
@@ -1551,6 +1559,77 @@ fn build_json_column(
     ))
 }
 
+struct PgMixedArrayJson<'a>(&'a ResultValue);
+
+impl serde::Serialize for PgMixedArrayJson<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        match self.0 {
+            ResultValue::Decimal(s) => {
+                if let Ok(i) = s.parse::<i64>() {
+                    serializer.serialize_i64(i)
+                } else if let Ok(f) = s.parse::<f64>() {
+                    if f.is_finite() {
+                        serializer.serialize_f64(f)
+                    } else {
+                        serializer.serialize_unit()
+                    }
+                } else {
+                    serializer.serialize_str(s)
+                }
+            }
+            ResultValue::List(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items.iter() {
+                    seq.serialize_element(&PgMixedArrayJson(item))?;
+                }
+                seq.end()
+            }
+            other => other.as_canonical_json().serialize(serializer),
+        }
+    }
+}
+
+fn build_pg_mixed_array_column(
+    name: &str,
+    values: &[Option<&ResultValue>],
+    explicit_meta_type: Option<&'static str>,
+) -> Result<(Field, ArrayRef)> {
+    let count = values.len();
+    let mut builder = StringBuilder::with_capacity(count, count * 64);
+    let mut json_buf: Vec<u8> = Vec::with_capacity(256);
+    for v in values {
+        match v {
+            None => builder.append_null(),
+            Some(other) => {
+                json_buf.clear();
+                match serde_json::to_writer(&mut json_buf, &PgMixedArrayJson(other)) {
+                    Ok(()) => {
+                        let s = std::str::from_utf8(&json_buf).unwrap_or("null");
+                        builder.append_value(s);
+                    }
+                    Err(_) => builder.append_value("null"),
+                }
+            }
+        }
+    }
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        VOYAGER_META_ENCODING.to_string(),
+        META_ENCODING_JSON.to_string(),
+    );
+    if let Some(meta_type) = explicit_meta_type {
+        metadata.insert(VOYAGER_META_TYPE.to_string(), meta_type.to_string());
+    }
+    Ok((
+        Field::new(name, DataType::Utf8, true).with_metadata(metadata),
+        Arc::new(builder.finish()),
+    ))
+}
+
 fn build_column_values(
     name: &str,
     values: &[Option<&ResultValue>],
@@ -1564,7 +1643,12 @@ fn build_column_values(
         return build_nested_list_column(name, values, *depth, elem_hint, tz_cache);
     }
 
-    // 2. Explicit JSON column (PG json/jsonb or PG mixed-depth array fallback).
+    // 2. Explicit PG mixed-depth array column (serialized to JSON only when Arrow is built).
+    if let ColumnHint::PgMixedArray { meta_type } = hint {
+        return build_pg_mixed_array_column(name, values, *meta_type);
+    }
+
+    // 3. Explicit JSON column (PG json/jsonb).
     if let ColumnHint::JsonColumn { meta_type } = hint {
         return build_json_column(name, values, *meta_type, 0, 0, 0, 0);
     }

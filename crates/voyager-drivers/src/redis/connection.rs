@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::Auth;
-use crate::engine::{AsyncConnection, QueryResult, QuerySummary};
+use crate::engine::{AsyncConnection, QueryResult, QuerySummary, ResultMode};
 use crate::error::{NetError, Result};
 use crate::params::ParamValue;
 use crate::redis::codec::{read_resp_value, write_command};
@@ -426,12 +426,12 @@ pub(crate) fn falkordb_transaction_error() -> NetError {
     )
 }
 
-#[async_trait]
-impl AsyncConnection for RedisConnection {
-    async fn execute(
+impl RedisConnection {
+    async fn execute_with_optional_mode(
         &mut self,
         query: &str,
         params: &HashMap<String, ParamValue>,
+        mode: Option<ResultMode>,
     ) -> Result<QueryResult> {
         let graph = self.default_graph.clone();
         match self.graph_query_compact(&graph, query, params).await {
@@ -445,7 +445,10 @@ impl AsyncConnection for RedisConnection {
                 } else {
                     cached.unwrap_or_default()
                 };
-                compact_res.to_query_result(&schema)
+                match mode {
+                    Some(m) => compact_res.to_query_result_with_mode(&schema, m),
+                    None => compact_res.to_query_result(&schema),
+                }
             }
             Err(e) => {
                 let q_lower = query.trim().to_ascii_lowercase();
@@ -464,6 +467,27 @@ impl AsyncConnection for RedisConnection {
                 Err(e)
             }
         }
+    }
+}
+
+#[async_trait]
+impl AsyncConnection for RedisConnection {
+    async fn execute(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+    ) -> Result<QueryResult> {
+        self.execute_with_optional_mode(query, params, None).await
+    }
+
+    async fn execute_with_mode(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        mode: ResultMode,
+    ) -> Result<QueryResult> {
+        self.execute_with_optional_mode(query, params, Some(mode))
+            .await
     }
 
     async fn ping(&mut self) -> Result<()> {

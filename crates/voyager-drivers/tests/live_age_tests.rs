@@ -416,3 +416,70 @@ async fn test_live_age_simultaneous_explain_and_profile_connections() {
         ))
         .await;
 }
+
+#[tokio::test]
+async fn test_live_age_execute_rows_and_arrow_equivalence() {
+    if get_age_connection().await.is_none() {
+        return;
+    }
+
+    use voyager_drivers::NativeClient;
+    let client = NativeClient::new(AGE_URI, None).unwrap();
+    let graph_name = "zz_stage1_462_age";
+
+    let _ = client
+        .execute(
+            &format!("SELECT * FROM ag_catalog.drop_graph('{graph_name}', true);"),
+            &HashMap::new(),
+        )
+        .await;
+    client
+        .execute(
+            &format!("SELECT * FROM ag_catalog.create_graph('{graph_name}');"),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    client
+        .execute(
+            &format!(
+                "SELECT * FROM cypher('{graph_name}', $$ CREATE (a:Person {{name: 'Alice', age: 30}})-[:KNOWS {{since: 2024}}]->(b:Person {{name: 'Bob', age: 25}}) $$) as (v agtype);"
+            ),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let q_rich = format!(
+        "SELECT * FROM cypher('{graph_name}', $$ MATCH p=(a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, a.age, a, r, p $$) as (name agtype, age agtype, a agtype, r agtype, p agtype);"
+    );
+    let leg = client.execute(&q_rich, &HashMap::new()).await.unwrap();
+    let rows = client.execute_rows(&q_rich, &HashMap::new()).await.unwrap();
+    let arr = client
+        .execute_arrow(&q_rich, &HashMap::new())
+        .await
+        .unwrap();
+
+    assert!(rows.batches.is_empty());
+    assert!(rows.bolt_rows.is_none());
+    assert!(arr.result_rows.is_none());
+    assert!(arr.bolt_rows.is_none());
+    assert_eq!(rows.row_count(), 1);
+    assert_eq!(
+        rows.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+
+    let _ = client
+        .execute(
+            &format!("SELECT * FROM ag_catalog.drop_graph('{graph_name}', true);"),
+            &HashMap::new(),
+        )
+        .await;
+    client.close().await;
+}

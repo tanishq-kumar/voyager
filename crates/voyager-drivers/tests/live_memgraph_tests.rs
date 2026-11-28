@@ -374,3 +374,51 @@ async fn test_live_memgraph_simultaneous_explain_and_profile_connections() {
         .await
         .expect("Failed to close setup connection");
 }
+
+#[tokio::test]
+async fn test_live_memgraph_execute_rows_and_arrow_equivalence() {
+    if !is_memgraph_online().await {
+        eprintln!("[SKIP] Live Memgraph instance is not reachable on 127.0.0.1:7688");
+        return;
+    }
+
+    use voyager_drivers::NativeClient;
+    let client = NativeClient::new(MEMGRAPH_URI, None).unwrap();
+
+    let _ = client
+        .execute("MATCH (n:ZzStage1Mg) DETACH DELETE n", &HashMap::new())
+        .await;
+    client
+        .execute(
+            "CREATE (a:ZzStage1Mg {name: 'Alice', age: 30})-[:ZZ_KNOWS {since: 2024}]->(b:ZzStage1Mg {name: 'Bob', age: 25})",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let q_rich = "MATCH p=(a:ZzStage1Mg)-[r:ZZ_KNOWS]->(b:ZzStage1Mg) \
+                  RETURN a.name AS name, a.age AS age, a, r, p, {k: [1, 'x']} AS m";
+    let leg = client.execute(q_rich, &HashMap::new()).await.unwrap();
+    let rows = client.execute_rows(q_rich, &HashMap::new()).await.unwrap();
+    let arr = client.execute_arrow(q_rich, &HashMap::new()).await.unwrap();
+
+    assert!(rows.batches.is_empty());
+    assert!(rows.bolt_rows.is_none());
+    assert!(arr.result_rows.is_none());
+    assert!(arr.bolt_rows.is_none());
+    assert_eq!(rows.row_count(), 1);
+    assert_eq!(
+        rows.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(
+        arr.to_record_batch().unwrap().unwrap(),
+        leg.to_record_batch().unwrap().unwrap()
+    );
+    assert_eq!(rows.result_rows, leg.result_rows);
+
+    let _ = client
+        .execute("MATCH (n:ZzStage1Mg) DETACH DELETE n", &HashMap::new())
+        .await;
+    client.close().await;
+}
