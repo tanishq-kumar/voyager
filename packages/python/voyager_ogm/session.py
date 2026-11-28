@@ -1780,7 +1780,11 @@ class Session(_SessionBase):
 
         if should_try_native:
             try:
-                native_res = self._native_client.execute_sync(stmt, params)
+                arrow_execute = getattr(self._native_client, "execute_arrow_sync", None)
+                if callable(arrow_execute):
+                    native_res = arrow_execute(stmt, params)
+                else:
+                    native_res = self._native_client.execute_sync(stmt, params)
                 self._record_native_success()
                 return _stream_to_polars(native_res.stream)
             except Exception as e:
@@ -1830,7 +1834,11 @@ class Session(_SessionBase):
 
         if should_try_native:
             try:
-                native_res = self._native_client.execute_sync(stmt, params)
+                arrow_execute = getattr(self._native_client, "execute_arrow_sync", None)
+                if callable(arrow_execute):
+                    native_res = arrow_execute(stmt, params)
+                else:
+                    native_res = self._native_client.execute_sync(stmt, params)
                 self._record_native_success()
                 return _stream_to_arrow(native_res.stream)
             except Exception as e:
@@ -2701,7 +2709,11 @@ class AsyncSession(_SessionBase):
 
         if should_try_native:
             try:
-                native_res = await self._native_client.execute(stmt, params)
+                arrow_execute = getattr(self._native_client, "execute_arrow", None)
+                if callable(arrow_execute):
+                    native_res = await arrow_execute(stmt, params)
+                else:
+                    native_res = await self._native_client.execute(stmt, params)
                 self._record_native_success()
                 return _stream_to_polars(native_res.stream)
             except Exception as e:
@@ -2751,7 +2763,11 @@ class AsyncSession(_SessionBase):
 
         if should_try_native:
             try:
-                native_res = await self._native_client.execute(stmt, params)
+                arrow_execute = getattr(self._native_client, "execute_arrow", None)
+                if callable(arrow_execute):
+                    native_res = await arrow_execute(stmt, params)
+                else:
+                    native_res = await self._native_client.execute(stmt, params)
                 self._record_native_success()
                 return _stream_to_arrow(native_res.stream)
             except Exception as e:
