@@ -17,7 +17,7 @@ pub use codec::{
     DEFAULT_BUFFER_CAPACITY, DEFAULT_READ_BUFFER_CAPACITY, MAX_PG_MESSAGE_SIZE,
     read_backend_message, write_frontend_message, write_frontend_messages, write_startup_message,
 };
-pub use connection::PostgresConnection;
+pub use connection::{PostgresConnection, PostgresStreamCursor};
 pub use message::{
     AuthenticationRequest, BackendMessage, FieldDescription, FrontendMessage, PG_PROTOCOL_V3,
     PgDiagnostic, StartupMessage, TransactionStatus, oids,

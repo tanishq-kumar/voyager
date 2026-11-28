@@ -376,6 +376,10 @@ pub trait AsyncConnection: Send + Sync {
             StreamCursor::Bolt(_) => Err(NetError::ProtocolError(
                 "Bolt stream cursor passed to non-Bolt connection".to_string(),
             )),
+            #[cfg(feature = "postgres")]
+            StreamCursor::Postgres(_) => Err(NetError::ProtocolError(
+                "PostgreSQL stream cursor passed to non-PostgreSQL connection".to_string(),
+            )),
         }
     }
 
@@ -389,6 +393,10 @@ pub trait AsyncConnection: Send + Sync {
             #[cfg(feature = "bolt")]
             StreamCursor::Bolt(_) => Err(NetError::ProtocolError(
                 "Bolt stream cursor passed to non-Bolt connection".to_string(),
+            )),
+            #[cfg(feature = "postgres")]
+            StreamCursor::Postgres(_) => Err(NetError::ProtocolError(
+                "PostgreSQL stream cursor passed to non-PostgreSQL connection".to_string(),
             )),
         }
     }

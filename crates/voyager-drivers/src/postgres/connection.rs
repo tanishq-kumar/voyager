@@ -4,7 +4,8 @@ use arrow_array::Array;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -25,8 +26,10 @@ use crate::postgres::message::{
     AuthenticationRequest, BackendMessage, FrontendMessage, StartupMessage, TransactionStatus,
 };
 use crate::postgres::params::{PreparedPostgresStatement, prepare_postgres_statement};
+use crate::stream::{ResultChunk, StreamCursor, StreamOptions};
 use crate::tls::{NetStream, SslMode, SslNegotiation, TlsOptions};
 use crate::uri::ParsedUri;
+use crate::value::arrow::ColumnHint;
 
 /// Default number of named prepared statements cached per connection.
 pub const DEFAULT_PREPARED_STATEMENT_CACHE_SIZE: usize = 128;
@@ -38,6 +41,8 @@ pub const PREPARED_STATEMENT_CACHE_SIZE_PARAM: &str = "prepared_statement_cache_
 const SQLSTATE_INVALID_STATEMENT_NAME: &str = "26000";
 /// SQLSTATE returned when a re-planned statement would change its result type.
 const SQLSTATE_CACHED_PLAN_RESULT_TYPE_CHANGED: &str = "0A000";
+/// SQLSTATE returned for syntax errors or multi-statement strings in `Parse`.
+const SQLSTATE_SYNTAX_ERROR: &str = "42601";
 
 /// Cache key for a named prepared statement: its SQL text and parameter type OIDs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -170,6 +175,60 @@ impl PreparedStatementCache {
     }
 }
 
+/// PostgreSQL / Apache AGE wire-protocol cursor state for an active named-portal stream.
+#[derive(Debug)]
+pub struct PostgresStreamCursor {
+    pub(crate) portal_name: String,
+    pub(crate) columns: Arc<[String]>,
+    pub(crate) column_hints: Arc<[ColumnHint]>,
+    pub(crate) summary: QuerySummary,
+    pub(crate) decoder: PgRowDecoder,
+    pub(crate) fetch_size: i32,
+    pub(crate) execute_in_flight: bool,
+    pub(crate) has_more: bool,
+    pub(crate) finished: bool,
+    pub(crate) failed: bool,
+    pub(crate) wire_clean: bool,
+    pub(crate) cancelled_mid_read: bool,
+    pub(crate) start_time: Instant,
+}
+
+impl PostgresStreamCursor {
+    /// Returns `true` when no wire frames or open server portal remain pending.
+    pub fn is_wire_clean(&self) -> bool {
+        self.wire_clean
+    }
+
+    /// Returns `true` once the stream reached completion, close, or failure.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Returns the projected column names for this stream.
+    pub fn columns(&self) -> &Arc<[String]> {
+        &self.columns
+    }
+
+    /// Returns per-column Arrow conversion hints for this stream.
+    pub fn column_hints(&self) -> &Arc<[ColumnHint]> {
+        &self.column_hints
+    }
+
+    /// Returns the query execution summary accumulated so far.
+    pub fn summary(&self) -> &QuerySummary {
+        &self.summary
+    }
+
+    fn mark_failed_broken(&mut self) {
+        self.execute_in_flight = false;
+        self.has_more = false;
+        self.finished = true;
+        self.failed = true;
+        self.wire_clean = false;
+        self.cancelled_mid_read = false;
+    }
+}
+
 /// Asynchronous physical connection to a PostgreSQL database server or Apache AGE instance.
 pub struct PostgresConnection {
     stream: NetStream,
@@ -181,6 +240,8 @@ pub struct PostgresConnection {
     secret_key: i32,
     transaction_status: TransactionStatus,
     is_broken: bool,
+    has_active_portal: bool,
+    next_portal_id: u64,
     is_age_initialized: bool,
     agtype_oid: Option<i32>,
     query_timeout: Option<std::time::Duration>,
@@ -448,6 +509,8 @@ impl PostgresConnection {
             secret_key: 0,
             transaction_status: TransactionStatus::Idle,
             is_broken: false,
+            has_active_portal: false,
+            next_portal_id: 0,
             is_age_initialized: false,
             agtype_oid: None,
             query_timeout,
@@ -711,9 +774,9 @@ impl PostgresConnection {
     }
 
     async fn execute_simple_command_inner(&mut self, query: &str) -> Result<()> {
-        if self.is_broken {
+        if self.is_broken || self.has_active_portal {
             return Err(NetError::Closed(
-                "PostgreSQL connection is closed or broken".to_string(),
+                "PostgreSQL connection is closed, broken, or has an active portal".to_string(),
             ));
         }
         self.is_broken = true;
@@ -756,9 +819,9 @@ impl PostgresConnection {
         query: &str,
         mode: Option<ResultMode>,
     ) -> Result<QueryResult> {
-        if self.is_broken {
+        if self.is_broken || self.has_active_portal {
             return Err(NetError::Closed(
-                "PostgreSQL connection is closed or broken".to_string(),
+                "PostgreSQL connection is closed, broken, or has an active portal".to_string(),
             ));
         }
         self.is_broken = true;
@@ -917,9 +980,9 @@ impl PostgresConnection {
         prepared: &PreparedPostgresStatement,
         mode: Option<ResultMode>,
     ) -> Result<QueryResult> {
-        if self.is_broken {
+        if self.is_broken || self.has_active_portal {
             return Err(NetError::Closed(
-                "PostgreSQL connection is closed or broken".to_string(),
+                "PostgreSQL connection is closed, broken, or has an active portal".to_string(),
             ));
         }
         self.is_broken = true;
@@ -1120,6 +1183,484 @@ impl PostgresConnection {
     pub fn set_prepared_statement_cache_size(&mut self, capacity: usize) {
         self.prepared_statements = PreparedStatementCache::new(capacity);
     }
+
+    /// Returns `true` if a named portal stream is currently open on this connection.
+    pub fn has_active_portal(&self) -> bool {
+        self.has_active_portal
+    }
+
+    async fn drain_sync_after_error(&mut self) -> Result<TransactionStatus> {
+        write_frontend_message(&mut self.stream, &FrontendMessage::Sync).await?;
+        loop {
+            let msg = read_backend_message(&mut self.stream, &mut self.read_buf).await?;
+            match msg {
+                BackendMessage::ReadyForQuery(status) => {
+                    self.transaction_status = status;
+                    self.has_active_portal = false;
+                    self.is_broken = false;
+                    return Ok(status);
+                }
+                BackendMessage::ParameterStatus { name, value } => {
+                    self.server_parameters.insert(name, value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn close_portal_and_sync(&mut self, portal_name: &str) -> Result<Option<NetError>> {
+        write_frontend_messages(
+            &mut self.stream,
+            &[
+                FrontendMessage::Close {
+                    target_type: b'P',
+                    name: portal_name.to_string(),
+                },
+                FrontendMessage::Sync,
+            ],
+        )
+        .await?;
+
+        let mut close_error = None;
+        loop {
+            let msg = read_backend_message(&mut self.stream, &mut self.read_buf).await?;
+            match msg {
+                BackendMessage::CloseComplete => {}
+                BackendMessage::ErrorResponse(diag) => {
+                    if close_error.is_none() {
+                        close_error = Some(NetError::ProtocolError(diag.format_error()));
+                    }
+                }
+                BackendMessage::ParameterStatus { name, value } => {
+                    self.server_parameters.insert(name, value);
+                }
+                BackendMessage::ReadyForQuery(status) => {
+                    self.transaction_status = status;
+                    self.has_active_portal = false;
+                    self.is_broken = false;
+                    return Ok(close_error);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn open_stream_inner(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        fetch_size: i32,
+    ) -> Result<StreamCursor> {
+        if self.is_broken || self.has_active_portal {
+            return Err(NetError::Closed(
+                "PostgreSQL connection is closed, broken, or has an active portal".to_string(),
+            ));
+        }
+
+        let start_time = Instant::now();
+        let prepared = prepare_postgres_statement(query, params)?;
+        let parameter_count = prepared.parameter_values.len();
+        let key = StatementKey::new(&prepared);
+        let mut retried_invalid_statement = false;
+        let mut force_fresh = false;
+        let mut close_statement: Option<String> = None;
+
+        loop {
+            let portal_id = self.next_portal_id;
+            self.next_portal_id += 1;
+            let portal_name = format!("voyager_p_{portal_id}");
+
+            let plan = if std::mem::take(&mut force_fresh) {
+                self.prepared_statements.acquire_fresh(&key)
+            } else {
+                self.prepared_statements.acquire(&key)
+            };
+            let was_idle = self.transaction_status == TransactionStatus::Idle;
+
+            let mut messages: Vec<FrontendMessage> = Vec::with_capacity(7);
+            if let Some(name) = close_statement.take() {
+                messages.push(FrontendMessage::Close {
+                    target_type: b'S',
+                    name,
+                });
+            }
+            if let Some(evicted) = plan.evicted {
+                messages.push(FrontendMessage::Close {
+                    target_type: b'S',
+                    name: evicted,
+                });
+            }
+            if plan.needs_parse {
+                messages.push(FrontendMessage::Parse {
+                    name: plan.name.clone(),
+                    query: prepared.statement.clone(),
+                    param_types: prepared.parameter_oids.clone(),
+                });
+            }
+            messages.push(FrontendMessage::Bind {
+                portal: portal_name.clone(),
+                statement: plan.name.clone(),
+                param_formats: vec![0; parameter_count],
+                params: prepared.parameter_values.clone(),
+                result_formats: vec![0],
+            });
+            messages.push(FrontendMessage::Describe {
+                target_type: b'P',
+                name: portal_name.clone(),
+            });
+            messages.push(FrontendMessage::Execute {
+                portal: portal_name.clone(),
+                max_rows: fetch_size,
+            });
+            messages.push(FrontendMessage::Flush);
+
+            self.is_broken = true;
+            write_frontend_messages(&mut self.stream, &messages).await?;
+
+            loop {
+                let msg = read_backend_message(&mut self.stream, &mut self.read_buf).await?;
+                match msg {
+                    BackendMessage::ParseComplete
+                    | BackendMessage::BindComplete
+                    | BackendMessage::CloseComplete
+                    | BackendMessage::NoticeResponse(_) => {}
+                    BackendMessage::ParameterStatus { name, value } => {
+                        self.server_parameters.insert(name, value);
+                    }
+                    BackendMessage::RowDescription(fields) => {
+                        let field_types: Vec<i32> = fields.iter().map(|f| f.type_oid).collect();
+                        let field_type_modifiers: Vec<i32> =
+                            fields.iter().map(|f| f.type_modifier).collect();
+                        let columns: Vec<String> = fields.into_iter().map(|f| f.name).collect();
+                        let age_cols = self.age_columns(&field_types);
+
+                        let mut decoder = PgRowDecoder::new_stream();
+                        decoder.set_schema(columns, &field_types, &field_type_modifiers, &age_cols);
+                        let columns_arc = decoder.columns_arc();
+                        let column_hints = decoder.column_hints_arc();
+
+                        self.has_active_portal = true;
+                        self.is_broken = false;
+                        return Ok(StreamCursor::Postgres(PostgresStreamCursor {
+                            portal_name,
+                            columns: columns_arc,
+                            column_hints,
+                            summary: QuerySummary::empty(),
+                            decoder,
+                            fetch_size,
+                            execute_in_flight: true,
+                            has_more: true,
+                            finished: false,
+                            failed: false,
+                            wire_clean: false,
+                            cancelled_mid_read: false,
+                            start_time,
+                        }));
+                    }
+                    BackendMessage::NoData => {
+                        let decoder = PgRowDecoder::new_stream();
+                        let columns_arc = decoder.columns_arc();
+                        let column_hints = decoder.column_hints_arc();
+
+                        self.has_active_portal = true;
+                        self.is_broken = false;
+                        return Ok(StreamCursor::Postgres(PostgresStreamCursor {
+                            portal_name,
+                            columns: columns_arc,
+                            column_hints,
+                            summary: QuerySummary::empty(),
+                            decoder,
+                            fetch_size,
+                            execute_in_flight: true,
+                            has_more: true,
+                            finished: false,
+                            failed: false,
+                            wire_clean: false,
+                            cancelled_mid_read: false,
+                            start_time,
+                        }));
+                    }
+                    BackendMessage::ErrorResponse(diag) => {
+                        self.drain_sync_after_error().await?;
+                        if plan.needs_parse {
+                            self.prepared_statements.remove(&key);
+                        }
+                        let code = diag.code.as_str();
+                        let invalid_statement = code == SQLSTATE_INVALID_STATEMENT_NAME;
+                        let plan_changed = code == SQLSTATE_CACHED_PLAN_RESULT_TYPE_CHANGED;
+                        if invalid_statement || plan_changed {
+                            self.prepared_statements.remove(&key);
+                            if !retried_invalid_statement && was_idle {
+                                retried_invalid_statement = true;
+                                if plan_changed && !plan.name.is_empty() {
+                                    close_statement = Some(plan.name);
+                                }
+                                force_fresh = true;
+                                break;
+                            }
+                            return Err(NetError::ProtocolError(diag.format_error()));
+                        }
+                        if code == SQLSTATE_SYNTAX_ERROR {
+                            return Err(NetError::ProtocolError(format!(
+                                "{} (stream() accepts a single SQL statement)",
+                                diag.format_error()
+                            )));
+                        }
+                        return Err(NetError::ProtocolError(diag.format_error()));
+                    }
+                    other => {
+                        return Err(NetError::ProtocolError(format!(
+                            "Unexpected PostgreSQL message during open_stream: {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn next_stream_chunk_io(
+        &mut self,
+        cursor: &mut PostgresStreamCursor,
+    ) -> Result<Option<ResultChunk>> {
+        let mut empty_suspended_rounds = 0u8;
+        loop {
+            if !cursor.execute_in_flight {
+                write_frontend_messages(
+                    &mut self.stream,
+                    &[
+                        FrontendMessage::Execute {
+                            portal: cursor.portal_name.clone(),
+                            max_rows: cursor.fetch_size,
+                        },
+                        FrontendMessage::Flush,
+                    ],
+                )
+                .await?;
+                cursor.execute_in_flight = true;
+            }
+
+            let mut decode_error: Option<NetError> = None;
+            loop {
+                let msg = read_backend_message(&mut self.stream, &mut self.read_buf).await?;
+                match msg {
+                    BackendMessage::DataRow(vals) => {
+                        if decode_error.is_none()
+                            && let Err(err) = cursor.decoder.push_row(vals)
+                        {
+                            decode_error = Some(err);
+                        }
+                    }
+                    BackendMessage::PortalSuspended => {
+                        cursor.execute_in_flight = false;
+                        cursor.has_more = true;
+                        self.is_broken = false;
+                        break;
+                    }
+                    BackendMessage::CommandComplete(tag) => {
+                        self.last_command_tag = Some(tag.clone());
+                        parse_command_tag(&tag, &mut cursor.summary);
+                        cursor.execute_in_flight = false;
+                        cursor.has_more = false;
+                        break;
+                    }
+                    BackendMessage::EmptyQueryResponse => {
+                        cursor.execute_in_flight = false;
+                        cursor.has_more = false;
+                        break;
+                    }
+                    BackendMessage::ErrorResponse(diag) => {
+                        cursor.decoder.discard_partial_chunk();
+                        self.drain_sync_after_error().await?;
+                        cursor.execute_in_flight = false;
+                        cursor.has_more = false;
+                        cursor.finished = true;
+                        cursor.failed = true;
+                        cursor.wire_clean = true;
+                        cursor.cancelled_mid_read = false;
+                        return Err(NetError::ProtocolError(diag.format_error()));
+                    }
+                    BackendMessage::NoticeResponse(_) => {}
+                    BackendMessage::ParameterStatus { name, value } => {
+                        self.server_parameters.insert(name, value);
+                    }
+                    other => {
+                        return Err(NetError::ProtocolError(format!(
+                            "Unexpected PostgreSQL message during stream chunk: {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+
+            if let Some(err) = decode_error {
+                cursor.decoder.discard_partial_chunk();
+                if self
+                    .close_portal_and_sync(&cursor.portal_name)
+                    .await
+                    .is_ok()
+                {
+                    cursor.has_more = false;
+                    cursor.finished = true;
+                    cursor.failed = true;
+                    cursor.wire_clean = true;
+                    cursor.cancelled_mid_read = false;
+                }
+                return Err(err);
+            }
+
+            if !cursor.has_more {
+                let close_err = self.close_portal_and_sync(&cursor.portal_name).await?;
+                cursor.summary.execution_time_ms = cursor.start_time.elapsed().as_millis() as u64;
+                cursor.finished = true;
+                cursor.wire_clean = true;
+                cursor.cancelled_mid_read = false;
+                if let Some(err) = close_err {
+                    cursor.decoder.discard_partial_chunk();
+                    cursor.failed = true;
+                    return Err(err);
+                }
+            }
+
+            if let Some(chunk) = cursor.decoder.take_chunk() {
+                return Ok(Some(chunk));
+            }
+
+            if !cursor.has_more {
+                return Ok(None);
+            }
+
+            empty_suspended_rounds += 1;
+            if empty_suspended_rounds > 1 {
+                return Err(NetError::ProtocolError(
+                    "PostgreSQL server returned consecutive empty PortalSuspended responses"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    async fn next_stream_chunk_inner(
+        &mut self,
+        cursor: &mut PostgresStreamCursor,
+    ) -> Result<Option<ResultChunk>> {
+        if cursor.finished || cursor.failed || !cursor.has_more {
+            return Ok(None);
+        }
+        if cursor.cancelled_mid_read || self.is_broken {
+            self.is_broken = true;
+            cursor.mark_failed_broken();
+            return Err(NetError::Closed(
+                "Stream was cancelled mid-flight; connection cannot be reused".to_string(),
+            ));
+        }
+
+        cursor.cancelled_mid_read = true;
+        self.is_broken = true;
+        let res = self.next_stream_chunk_io(cursor).await;
+        match res {
+            Ok(chunk) => {
+                cursor.cancelled_mid_read = false;
+                Ok(chunk)
+            }
+            Err(err) => {
+                if !cursor.failed {
+                    self.is_broken = true;
+                    cursor.mark_failed_broken();
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn close_stream_io(&mut self, cursor: &mut PostgresStreamCursor) -> Result<()> {
+        if cursor.execute_in_flight {
+            loop {
+                let msg = read_backend_message(&mut self.stream, &mut self.read_buf).await?;
+                match msg {
+                    BackendMessage::DataRow(_) | BackendMessage::NoticeResponse(_) => {}
+                    BackendMessage::ParameterStatus { name, value } => {
+                        self.server_parameters.insert(name, value);
+                    }
+                    BackendMessage::PortalSuspended => {
+                        cursor.execute_in_flight = false;
+                        cursor.has_more = true;
+                        break;
+                    }
+                    BackendMessage::CommandComplete(tag) => {
+                        self.last_command_tag = Some(tag.clone());
+                        parse_command_tag(&tag, &mut cursor.summary);
+                        cursor.execute_in_flight = false;
+                        cursor.has_more = false;
+                        break;
+                    }
+                    BackendMessage::EmptyQueryResponse => {
+                        cursor.execute_in_flight = false;
+                        cursor.has_more = false;
+                        break;
+                    }
+                    BackendMessage::ErrorResponse(diag) => {
+                        cursor.decoder.discard_partial_chunk();
+                        self.drain_sync_after_error().await?;
+                        cursor.execute_in_flight = false;
+                        cursor.has_more = false;
+                        cursor.finished = true;
+                        cursor.failed = true;
+                        cursor.wire_clean = true;
+                        cursor.cancelled_mid_read = false;
+                        return Err(NetError::ProtocolError(diag.format_error()));
+                    }
+                    other => {
+                        return Err(NetError::ProtocolError(format!(
+                            "Unexpected PostgreSQL message while draining stream: {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
+
+        let close_err = self.close_portal_and_sync(&cursor.portal_name).await?;
+        cursor.summary.execution_time_ms = cursor.start_time.elapsed().as_millis() as u64;
+        cursor.has_more = false;
+        cursor.execute_in_flight = false;
+        cursor.finished = true;
+        cursor.wire_clean = true;
+        cursor.cancelled_mid_read = false;
+        cursor.decoder.discard_partial_chunk();
+        if let Some(err) = close_err {
+            cursor.failed = true;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    async fn close_stream_inner(&mut self, cursor: &mut PostgresStreamCursor) -> Result<()> {
+        if cursor.wire_clean || cursor.finished {
+            return Ok(());
+        }
+        if cursor.cancelled_mid_read || self.is_broken {
+            self.is_broken = true;
+            cursor.mark_failed_broken();
+            return Err(NetError::Closed(
+                "Stream was cancelled mid-flight; connection cannot be reused".to_string(),
+            ));
+        }
+
+        cursor.cancelled_mid_read = true;
+        self.is_broken = true;
+        let res = self.close_stream_io(cursor).await;
+        match res {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if !cursor.failed {
+                    self.is_broken = true;
+                    cursor.mark_failed_broken();
+                }
+                Err(err)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1159,9 +1700,9 @@ impl AsyncConnection for PostgresConnection {
     }
 
     async fn reset(&mut self) -> Result<()> {
-        if self.is_broken {
+        if self.is_broken || self.has_active_portal {
             return Err(NetError::Closed(
-                "PostgreSQL connection is closed or broken".to_string(),
+                "PostgreSQL connection is closed, broken, or has an active portal".to_string(),
             ));
         }
         if self.transaction_status != TransactionStatus::Idle {
@@ -1174,7 +1715,9 @@ impl AsyncConnection for PostgresConnection {
     }
 
     fn is_valid(&self) -> bool {
-        !self.is_broken && self.transaction_status != TransactionStatus::FailedTransaction
+        !self.is_broken
+            && !self.has_active_portal
+            && self.transaction_status != TransactionStatus::FailedTransaction
     }
 
     fn is_locally_alive(&self) -> bool {
@@ -1260,6 +1803,97 @@ impl AsyncConnection for PostgresConnection {
 
     fn supports_savepoints(&self) -> bool {
         true
+    }
+
+    async fn open_stream(
+        &mut self,
+        query: &str,
+        params: &HashMap<String, ParamValue>,
+        options: &StreamOptions,
+    ) -> Result<StreamCursor> {
+        let fetch_size = i32::try_from(options.validate_fetch_size()?)
+            .map_err(|_| NetError::ProtocolError("Stream fetch_size overflows i32".to_string()))?;
+
+        if let Some(to) = self.query_timeout {
+            match tokio::time::timeout(to, self.open_stream_inner(query, params, fetch_size)).await
+            {
+                Ok(res) => res,
+                Err(_) => {
+                    self.is_broken = true;
+                    self.transaction_status = TransactionStatus::FailedTransaction;
+                    Err(NetError::Timeout(format!(
+                        "Opening stream timed out after {:?}",
+                        to
+                    )))
+                }
+            }
+        } else {
+            self.open_stream_inner(query, params, fetch_size).await
+        }
+    }
+
+    async fn next_stream_chunk(
+        &mut self,
+        cursor: &mut StreamCursor,
+    ) -> Result<Option<ResultChunk>> {
+        match cursor {
+            StreamCursor::Postgres(pg_cursor) => {
+                if let Some(to) = self.query_timeout {
+                    match tokio::time::timeout(to, self.next_stream_chunk_inner(pg_cursor)).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            self.is_broken = true;
+                            pg_cursor.mark_failed_broken();
+                            Err(NetError::Timeout(format!(
+                                "Streaming next chunk timed out after {:?}",
+                                to
+                            )))
+                        }
+                    }
+                } else {
+                    self.next_stream_chunk_inner(pg_cursor).await
+                }
+            }
+            StreamCursor::Buffered(_) => Ok(cursor.next_buffered_chunk()),
+            #[cfg(feature = "bolt")]
+            StreamCursor::Bolt(_) => Err(NetError::ProtocolError(
+                "Bolt stream cursor passed to PostgreSQL connection".to_string(),
+            )),
+        }
+    }
+
+    async fn close_stream(&mut self, cursor: &mut StreamCursor) -> Result<()> {
+        match cursor {
+            StreamCursor::Postgres(pg_cursor) => {
+                if let Some(to) = self.query_timeout {
+                    match tokio::time::timeout(to, self.close_stream_inner(pg_cursor)).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            self.is_broken = true;
+                            pg_cursor.mark_failed_broken();
+                            Err(NetError::Timeout(format!(
+                                "Closing stream timed out after {:?}",
+                                to
+                            )))
+                        }
+                    }
+                } else {
+                    self.close_stream_inner(pg_cursor).await
+                }
+            }
+            StreamCursor::Buffered(_) => {
+                cursor.close_buffered();
+                Ok(())
+            }
+            #[cfg(feature = "bolt")]
+            StreamCursor::Bolt(_) => Err(NetError::ProtocolError(
+                "Bolt stream cursor passed to PostgreSQL connection".to_string(),
+            )),
+        }
+    }
+
+    fn stream_close_timeout(&self) -> Duration {
+        self.query_timeout.unwrap_or_else(|| Duration::from_secs(5))
     }
 }
 
@@ -1568,6 +2202,8 @@ mod tests {
             secret_key: 0,
             transaction_status: TransactionStatus::Idle,
             is_broken: false,
+            has_active_portal: false,
+            next_portal_id: 0,
             is_age_initialized: false,
             agtype_oid: None,
             query_timeout: None,

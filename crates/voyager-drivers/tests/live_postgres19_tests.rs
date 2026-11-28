@@ -713,3 +713,368 @@ async fn test_live_postgres19_execute_rows_and_arrow_equivalence() {
         .await;
     client.close().await;
 }
+
+#[tokio::test]
+async fn test_live_postgres19_stream_lifecycle_early_close_tx_and_timeout_cancel() {
+    if get_pg19_connection().await.is_none() {
+        return;
+    }
+
+    use std::time::Duration;
+    use voyager_drivers::config::PoolConfig;
+    use voyager_drivers::value::result::ResultValue;
+    use voyager_drivers::{NativeClient, NetError, StreamOptions};
+
+    let client = NativeClient::new(
+        &pg19_uri(),
+        Some(
+            PoolConfig::new()
+                .with_min_idle(0)
+                .with_max_size(1)
+                .with_acquire_timeout(Duration::from_secs(5)),
+        ),
+    )
+    .unwrap();
+
+    // Helper to inspect current backend_pid on the single pooled connection
+    async fn fetch_pid(c: &NativeClient) -> i64 {
+        let res = c
+            .execute_rows("SELECT pg_backend_pid() AS pid", &HashMap::new())
+            .await
+            .unwrap();
+        match res.result_rows.as_ref().unwrap()[0][0] {
+            ResultValue::Int(pid) => pid,
+            ref other => panic!("expected Int backend_pid, got {other:?}"),
+        }
+    }
+    let initial_pid = fetch_pid(&client).await;
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 1. Full multi-chunk stream (2,500 rows, fetch_size=1000) -> 3 chunks, eager lease release
+    let mut full_stream = client
+        .stream(
+            "SELECT g FROM generate_series(1, 2500) AS g",
+            &HashMap::new(),
+            StreamOptions::new(1_000),
+        )
+        .await
+        .unwrap();
+    assert!(full_stream.is_server_streaming());
+    assert_eq!(full_stream.columns(), &["g".to_string()]);
+    assert_eq!(client.pool().active_count(), 1);
+
+    let mut chunk_sizes = Vec::new();
+    let mut last_val = 0i64;
+    while let Some(chunk) = full_stream.next_chunk().await.unwrap() {
+        chunk_sizes.push(chunk.num_rows());
+        if let Some(row) = chunk.rows.last()
+            && let ResultValue::Int(v) = row[0]
+        {
+            last_val = v;
+        }
+        assert!(chunk.to_record_batch().is_ok());
+    }
+    assert_eq!(chunk_sizes, vec![1_000, 1_000, 500]);
+    assert_eq!(last_val, 2_500);
+    assert!(full_stream.is_closed());
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 1);
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 2. Early close after chunk 1 reuses the exact same backend_pid
+    let mut early_stream = client
+        .stream(
+            "SELECT g FROM generate_series(1, 10000) AS g",
+            &HashMap::new(),
+            StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+    let c1 = early_stream.next_chunk().await.unwrap().expect("chunk 1");
+    assert_eq!(c1.num_rows(), 100);
+    early_stream.close().await.unwrap();
+    assert_eq!(client.pool().active_count(), 0);
+    assert_eq!(client.pool().idle_count(), 1);
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 3. Close before chunk 1 drains & closes portal, reusing same backend_pid
+    let mut unread_stream = client
+        .stream(
+            "SELECT g FROM generate_series(1, 500) AS g",
+            &HashMap::new(),
+            StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+    unread_stream.close().await.unwrap();
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 4. Explicit transaction stream: fail-fast guard, early close, follow-up INSERT, COMMIT
+    let _ = client
+        .execute_rows("DROP TABLE IF EXISTS zz_stage4_458_tx;", &HashMap::new())
+        .await;
+    client
+        .execute_rows(
+            "CREATE TABLE zz_stage4_458_tx (id INT PRIMARY KEY);",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    let mut tx = client.begin_transaction().await.unwrap();
+    let mut cursor = tx
+        .open_stream_cursor(
+            "SELECT g FROM generate_series(1, 500) AS g",
+            &HashMap::new(),
+            &StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+    let err_concurrent = tx
+        .execute_rows("SELECT 1 AS x", &HashMap::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err_concurrent, NetError::TransactionError(ref m) if m.contains("active stream"))
+    );
+    let tx_c1 = tx.next_stream_chunk(&mut cursor).await.unwrap().unwrap();
+    let tx_c2 = tx.next_stream_chunk(&mut cursor).await.unwrap().unwrap();
+    assert_eq!(tx_c1.num_rows(), 100);
+    assert_eq!(tx_c2.num_rows(), 100);
+    tx.close_stream_cursor(&mut cursor).await.unwrap();
+    tx.execute_rows("INSERT INTO zz_stage4_458_tx VALUES (42);", &HashMap::new())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let check_tx = client
+        .execute_rows("SELECT id FROM zz_stage4_458_tx;", &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(check_tx.row_count(), 1);
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 5. Mid-stream ErrorResponse recovers via Sync on the same backend_pid
+    let mut err_stream = client
+        .stream(
+            "SELECT 1000 / (150 - g) AS q FROM generate_series(1, 300) AS g",
+            &HashMap::new(),
+            StreamOptions::new(100),
+        )
+        .await
+        .unwrap();
+    let ok1 = err_stream.next_chunk().await.unwrap().unwrap();
+    assert_eq!(ok1.num_rows(), 100);
+    let mid_err = err_stream.next_chunk().await.unwrap_err();
+    assert!(matches!(mid_err, NetError::ProtocolError(_)));
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 1);
+
+    // 6. Multi-statement SQL (42601) returns clear hint and reuses same backend_pid
+    let multi_err = match client
+        .stream(
+            "SELECT 1; SELECT 2;",
+            &HashMap::new(),
+            StreamOptions::new(10),
+        )
+        .await
+    {
+        Ok(_) => panic!("multi-statement stream must fail with 42601"),
+        Err(e) => e,
+    };
+    let multi_msg = multi_err.to_string();
+    assert!(multi_msg.contains("42601"), "got: {multi_msg}");
+    assert!(
+        multi_msg.contains("single SQL statement"),
+        "got: {multi_msg}"
+    );
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+
+    // 7. Unconstrained NUMERIC keeps identical Utf8 + voyager.type=decimal schema across scale-drifting chunks
+    let mut num_stream = client
+        .stream(
+            "SELECT CASE WHEN g <= 2 THEN 1.5::numeric ELSE 1.123456::numeric END AS n FROM generate_series(1, 4) AS g",
+            &HashMap::new(),
+            StreamOptions::new(2),
+        )
+        .await
+        .unwrap();
+    let nc1 = num_stream
+        .next_chunk()
+        .await
+        .unwrap()
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    let nc2 = num_stream
+        .next_chunk()
+        .await
+        .unwrap()
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    assert!(num_stream.next_chunk().await.unwrap().is_none());
+    assert_eq!(nc1.schema(), nc2.schema());
+    assert_eq!(
+        nc1.schema().field(0).data_type(),
+        &arrow_schema::DataType::Utf8
+    );
+    assert_eq!(
+        nc1.schema()
+            .field(0)
+            .metadata()
+            .get("voyager.type")
+            .map(String::as_str),
+        Some("decimal")
+    );
+
+    // 8. Stale cached statement (26000) recovery on open_stream after DEALLOCATE ALL
+    let q_cached = "SELECT g FROM generate_series(1, $v::int) AS g";
+    let _ = client.execute_rows(q_cached, &int_param(3)).await.unwrap();
+    let _ = client
+        .execute_rows("DEALLOCATE ALL;", &HashMap::new())
+        .await
+        .unwrap();
+    let mut s_26000 = client
+        .stream(q_cached, &int_param(3), StreamOptions::new(2))
+        .await
+        .unwrap();
+    let mut rows_26000 = 0usize;
+    while let Some(chunk) = s_26000.next_chunk().await.unwrap() {
+        rows_26000 += chunk.num_rows();
+    }
+    assert_eq!(rows_26000, 3);
+    assert_eq!(fetch_pid(&client).await, initial_pid);
+
+    // 9. prepared_statement_cache_size=0 streams cleanly across repeated parameterized calls
+    let nocache_uri = format!("{}?prepared_statement_cache_size=0", pg19_uri());
+    let nocache_client = NativeClient::new(&nocache_uri, None).unwrap();
+    for v in [10i64, 20i64] {
+        let mut s = nocache_client
+            .stream(
+                "SELECT g FROM generate_series(1, $v::int) AS g",
+                &int_param(v),
+                StreamOptions::new(5),
+            )
+            .await
+            .unwrap();
+        let mut count = 0usize;
+        while let Some(chunk) = s.next_chunk().await.unwrap() {
+            count += chunk.num_rows();
+        }
+        assert_eq!(count, v as usize);
+    }
+    nocache_client.close().await;
+
+    // 10. Drop unclosed stream marks broken & replaces backend_pid
+    let mut dropped_stream = client
+        .stream(
+            "SELECT g FROM generate_series(1, 500) AS g",
+            &HashMap::new(),
+            StreamOptions::new(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dropped_stream
+            .next_chunk()
+            .await
+            .unwrap()
+            .unwrap()
+            .num_rows(),
+        10
+    );
+    drop(dropped_stream);
+    assert_eq!(client.pool().total_count(), 0);
+    let pid_after_drop = fetch_pid(&client).await;
+    assert_ne!(pid_after_drop, initial_pid);
+    assert_eq!(client.pool().metrics().connections_created, 2);
+
+    // 11. Mid-flight tokio::time::timeout cancellation replaces backend_pid transparently
+    let mut slow_stream = client
+        .stream(
+            "SELECT g, pg_sleep(0.05) FROM generate_series(1, 200) AS g",
+            &HashMap::new(),
+            StreamOptions::new(1),
+        )
+        .await
+        .unwrap();
+    let _first_slow = slow_stream.next_chunk().await.unwrap().expect("chunk 1");
+    let cancel_res = tokio::time::timeout(Duration::from_millis(5), slow_stream.next_chunk()).await;
+    assert!(
+        cancel_res.is_err(),
+        "expected mid-flight timeout cancellation on chunk 2"
+    );
+    drop(slow_stream);
+    assert_eq!(client.pool().total_count(), 0);
+    let pid_after_cancel = fetch_pid(&client).await;
+    assert_ne!(pid_after_cancel, pid_after_drop);
+    assert_eq!(client.pool().metrics().connections_created, 3);
+
+    let _ = client
+        .execute_rows("DROP TABLE IF EXISTS zz_stage4_458_tx;", &HashMap::new())
+        .await;
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_live_postgres19_stream_ttfb_1k_vs_100k() {
+    if get_pg19_connection().await.is_none() {
+        return;
+    }
+
+    use std::time::Instant;
+    use voyager_drivers::{NativeClient, StreamOptions};
+
+    let client = NativeClient::new(&pg19_uri(), None).unwrap();
+    client.ping().await.unwrap();
+
+    let t0_1k = Instant::now();
+    let mut s_1k = client
+        .stream(
+            "SELECT g FROM generate_series(1, 1000) AS g",
+            &HashMap::new(),
+            StreamOptions::new(1_000),
+        )
+        .await
+        .unwrap();
+    let first_1k = s_1k.next_chunk().await.unwrap().unwrap();
+    let ttfb_1k = t0_1k.elapsed();
+    assert_eq!(first_1k.num_rows(), 1_000);
+    while s_1k.next_chunk().await.unwrap().is_some() {}
+
+    let t0_100k = Instant::now();
+    let mut s_100k = client
+        .stream(
+            "SELECT g FROM generate_series(1, 100000) AS g",
+            &HashMap::new(),
+            StreamOptions::new(1_000),
+        )
+        .await
+        .unwrap();
+    let first_100k = s_100k.next_chunk().await.unwrap().unwrap();
+    let ttfb_100k = t0_100k.elapsed();
+    assert_eq!(first_100k.num_rows(), 1_000);
+    let mut total_100k = first_100k.num_rows();
+    while let Some(c) = s_100k.next_chunk().await.unwrap() {
+        total_100k += c.num_rows();
+    }
+    let ttlb_100k = t0_100k.elapsed();
+    assert_eq!(total_100k, 100_000);
+
+    eprintln!(
+        "[pg19 stream] ttfb_1k={:?}, ttfb_100k={:?}, ttlb_100k={:?}",
+        ttfb_1k, ttfb_100k, ttlb_100k
+    );
+    assert!(
+        ttfb_100k.as_secs_f64() < ttlb_100k.as_secs_f64() * 0.25,
+        "100k TTFB {:?} was not well below TTLB {:?}",
+        ttfb_100k,
+        ttlb_100k
+    );
+
+    client.close().await;
+}

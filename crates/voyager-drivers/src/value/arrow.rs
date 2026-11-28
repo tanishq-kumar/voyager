@@ -76,6 +76,10 @@ pub enum ColumnHint {
         /// PostgreSQL `RowDescription` type modifier (`-1` when unconstrained).
         typmod: Option<i32>,
     },
+    /// PostgreSQL unconstrained `NUMERIC` in streaming mode: preserves exact decimal
+    /// strings as `Utf8` tagged with `voyager.type=decimal` so Arrow schemas stay
+    /// identical across chunks even when decimal scale varies.
+    PgDecimalText,
     /// PostgreSQL `TIME` column (microsecond `Time64(Microsecond)` resolution).
     PgLocalTimeUs,
     /// PostgreSQL typed scalar column whose empty/all-NULL Arrow type is known.
@@ -939,14 +943,7 @@ fn build_typed_scalar_column(
                         None => builder.append_null(),
                     }
                 }
-                Ok((
-                    field_with_meta(
-                        name,
-                        DataType::Utf8,
-                        &[(VOYAGER_META_TYPE, META_TYPE_DECIMAL)],
-                    ),
-                    Arc::new(builder.finish()),
-                ))
+                Ok(finish_decimal_text_column(name, builder))
             }
         }
         ScalarKind::Uuid => {
@@ -1630,6 +1627,31 @@ fn build_pg_mixed_array_column(
     ))
 }
 
+fn finish_decimal_text_column(name: &str, mut builder: StringBuilder) -> (Field, ArrayRef) {
+    (
+        field_with_meta(
+            name,
+            DataType::Utf8,
+            &[(VOYAGER_META_TYPE, META_TYPE_DECIMAL)],
+        ),
+        Arc::new(builder.finish()),
+    )
+}
+
+fn build_pg_decimal_text_column(name: &str, values: &[Option<&ResultValue>]) -> (Field, ArrayRef) {
+    let count = values.len();
+    let mut builder = StringBuilder::with_capacity(count, count * 16);
+    for v in values {
+        match v {
+            Some(ResultValue::Decimal(s)) => builder.append_value(&**s),
+            Some(ResultValue::TypedText(tt)) => builder.append_value(&*tt.text),
+            Some(ResultValue::Str(s)) => builder.append_value(&**s),
+            _ => builder.append_null(),
+        }
+    }
+    finish_decimal_text_column(name, builder)
+}
+
 fn build_column_values(
     name: &str,
     values: &[Option<&ResultValue>],
@@ -1651,6 +1673,11 @@ fn build_column_values(
     // 3. Explicit JSON column (PG json/jsonb).
     if let ColumnHint::JsonColumn { meta_type } = hint {
         return build_json_column(name, values, *meta_type, 0, 0, 0, 0);
+    }
+
+    // 3b. Streaming unconstrained PG Numeric column (fixed Utf8 + voyager.type=decimal across chunks).
+    if matches!(hint, ColumnHint::PgDecimalText) {
+        return Ok(build_pg_decimal_text_column(name, values));
     }
 
     // 3. Explicit PG Decimal column (preserves typmod scale even when all values are NULL).

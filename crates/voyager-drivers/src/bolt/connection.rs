@@ -1734,6 +1734,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
                 }
             }
             StreamCursor::Buffered(_) => Ok(cursor.next_buffered_chunk()),
+            #[cfg(feature = "postgres")]
+            StreamCursor::Postgres(_) => Err(NetError::ProtocolError(
+                "PostgreSQL stream cursor passed to Bolt connection".to_string(),
+            )),
         }
     }
 
@@ -1760,6 +1764,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncConnection for BoltCo
                 cursor.close_buffered();
                 Ok(())
             }
+            #[cfg(feature = "postgres")]
+            StreamCursor::Postgres(_) => Err(NetError::ProtocolError(
+                "PostgreSQL stream cursor passed to Bolt connection".to_string(),
+            )),
         }
     }
 
