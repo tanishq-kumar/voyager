@@ -1,5 +1,6 @@
 //! Python PyO3 bindings and Apache Arrow bridge for Voyager OGM.
 
+mod stream_schema;
 mod values;
 
 use std::sync::Arc;
@@ -7,7 +8,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use pyo3::exceptions::{
-    PyNotImplementedError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError,
+    PyNotImplementedError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration, PyTypeError,
+    PyUserWarning, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
@@ -3007,6 +3009,22 @@ impl PyArrowStream {
         }
     }
 
+    /// Creates a row-backed `PyArrowStream` directly from a streaming [`voyager_drivers::ResultChunk`].
+    pub fn from_result_chunk(chunk: voyager_drivers::ResultChunk) -> Self {
+        let row_len = chunk.rows.len();
+        Self {
+            backing: StreamBacking::Rows {
+                columns: chunk.columns,
+                rows: Arc::new(chunk.rows),
+                column_hints: chunk.column_hints,
+                row_offset: 0,
+                row_len,
+                materialized: Arc::new(OnceLock::new()),
+            },
+            consumed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Returns the canonical Arrow batch, materializing a row-backed stream at most once.
     ///
     /// Arrow construction runs with the GIL detached because it is pure Rust work.
@@ -4002,7 +4020,7 @@ impl PyNativeClient {
     /// `age=True` runs Apache AGE setup on every PostgreSQL connection even when the URI
     /// does not name AGE, so a Session can select AGE through its dialect or graph name.
     #[new]
-    #[pyo3(signature = (uri, min_idle=1, max_size=10, age=false, test_on_acquire=false, test_on_idle_after=Some(30.0)))]
+    #[pyo3(signature = (uri, min_idle=1, max_size=10, age=false, test_on_acquire=false, test_on_idle_after=Some(30.0), acquire_timeout=None))]
     fn new(
         uri: &str,
         min_idle: usize,
@@ -4010,6 +4028,7 @@ impl PyNativeClient {
         age: bool,
         test_on_acquire: bool,
         test_on_idle_after: Option<f64>,
+        acquire_timeout: Option<f64>,
     ) -> PyResult<Self> {
         let test_on_idle_after = match test_on_idle_after {
             Some(secs) if secs.is_finite() && secs >= 0.0 => {
@@ -4022,13 +4041,22 @@ impl PyNativeClient {
             }
             None => None,
         };
-        let pool_config = voyager_drivers::PoolConfig {
+        let mut pool_config = voyager_drivers::PoolConfig {
             min_idle,
             max_size,
             test_on_acquire,
             test_on_idle_after,
             ..Default::default()
         };
+        if let Some(secs) = acquire_timeout {
+            if secs.is_finite() && secs >= 0.0 {
+                pool_config.acquire_timeout = std::time::Duration::from_secs_f64(secs);
+            } else {
+                return Err(PyValueError::new_err(
+                    "acquire_timeout must be a non-negative finite number of seconds or None",
+                ));
+            }
+        }
         let client = voyager_drivers::NativeClient::new_with_options(
             uri,
             Some(pool_config),
@@ -4146,6 +4174,74 @@ impl PyNativeClient {
         })
     }
 
+    /// Synchronously opens a pull-based result stream over a pooled connection.
+    #[pyo3(signature = (query, params=None, fetch_size=1_000))]
+    fn stream_sync<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        params: Option<Bound<'py, PyDict>>,
+        fetch_size: usize,
+    ) -> PyResult<PyNativeResultStream> {
+        if fetch_size == 0 {
+            return Err(PyValueError::new_err("fetch_size must be at least 1"));
+        }
+        let params_map = py_dict_to_params(params)?;
+        let client = self.client.clone();
+        let options = voyager_drivers::StreamOptions::new(fetch_size);
+        let stream = py
+            .detach(|| {
+                get_tokio_runtime()
+                    .block_on(async move { client.stream(&query, &params_map, options).await })
+            })
+            .map_err(net_err_to_py)?;
+        Ok(PyNativeResultStream::from_standalone(stream))
+    }
+
+    /// Asynchronously opens a pull-based result stream over a pooled connection.
+    #[pyo3(signature = (query, params=None, fetch_size=1_000))]
+    fn stream<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        params: Option<Bound<'py, PyDict>>,
+        fetch_size: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if fetch_size == 0 {
+            return Err(PyValueError::new_err("fetch_size must be at least 1"));
+        }
+        let params_map = py_dict_to_params(params)?;
+        let client = self.client.clone();
+        let options = voyager_drivers::StreamOptions::new(fetch_size);
+        tokio_future_into_py(py, async move {
+            let stream = client
+                .stream(&query, &params_map, options)
+                .await
+                .map_err(net_err_to_py)?;
+            Ok(PyNativeResultStream::from_standalone(stream))
+        })
+    }
+
+    /// Diagnostic pool telemetry snapshot for tests and connection-lease assertions.
+    fn _pool_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let pool = self.client.pool();
+        let snap = pool.metrics();
+        let dict = PyDict::new(py);
+        dict.set_item("active_count", pool.active_count())?;
+        dict.set_item("idle_count", pool.idle_count())?;
+        dict.set_item("total_count", pool.total_count())?;
+        dict.set_item("max_size", pool.max_size())?;
+        dict.set_item("acquire_count", snap.acquire_count)?;
+        dict.set_item("acquire_timeout_count", snap.acquire_timeout_count)?;
+        dict.set_item("connections_created", snap.connections_created)?;
+        dict.set_item("connections_evicted", snap.connections_evicted)?;
+        dict.set_item(
+            "connections_failed_health_check",
+            snap.connections_failed_health_check,
+        )?;
+        Ok(dict)
+    }
+
     /// Synchronously checks database connectivity.
     fn ping_sync(&self, py: Python<'_>) -> PyResult<bool> {
         let client = self.client.clone();
@@ -4203,6 +4299,13 @@ impl PyNativeClient {
             client.close().await;
             Ok(())
         })
+    }
+}
+
+fn net_err_to_py(err: voyager_drivers::NetError) -> PyErr {
+    match err {
+        voyager_drivers::NetError::TransactionError(_) => PyRuntimeError::new_err(err.to_string()),
+        other => PyValueError::new_err(other.to_string()),
     }
 }
 
@@ -4351,6 +4454,15 @@ impl PyNativeTransaction {
         self.supports_savepoints
     }
 
+    /// Returns `true` while a streaming cursor is active on this transaction.
+    #[getter]
+    fn has_open_stream(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(|tx| tx.has_open_stream())
+    }
+
     /// Synchronously executes a statement inside the transaction.
     ///
     /// Returns a row-backed result without building an untransported Arrow batch.
@@ -4371,7 +4483,7 @@ impl PyNativeTransaction {
         });
         self.sync_state_from_handle(&tx);
         self.put(tx);
-        query_result_to_py(result.map_err(|e| PyValueError::new_err(e.to_string()))?)
+        query_result_to_py(result.map_err(net_err_to_py)?)
     }
 
     /// Synchronously executes a statement inside the transaction returning Arrow only.
@@ -4392,7 +4504,7 @@ impl PyNativeTransaction {
         });
         self.sync_state_from_handle(&tx);
         self.put(tx);
-        query_result_to_py_arrow(result.map_err(|e| PyValueError::new_err(e.to_string()))?)
+        query_result_to_py_arrow(result.map_err(net_err_to_py)?)
     }
 
     /// Asynchronously executes a statement inside the transaction.
@@ -4421,7 +4533,7 @@ impl PyNativeTransaction {
             *inner.lock() = Some(tx);
             state.store(native_transaction_state_code(tx_state), Ordering::Release);
             guard.disarm();
-            query_result_to_py(result.map_err(|e| PyValueError::new_err(e.to_string()))?)
+            query_result_to_py(result.map_err(net_err_to_py)?)
         })
     }
 
@@ -4451,7 +4563,74 @@ impl PyNativeTransaction {
             *inner.lock() = Some(tx);
             state.store(native_transaction_state_code(tx_state), Ordering::Release);
             guard.disarm();
-            query_result_to_py_arrow(result.map_err(|e| PyValueError::new_err(e.to_string()))?)
+            query_result_to_py_arrow(result.map_err(net_err_to_py)?)
+        })
+    }
+
+    /// Synchronously opens a pull-based result stream inside this transaction.
+    #[pyo3(signature = (query, params=None, fetch_size=1_000))]
+    fn stream_sync(
+        &self,
+        py: Python<'_>,
+        query: String,
+        params: Option<Bound<'_, PyDict>>,
+        fetch_size: usize,
+    ) -> PyResult<PyNativeResultStream> {
+        if fetch_size == 0 {
+            return Err(PyValueError::new_err("fetch_size must be at least 1"));
+        }
+        self.ensure_active()?;
+        let params_map = py_dict_to_params(params)?;
+        let options = voyager_drivers::StreamOptions::new(fetch_size);
+        let mut tx = self.take()?;
+        let (tx, result) = py.detach(|| {
+            let result = get_tokio_runtime()
+                .block_on(async { tx.open_stream_cursor(&query, &params_map, &options).await });
+            (tx, result)
+        });
+        self.sync_state_from_handle(&tx);
+        self.put(tx);
+        let cursor = result.map_err(net_err_to_py)?;
+        Ok(PyNativeResultStream::from_transaction(
+            self.inner.clone(),
+            self.state.clone(),
+            cursor,
+        ))
+    }
+
+    /// Asynchronously opens a pull-based result stream inside this transaction.
+    #[pyo3(signature = (query, params=None, fetch_size=1_000))]
+    fn stream<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        params: Option<Bound<'py, PyDict>>,
+        fetch_size: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if fetch_size == 0 {
+            return Err(PyValueError::new_err("fetch_size must be at least 1"));
+        }
+        self.ensure_active()?;
+        let params_map = py_dict_to_params(params)?;
+        let options = voyager_drivers::StreamOptions::new(fetch_size);
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        tokio_future_into_py(py, async move {
+            let mut guard = TxFutureGuard::new(inner.clone(), state.clone());
+            let mut tx = match inner.lock().take() {
+                Some(tx) => tx,
+                None => {
+                    guard.disarm();
+                    return Err(PyRuntimeError::new_err("Transaction is not active"));
+                }
+            };
+            let result = tx.open_stream_cursor(&query, &params_map, &options).await;
+            let tx_state = tx.state();
+            *inner.lock() = Some(tx);
+            state.store(native_transaction_state_code(tx_state), Ordering::Release);
+            guard.disarm();
+            let cursor = result.map_err(net_err_to_py)?;
+            Ok(PyNativeResultStream::from_transaction(inner, state, cursor))
         })
     }
 
@@ -4471,7 +4650,7 @@ impl PyNativeTransaction {
             Err(err) => {
                 self.sync_state_from_handle(&tx);
                 self.put(tx);
-                Err(PyValueError::new_err(err.to_string()))
+                Err(net_err_to_py(err))
             }
         }
     }
@@ -4501,7 +4680,7 @@ impl PyNativeTransaction {
                     *inner.lock() = Some(tx);
                     state.store(native_transaction_state_code(tx_state), Ordering::Release);
                     guard.disarm();
-                    Err(PyValueError::new_err(err.to_string()))
+                    Err(net_err_to_py(err))
                 }
             }
         })
@@ -4523,7 +4702,7 @@ impl PyNativeTransaction {
             Err(err) => {
                 self.sync_state_from_handle(&tx);
                 self.put(tx);
-                Err(PyValueError::new_err(err.to_string()))
+                Err(net_err_to_py(err))
             }
         }
     }
@@ -4553,7 +4732,7 @@ impl PyNativeTransaction {
                     *inner.lock() = Some(tx);
                     state.store(native_transaction_state_code(tx_state), Ordering::Release);
                     guard.disarm();
-                    Err(PyValueError::new_err(err.to_string()))
+                    Err(net_err_to_py(err))
                 }
             }
         })
@@ -4570,7 +4749,7 @@ impl PyNativeTransaction {
         });
         self.sync_state_from_handle(&tx);
         self.put(tx);
-        result.map_err(|e| PyValueError::new_err(e.to_string()))
+        result.map_err(net_err_to_py)
     }
 
     /// Asynchronously creates a real database savepoint.
@@ -4593,7 +4772,7 @@ impl PyNativeTransaction {
             *inner.lock() = Some(tx);
             state.store(native_transaction_state_code(tx_state), Ordering::Release);
             guard.disarm();
-            result.map_err(|e| PyValueError::new_err(e.to_string()))
+            result.map_err(net_err_to_py)
         })
     }
 
@@ -4609,7 +4788,7 @@ impl PyNativeTransaction {
         });
         self.sync_state_from_handle(&tx);
         self.put(tx);
-        result.map_err(|e| PyValueError::new_err(e.to_string()))
+        result.map_err(net_err_to_py)
     }
 
     /// Asynchronously rolls the transaction back to a savepoint.
@@ -4636,7 +4815,7 @@ impl PyNativeTransaction {
             *inner.lock() = Some(tx);
             state.store(native_transaction_state_code(tx_state), Ordering::Release);
             guard.disarm();
-            result.map_err(|e| PyValueError::new_err(e.to_string()))
+            result.map_err(net_err_to_py)
         })
     }
 
@@ -4651,7 +4830,7 @@ impl PyNativeTransaction {
         });
         self.sync_state_from_handle(&tx);
         self.put(tx);
-        result.map_err(|e| PyValueError::new_err(e.to_string()))
+        result.map_err(net_err_to_py)
     }
 
     /// Asynchronously releases a database savepoint.
@@ -4674,8 +4853,719 @@ impl PyNativeTransaction {
             *inner.lock() = Some(tx);
             state.store(native_transaction_state_code(tx_state), Ordering::Release);
             guard.disarm();
-            result.map_err(|e| PyValueError::new_err(e.to_string()))
+            result.map_err(net_err_to_py)
         })
+    }
+}
+
+const STREAM_STATE_ACTIVE: u8 = 1;
+const STREAM_STATE_EXHAUSTED: u8 = 2;
+const STREAM_STATE_CLOSED: u8 = 3;
+const STREAM_STATE_FAILED: u8 = 4;
+
+enum NativeStreamOwner {
+    Standalone(voyager_drivers::ResultStream<Box<dyn voyager_drivers::AsyncConnection>>),
+    Transaction {
+        tx_inner: Arc<parking_lot::Mutex<Option<NativeTransactionHandle>>>,
+        tx_state: Arc<AtomicU8>,
+        cursor: voyager_drivers::StreamCursor,
+    },
+}
+
+impl NativeStreamOwner {
+    fn summary(&self) -> &voyager_drivers::QuerySummary {
+        match self {
+            Self::Standalone(stream) => stream.summary(),
+            Self::Transaction { cursor, .. } => cursor.summary(),
+        }
+    }
+}
+
+impl Drop for NativeStreamOwner {
+    fn drop(&mut self) {
+        if let Self::Transaction {
+            tx_inner,
+            tx_state,
+            cursor,
+        } = self
+            && let Some(tx) = tx_inner.lock().as_mut()
+            && tx.has_open_stream()
+        {
+            if !cursor.is_wire_clean() {
+                tx.abort_stream_on_drop();
+            } else {
+                tx.clear_clean_stream(cursor);
+            }
+            tx_state.store(native_transaction_state_code(tx.state()), Ordering::Release);
+        }
+    }
+}
+
+/// Marks a PyO3 result stream closed and drops any checked-out owner if its
+/// asyncio future is cancelled mid-await.
+struct StreamFutureGuard {
+    inner: Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+    state: Arc<AtomicU8>,
+    armed: bool,
+}
+
+impl StreamFutureGuard {
+    fn new(
+        inner: Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+        state: Arc<AtomicU8>,
+    ) -> Self {
+        Self {
+            inner,
+            state,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamFutureGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.store(STREAM_STATE_CLOSED, Ordering::Release);
+            self.inner.lock().take();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StreamOpError {
+    Net(voyager_drivers::NetError),
+    Runtime(String),
+}
+
+impl StreamOpError {
+    fn into_py_err(self) -> PyErr {
+        match self {
+            Self::Net(err) => net_err_to_py(err),
+            Self::Runtime(msg) => PyRuntimeError::new_err(msg),
+        }
+    }
+}
+
+impl std::fmt::Display for StreamOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Net(err) => write!(f, "{err}"),
+            Self::Runtime(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamOpError {}
+
+async fn pull_next_chunk_async(
+    inner: &Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+    state: &Arc<AtomicU8>,
+    summary: &Arc<parking_lot::Mutex<voyager_drivers::QuerySummary>>,
+) -> Result<Option<voyager_drivers::ResultChunk>, StreamOpError> {
+    if state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE {
+        return Ok(None);
+    }
+    let mut owner = match inner.lock().take() {
+        Some(owner) => owner,
+        None => {
+            if state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE {
+                return Ok(None);
+            }
+            return Err(StreamOpError::Runtime(
+                "NativeResultStream operation is already in progress".to_string(),
+            ));
+        }
+    };
+
+    let mut keep_owner_on_busy = false;
+    let result = match &mut owner {
+        NativeStreamOwner::Standalone(stream) => {
+            stream.next_chunk().await.map_err(StreamOpError::Net)
+        }
+        NativeStreamOwner::Transaction {
+            tx_inner,
+            tx_state,
+            cursor,
+        } => {
+            let taken_tx = tx_inner.lock().take();
+            match taken_tx {
+                Some(mut tx) => {
+                    let mut tx_guard = TxFutureGuard::new(tx_inner.clone(), tx_state.clone());
+                    let res = tx.next_stream_chunk(cursor).await;
+                    let new_tx_state = tx.state();
+                    *tx_inner.lock() = Some(tx);
+                    tx_state.store(
+                        native_transaction_state_code(new_tx_state),
+                        Ordering::Release,
+                    );
+                    tx_guard.disarm();
+                    res.map_err(StreamOpError::Net)
+                }
+                None => {
+                    if tx_state.load(Ordering::Acquire) != TX_STATE_ACTIVE {
+                        state.store(STREAM_STATE_CLOSED, Ordering::Release);
+                        Err(StreamOpError::Runtime(
+                            "Transaction is not active; stream cannot continue".to_string(),
+                        ))
+                    } else {
+                        keep_owner_on_busy = true;
+                        Err(StreamOpError::Runtime(
+                            "Transaction operation is already in progress".to_string(),
+                        ))
+                    }
+                }
+            }
+        }
+    };
+
+    *summary.lock() = owner.summary().clone();
+
+    match result {
+        Ok(Some(chunk)) => {
+            *inner.lock() = Some(owner);
+            Ok(Some(chunk))
+        }
+        Ok(None) => {
+            state.store(STREAM_STATE_EXHAUSTED, Ordering::Release);
+            drop(owner);
+            Ok(None)
+        }
+        Err(err) => {
+            if keep_owner_on_busy {
+                *inner.lock() = Some(owner);
+            } else if state.load(Ordering::Acquire) == STREAM_STATE_ACTIVE {
+                state.store(STREAM_STATE_FAILED, Ordering::Release);
+                drop(owner);
+            } else {
+                drop(owner);
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn close_stream_async(
+    inner: &Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+    state: &Arc<AtomicU8>,
+    summary: &Arc<parking_lot::Mutex<voyager_drivers::QuerySummary>>,
+    target_state: u8,
+) -> Result<(), StreamOpError> {
+    if state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE {
+        return Ok(());
+    }
+    let Some(mut owner) = inner.lock().take() else {
+        state.store(target_state, Ordering::Release);
+        return Ok(());
+    };
+
+    let result = match &mut owner {
+        NativeStreamOwner::Standalone(stream) => stream.close().await,
+        NativeStreamOwner::Transaction {
+            tx_inner,
+            tx_state,
+            cursor,
+        } => {
+            let taken_tx = tx_inner.lock().take();
+            match taken_tx {
+                Some(mut tx) => {
+                    let mut tx_guard = TxFutureGuard::new(tx_inner.clone(), tx_state.clone());
+                    let res = tx.close_stream_cursor(cursor).await;
+                    let new_tx_state = tx.state();
+                    *tx_inner.lock() = Some(tx);
+                    tx_state.store(
+                        native_transaction_state_code(new_tx_state),
+                        Ordering::Release,
+                    );
+                    tx_guard.disarm();
+                    res
+                }
+                None => Ok(()),
+            }
+        }
+    };
+
+    *summary.lock() = owner.summary().clone();
+    state.store(target_state, Ordering::Release);
+    drop(owner);
+    result.map_err(StreamOpError::Net)
+}
+
+async fn pull_next_chunk_guarded(
+    inner: Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+    state: Arc<AtomicU8>,
+    summary: Arc<parking_lot::Mutex<voyager_drivers::QuerySummary>>,
+) -> PyResult<Option<PyArrowStream>> {
+    let mut guard = StreamFutureGuard::new(inner.clone(), state.clone());
+    let result = pull_next_chunk_async(&inner, &state, &summary).await;
+    guard.disarm();
+    match result {
+        Ok(Some(chunk)) => Ok(Some(PyArrowStream::from_result_chunk(chunk))),
+        Ok(None) => Ok(None),
+        Err(err) => Err(err.into_py_err()),
+    }
+}
+
+struct NativeArrowStreamReader {
+    locked_schema: Arc<arrow_schema::Schema>,
+    pending_first: Option<arrow_array::RecordBatch>,
+    inner: Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+    state: Arc<AtomicU8>,
+    summary: Arc<parking_lot::Mutex<voyager_drivers::QuerySummary>>,
+}
+
+impl NativeArrowStreamReader {
+    fn empty(locked_schema: Arc<arrow_schema::Schema>) -> Self {
+        Self {
+            locked_schema,
+            pending_first: None,
+            inner: Arc::new(parking_lot::Mutex::new(None)),
+            state: Arc::new(AtomicU8::new(STREAM_STATE_EXHAUSTED)),
+            summary: Arc::new(parking_lot::Mutex::new(
+                voyager_drivers::QuerySummary::empty(),
+            )),
+        }
+    }
+
+    fn new(
+        locked_schema: Arc<arrow_schema::Schema>,
+        pending_first: Option<arrow_array::RecordBatch>,
+        inner: Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+        state: Arc<AtomicU8>,
+        summary: Arc<parking_lot::Mutex<voyager_drivers::QuerySummary>>,
+    ) -> Self {
+        Self {
+            locked_schema,
+            pending_first,
+            inner,
+            state,
+            summary,
+        }
+    }
+}
+
+impl Iterator for NativeArrowStreamReader {
+    type Item = Result<arrow_array::RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(first) = self.pending_first.take() {
+            return Some(Ok(first));
+        }
+        if self.state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE {
+            return None;
+        }
+        let next_chunk = Python::attach(|py| {
+            py.detach(|| {
+                get_tokio_runtime().block_on(pull_next_chunk_async(
+                    &self.inner,
+                    &self.state,
+                    &self.summary,
+                ))
+            })
+        });
+        match next_chunk {
+            Ok(Some(chunk)) => {
+                let batch = match chunk.to_record_batch() {
+                    Ok(batch) => batch,
+                    Err(err) => {
+                        Python::attach(|py| {
+                            py.detach(|| {
+                                let _ = get_tokio_runtime().block_on(close_stream_async(
+                                    &self.inner,
+                                    &self.state,
+                                    &self.summary,
+                                    STREAM_STATE_FAILED,
+                                ));
+                            })
+                        });
+                        return Some(Err(arrow_schema::ArrowError::ExternalError(Box::new(err))));
+                    }
+                };
+                match stream_schema::reconcile_batch_to_schema(&batch, &self.locked_schema) {
+                    Ok(reconciled) => Some(Ok(reconciled)),
+                    Err(drift) => {
+                        Python::attach(|py| {
+                            py.detach(|| {
+                                let _ = get_tokio_runtime().block_on(close_stream_async(
+                                    &self.inner,
+                                    &self.state,
+                                    &self.summary,
+                                    STREAM_STATE_FAILED,
+                                ));
+                            })
+                        });
+                        Some(Err(arrow_schema::ArrowError::InvalidArgumentError(
+                            drift.to_string(),
+                        )))
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(err) => Some(Err(arrow_schema::ArrowError::ExternalError(Box::new(err)))),
+        }
+    }
+}
+
+impl arrow_array::RecordBatchReader for NativeArrowStreamReader {
+    fn schema(&self) -> Arc<arrow_schema::Schema> {
+        Arc::clone(&self.locked_schema)
+    }
+}
+
+impl Drop for NativeArrowStreamReader {
+    fn drop(&mut self) {
+        if self.state.load(Ordering::Acquire) == STREAM_STATE_ACTIVE {
+            self.state.store(STREAM_STATE_CLOSED, Ordering::Release);
+            drop(self.inner.lock().take());
+        }
+    }
+}
+
+/// Pull-based native result stream yielding row-backed `ArrowStream` chunks on demand.
+#[pyclass(name = "NativeResultStream")]
+pub struct PyNativeResultStream {
+    inner: Arc<parking_lot::Mutex<Option<NativeStreamOwner>>>,
+    state: Arc<AtomicU8>,
+    columns: Arc<[String]>,
+    column_hints: Arc<[voyager_drivers::value::arrow::ColumnHint]>,
+    is_server_streaming: bool,
+    summary: Arc<parking_lot::Mutex<voyager_drivers::QuerySummary>>,
+    consumed: Arc<AtomicBool>,
+    locked_arrow_schema: Arc<parking_lot::Mutex<Option<Arc<arrow_schema::Schema>>>>,
+}
+
+impl PyNativeResultStream {
+    fn from_standalone(
+        stream: voyager_drivers::ResultStream<Box<dyn voyager_drivers::AsyncConnection>>,
+    ) -> Self {
+        let columns: Arc<[String]> = Arc::from(stream.columns());
+        let column_hints: Arc<[voyager_drivers::value::arrow::ColumnHint]> =
+            Arc::from(stream.column_hints());
+        let is_server_streaming = stream.is_server_streaming();
+        let summary = stream.summary().clone();
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(Some(
+                NativeStreamOwner::Standalone(stream),
+            ))),
+            state: Arc::new(AtomicU8::new(STREAM_STATE_ACTIVE)),
+            columns,
+            column_hints,
+            is_server_streaming,
+            summary: Arc::new(parking_lot::Mutex::new(summary)),
+            consumed: Arc::new(AtomicBool::new(false)),
+            locked_arrow_schema: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    fn from_transaction(
+        tx_inner: Arc<parking_lot::Mutex<Option<NativeTransactionHandle>>>,
+        tx_state: Arc<AtomicU8>,
+        cursor: voyager_drivers::StreamCursor,
+    ) -> Self {
+        let columns = cursor.columns().clone();
+        let column_hints = cursor.column_hints().clone();
+        let is_server_streaming = cursor.is_server_streaming();
+        let summary = cursor.summary().clone();
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(Some(
+                NativeStreamOwner::Transaction {
+                    tx_inner,
+                    tx_state,
+                    cursor,
+                },
+            ))),
+            state: Arc::new(AtomicU8::new(STREAM_STATE_ACTIVE)),
+            columns,
+            column_hints,
+            is_server_streaming,
+            summary: Arc::new(parking_lot::Mutex::new(summary)),
+            consumed: Arc::new(AtomicBool::new(false)),
+            locked_arrow_schema: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    fn empty_schema_for_stream(&self) -> PyResult<Arc<arrow_schema::Schema>> {
+        if let Some(schema) = self.locked_arrow_schema.lock().as_ref() {
+            return Ok(Arc::clone(schema));
+        }
+        let batch = voyager_drivers::value::arrow::values_to_record_batch_with_hints(
+            &self.columns,
+            &[],
+            &self.column_hints,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let schema = batch.schema();
+        *self.locked_arrow_schema.lock() = Some(Arc::clone(&schema));
+        Ok(schema)
+    }
+}
+
+#[pymethods]
+impl PyNativeResultStream {
+    /// Ordered list of projected return column names.
+    #[getter]
+    fn columns(&self) -> Vec<String> {
+        self.columns.to_vec()
+    }
+
+    /// Returns `true` when rows are pulled incrementally from the server over the wire.
+    #[getter]
+    fn is_server_streaming(&self) -> bool {
+        self.is_server_streaming
+    }
+
+    /// Returns `true` once the stream is exhausted, explicitly closed, or failed.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE
+    }
+
+    /// Returns whether `__arrow_c_stream__` has already been called on this stream.
+    #[getter]
+    fn is_consumed(&self) -> bool {
+        self.consumed.load(Ordering::SeqCst)
+    }
+
+    /// Number of graph nodes created by the query.
+    #[getter]
+    fn nodes_created(&self) -> u64 {
+        self.summary.lock().nodes_created
+    }
+
+    /// Number of graph nodes deleted by the query.
+    #[getter]
+    fn nodes_deleted(&self) -> u64 {
+        self.summary.lock().nodes_deleted
+    }
+
+    /// Number of graph relationships created by the query.
+    #[getter]
+    fn relationships_created(&self) -> u64 {
+        self.summary.lock().relationships_created
+    }
+
+    /// Number of graph relationships deleted by the query.
+    #[getter]
+    fn relationships_deleted(&self) -> u64 {
+        self.summary.lock().relationships_deleted
+    }
+
+    /// Number of properties set or updated on nodes/relationships.
+    #[getter]
+    fn properties_set(&self) -> u64 {
+        self.summary.lock().properties_set
+    }
+
+    /// Total server-side execution duration in milliseconds.
+    #[getter]
+    fn execution_time_ms(&self) -> u64 {
+        self.summary.lock().execution_time_ms
+    }
+
+    /// Access to this stream's execution summary counters.
+    #[getter]
+    fn summary(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        slf
+    }
+
+    /// Synchronously pulls the next chunk as a row-backed `ArrowStream`, or `None` when exhausted.
+    fn next_chunk_sync(&self, py: Python<'_>) -> PyResult<Option<PyArrowStream>> {
+        if self.state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE {
+            return Ok(None);
+        }
+        let result = py.detach(|| {
+            get_tokio_runtime().block_on(pull_next_chunk_async(
+                &self.inner,
+                &self.state,
+                &self.summary,
+            ))
+        });
+        match result {
+            Ok(Some(chunk)) => Ok(Some(PyArrowStream::from_result_chunk(chunk))),
+            Ok(None) => Ok(None),
+            Err(err) => Err(err.into_py_err()),
+        }
+    }
+
+    /// Asynchronously pulls the next chunk as a row-backed `ArrowStream`, or `None` when exhausted.
+    fn next_chunk<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        let summary = self.summary.clone();
+        tokio_future_into_py(py, async move {
+            pull_next_chunk_guarded(inner, state, summary).await
+        })
+    }
+
+    /// Synchronously closes the stream, discarding any unread server-side rows. Idempotent.
+    fn close_sync(&self, py: Python<'_>) -> PyResult<()> {
+        if self.state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE {
+            return Ok(());
+        }
+        py.detach(|| {
+            get_tokio_runtime().block_on(close_stream_async(
+                &self.inner,
+                &self.state,
+                &self.summary,
+                STREAM_STATE_CLOSED,
+            ))
+        })
+        .map_err(StreamOpError::into_py_err)
+    }
+
+    /// Asynchronously closes the stream, discarding any unread server-side rows. Idempotent.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        let summary = self.summary.clone();
+        tokio_future_into_py(py, async move {
+            let mut guard = StreamFutureGuard::new(inner.clone(), state.clone());
+            let result = close_stream_async(&inner, &state, &summary, STREAM_STATE_CLOSED).await;
+            guard.disarm();
+            result.map_err(StreamOpError::into_py_err)
+        })
+    }
+
+    /// Asynchronous close alias supporting `contextlib.aclosing`.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.close(py)
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<PyArrowStream> {
+        match self.next_chunk_sync(py)? {
+            Some(chunk) => Ok(chunk),
+            None => Err(PyStopIteration::new_err(())),
+        }
+    }
+
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        let summary = self.summary.clone();
+        tokio_future_into_py(py, async move {
+            match pull_next_chunk_guarded(inner, state, summary).await? {
+                Some(chunk) => Ok(chunk),
+                None => Err(PyStopAsyncIteration::new_err(())),
+            }
+        })
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<Bound<'_, PyAny>>,
+        _exc_val: Option<Bound<'_, PyAny>>,
+        _exc_tb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let has_exc = exc_type.is_some_and(|e| !e.is_none());
+        let res = self.close_sync(py);
+        if !has_exc {
+            res?;
+        }
+        Ok(false)
+    }
+
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        tokio_future_into_py(py, async move { Ok(slf) })
+    }
+
+    #[pyo3(signature = (exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        exc_type: Option<Bound<'py, PyAny>>,
+        _exc_val: Option<Bound<'py, PyAny>>,
+        _exc_tb: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let has_exc = exc_type.is_some_and(|e| !e.is_none());
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        let summary = self.summary.clone();
+        tokio_future_into_py(py, async move {
+            let mut guard = StreamFutureGuard::new(inner.clone(), state.clone());
+            let result = close_stream_async(&inner, &state, &summary, STREAM_STATE_CLOSED).await;
+            guard.disarm();
+            if !has_exc {
+                result.map_err(StreamOpError::into_py_err)?;
+            }
+            Ok(false)
+        })
+    }
+
+    /// Exports the stream via the Apache Arrow C Stream PyCapsule protocol with schema locking.
+    ///
+    /// Locks the Arrow schema from the first pulled chunk (or empty typed schema for 0-row
+    /// streams) and reconciles subsequent chunks via `reconcile_batch_to_schema`.
+    #[pyo3(signature = (requested_schema=None))]
+    fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let _ = requested_schema;
+        if self.consumed.swap(true, Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err(
+                "NativeResultStream ArrowArrayStream has already been consumed: the Apache Arrow C Data Interface specification enforces single-pass stream consumption.",
+            ));
+        }
+
+        if self.state.load(Ordering::Acquire) != STREAM_STATE_ACTIVE {
+            let schema = py.detach(|| self.empty_schema_for_stream())?;
+            let ffi_stream = arrow_array::ffi_stream::FFI_ArrowArrayStream::new(Box::new(
+                NativeArrowStreamReader::empty(schema),
+            ));
+            return pyo3::types::PyCapsule::new_with_value(py, ffi_stream, c"arrow_array_stream");
+        }
+
+        let first_chunk = py
+            .detach(|| {
+                get_tokio_runtime().block_on(pull_next_chunk_async(
+                    &self.inner,
+                    &self.state,
+                    &self.summary,
+                ))
+            })
+            .map_err(StreamOpError::into_py_err)?;
+
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = match first_chunk {
+            Some(chunk) => {
+                let batch = py
+                    .detach(|| chunk.to_record_batch())
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let schema = batch.schema();
+                *self.locked_arrow_schema.lock() = Some(Arc::clone(&schema));
+                Box::new(NativeArrowStreamReader::new(
+                    schema,
+                    Some(batch),
+                    self.inner.clone(),
+                    self.state.clone(),
+                    self.summary.clone(),
+                ))
+            }
+            None => {
+                let schema = py.detach(|| self.empty_schema_for_stream())?;
+                Box::new(NativeArrowStreamReader::empty(schema))
+            }
+        };
+
+        let ffi_stream = arrow_array::ffi_stream::FFI_ArrowArrayStream::new(reader);
+        pyo3::types::PyCapsule::new_with_value(py, ffi_stream, c"arrow_array_stream")
     }
 }
 
@@ -7069,6 +7959,7 @@ fn _voyager_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAstExpr>()?;
     m.add_class::<PyArrowStream>()?;
     m.add_class::<PyNativeQueryResult>()?;
+    m.add_class::<PyNativeResultStream>()?;
     m.add_class::<PyNativeClient>()?;
     m.add_class::<PyNativeTransaction>()?;
     m.add_class::<PyNativeCircuitRouter>()?;
